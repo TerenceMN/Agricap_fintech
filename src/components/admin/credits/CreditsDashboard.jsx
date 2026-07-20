@@ -75,8 +75,16 @@ const AdminCreditsDashboard = () => {
 
     // Actions par dossier → endpoint générique.
     if (!credit?.id) return;
+    // `contract` et `export` n'ont plus d'entrée de menu (cf. CreditRow.jsx) : aucun
+    // endpoint backend ne les sert. Le garde-fou reste ici pour qu'un appel résiduel
+    // dise la vérité au lieu d'afficher un faux succès.
     if (action === 'contract' || action === 'export') {
-      toast({ title: action === 'contract' ? 'Contrat' : 'Export', description: 'Génération du document — à brancher (gabarit).' });
+      toast({
+        variant: 'destructive',
+        title: 'Fonction indisponible',
+        description: "Aucun service de génération de document n'existe côté serveur. "
+          + "Rien n'a été produit ni enregistré.",
+      });
       return;
     }
     let params = {};

@@ -49,11 +49,15 @@ class CreditScoringEngine:
     Instancié avec un CreditApplication ; appeler .compute() pour obtenir le résultat.
     """
 
-    def __init__(self, application) -> None:
+    def __init__(self, application, needs_totals: dict[str, float] | None = None) -> None:
         self.app = application
         self.client = application.client
         self.value_chain = application.value_chain
         self.needs_sheet = application.needs_sheet
+        #: Totaux par module LUS EN BASE (DataRecord de `application.needs_source`).
+        #: Quand ils sont fournis, ils font foi : le scoring ne dépend plus des
+        #: totaux figés au parse ni d'un payload client (principe 1).
+        self.needs_totals = needs_totals
 
     def compute(self) -> dict[str, Any]:
         from credits.models import ScoringCriterion
@@ -173,8 +177,9 @@ class CreditScoringEngine:
         """
         ns = self.needs_sheet
         vc = self.value_chain
+        from_tables = self.needs_totals is not None
 
-        if ns is None or not ns.parsed_ok:
+        if not from_tables and (ns is None or not ns.parsed_ok):
             pts = config.get("no_needs_sheet", max_points // 2)
             return pts, {"note": "Feuille de Besoins absente ou non parsée."}
 
@@ -182,17 +187,18 @@ class CreditScoringEngine:
             pts = config.get("no_needs_sheet", max_points // 2)
             return pts, {"note": "Filière non renseignée — comparaison impossible."}
 
-        area = float(self.app.area_ha or ns.area_ha or 0)
+        area = float(self.app.area_ha or (ns.area_ha if ns else 0) or 0)
         if area <= 0:
             pts = config.get("no_needs_sheet", max_points // 2)
             return pts, {"note": "Superficie non renseignée."}
 
-        currency = (self.app.currency or ns.currency or "USD").upper()
+        currency = (self.app.currency or (ns.currency if ns else "USD") or "USD").upper()
         ref_per_ha = float(
             vc.cost_per_hectare_usd if currency == "USD" else vc.cost_per_hectare_cdf
         )
         ref_total = ref_per_ha * area
-        declared = float(ns.grand_total)
+        declared = (sum(self.needs_totals.values()) if from_tables
+                    else float(ns.grand_total))
 
         if ref_total == 0:
             return max_points // 2, {"note": "Coût référentiel = 0, comparaison ignorée."}

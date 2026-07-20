@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Helmet } from 'react-helmet';
 import { motion, AnimatePresence } from 'framer-motion';
 import Layout from '@/components/Layout';
@@ -11,16 +11,23 @@ import { useToast } from '@/components/ui/use-toast';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Checkbox } from '@/components/ui/checkbox';
 import { useAuth } from '@/contexts/AuthContext.jsx';
 import AdminCreditsDashboard from '@/components/admin/credits/CreditsDashboard.jsx';
 import { api, ApiError } from '@/services/api';
 
 import { 
-    BarChart, Check, ChevronsRight, FileText, Leaf, Send, Shield, Sparkles, TrendingUp, Users, ArrowLeft, RefreshCw, Info, FileUp, Banknote, History, Shuffle, Plus, Building, Car, PiggyBank, HeartHandshake as Handshake, FileSignature, User, Landmark, Repeat, CalendarDays, AlertTriangle, Package, ShieldCheck
+    BarChart, Check, ChevronsRight, FileText, Leaf, Send, Shield, Sparkles, TrendingUp, Users, ArrowLeft, RefreshCw, Info, FileUp, Banknote, History, Shuffle, Plus, Car, FileSignature, User, Landmark, Repeat, CalendarDays, AlertTriangle, Package, ShieldCheck
 } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  GUARANTEE_CONFIG, guaranteeConfig,
+} from '@/components/guarantees/guaranteeConfig';
+import { guaranteeErrorMessage } from '@/components/guarantees/guaranteeErrors';
+import { formatMontant } from '@/components/guarantees/format';
+import GuaranteeCoverage from '@/components/guarantees/GuaranteeCoverage';
+import PledgeableAssets from '@/components/guarantees/PledgeableAssets';
 
 // =================================================================
 // ===== CLIENT VIEW COMPONENTS (EXISTING & UPDATED) ===============
@@ -136,11 +143,22 @@ const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
   );
 };
 
+/** Lettre correspondant à un score renvoyé par le moteur. Présentation d'un
+ *  chiffre serveur — le front n'invente ni le score ni le seuil d'éligibilité. */
+const scoreLetterOf = (score) => (score > 85 ? 'A' : score > 70 ? 'B' : score > 50 ? 'C' : 'D');
+
 const DonutChartScore = ({ score }) => {
-    const radius = 60; const circumference = 2 * Math.PI * radius; const offset = circumference - (score / 100) * circumference;
-    const scoreColor = score > 85 ? '#34d399' : score > 70 ? '#60a5fa' : score > 50 ? '#fbbf24' : '#f87171';
-    const scoreLetter = score > 85 ? 'A' : score > 70 ? 'B' : score > 50 ? 'C' : 'D';
-    return (<div className="relative flex items-center justify-center w-48 h-48"><svg className="w-full h-full" viewBox="0 0 150 150"><circle cx="75" cy="75" r={radius} fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="15"/><motion.circle cx="75" cy="75" r={radius} fill="none" stroke={scoreColor} strokeWidth="15" strokeDasharray={circumference} strokeDashoffset={offset} strokeLinecap="round" transform="rotate(-90 75 75)" initial={{ strokeDashoffset: circumference }} animate={{ strokeDashoffset: offset }} transition={{ duration: 1.5, ease: "easeOut" }}/></svg><div className="absolute flex flex-col items-center justify-center"><span className="text-sm text-gray-400">Score</span><span className="text-5xl font-black" style={{ color: scoreColor }}>{scoreLetter}</span><span className="font-bold">{score.toFixed(0)}/100</span></div></div>);
+    const radius = 60; const circumference = 2 * Math.PI * radius;
+    // Tant que le moteur n'a pas répondu, on n'affiche pas de score : le
+    // fallback client précédent fabriquait une note à partir du montant et de
+    // la superficie, sans rapport avec le scoring réel.
+    if (score == null || !Number.isFinite(Number(score))) {
+      return (<div className="relative flex items-center justify-center w-48 h-48"><svg className="w-full h-full" viewBox="0 0 150 150"><circle cx="75" cy="75" r={radius} fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="15"/></svg><div className="absolute flex flex-col items-center justify-center text-center px-6"><span className="text-sm text-gray-400">Score</span><span className="text-4xl font-black text-gray-600">—</span><span className="text-[11px] text-gray-500 mt-1">Lancez la simulation pour obtenir votre score</span></div></div>);
+    }
+    const value = Number(score);
+    const offset = circumference - (value / 100) * circumference;
+    const scoreColor = value > 85 ? '#34d399' : value > 70 ? '#60a5fa' : value > 50 ? '#fbbf24' : '#f87171';
+    return (<div className="relative flex items-center justify-center w-48 h-48"><svg className="w-full h-full" viewBox="0 0 150 150"><circle cx="75" cy="75" r={radius} fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="15"/><motion.circle cx="75" cy="75" r={radius} fill="none" stroke={scoreColor} strokeWidth="15" strokeDasharray={circumference} strokeDashoffset={offset} strokeLinecap="round" transform="rotate(-90 75 75)" initial={{ strokeDashoffset: circumference }} animate={{ strokeDashoffset: offset }} transition={{ duration: 1.5, ease: "easeOut" }}/></svg><div className="absolute flex flex-col items-center justify-center"><span className="text-sm text-gray-400">Score</span><span className="text-5xl font-black" style={{ color: scoreColor }}>{scoreLetterOf(value)}</span><span className="font-bold">{value.toFixed(0)}/100</span></div></div>);
 };
 
 const SimulateurIntelligent = ({ formData, setFormData, nextStep, prevStep, runSimulation }) => {
@@ -164,14 +182,14 @@ const SimulateurIntelligent = ({ formData, setFormData, nextStep, prevStep, runS
 
   const { totalFinanced, scoreLocal, pieData } = useMemo(() => {
     const totalFinanced = Object.values(modules).reduce((s, m) => s + (m.active ? m.cost * m.financing / 100 : 0), 0);
-    const scoreLocal = simResult
-      ? simResult.score
-      : Math.min(100, 30 + (parseFloat(formData.montant) > 0 ? (totalFinanced / parseFloat(formData.montant)) * 40 : 0) + (parseFloat(formData.superficie) > 0 ? 15 : 0) + 15);
+    // Aucun score avant la réponse du moteur : le front affiche ce que
+    // l'API retourne, il ne l'estime pas (CLAUDE.md, standards frontend).
+    const scoreLocal = simResult ? simResult.score : null;
     const pieData = Object.entries(modules)
       .filter(([, m]) => m.active)
       .map(([k, v]) => ({ name: MODULES_CONFIG[k].label, value: v.cost * v.financing / 100, color: MODULES_CONFIG[k].color }));
     return { totalFinanced, scoreLocal, pieData };
-  }, [modules, formData, simResult]);
+  }, [modules, simResult]);
 
   const handleSimulate = async () => {
     setSimLoading(true);
@@ -318,99 +336,226 @@ const SimulateurIntelligent = ({ formData, setFormData, nextStep, prevStep, runS
   );
 };
 
-const ConfigurationGaranties = ({ formData, setFormData, nextStep, prevStep }) => {
-  const [selectedGuarantees, setSelectedGuarantees] = useState(formData.guarantees || []);
-  const [availableAssets, setAvailableAssets] = useState([]);
-  
-  useEffect(() => {
-    api.assets.mine().then(setAvailableAssets).catch(() => setAvailableAssets([]));
+/**
+ * Étape 3 — garanties opposables (SPEC §2.4).
+ *
+ * Ce que cet écran ne fait plus :
+ *  - lire `localStorage.agricap_assets` (les actifs viennent de `/api/assets/mine`) ;
+ *  - calculer un nantissement d'épargne à « 20 % du montant » côté client ;
+ *  - proposer des cases à cocher sans endpoint derrière.
+ *
+ * Ce qu'il fait : le client mobilise **ses** actifs vérifiés via
+ * `POST /credits/applications/<code>/guarantees/asset/`, seul type de garantie
+ * qu'un client peut poser lui-même. Épargne et caution solidaire relèvent d'un
+ * agent (`CAN_INSTRUCT` côté serveur) : elles sont présentées, jamais cochables
+ * — un bouton sans permission serveur n'existe pas (CLAUDE.md §7.2).
+ *
+ * La couverture affichée vient de `coverage`, calculé par le backend sur les
+ * valeurs retenues après décote.
+ */
+const CLIENT_PLACEABLE_GUARANTEES = ['materiel', 'foncier'];
+const AGENT_PLACEABLE_GUARANTEES = ['epargne', 'morale'];
+
+const ConfigurationGaranties = ({ nextStep, prevStep, draftCode, ensureDraft, onGuaranteesChange }) => {
+  const { toast } = useToast();
+
+  const [assets, setAssets] = useState([]);
+  const [assetsLoading, setAssetsLoading] = useState(true);
+  const [assetsError, setAssetsError] = useState(null);
+
+  const [guaranteeSet, setGuaranteeSetState] = useState(null);
+  // Le résumé serveur est aussi remonté au parent : l'étape 4 affiche les
+  // garanties du dossier, pas une copie locale de la sélection.
+  const setGuaranteeSet = useCallback((value) => {
+    setGuaranteeSetState(value);
+    onGuaranteesChange?.(value);
+  }, [onGuaranteesChange]);
+
+  const [guaranteesLoading, setGuaranteesLoading] = useState(false);
+  const [pledgingId, setPledgingId] = useState(null);
+  const [pledgeError, setPledgeError] = useState(null);
+
+  const loadAssets = useCallback(async () => {
+    setAssetsLoading(true);
+    setAssetsError(null);
+    try {
+      // Le backend filtre lui-même les actifs mobilisables : vérifié ou libéré,
+      // libre de gage, valeur retenue > 0. Le front n'en déduit rien.
+      const res = await api.assets.mine({ pledgeable: true });
+      setAssets(Array.isArray(res?.items) ? res.items : []);
+    } catch (e) {
+      setAssets([]);
+      setAssetsError(guaranteeErrorMessage(e, 'Impossible de charger vos actifs mobilisables.'));
+    } finally {
+      setAssetsLoading(false);
+    }
   }, []);
 
-  const toggleGuarantee = (type, id = null, details = {}) => {
-    setSelectedGuarantees(prev => {
-      const exists = prev.find(g => g.type === type && g.id === id);
-      if (exists) {
-        return prev.filter(g => !(g.type === type && g.id === id));
-      } else {
-        return [...prev, { type, id, ...details }];
-      }
-    });
+  const loadGuarantees = useCallback(async (code) => {
+    if (!code) return;
+    setGuaranteesLoading(true);
+    try {
+      setGuaranteeSet(await api.credits.guarantees(code));
+    } catch (e) {
+      setPledgeError(guaranteeErrorMessage(e, 'Impossible de relire les garanties du dossier.'));
+    } finally {
+      setGuaranteesLoading(false);
+    }
+  }, [setGuaranteeSet]);
+
+  useEffect(() => { loadAssets(); }, [loadAssets]);
+  useEffect(() => { if (draftCode) loadGuarantees(draftCode); }, [draftCode, loadGuarantees]);
+
+  const pledgedAssetIds = useMemo(
+    () => (guaranteeSet?.items || []).filter(g => g.asset?.id).map(g => g.asset.id),
+    [guaranteeSet],
+  );
+
+  const handlePledge = async (asset) => {
+    setPledgingId(asset.id);
+    setPledgeError(null);
+    try {
+      const code = draftCode || await ensureDraft();
+      const updated = await api.credits.placeAssetGuarantee(code, asset.id);
+      setGuaranteeSet(updated);
+      await loadAssets(); // l'actif proposé n'est plus mobilisable ailleurs
+      toast({
+        title: 'Actif proposé en garantie',
+        description: `« ${asset.name} » est rattaché à votre dossier. Un agent AGRICAP doit encore confirmer le gage pour qu'il couvre le crédit.`,
+      });
+    } catch (e) {
+      // 422 → chaque règle refusée devient une consigne actionnable, jamais « erreur ».
+      const message = guaranteeErrorMessage(e);
+      setPledgeError(message);
+      toast({ variant: 'destructive', title: 'Garantie refusée', description: message });
+    } finally {
+      setPledgingId(null);
+    }
   };
 
-  const handleNext = () => {
-    setFormData(prev => ({ ...prev, guarantees: selectedGuarantees }));
-    nextStep();
-  };
+  const hasGuarantee = (guaranteeSet?.items || []).some(
+    g => g.status === 'pending' || g.status === 'active',
+  );
 
   return (
     <motion.div initial={{ opacity: 0, x: -50 }} animate={{ opacity: 1, x: 0 }} className="space-y-6">
-       <div className="glass-effect p-6 rounded-2xl mb-6">
-         <h3 className="text-xl font-bold text-white mb-2">Sélection des Garanties</h3>
-         <p className="text-gray-400">Pour sécuriser votre crédit, veuillez sélectionner une ou plusieurs garanties. Le montant total du crédit influence les garanties requises.</p>
-       </div>
+      <div className="glass-effect p-6 rounded-2xl">
+        <h3 className="text-xl font-bold text-white mb-2">Garanties du dossier</h3>
+        <p className="text-gray-400 text-sm leading-relaxed">
+          Une garantie n'a de valeur que si elle est opposable : l'actif doit exister à votre nom,
+          avoir été vérifié par un agent AGRICAP et être libre de tout gage. Vous mobilisez ici vos
+          actifs vérifiés ; les autres types de garantie sont constitués avec votre agent pendant
+          l'instruction du dossier.
+        </p>
+      </div>
 
-       <div className="space-y-4">
-          {/* Moral / Solidarity */}
-          <div className={`p-4 rounded-xl border transition-all ${selectedGuarantees.find(g => g.type === 'morale') ? 'bg-emerald-500/10 border-emerald-500/50' : 'bg-white/5 border-white/10'}`}>
-            <div className="flex items-start gap-3">
-              <Checkbox id="moral" checked={!!selectedGuarantees.find(g => g.type === 'morale')} onCheckedChange={() => toggleGuarantee('morale', 'gm1', { label: 'Garantie Solidaire (Coopérative)' })} />
-              <div className="flex-1">
-                 <Label htmlFor="moral" className="text-base font-semibold text-white">Garantie Morale / Solidaire</Label>
-                 <p className="text-sm text-gray-400 mt-1">Caution solidaire fournie par votre coopérative ou groupe d'appartenance.</p>
-              </div>
-              <Handshake className="text-emerald-400 w-6 h-6" />
-            </div>
+      {/* ── Garanties sur actif : les seules qu'un client peut poser lui-même ── */}
+      <div className="space-y-4">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <h4 className="font-semibold text-white flex items-center gap-2">
+            <Package className="w-4 h-4" aria-hidden="true" /> Mes actifs mobilisables
+          </h4>
+          <div className="flex gap-2">
+            {CLIENT_PLACEABLE_GUARANTEES.map(code => {
+              const cfg = GUARANTEE_CONFIG[code];
+              const Icon = cfg.icon;
+              const available = assets.some(a => a.guaranteeType === code);
+              return (
+                <span
+                  key={code}
+                  className={`px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 ${
+                    available
+                      ? 'border-white/20 text-gray-200 bg-white/5'
+                      : 'border-white/10 text-gray-600 bg-white/[0.02]'
+                  }`}
+                  title={available ? undefined : `Aucun actif vérifié de type « ${cfg.label} »`}
+                >
+                  <Icon className="w-3 h-3" style={{ color: available ? cfg.color : undefined }} aria-hidden="true" />
+                  {cfg.label}
+                </span>
+              );
+            })}
           </div>
+        </div>
 
-           {/* Savings Pledge */}
-           <div className={`p-4 rounded-xl border transition-all ${selectedGuarantees.find(g => g.type === 'epargne') ? 'bg-purple-500/10 border-purple-500/50' : 'bg-white/5 border-white/10'}`}>
-            <div className="flex items-start gap-3">
-              <Checkbox id="savings" checked={!!selectedGuarantees.find(g => g.type === 'epargne')} onCheckedChange={() => toggleGuarantee('epargne', 'ep1', { label: 'Nantissement Épargne (20%)', value: formData.totalFinanced * 0.2 })} />
-              <div className="flex-1">
-                 <Label htmlFor="savings" className="text-base font-semibold text-white">Nantissement Épargne</Label>
-                 <p className="text-sm text-gray-400 mt-1">Blocage temporaire de 20% du montant du crédit sur votre compte épargne.</p>
-              </div>
-              <PiggyBank className="text-purple-400 w-6 h-6" />
-            </div>
+        <PledgeableAssets
+          assets={assets}
+          loading={assetsLoading}
+          error={assetsError}
+          pledgingId={pledgingId}
+          pledgedAssetIds={pledgedAssetIds}
+          onRetry={loadAssets}
+          onPledge={handlePledge}
+        />
+
+        {pledgeError && (
+          <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+            <p className="text-sm text-red-200 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" aria-hidden="true" />
+              <span>{pledgeError}</span>
+            </p>
           </div>
+        )}
+      </div>
 
-          {/* Registered Assets */}
-          <h4 className="font-semibold text-white mt-6 mb-2 flex items-center gap-2"><Package className="w-4 h-4"/> Mes Actifs Enregistrés</h4>
-          {availableAssets.length > 0 ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {availableAssets.map(asset => {
-                const isSelected = !!selectedGuarantees.find(g => g.id === asset.id);
-                return (
-                  <div key={asset.id} className={`p-4 rounded-xl border cursor-pointer transition-all ${isSelected ? 'bg-blue-500/10 border-blue-500/50' : 'bg-white/5 border-white/10 hover:bg-white/10'}`}
-                       onClick={() => toggleGuarantee('actif', asset.id, { label: asset.name, value: asset.value })}>
-                     <div className="flex justify-between items-start">
-                       <div>
-                         <p className="font-semibold text-white">{asset.name}</p>
-                         <p className="text-xs text-gray-400">{asset.type} • {asset.value} {asset.currency}</p>
-                       </div>
-                       {isSelected && <Check className="w-5 h-5 text-blue-400" />}
-                     </div>
-                  </div>
-                );
-              })}
+      {/* ── Garanties constituées en agence (endpoints réservés au staff) ── */}
+      <div className="space-y-3">
+        <h4 className="font-semibold text-white flex items-center gap-2">
+          <Shield className="w-4 h-4" aria-hidden="true" /> Garanties constituées avec votre agent
+        </h4>
+        {AGENT_PLACEABLE_GUARANTEES.map(code => {
+          const cfg = GUARANTEE_CONFIG[code];
+          const Icon = cfg.icon;
+          return (
+            <div key={code} className="p-4 rounded-xl border border-white/10 bg-white/[0.03]">
+              <div className="flex items-start gap-3">
+                <Icon className="w-5 h-5 shrink-0 mt-0.5" style={{ color: cfg.color }} aria-hidden="true" />
+                <div className="flex-1">
+                  <p className="font-semibold text-gray-200">{cfg.label}</p>
+                  <p className="text-sm text-gray-400 mt-1">{cfg.description}</p>
+                  <p className="text-xs text-gray-500 mt-2">
+                    {code === 'epargne'
+                      ? "Le montant à bloquer est arrêté par AGRICAP à l'instruction, en fonction du solde réellement disponible sur votre plan d'épargne."
+                      : "Le garant doit consentir personnellement à son engagement : cette caution est enregistrée par votre agent, jamais depuis votre espace."}
+                  </p>
+                </div>
+              </div>
             </div>
-          ) : (
-            <div className="text-center p-6 border border-dashed border-gray-600 rounded-xl">
-              <p className="text-gray-500">Aucun actif enregistré. Ajoutez-en dans la section "Mes Actifs".</p>
-            </div>
+          );
+        })}
+      </div>
+
+      {/* ── Couverture, telle que le backend la calcule ── */}
+      {guaranteesLoading && !guaranteeSet && (
+        <div className="glass-effect rounded-2xl p-5 space-y-3">
+          <Skeleton className="h-5 w-40" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      )}
+      {guaranteeSet && <GuaranteeCoverage guaranteeSet={guaranteeSet} />}
+
+      <div className="flex flex-col sm:flex-row justify-between items-stretch sm:items-end gap-3 mt-8">
+        <Button onClick={prevStep} variant="ghost">
+          <ArrowLeft className="w-5 h-5 mr-2" aria-hidden="true" /> Retour
+        </Button>
+        <div className="flex flex-col items-end gap-2">
+          {!hasGuarantee && (
+            <p className="text-xs text-gray-500 text-right max-w-md">
+              Aucune garantie n'est encore rattachée au dossier. Vous pouvez continuer : votre
+              agent pourra en constituer une pendant l'instruction.
+            </p>
           )}
-       </div>
-
-       <div className="flex justify-between mt-8">
-          <Button onClick={prevStep} variant="ghost"><ArrowLeft className="w-5 h-5 mr-2"/> Retour</Button>
-          <Button onClick={handleNext} disabled={selectedGuarantees.length === 0} className="bg-gradient-to-r from-emerald-500 to-blue-600 py-6 text-lg">Voir la synthèse <ArrowLeft className="w-5 h-5 ml-2 transform rotate-180" /></Button>
-       </div>
+          <Button onClick={nextStep} className="bg-gradient-to-r from-emerald-500 to-blue-600 py-6 text-lg">
+            Voir la synthèse <ArrowLeft className="w-5 h-5 ml-2 transform rotate-180" aria-hidden="true" />
+          </Button>
+        </div>
+      </div>
     </motion.div>
   );
 };
 
 
-const FicheSynthese = ({ formData, prevStep, submitApplication }) => (
+const FicheSynthese = ({ formData, prevStep, submitApplication, guaranteeSet }) => (
     <motion.div initial={{ opacity: 0, x: -50 }} animate={{ opacity: 1, x: 0 }} className="space-y-6">
       <div className="glass-effect p-8 rounded-2xl">
         <h3 className="text-2xl font-bold text-white mb-6">Fiche de Synthèse Finale</h3>
@@ -418,21 +563,40 @@ const FicheSynthese = ({ formData, prevStep, submitApplication }) => (
           <div className="bg-white/5 p-4 rounded-lg"><p className="text-sm text-gray-400">Demandeur</p><p className="font-bold">{formData.demandeur}</p></div>
           <div className="bg-white/5 p-4 rounded-lg"><p className="text-sm text-gray-400">Superficie</p><p className="font-bold">{formData.superficie} ha</p></div>
           <div className="bg-white/5 p-4 rounded-lg"><p className="text-sm text-gray-400">Culture</p><p className="font-bold">{formData.culture}</p></div>
-          <div className="bg-white/5 p-4 rounded-lg col-span-2 md:col-span-1"><p className="text-sm text-gray-400">Montant total financé</p><p className="font-bold text-2xl text-emerald-400">{formData.totalFinanced?.toLocaleString('fr-FR', { maximumFractionDigits: 0 })} {formData.currency}</p></div>
-          <div className="bg-white/5 p-4 rounded-lg text-center"><p className="text-sm text-gray-400">Score</p><p className="font-black text-4xl gradient-text">{formData.scoreLetter}</p></div>
-          <div className="bg-white/5 p-4 rounded-lg text-center"><p className="text-sm text-gray-400">Taux indicatif</p><p className="font-bold text-2xl">{((100 - (formData.score || 0)) / 10 + 8).toFixed(1)}%</p></div>
+          <div className="bg-white/5 p-4 rounded-lg col-span-2 md:col-span-1"><p className="text-sm text-gray-400">Montant total financé</p><p className="font-bold text-2xl text-emerald-400">{formatMontant(formData.totalFinanced, formData.currency, { decimals: 0 })}</p></div>
+          {/* Score du moteur ; `formData.scoreLetter` n'était jamais alimenté. */}
+          <div className="bg-white/5 p-4 rounded-lg text-center"><p className="text-sm text-gray-400">Score</p><p className="font-black text-4xl gradient-text">{formData.simResult?.score != null ? scoreLetterOf(formData.simResult.score) : '—'}</p><p className="text-[11px] text-gray-500 mt-1">{formData.simResult?.score != null ? `${Math.round(formData.simResult.score)}/100` : 'simulation non lancée'}</p></div>
+          {/* Taux proposé par le moteur ; le front n'en dérive aucun. */}
+          <div className="bg-white/5 p-4 rounded-lg text-center"><p className="text-sm text-gray-400">Taux indicatif</p><p className="font-bold text-2xl">{formData.simResult?.proposedRate != null ? `${formData.simResult.proposedRate} %` : '—'}</p><p className="text-[11px] text-gray-500 mt-1">{formData.simResult?.proposedRate != null ? 'communiqué par AGRICAP' : 'communiqué après analyse'}</p></div>
         </div>
-        
+
         <div className="mt-6">
-           <h4 className="font-bold text-white mb-2">Garanties Sélectionnées</h4>
+           <h4 className="font-bold text-white mb-2">Garanties rattachées au dossier</h4>
+           {/* Source unique : le résumé serveur des garanties du dossier. */}
            <div className="flex flex-wrap gap-2">
-             {formData.guarantees && formData.guarantees.map((g, idx) => (
-                <Badge key={idx} variant="outline" className="text-blue-300 border-blue-500/30 bg-blue-500/10 py-1 px-3">
-                  <ShieldCheck className="w-3 h-3 mr-1"/> {g.label}
-                </Badge>
-             ))}
+             {(guaranteeSet?.items || []).map((g) => {
+                const cfg = guaranteeConfig(g.type);
+                return (
+                  <Badge key={g.id} variant="outline" className="text-blue-300 border-blue-500/30 bg-blue-500/10 py-1 px-3">
+                    <ShieldCheck className="w-3 h-3 mr-1"/> {cfg.label}
+                    {g.asset?.name ? ` — ${g.asset.name}` : ''}
+                    {g.status === 'pending' ? ' (à confirmer)' : ''}
+                  </Badge>
+                );
+             })}
+             {!(guaranteeSet?.items || []).length && (
+               <p className="text-sm text-gray-500">
+                 Aucune garantie rattachée pour l'instant : votre agent pourra en constituer une pendant l'instruction.
+               </p>
+             )}
            </div>
         </div>
+
+        {guaranteeSet?.coverage && (
+          <div className="mt-6">
+            <GuaranteeCoverage guaranteeSet={guaranteeSet} />
+          </div>
+        )}
 
         <div className="mt-6"><h4 className="font-bold text-white mb-2">Répartition du financement</h4><div className="space-y-2">{formData.modules && Object.entries(formData.modules).filter(([,mod]) => mod.active).map(([key, mod]) => {const Icon = MODULES_CONFIG[key].icon;return (<div key={key} className="flex justify-between items-center bg-white/5 p-2 rounded"><span className="flex items-center gap-2 text-sm"><Icon className="w-4 h-4" style={{color: MODULES_CONFIG[key].color}}/> {MODULES_CONFIG[key].label}</span><span className="font-semibold">{(mod.cost * mod.financing / 100).toLocaleString('fr-FR', {maximumFractionDigits: 0})} {formData.currency}</span></div>)})}</div></div>
       </div>
@@ -441,14 +605,11 @@ const FicheSynthese = ({ formData, prevStep, submitApplication }) => (
 );
 const SuccessMessage = ({ loan, reset }) => ( <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="text-center glass-effect p-12 rounded-2xl"><Check className="w-16 h-16 mx-auto bg-emerald-500 text-white rounded-full p-2 mb-4" /><h2 className="text-3xl font-bold text-white">Demande Soumise !</h2><p className="text-gray-300 mt-2 mb-6">Bonjour {loan.operator}, votre demande de {loan.amountApproved?.toLocaleString('fr-FR', { maximumFractionDigits: 0 })} {loan.currency} a été envoyée. <br/> Nous vous notifierons dans 3 à 5 jours ouvrables.</p><Button onClick={reset}><RefreshCw className="w-4 h-4 mr-2"/> Nouvelle Demande</Button></motion.div>);
 
-const GUARANTEE_CONFIG = {
-  actif: { label: 'Actif', icon: Package, color: '#3b82f6' },
-  immobilier: { label: 'Immobilier', icon: Building, color: '#8b5cf6' },
-  epargne: { label: 'Épargne', icon: PiggyBank, color: '#ec4899' },
-  morale: { label: 'Garantie Morale', icon: Handshake, color: '#10b981' },
-  'Gage matériel': { label: 'Gage matériel', icon: Shield, color: '#f59e0b' },
-  'Hypothèque': { label: 'Hypothèque', icon: Building, color: '#8b5cf6' }
-};
+// La nomenclature des garanties vit désormais dans
+// `@/components/guarantees/guaranteeConfig` : 4 codes canoniques
+// (`epargne`, `morale`, `materiel`, `foncier`), alignés sur le backend, et
+// `actif` / `immobilier` / `Gage matériel` / `Hypothèque` réduits à des alias
+// d'affichage résolus par `guaranteeConfig()` (SPEC §2.2, principe 6).
 
 
 const TransferDialog = ({ open, onOpenChange, subwallet, onTransfer, currency, suppliers }) => {
@@ -670,8 +831,10 @@ const GestionCreditsClient = ({ approvedCredit, refreshCredit }) => {
             <h3 className="text-xl font-bold text-white mb-4">Garanties Enregistrées</h3>
             <div className="space-y-3">
               {approvedCredit.guarantees.map(g => {
-                const Icon = GUARANTEE_CONFIG[g.type]?.icon || Shield;
-                return (<div key={g.id} className="bg-white/5 p-3 rounded-lg flex items-center gap-3"><div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{backgroundColor: `${GUARANTEE_CONFIG[g.type]?.color}20`}}><Icon className="w-4 h-4" style={{color: GUARANTEE_CONFIG[g.type]?.color}}/></div><div><p className="font-semibold text-sm">{GUARANTEE_CONFIG[g.type]?.label || g.label || g.type}</p><p className="text-xs text-gray-400">{g.description || g.label}</p></div></div>)
+                // `guaranteeConfig` résout aussi les alias hérités (actif, immobilier…).
+                const cfg = guaranteeConfig(g.type);
+                const Icon = cfg.icon;
+                return (<div key={g.id} className="bg-white/5 p-3 rounded-lg flex items-center gap-3"><div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{backgroundColor: `${cfg.color}20`}}><Icon className="w-4 h-4" style={{color: cfg.color}}/></div><div><p className="font-semibold text-sm">{cfg.label}</p><p className="text-xs text-gray-400">{g.description || ''}</p></div></div>)
               })}
               {approvedCredit.guarantees.length === 0 && <p className="text-sm text-gray-500 text-center py-4">Aucune garantie enregistrée.</p>}
             </div>
@@ -705,11 +868,19 @@ const Credits = () => {
   const [approvedCredit, setApprovedCredit] = useState(null);
   const [submittedAppCode, setSubmittedAppCode] = useState(null);
   const [prefill, setPrefill] = useState(null);
+  // Code du dossier brouillon : porte les garanties posées avant soumission.
+  const [draftCode, setDraftCode] = useState(null);
+  const [guaranteeSet, setGuaranteeSet] = useState(null);
   const [formData, setFormData] = useState({
     demandeur: '', localisation: '', superficie: '', culture: '',
-    montant: '', currency: 'USD', guarantees: [],
+    montant: '', currency: 'USD',
     vcCode: '', nsFile: null, nsResult: null, simResult: null,
   });
+  // Refs lues par `ensureDraft` : évite de recréer le callback (et donc de
+  // relancer les effets enfants) à chaque frappe dans le formulaire.
+  const draftCodeRef = React.useRef(null);
+  const formDataRef = React.useRef(formData);
+  useEffect(() => { formDataRef.current = formData; }, [formData]);
 
   useEffect(() => {
     if (user?.role === 'client') {
@@ -738,11 +909,15 @@ const Credits = () => {
     }
   }, [user]);
 
-  // Convertit un CreditApplication en forme affichable dans GestionCreditsClient
+  // Convertit un CreditApplication en forme affichable dans GestionCreditsClient.
+  // Les clés suivent `credits/workflow.py::serialize_application`, qui émet du
+  // camelCase (`valueChain`, `amountApproved`, `scoreResult`…). Les lectures en
+  // snake_case précédentes ne croisaient jamais la réponse : les montants et la
+  // filière s'affichaient vides sur des données pourtant présentes.
   const _appToLoan = (app) => ({
     id: app.code,
-    type: app.value_chain?.label || 'Crédit Agricole',
-    amountApproved: app.amount_approved || app.amount_requested,
+    type: app.valueChain?.label || 'Crédit Agricole',
+    amountApproved: app.amountApproved ?? app.amountRequested ?? 0,
     currency: app.currency,
     manager: app.reviewedBySub || 'AGRICAP',
     investor: '—',
@@ -756,18 +931,19 @@ const Credits = () => {
     guarantees: app.guarantees?.items?.map(g => ({
       id: g.id,
       type: g.type,
-      label: g.type === 'epargne' ? 'Nantissement Épargne' : 'Caution Morale',
-      description: g.type === 'epargne'
-        ? `${g.holdAmount?.toLocaleString() || 0} ${g.holdCurrency || app.currency} bloqués`
-        : `${g.guarantorName || '—'} — ${g.status}`,
+      description: g.asset
+        ? `${g.asset.name} — retenu ${formatMontant(g.asset.retainedValue, g.asset.currency)}`
+        : g.type === 'epargne'
+          ? `${formatMontant(g.holdAmount, g.holdCurrency || app.currency)} bloqués`
+          : `${g.guarantorName || '—'} — ${g.status}`,
     })) || [],
     transactions: [],
-    schedule: app.score_result?.scheduleDraft?.map((s, i) => ({
+    schedule: app.scoreResult?.scheduleDraft?.map((s, i) => ({
       number: i + 1, date: `Mois ${s.month}`,
       principal: s.principal, interest: s.interest,
       total: s.payment, balance: s.balance,
     })) || [],
-    startDate: app.disbursedAt || app.createdAt,
+    startDate: app.disbursement?.confirmedAt || app.createdAt,
   });
 
   const refreshCredit = async () => {
@@ -785,32 +961,54 @@ const Credits = () => {
   const nextStep = () => setCurrentStep(prev => Math.min(prev + 1, 4));
   const prevStep = (step) => setCurrentStep(prev => step || Math.max(prev - 1, 1));
 
+  /**
+   * Crée le dossier en DRAFT au plus tard, et une seule fois.
+   *
+   * Poser une garantie exige un dossier existant côté serveur
+   * (`POST /credits/applications/<code>/guarantees/asset/`). Le brouillon est
+   * donc créé à la première mobilisation d'actif — pas à l'ouverture de
+   * l'étape, pour ne pas semer des dossiers vides — puis réutilisé à la
+   * soumission.
+   */
+  const ensureDraft = useCallback(async () => {
+    if (draftCodeRef.current) return draftCodeRef.current;
+    const fd = formDataRef.current;
+    const app = await api.credits.create({
+      value_chain_code: fd.vcCode || undefined,
+      area_ha: fd.superficie ? parseFloat(fd.superficie) : undefined,
+      currency: fd.currency,
+      amount_requested: parseFloat(fd.montant) || fd.totalFinanced || 0,
+      needs_sheet_id: fd.nsResult?.id,
+      prefill_snapshot: { demandeur: fd.demandeur, localisation: fd.localisation },
+    });
+    draftCodeRef.current = app.code;
+    setDraftCode(app.code);
+    return app.code;
+  }, []);
+
   const submitApplication = async (finalFormData) => {
     try {
-      // 1. Créer le dossier en DRAFT
-      const app = await api.credits.create({
-        value_chain_code: finalFormData.vcCode || undefined,
-        area_ha: finalFormData.superficie ? parseFloat(finalFormData.superficie) : undefined,
-        currency: finalFormData.currency,
-        amount_requested: parseFloat(finalFormData.montant) || finalFormData.totalFinanced || 0,
-        needs_sheet_id: finalFormData.nsResult?.id,
-        guarantee_type: finalFormData.guarantees?.[0]?.type || undefined,
-        prefill_snapshot: { demandeur: finalFormData.demandeur, localisation: finalFormData.localisation },
-      });
-      // 2. Soumettre
-      await api.credits.submit(app.code);
-      setSubmittedAppCode(app.code);
+      // 1. Réutiliser le brouillon s'il existe (garanties déjà rattachées),
+      //    sinon le créer maintenant.
+      const code = await ensureDraft();
+      // 2. Soumettre. Le serveur revérifie l'éligibilité des garanties posées.
+      await api.credits.submit(code);
+      setSubmittedAppCode(code);
       setIsSubmitted(true);
-      // Créer un objet "loan-like" pour SuccessMessage
+      // Objet "loan-like" pour SuccessMessage
       setApprovedCredit({
-        id: app.code,
+        id: code,
         operator: finalFormData.demandeur,
         amountApproved: parseFloat(finalFormData.montant) || finalFormData.totalFinanced,
         currency: finalFormData.currency,
       });
-      toast({ title: '✅ Demande soumise !', description: `Dossier ${app.code} en cours d'analyse.` });
+      toast({ title: '✅ Demande soumise !', description: `Dossier ${code} en cours d'analyse.` });
     } catch (e) {
-      toast({ variant: 'destructive', title: 'Échec', description: e instanceof ApiError ? e.message : String(e) });
+      toast({
+        variant: 'destructive',
+        title: 'Soumission refusée',
+        description: guaranteeErrorMessage(e, 'La soumission du dossier a échoué.'),
+      });
     }
   };
 
@@ -818,10 +1016,13 @@ const Credits = () => {
     setCurrentStep(1);
     setIsSubmitted(false);
     setSubmittedAppCode(null);
+    draftCodeRef.current = null;
+    setDraftCode(null);
+    setGuaranteeSet(null);
     setFormData({
       demandeur: prefill?.client?.displayName || '',
       localisation: '', superficie: '', culture: '', montant: '',
-      currency: prefill?.defaults?.currency || 'USD', guarantees: [],
+      currency: prefill?.defaults?.currency || 'USD',
       vcCode: prefill?.defaults?.value_chain_code || '',
       nsFile: null, nsResult: null, simResult: null,
     });
@@ -850,8 +1051,8 @@ const Credits = () => {
     switch (currentStep) {
       case 1: return <DemandeInitiale formData={formData} setFormData={setFormData} nextStep={nextStep} prefill={prefill} />;
       case 2: return <SimulateurIntelligent formData={formData} setFormData={setFormData} nextStep={nextStep} prevStep={prevStep} runSimulation={runSimulation} />;
-      case 3: return <ConfigurationGaranties formData={formData} setFormData={setFormData} nextStep={nextStep} prevStep={prevStep} />;
-      case 4: return <FicheSynthese formData={formData} prevStep={prevStep} submitApplication={() => submitApplication(formData)} />;
+      case 3: return <ConfigurationGaranties nextStep={nextStep} prevStep={prevStep} draftCode={draftCode} ensureDraft={ensureDraft} onGuaranteesChange={setGuaranteeSet} />;
+      case 4: return <FicheSynthese formData={formData} prevStep={prevStep} submitApplication={() => submitApplication(formData)} guaranteeSet={guaranteeSet} />;
       default: return null;
     }
   };

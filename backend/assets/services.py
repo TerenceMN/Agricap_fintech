@@ -147,6 +147,31 @@ def pledge_asset(asset_id: int, application) -> "assets.models.Asset":
     return asset
 
 
+def invalidate_verification(asset) -> bool:
+    """Renvoie un actif modifié en file de vérification. `True` si l'état a changé.
+
+    Un actif `verifie` OU `libere` est `is_pledgeable` et porte une
+    `valeur_retenue` certifiée par un agent. Dès que le client touche à sa
+    description, cette certification ne porte plus sur le même bien : elle doit
+    tomber, sinon un gage levé puis l'actif redésigné resterait mobilisable avec
+    la valeur d'un objet qui n'existe plus.
+
+    Ne modifie PAS un actif `gage` (la vue refuse la modification en amont) ni un
+    actif `declare`/`rejete` (rien à invalider). N'écrit pas en base : l'appelant
+    enregistre, pour rester dans une seule sauvegarde.
+    """
+    from assets.models import Asset
+
+    if asset.status not in (Asset.Status.VERIFIE, Asset.Status.LIBERE):
+        return False
+
+    asset.status = Asset.Status.DECLARE
+    asset.valeur_retenue = None
+    asset.verifie_par_sub = ""
+    asset.verifie_le = None
+    return True
+
+
 @transaction.atomic
 def release_asset(asset) -> None:
     """`gage` → `libere`. L'actif redevient mobilisable, valeur retenue conservée."""

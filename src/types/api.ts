@@ -792,34 +792,49 @@ export interface CreditModuleAllocation {
   source: 'needs_sheet' | 'referential' | 'manual';
 }
 
+/** Dossier de crédit, tel que réellement sérialisé par
+ *  `backend/credits/workflow.py::serialize_application`.
+ *
+ *  Jusqu'en juillet 2026 ce type déclarait huit champs en snake_case
+ *  (`value_chain`, `amount_requested`, `score_result`…) que le backend émet en
+ *  camelCase. Les clés ne se croisaient jamais : les écrans affichaient « — »
+ *  sur des données pourtant présentes, et TypeScript ne signalait rien puisque
+ *  c'était le type qui mentait. Toute évolution de `serialize_application` doit
+ *  être répercutée ici — c'est le seul garde-fou du front. */
 export interface CreditApplication {
   code: string;
   status: CreditApplicationStatus;
   client: CreditClient;
-  value_chain: CreditValueChain | null;
-  needs_sheet: CreditNeedsSheet | null;
-  amount_requested: number;
-  amount_approved: number | null;
+  valueChain: CreditValueChain | null;
+  needsSheet: CreditNeedsSheet | null;
+  amountRequested: number;
+  amountApproved: number | null;
   currency: string;
-  area_ha: number | null;
-  guarantee_type: 'epargne' | 'morale' | '' | null;
-  score_result: CreditScoreResult | null;
+  areaHa: number | null;
+  /** Codes canoniques du backend : `actif`/`immobilier` sont des alias d'affichage. */
+  guaranteeType: 'epargne' | 'morale' | 'materiel' | 'foncier' | '' | null;
+  scoreResult: CreditScoreResult | null;
+  isOnBehalfOf?: boolean;
+  initiatedBySub?: string | null;
   submittedAt: string | null;
   submittedBySub?: string | null;
+  pendingClientConsent?: boolean;
   reviewedBySub?: string | null;
   reviewedAt?: string | null;
   approvalComment?: string | null;
   rejectionReasonCode?: string | null;
-  rejectionReasonComment?: string | null;
-  disbursedAt: string | null;
-  disbursedBySub?: string | null;
-  disbursed_amount: number | null;
+  /** Attention : `rejectionComment` sur le détail, `rejectionMessage` sur la réponse de rejet. */
+  rejectionComment?: string | null;
   clientConsentAt?: string | null;
   clientConsentExpires?: string | null;
+  /** Le décaissement ne vit QUE dans cet objet. Il n'existe aucun `disbursedAt`
+   *  ni `disbursedAmount` à la racine — les lire produit des cartes vides. */
   disbursement: CreditDisbursement | null;
   guarantees: CreditGuaranteeSet;
   moduleAllocations: CreditModuleAllocation[];
-  availableActions: string[];
+  /** Ajouté par `ViewContextService.serialize_for_role`, pas par le sérialiseur
+   *  de base : absent des réponses de transition (`approve`, `reject`…). */
+  availableActions?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -919,3 +934,32 @@ export interface CreditDashboardAgent {
 }
 
 export type CreditDashboard = CreditDashboardClient | CreditDashboardAgent | Record<string, unknown>;
+
+/** Actif gageable du registre `assets`.
+ *  `value` est declaree par le client ; `valeurRetenue` est fixee par l'agent
+ *  apres verification et decote — c'est elle, et elle seule, qui couvre un credit. */
+export interface AssetRow {
+  id: number;
+  name: string;
+  /** materiel | foncier | vehicule | stock | autre */
+  type: string;
+  value: number;
+  currency: string;
+  description: string;
+  localisation: string;
+  /** declare | verifie | rejete | gage | libere */
+  status: string;
+  image: string;
+  documents: unknown[];
+  valeurRetenue: number | null;
+  isPledgeable: boolean;
+  /** Type de garantie canonique deduit de la categorie : materiel | foncier | null */
+  guaranteeType: string | null;
+  motifRejet: string | null;
+  verifieLe: string | null;
+  createdAt: string;
+  /** Presents uniquement pour le staff */
+  verifieParSub?: string | null;
+  gageApplication?: string | null;
+  owner?: { sub: string; displayName: string; phone: string };
+}

@@ -19,8 +19,13 @@ from django.db import models
 KIND_REFERENTIEL = "REFERENTIEL"
 KIND_SIMULATEUR = "SIMULATEUR"
 KIND_ANNEXE = "ANNEXE"
+KIND_FEUILLE_BESOINS = "FEUILLE_BESOINS"
 KIND_AUTRE = "AUTRE"
-KIND_CHOICES = [(k, k) for k in (KIND_REFERENTIEL, KIND_SIMULATEUR, KIND_ANNEXE, KIND_AUTRE)]
+KIND_CHOICES = [
+    (k, k) for k in (
+        KIND_REFERENTIEL, KIND_SIMULATEUR, KIND_ANNEXE, KIND_FEUILLE_BESOINS, KIND_AUTRE,
+    )
+]
 
 STATUS_STAGED = "STAGED"        # uploadé, analysé, PAS encore enregistré
 STATUS_COMMITTED = "COMMITTED"  # enregistré manuellement en base
@@ -37,6 +42,19 @@ class DataSource(models.Model):
     dataset_key = models.CharField(max_length=255, db_index=True)  # clé logique (nom normalisé)
     kind = models.CharField(max_length=20, choices=KIND_CHOICES, default=KIND_AUTRE)
     status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_STAGED)
+
+    # Empreinte du fichier source : c'est elle qui rend une analyse rejouable et qui
+    # permet de comparer deux révisions (principe 3 — l'écart entre deux analyses est
+    # lui-même une donnée).
+    sha256 = models.CharField(max_length=64, blank=True, db_index=True)
+
+    # Rattachement optionnel à un dossier de crédit — renseigné pour le seul
+    # kind FEUILLE_BESOINS. PROTECT : une pièce probante d'un dossier ne disparaît
+    # jamais, même si le dossier est clôturé.
+    credit_application = models.ForeignKey(
+        "credits.CreditApplication", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="needs_sources",
+    )
 
     # Versionnage / historique.
     revision = models.IntegerField(default=1)

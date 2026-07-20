@@ -4,7 +4,7 @@
 
 import { tokens, refresh } from './oidc';
 import type {
-  AgencyComplianceScore, AnalyseFormPayload, AnalysisResult, AnalystObservation, ApplicationSummary, BesoinInput,
+  AgencyComplianceScore, AnalyseFormPayload, AnalysisResult, AnalystObservation, ApplicationSummary, AssetRow, BesoinInput,
   BondConversion, BondWithdrawal, CashRegisterSessionRow, ClientLoan, Collateral, DataSource,
   EvolutionPlanRow, FinancialAnalysis, InvestmentMovement,
   InvestmentOffer, InvestmentProject, InvestmentSubscription, InvestorProfile, KycMine, LedgerAccount, LoanAlert,
@@ -20,8 +20,22 @@ interface RequestOpts {
   retry?: boolean;
 }
 
+/** Erreur métier renvoyée par le backend.
+ *
+ *  `code` est le contrat stable — `message` est du texte destiné à l'affichage et
+ *  peut être reformulé à tout moment. Un écran qui route sur le texte casse
+ *  silencieusement au premier reformulage côté serveur, sans erreur de
+ *  compilation ni test rouge : router TOUJOURS sur `code`.
+ *
+ *  `errors` porte les validations multi-erreurs (422 du pipeline feuille de
+ *  besoins), où chaque entrée a son propre `{code, message}`. */
 class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+    public code: string | null = null,
+    public errors: Array<{ code: string; message: string }> = [],
+  ) {
     super(message);
     this.name = 'ApiError';
   }
@@ -44,12 +58,30 @@ async function request<T = unknown>(path: string, opts: RequestOpts = {}): Promi
   }
   if (!res.ok) {
     let detail = `Erreur ${res.status}`;
-    try { detail = ((await res.json()) as { detail?: string }).detail || detail; } catch { /* noop */ }
+    let code: string | null = null;
+    let errors: Array<{ code: string; message: string }> = [];
+    try {
+      const body = (await res.json()) as {
+        detail?: string;
+        code?: string;
+        errors?: Array<{ code?: string; message?: string }>;
+      };
+      detail = body.detail || detail;
+      code = body.code ?? null;
+      // 422 multi-erreurs du pipeline de validation : chaque entrée porte son code.
+      if (Array.isArray(body.errors)) {
+        errors = body.errors.map((e) => ({
+          code: e.code || 'ERREUR',
+          message: e.message || '',
+        }));
+        if (!detail && errors.length) detail = errors[0].message;
+      }
+    } catch { /* corps non-JSON : on garde le message par défaut */ }
     // Une ligne concise (page/route appelante identifiable via `path`) — pas de stack trace,
     // volontairement : les erreurs métier attendues (ex. 404 "pas encore configuré") ne sont
     // pas des bugs à investiguer, juste un signal utile en dev.
-    console.warn(`[API] ${method} ${path} -> ${res.status} ${detail}`);
-    throw new ApiError(res.status, detail);
+    console.warn(`[API] ${method} ${path} -> ${res.status}${code ? ` [${code}]` : ''} ${detail}`);
+    throw new ApiError(res.status, detail, code, errors);
   }
   const ct = res.headers.get('content-type') || '';
   return (ct.includes('application/json') ? await res.json() : (res as unknown)) as T;
@@ -86,8 +118,11 @@ export const api = {
   // ── Module Crédits Agricoles complet (Étapes 1-7) ────────────────────────
   credits: {
     // Tableau de bord (rôle-aware)
-    dashboard: () =>
-      request<import('@/types/api').CreditDashboard>('/credits/dashboard/'),
+    /** `view=committee` sert la corbeille du comite (reserve a la direction). */
+    dashboard: (view?: 'committee') =>
+      request<import('@/types/api').CreditDashboard>(
+        `/credits/dashboard/${view ? `?view=${view}` : ''}`,
+      ),
 
     // Préremplissage
     prefill: (clientSub?: string) =>
@@ -173,6 +208,9 @@ export const api = {
     }) => request<import('@/types/api').CreditGuaranteeSet>(`/credits/applications/${code}/guarantees/moral/`, { method: 'POST', body: data }),
     confirmGuarantee: (code: string, guaranteeId: number) =>
       request<import('@/types/api').CreditGuaranteeSet>(`/credits/applications/${code}/guarantees/${guaranteeId}/confirm/`, { method: 'POST', body: {} }),
+    /** Gage sur un actif verifie du client. 422 + code si une des 5 regles echoue. */
+    placeAssetGuarantee: (code: string, assetId: number) =>
+      request<import('@/types/api').CreditGuaranteeSet>(`/credits/applications/${code}/guarantees/asset/`, { method: 'POST', body: { asset_id: assetId } }),
     releaseGuarantee: (code: string, guaranteeId: number) =>
       request<import('@/types/api').CreditGuaranteeSet>(`/credits/applications/${code}/guarantees/${guaranteeId}/release/`, { method: 'POST', body: {} }),
   },
@@ -760,12 +798,31 @@ export const api = {
   },
 
   // Inventaire des actifs/garanties (AssetsInventory.jsx, étape Garanties de Credits.jsx).
+  // Registre d'actifs gageables. Le client décrit ses actifs ; seul un agent
+  // de terrain les vérifie et fixe leur valeur retenue (le statut n'est jamais
+  // écrit depuis le front).
   assets: {
-    mine: () => request<unknown[]>('/assets/mine'),
-    create: (data: Record<string, unknown>) => request<unknown>('/assets/mine', { method: 'POST', body: data }),
+    /** `status` filtre par statut ; `pledgeable` ne garde que les actifs mobilisables. */
+    mine: (params?: { status?: string; pledgeable?: boolean }) => {
+      const qs = new URLSearchParams();
+      if (params?.status) qs.set('status', params.status);
+      if (params?.pledgeable) qs.set('pledgeable', 'true');
+      const suffix = qs.toString() ? `?${qs}` : '';
+      return request<{ total_rows: number; items: AssetRow[] }>(`/assets/mine${suffix}`);
+    },
+    create: (data: Record<string, unknown>) => request<AssetRow>('/assets/mine', { method: 'POST', body: data }),
     update: (id: number, data: Record<string, unknown>) =>
-      request<unknown>(`/assets/mine/${id}`, { method: 'PATCH', body: data }),
-    remove: (id: number) => request<unknown>(`/assets/mine/${id}`, { method: 'DELETE' }),
+      request<AssetRow>(`/assets/mine/${id}`, { method: 'PATCH', body: data }),
+    remove: (id: number) => request<{ detail: string }>(`/assets/mine/${id}`, { method: 'DELETE' }),
+
+    // ── Surface agent terrain ───────────────────────────────────────────────
+    /** File de vérification : actifs déclarés en attente de contrôle. */
+    pending: () => request<{ total_rows: number; items: AssetRow[] }>('/assets/pending'),
+    /** La valeur retenue est calculée par le serveur (valeur constatée − décote). */
+    verify: (id: number, data: { valeur_verifiee: number | string; documents?: unknown[] }) =>
+      request<AssetRow>(`/assets/${id}/verify`, { method: 'POST', body: data }),
+    reject: (id: number, motif: string) =>
+      request<AssetRow>(`/assets/${id}/reject`, { method: 'POST', body: { motif } }),
   },
 
   // Contrats client (Contracts.jsx) — signature électronique simple partie.

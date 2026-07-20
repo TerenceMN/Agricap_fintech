@@ -58,7 +58,15 @@ class InsufficientSavingsError(Exception):
 
 
 class GuaranteeError(Exception):
-    pass
+    """Refus de pose/confirmation d'une garantie.
+
+    Chaque sous-classe porte son `code` : c'est lui qui remonte au front, pas le
+    texte du message. Une reformulation d'un message ne doit jamais changer le
+    comportement d'un client — le front ne doit avoir aucune raison de deviner la
+    règle par la signature de la phrase.
+    """
+
+    code = "GUARANTEE_ERROR"
 
 
 @transaction.atomic
@@ -152,6 +160,8 @@ def _do_release(guarantee) -> None:
 class GuaranteeTypeNotEligible(GuaranteeError):
     """Type de garantie non admis pour la filière du dossier."""
 
+    code = "GUARANTEE_TYPE_NOT_ELIGIBLE"
+
 
 def assert_type_eligible(application, guarantee_type: str) -> None:
     """Vérifie que le type figure dans `ValueChain.eligible_guarantees`.
@@ -182,6 +192,36 @@ def assert_type_eligible(application, guarantee_type: str) -> None:
 
 # ── Garantie sur actif (materiel / foncier) ───────────────────────────────────
 
+class AssetNotOwned(GuaranteeError):
+    """L'actif n'existe pas ou n'appartient pas au client du dossier."""
+
+    code = "ASSET_NOT_OWNED"
+
+
+class AssetNotVerified(GuaranteeError):
+    """L'actif n'a pas été contrôlé par un agent de terrain."""
+
+    code = "ASSET_NOT_VERIFIED"
+
+
+class AssetAlreadyPledged(GuaranteeError):
+    """L'actif est déjà nanti sur un autre dossier."""
+
+    code = "ASSET_ALREADY_PLEDGED"
+
+
+class AssetCategoryMismatch(GuaranteeError):
+    """La catégorie de l'actif ne correspond à aucun type de garantie."""
+
+    code = "ASSET_CATEGORY_MISMATCH"
+
+
+class AssetNoRetainedValue(GuaranteeError):
+    """L'actif n'a pas de valeur retenue : la vérification est incomplète."""
+
+    code = "ASSET_NO_RETAINED_VALUE"
+
+
 @transaction.atomic
 def place_asset_guarantee(
     application,
@@ -208,17 +248,17 @@ def place_asset_guarantee(
     # 1. Propriété
     asset = Asset.objects.filter(pk=asset_id).first()
     if asset is None or asset.user_id != application.client_id:
-        raise GuaranteeError(
+        raise AssetNotOwned(
             "Actif introuvable ou n'appartenant pas au client du dossier."
         )
 
     # 2. Statut
     if asset.gage_application_id is not None:
-        raise GuaranteeError(
+        raise AssetAlreadyPledged(
             f"L'actif « {asset.name} » est déjà nanti sur un autre dossier."
         )
     if asset.status not in (Asset.Status.VERIFIE, Asset.Status.LIBERE):
-        raise GuaranteeError(
+        raise AssetNotVerified(
             f"L'actif « {asset.name} » n'a pas été vérifié par un agent. "
             "Un actif déclaré ne peut pas servir de garantie."
         )
@@ -226,7 +266,7 @@ def place_asset_guarantee(
     # 3. Catégorie → type de garantie
     guarantee_type = asset.guarantee_type
     if not guarantee_type:
-        raise GuaranteeError(
+        raise AssetCategoryMismatch(
             f"La catégorie « {asset.type} » ne correspond à aucun type de garantie."
         )
 
@@ -235,7 +275,7 @@ def place_asset_guarantee(
 
     # 5. Valeur retenue
     if not asset.valeur_retenue or asset.valeur_retenue <= 0:
-        raise GuaranteeError(
+        raise AssetNoRetainedValue(
             "L'actif n'a pas de valeur retenue : la vérification est incomplète."
         )
 

@@ -1,0 +1,271 @@
+# Fragment de statut — Front backoffice crédit
+
+> Auteur : MKOPO (agent front-backoffice). Juillet 2026.
+> Fragment destiné à être fusionné dans `CREDIT_MODULE_STATUS.md` §8 par le mainteneur.
+> Ce document ne modifie pas `CREDIT_MODULE_STATUS.md`.
+
+---
+
+## 1. Écrans livrés
+
+| Écran | Route | Fichier | Endpoint(s) |
+|---|---|---|---|
+| File d'instruction analyste | `/credit/dossiers` | [src/pages/credit/Applications.tsx](../../src/pages/credit/Applications.tsx) | `GET /api/credits/applications/?status=` |
+| File de vérification des actifs | `/credit/actifs` | [src/pages/credit/AssetVerification.tsx](../../src/pages/credit/AssetVerification.tsx) | `GET /api/assets/pending`, `POST /api/assets/<id>/verify`, `POST /api/assets/<id>/reject` |
+| Corbeille du comité de crédit | `/credit/comite` | [src/pages/credit/Committee.tsx](../../src/pages/credit/Committee.tsx) | `GET /api/credits/dashboard/?view=committee` |
+| Journal & audit (lecture seule) | `/credit/journal` | [src/pages/credit/AuditJournal.tsx](../../src/pages/credit/AuditJournal.tsx) | `GET /api/audit/entries` |
+
+Fichiers d'appui créés :
+
+- [src/pages/credit/wire.ts](../../src/pages/credit/wire.ts) — contrat de sérialisation réel,
+  formateurs de montants/dates, libellés de statuts, état de consentement. **Temporaire** :
+  voir §4.1.
+- [src/components/backoffice/States.tsx](../../src/components/backoffice/States.tsx) —
+  `Loading` / `Empty` / `ErrorPanel` / `Forbidden` / `KpiCard` / `TruncationNotice`.
+  `KpiCard` exige `scope` et `period` : le §7.2 « KPI honnêtes » est rendu structurel plutôt
+  que laissé à la discipline de chaque écran.
+
+Routes déclarées dans [src/App.jsx](../../src/App.jsx) **sans prop `roles`**, délibérément :
+`PrivateRoute roles={…}` compare via `menuKeyFor`, qui écrase les 16 rôles canoniques en
+5 clés de menu. Un garde front masquerait ces écrans à `gest_zone` ou `aud_fin`, qui y ont
+pourtant droit. L'autorisation est décidée par le serveur (403) et chaque écran restitue ce
+refus explicitement, sans le confondre avec une panne.
+
+### 1.1 Détail par écran
+
+**File d'instruction** — agrège `submitted` + `in_analysis` + `adjourned` en trois requêtes
+parallèles (l'API n'accepte qu'un statut par appel ; pas de filtrage client sur une liste déjà
+tronquée). Tri par ancienneté (croissant/décroissant) et par montant. Badge « consentement
+client en attente » / « expiré », plus un filtre pour n'afficher que ces dossiers. Ancienneté
+> 7 jours signalée en ambre. Les devises présentes sont listées sans être agrégées.
+Aucune action n'est proposée depuis la liste : elles vivent dans le détail du dossier, où
+`availableActions` est calculé par le serveur.
+
+**Vérification des actifs** — pour chaque actif : propriétaire (nom + téléphone), catégorie,
+valeur déclarée (marquée « déclarative — non opposable »), localisation, description, nombre
+de documents et présence d'une photo. Deux actes : vérifier (valeur constatée obligatoire,
+> 0) et rejeter (motif obligatoire, refusé avant même l'appel réseau, et re-refusé en 422 par
+le serveur). Un encart explique que **la valeur retenue est calculée par le serveur** ; elle
+n'est affichée qu'après retour de l'appel, dans un journal de session qui rappelle la valeur
+déclarée en regard. Le taux de décote n'est pas exposé par l'API : le front ne pourrait pas le
+calculer même s'il le voulait.
+
+**Comité** — trois KPI (dossiers en attente, volume cumulé, plafond de délégation) portant
+chacun périmètre et période. La liste servie est plafonnée à 20 lignes côté serveur ; le
+compteur honnête affiché est `summary.pendingReview`, avec bandeau de troncature. Un bloc
+« ce que cet écran ne fait pas » énumère quorum et procès-verbal (sans endpoint) et
+l'anomalie de devise du seuil (§3.2). 403 traité par un écran dédié.
+
+**Journal & audit** — aucun bouton d'écriture. Filtres serveur : type d'entité, identifiant
+d'entité, acteur, catégorie financière. Filtre de période **client-side**, explicitement
+signalé comme tel. Un bandeau permanent avertit que le module d'instruction du crédit
+n'alimente pas ce journal (§3.1) — sans lui, l'écran laisserait croire qu'une absence de
+ligne vaut absence d'événement.
+
+---
+
+## 2. Actions fantômes traitées
+
+| Action | Avant | Après |
+|---|---|---|
+| `block` / `suspend` / `resume` dans `RateMaturityModal.jsx` | Écriture `localStorage` + toast de succès, **aucun appel backend** | Branché sur `POST /api/portfolio/loans/<ref>/action` (`run_action`, branches `block`, `pause\|suspend`, `resume`). Relecture de `GET …/config` après coup : plus aucun état optimiste. Bouton désactivé pendant l'appel, échec affiché en toast destructif. |
+| « Voir / Télécharger Contrat » (`CreditRow.jsx`) | Toast « Génération du document — à brancher (gabarit) » | **Entrée de menu retirée.** Garde-fou conservé dans `CreditsDashboard.jsx` : un appel résiduel produit un toast destructif « Fonction indisponible … rien n'a été produit ni enregistré ». |
+| « Exporter Dossier » (`CreditRow.jsx`) | Idem | Idem. |
+
+Corrections connexes dans `RateMaturityModal.jsx` :
+
+- le basculement Suspendre/Bloquer ↔ Réactiver testait `config.status === 'Active'` alors que
+  le backend renvoie des libellés français (`En cours`, `Suspendu`, `Bloqué`). La constante
+  `ACTIVE_STATES`, déclarée mais morte depuis l'origine, est désormais utilisée : un prêt actif
+  n'affiche plus « Réactiver » ;
+- le tableau d'amortissement et les trois totaux (intérêts, total à rembourser, TAEG) sont
+  calculés **dans le navigateur**. Ils ne sont pas retirés — ils cadrent une configuration
+  avant enregistrement — mais sont désormais étiquetés « simulation locale, non contractuelle »
+  avec renvoi vers l'échéancier serveur (`GET /api/portfolio/loans/<ref>/schedule`).
+  Réserve : cela reste un chiffre métier calculé côté client, contraire au §5 « Frontend ».
+  Le supprimer exigerait un endpoint de simulation d'échéancier *à paramètres non encore
+  enregistrés*, qui n'existe pas (§3.3).
+
+**Dette croisée assumée** : `/action` écrit `loan.status` sans passer par `credits/workflow.py`
+— donc sans maker ≠ checker ni contrôle de délégation (§8.4 du statut). L'action est
+authentiquement persistée, elle n'est pas pour autant sous le régime de séparation des tâches
+du module crédit. Le bandeau de confirmation le dit à l'utilisateur.
+
+---
+
+## 3. Manques backend identifiés
+
+### 3.1 Aucune décision de crédit n'est journalisée — bloquant pour l'auditabilité
+
+`backend/credits/` ne contient **aucun** appel à `audit.services.record`, et
+`credits/models.py` ne définit **aucun** modèle `JournalValidation`. Les entités journalisées
+dans `audit.AuditEntry` sont au nombre de 35 ; `CreditApplication` n'en fait pas partie.
+
+Concrètement : prise en charge, approbation, rejet (avec son `reason_code`), ajournement,
+réouverture, demande et confirmation de décaissement ne laissent **aucune trace consultable**.
+Seuls `assets.create|verify|reject|delete` et `portfolio.*` alimentent le journal.
+
+Le principe 3 (« append-only sur tout ce qui est probant », `JournalValidation`) et l'objectif
+« un auditeur reconstitue toute décision deux ans après » ne sont donc pas tenus, quelle que
+soit la qualité de l'écran de consultation. C'est le manque le plus grave rencontré.
+Correctif attendu : `audit_record(...)` sur chaque transition de `credits/workflow.py`, avec
+`entity_type="CreditApplication"` et `entity_id=app.code`, dans la même `transaction.atomic()`
+que la transition.
+
+### 3.2 Corbeille comité — seuil comparé sans conversion de devise
+
+`credits/dashboard.py::_committee_dashboard` filtre
+`amount_requested__gte=branch_limit` où `branch_limit` est en **USD**, sans convertir
+`amount_requested` depuis `app.currency`. Un dossier de 30 000 CDF (≈ 10 USD) franchit un
+seuil de 25 000 USD et atterrit dans la corbeille du comité ; symétriquement, un vrai dossier
+en CDF au-dessus du plafond peut en sortir. `credits/workflow.py::_to_usd` existe et devrait
+être appliqué ici. De même, `totalVolumeUsd` somme des montants de devises hétérogènes sous
+un nom qui affirme « Usd ».
+
+### 3.3 Endpoints manquants (ordre d'utilité décroissante)
+
+| Besoin | Endpoint attendu | Conséquence actuelle |
+|---|---|---|
+| Journalisation des décisions crédit | écriture `audit_record` dans `workflow.py` | §3.1 — écran d'audit structurellement incomplet |
+| Consentement client expiré | champ `clientConsentExpired` dans `serialize_application` | Le front compare `clientConsentExpires` à son horloge locale (voir `wire.ts::consentState`). `pendingClientConsent=false` confond aujourd'hui « pas requis » et « expiré ». |
+| Filtrage du journal par période | `?date_from=` / `?date_to=` sur `/api/audit/entries` | Filtre de période appliqué dans le navigateur sur les 500 dernières entrées seulement — signalé à l'écran |
+| Pagination / `total_rows` du journal | `qs[:500]` sans compteur ni curseur | Troncature annoncée mais non résolvable par l'utilisateur |
+| Pagination / `total_rows` des dossiers | `list_applications` coupe à `[:100]` et renvoie un tableau nu | La file d'instruction ne peut afficher qu'un « possiblement tronqué » heuristique (seau plein) |
+| Corbeille comité complète | `_committee_dashboard` coupe à `[:20]` | Au-delà de 20 dossiers, le comité ne peut pas atteindre les suivants depuis cet écran |
+| Quorum + procès-verbal du comité | aucun (`InstitutionConfig` porte le plafond, pas le quorum) | Décision collégiale du §7.1 non réalisable ; aucun bouton ne la simule |
+| Génération de contrat / export de dossier | aucun | Entrées de menu retirées (§2) |
+| Simulation d'échéancier à paramètres non enregistrés | aucun (`/schedule` porte sur la config **sauvegardée**) | Simulation locale conservée mais étiquetée (§2) |
+| Filtre multi-statuts | `?status=a,b,c` sur `/applications/` | Trois requêtes parallèles depuis le front |
+
+### 3.4 Limite de la couche service (`src/services/api.ts`, hors périmètre)
+
+`request()` ne conserve que le champ `detail` d'une réponse d'erreur :
+
+```ts
+detail = ((await res.json()) as { detail?: string }).detail || detail;
+```
+
+Deux pertes, pas une :
+
+- les 422 structurées du backend (`{errors: [{code, message}, …]}`, principe 5) sont
+  **aplaties en une ligne** ;
+- le champ **`code`** scalaire des corps 422/409 est **jeté** : `ApiError` ne porte que
+  `status` et `message`. Aucun écran ne peut router sur un code d'erreur métier.
+
+Conséquence sur mes écrans : la file de vérification des actifs reçoit bien
+`{detail, code: "ASSET_VERIFY_REFUSED"}` mais n'affiche que `detail`. Acceptable ici — je ne
+route sur aucun code — mais c'est de la chance, pas de la conception. `front-garanties`
+rencontre le même mur et contourne par signature du texte de `detail`, ce qui est fragile
+(tout reformulage d'un message serveur casse silencieusement le routage).
+
+`ErrorPanel` sait afficher une liste et un code dès que la couche service les transmettra.
+Correctif attendu dans `api.ts` : conserver le corps d'erreur complet sur `ApiError`
+(`code`, `errors[]`) plutôt que d'extraire le seul `detail`.
+
+---
+
+## 4. Dettes croisées rencontrées
+
+### 4.1 `types/api.ts` ment sur le contrat `CreditApplication` — corrigé par contournement
+
+`credits/workflow.py::serialize_application` émet du camelCase ; `src/types/api.ts` déclare du
+snake_case. Les clés ne se croisent jamais :
+
+| Type déclaré | Clé réellement servie |
+|---|---|
+| `amount_requested` | `amountRequested` |
+| `amount_approved` | `amountApproved` |
+| `value_chain` | `valueChain` |
+| `needs_sheet` | `needsSheet` |
+| `score_result` | `scoreResult` |
+| `area_ha` | `areaHa` |
+| `guarantee_type` | `guaranteeType` |
+| `rejectionReasonComment` | `rejectionComment` |
+| `disbursed_amount` | *(absent du sérialiseur)* |
+| `disbursedAt` | *(absent du sérialiseur)* |
+
+Champs servis mais absents du type : `pendingClientConsent`, `isOnBehalfOf`, `initiatedBySub`.
+
+Précision confirmée par `front-garanties` (relecture indépendante de `serialize_application`,
+lignes 392-441) : ni `disbursed_amount` ni `disbursedAt` ne sont émis. Le décaissement n'existe
+que dans l'objet `disbursement` (`_disbursement_summary`) — montant via `disbursement.amount`,
+date de départ via `disbursement.confirmedAt`. `wire.ts` ne déclare donc aucun de ces deux
+champs. `ApplicationDetail.tsx` lit les deux : ses cartes « Décaissé le » et « Montant
+décaissé » sont vides par construction.
+
+Conséquence : tout écran lisant ces champs affiche « — » sur des données pourtant présentes, et
+TypeScript ne peut rien signaler puisque le type ment sur le contrat. **`ApplicationDetail.tsx`
+est concerné** (montants, filière, superficie, scoring, feuille de besoins, décaissement) —
+il n'est pas dans mon périmètre de correction et reste donc affecté.
+
+J'ai décrit le contrat observé dans `src/pages/credit/wire.ts` et j'y cast. **Ce fichier est
+explicitement temporaire** : il disparaît le jour où `CreditApplication` est aligné sur le
+backend.
+
+**⚠️ Personne ne peut réparer ce type — à arbitrer.** `src/types/api.ts` est déclaré en
+**lecture seule dans le périmètre de `front-backoffice` (moi) et dans celui de
+`front-garanties`**, qui me l'a confirmé. Deux agents lisent donc un type qui ment sur le
+contrat, chacun le contourne de son côté, et aucun n'a le droit de le corriger. Il faut qu'un
+propriétaire soit désigné, sinon le contournement devient permanent et se duplique à chaque
+nouvel écran. C'est un point de coordination, pas une dette technique : le correctif lui-même
+est mécanique (aligner les 9 clés sur le camelCase, ajouter les 3 champs manquants).
+
+`AssetRow` est en revanche correct et conforme à `assets/views.py::_row` — il est utilisé
+directement, sans contournement.
+
+### 4.2 Build — cassé pendant le développement, réparé depuis
+
+`npx vite build` a échoué pendant tout mon développement sur
+`src/pages/Credits.jsx:572 — "The symbol GUARANTEE_CONFIG has already been declared"`
+(fichier hors de mon périmètre). `front-garanties` a corrigé : la constante locale a laissé
+place à `src/components/guarantees/guaranteeConfig.js`.
+
+**Build revérifié après correction : ✅ succès en 5,38 s**, mes quatre écrans compris.
+
+Leçon de méthode à retenir pour la CI, et pas seulement pour ce lot : `checkJs: false` +
+pages en `.jsx` ⇒ **`npx tsc --noEmit` ne dit rien de ces écrans**. Il est resté vert pendant
+toute la durée où le build était cassé. Le garde-fou de merge doit être
+`tsc --noEmit` **et** `vite build`, jamais le premier seul.
+
+---
+
+## 5. Vérifications effectuées, et ce qui ne l'a pas été
+
+**Effectué**
+- `npx tsc --noEmit` depuis `AGRICAP FINTECH/` : **0 erreur** (état préservé).
+- `npx vite build` : **succès, 5,38 s**, après réparation de `Credits.jsx` par
+  `front-garanties`. Contrôle nécessaire et non redondant avec tsc (cf. §4.2).
+- Lecture du contrat côté serveur pour chaque écran, plutôt que confiance au type partagé :
+  `credits/workflow.py`, `credits/view_context.py`, `credits/dashboard.py`, `credits/roles.py`,
+  `assets/views.py`, `assets/services.py`, `audit/views.py`, `portfolio/services.py`.
+- Vérification que chaque action affichée correspond à un endpoint réellement protégé, et que
+  les groupes RBAC cités (`CAN_VERIFY_ASSET`, `COMMITTEE_ROLES`, capacité `audit`) sont bien
+  ceux appliqués côté serveur.
+
+**Non effectué — je n'ai pas de navigateur**
+- Aucun écran n'a été ouvert. Rendu, mise en page responsive, contrastes, comportement des
+  filtres à l'usage : non vérifiés.
+- Aucun appel réseau réel : les chemins nominaux (liste non vide, vérification d'un actif,
+  affichage de la valeur retenue), les 403 (comité hors direction, actifs hors terrain, journal
+  sans capacité `audit`) et les 422 (rejet sans motif, valeur non numérique) sont écrits d'après
+  la lecture du code serveur, **pas exécutés**.
+- Pas de jeu de données de test : la base ne contient que 2 `CreditApplication` (§6.1 du statut)
+  et je n'ai pas vérifié qu'un actif au statut `declare` existe. La file de vérification n'a
+  donc jamais affiché de ligne réelle.
+- Aucun test automatisé n'accompagne ces écrans : le projet n'a pas de suite front. Un build
+  qui passe prouve que le code compile et s'assemble, pas qu'un écran affiche juste.
+
+---
+
+## 6. Reste à faire sur le périmètre backoffice (§7.1)
+
+| # | Écran | État |
+|---|---|---|
+| 1 | Dashboard role-aware réel | ❌ non traité — `api.credits.dashboard()` sert 5 formes de réponse différentes selon le rôle ; nécessite un écran par lentille |
+| 2 | File d'instruction analyste | ✅ livré |
+| 3 | Onglet Analyse du dossier (5 critères, écarts, DSCR, stress, révisions, SHA-256) | ❌ non traité — le plus gros morceau restant ; dépend de `analysis-report/` et d'un sélecteur de révision côté serveur |
+| 4 | Vue comité de crédit | ⚠️ corbeille livrée ; quorum et procès-verbal sans backend |
+| 5 | Onglet Référence (templates, `reference-data`, barèmes) | ❌ non traité — `api.ranges()`/`chains()`/`config()` restent du code mort côté UI |
+| 6 | File de vérification des actifs | ✅ livré |
+| 7 | Suivi des garanties (compte à rebours 72 h, confirmations, libérations) | ❌ non traité — périmètre de l'agent `front-garanties` |
+| 8 | Journal & audit | ⚠️ écran livré, mais vide de toute décision de crédit tant que §3.1 n'est pas corrigé |

@@ -183,19 +183,60 @@ class AssetClientWriteTest(TestCase):
             self.assertNotIn(interdit, CLIENT_WRITABLE)
 
     def test_modification_invalide_la_verification(self):
-        """Modifier un actif vérifié le remet en file de vérification."""
+        """Modifier un actif vérifié le remet en file de vérification.
+
+        Le test appelle la MÊME fonction que la vue PATCH. La version précédente
+        recopiait la condition de la vue en dur : elle validait sa propre copie
+        du code, pas le comportement du serveur — c'est ce qui a laissé passer
+        le cas `libere` ci-dessous.
+        """
+        from assets.services import invalidate_verification
+
         asset = _asset()
         verify_asset(asset, verifier_sub="sub-agent", valeur_verifiee=Decimal("10000"))
         asset.refresh_from_db()
         self.assertEqual(asset.status, Asset.Status.VERIFIE)
 
-        # Simule le passage par la vue PATCH
         asset.value = Decimal("50000")
-        if asset.status == Asset.Status.VERIFIE:
-            asset.status = Asset.Status.DECLARE
-            asset.valeur_retenue = None
+        self.assertTrue(invalidate_verification(asset))
         asset.save()
 
         asset.refresh_from_db()
         self.assertEqual(asset.status, Asset.Status.DECLARE)
+        self.assertIsNone(asset.valeur_retenue)
+        self.assertEqual(asset.verifie_par_sub, "")
+        self.assertIsNone(asset.verifie_le)
         self.assertFalse(asset.is_pledgeable)
+
+    def test_modification_d_un_actif_libere_le_remet_aussi_en_verification(self):
+        """Signalé par `front-garanties` : un actif `libere` est `is_pledgeable`
+        et conserve sa valeur retenue. Sans remise en file, un gage levé puis
+        l'actif redésigné restait mobilisable avec une valeur certifiée sur un
+        bien qui a changé depuis le contrôle terrain."""
+        from assets.services import invalidate_verification
+
+        asset = _asset()
+        verify_asset(asset, verifier_sub="sub-agent", valeur_verifiee=Decimal("10000"))
+        asset.refresh_from_db()
+        asset.status = Asset.Status.LIBERE
+        asset.save(update_fields=["status"])
+        self.assertTrue(asset.is_pledgeable)          # état de départ du scénario
+
+        asset.name = "Groupe électrogène (remplacé)"
+        asset.type = Asset.Type.VEHICULE
+        self.assertTrue(invalidate_verification(asset))
+        asset.save()
+
+        asset.refresh_from_db()
+        self.assertEqual(asset.status, Asset.Status.DECLARE)
+        self.assertIsNone(asset.valeur_retenue)
+        self.assertFalse(asset.is_pledgeable)
+
+    def test_un_actif_declare_ou_rejete_n_a_rien_a_invalider(self):
+        from assets.services import invalidate_verification
+
+        for statut in (Asset.Status.DECLARE, Asset.Status.REJETE):
+            with self.subTest(statut=statut):
+                asset = _asset(status=statut)
+                self.assertFalse(invalidate_verification(asset))
+                self.assertEqual(asset.status, statut)

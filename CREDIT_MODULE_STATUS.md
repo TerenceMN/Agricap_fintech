@@ -549,13 +549,53 @@ agent**, sous `select_for_update` — c'est là qu'est empêché le double gage.
 
 | Lot | Contenu | État |
 |---|---|---|
-| 1 | Nomenclature garanties + contrôle `eligible_guarantees` | ✅ backend — **front `GUARANTEE_CONFIG` non réécrit** |
-| 2 | Feuille de besoins → `dataio` (`kind=FEUILLE_BESOINS`) | ❌ non commencé |
-| 3 | Front simulateur en calque strict | ❌ non commencé — `Math.random()` toujours en place |
-| 4 | App `assets` : modèle, vérification terrain | ✅ backend — **front `AssetsInventory.jsx` toujours sur localStorage** |
-| 5 | Garantie sur actif, gage atomique | ✅ backend — **front `ConfigurationGaranties` non branché** |
+| 1 | Nomenclature garanties + contrôle `eligible_guarantees` | ✅ **fait** (backend + front) |
+| 2 | Feuille de besoins → `dataio` (`kind=FEUILLE_BESOINS`) | ✅ **backend fait** — front n'envoie pas encore `application_code` |
+| 3 | Front simulateur en calque strict | ⏳ partiel — score fictif supprimé, calque strict non fait |
+| 4 | App `assets` : modèle, vérification terrain | ✅ **fait** (backend + front client + file agent) |
+| 5 | Garantie sur actif, gage atomique | ✅ **fait** (backend + front) |
 | 6 | Caution solidaire : consentement garant 72 h, 5 règles | ❌ non commencé |
 | 7 | Nomenclature des rôles / délégation | ✅ fait |
+
+### SPEC Moteur d'analyse
+
+| Élément | État |
+|---|---|
+| `construire_echeancier` (`credits/echeancier.py`) | ✅ **fait** — cas A.2 reproduit au centime dans les deux modes |
+| `BaremeScore`, `AnalyseCredit`, fixtures | ❌ non commencé |
+| Les 5 scoreurs + orchestration | ❌ non commencé |
+| Endpoints analyse / justifier / réanalyser | ❌ non commencé |
+| Onglet Analyse (front) | ❌ non commencé |
+
+### Écrans backoffice (§7 de CLAUDE.md)
+
+Livrés : file d'instruction analyste (`/credit/dossiers`), file de vérification des
+actifs (`/credit/actifs`), corbeille du comité (`/credit/comite`), journal d'audit
+(`/credit/journal`). Non faits : onglet Analyse, onglet Référence (principe 11),
+suivi des garanties, décision collégiale avec quorum.
+
+### Deux failles supplémentaires trouvées et corrigées
+
+- **Le modèle Excel officiel faisait échouer sa propre validation.** La ligne
+  « TOTAL BESOINS DU CYCLE » de la feuille 4 était comptée comme un besoin,
+  doublant la rubrique et déclenchant `INCOHERENCE_INTERNE` **sur tout dossier
+  conforme** — y compris ceux remplis à partir du template distribué par AGRICAP.
+- **Un actif `libere` modifié restait mobilisable.** Le PATCH ne réinitialisait
+  que le cas `verifie`. Séquence : gage levé → le client change désignation,
+  catégorie ou valeur → le bien reste `is_pledgeable` avec une valeur retenue
+  certifiée par un agent sur un objet qui a changé. Règle remontée dans
+  `assets.services.invalidate_verification()`.
+
+> Cause racine du second cas, à traquer ailleurs : le test existant **recopiait la
+> condition de la vue en dur** au lieu d'appeler le code de production. Il validait
+> sa propre copie du bug.
+
+### Erreur relevée dans la SPEC Moteur
+
+Le pseudo-code de la §4 calcule `A = capital / N` **avant** le différé. En mode
+`franchise_totale`, le capital à amortir est le CRD après capitalisation : le prêt
+ne se solderait jamais. L'annexe A.2 de la même SPEC donne d'ailleurs
+`A = 477,59 = 1 432,78 / 3`. **L'implémentation suit l'annexe, pas le pseudo-code.**
 
 ### Anomalies bloquantes restantes — backoffice
 

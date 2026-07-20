@@ -73,7 +73,7 @@ const ApplicationDetail: React.FC = () => {
           break;
         case 'approve':
           result = await api.credits.approve(code, {
-            amount_approved: parseFloat(approveAmount) || (app?.amount_requested ?? 0),
+            amount_approved: parseFloat(approveAmount) || (app?.amountRequested ?? 0),
             comment: approveComment,
           });
           break;
@@ -108,7 +108,12 @@ const ApplicationDetail: React.FC = () => {
         default:
           return;
       }
-      setApp(result);
+      // Les réponses de transition sont produites par `serialize_application`,
+      // qui n'ajoute PAS `availableActions` — seul `serialize_for_role` le fait
+      // (`GET /applications/<code>/`). Afficher `result` tel quel viderait donc
+      // la barre d'actions après chaque acte. On relit le dossier complet.
+      void result;
+      reload();
       setExpandedAction(null);
       setActionResult({ ok: true });
     } catch (e) {
@@ -135,7 +140,11 @@ const ApplicationDetail: React.FC = () => {
   if (!app) return null;
 
   const st = STATUS_LABELS[app.status] ?? { label: app.status, color: 'text-gray-400 bg-gray-500/20' };
-  const score = app.score_result;
+  const score = app.scoreResult;
+  // `availableActions` est optionnel dans le contrat : absent des réponses de
+  // transition. Un dossier sans actions n'est pas une anomalie — c'est un
+  // dossier sur lequel le serveur n'autorise rien à cet utilisateur.
+  const actions = app.availableActions ?? [];
 
   return (
     <div className="p-6 max-w-5xl mx-auto space-y-6 text-white">
@@ -150,7 +159,7 @@ const ApplicationDetail: React.FC = () => {
           </div>
           <p className="text-slate-400 text-sm">
             Client : <span className="text-white font-medium">{app.client.displayName}</span>
-            {app.value_chain && <> · Filière : <span className="text-emerald-400">{app.value_chain.label}</span></>}
+            {app.valueChain && <> · Filière : <span className="text-emerald-400">{app.valueChain.label}</span></>}
           </p>
         </div>
         <Link to="/credit/dossiers" className="text-sm text-primary underline">
@@ -168,11 +177,11 @@ const ApplicationDetail: React.FC = () => {
       )}
 
       {/* Available actions */}
-      {app.availableActions.length > 0 && (
+      {actions.length > 0 && (
         <div className="bg-white/5 border border-white/10 rounded-xl p-4">
           <h3 className="font-semibold text-sm text-slate-400 mb-3 uppercase tracking-wide">Actions disponibles</h3>
           <div className="flex flex-wrap gap-2">
-            {app.availableActions.map((action) => (
+            {actions.map((action) => (
               <div key={action}>
                 <button
                   disabled={actionBusy === action}
@@ -198,7 +207,7 @@ const ApplicationDetail: React.FC = () => {
                           <input
                             type="number"
                             className="w-full mt-1 bg-white/10 border border-white/20 rounded px-3 py-1.5 text-sm"
-                            placeholder={String(app.amount_requested)}
+                            placeholder={String(app.amountRequested)}
                             value={approveAmount}
                             onChange={(e) => setApproveAmount(e.target.value)}
                           />
@@ -274,43 +283,41 @@ const ApplicationDetail: React.FC = () => {
                   </div>
                 )}
 
-                {/* No-input actions execute immediately */}
-                {expandedAction !== action &&
-                  ['submit', 'start_analysis', 'reopen_analysis', 'client_consent', 'score',
-                    'confirm_disbursement', 'cancel_disbursement'].includes(action) &&
-                  expandedAction === null && null}
               </div>
             ))}
           </div>
-          {/* Immediate-execute actions */}
-          <div className="flex flex-wrap gap-2 mt-2">
-            {app.availableActions
-              .filter((a) => ['submit', 'start_analysis', 'reopen_analysis', 'client_consent',
-                               'score', 'confirm_disbursement', 'cancel_disbursement'].includes(a))
-              .map((action) => (
-                <button
-                  key={`direct-${action}`}
-                  disabled={!!actionBusy}
-                  onClick={() => runAction(action)}
-                  className={`hidden`}
-                />
-              ))}
-          </div>
+          {/* Retiré : deux blocs morts qui prétendaient exécuter immédiatement les
+              actions sans saisie. Le premier se terminait par `&& null` (rien
+              rendu), le second produisait des <button className="hidden" /> sans
+              libellé — donc invisibles et inatteignables. Les actions sans saisie
+              passent par le même panneau de confirmation que les autres : un clic
+              ouvre, un clic confirme. Confirmer explicitement un décaissement ou
+              une prise en charge n'est pas une friction à supprimer. */}
         </div>
       )}
 
       {/* Info cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <InfoCard label="Montant demandé" value={`${(app.amount_requested ?? 0).toLocaleString('fr-FR')} ${app.currency}`} />
-        <InfoCard label="Montant approuvé" value={app.amount_approved ? `${app.amount_approved.toLocaleString('fr-FR')} ${app.currency}` : '—'} />
-        <InfoCard label="Superficie" value={app.area_ha ? `${app.area_ha} ha` : '—'} />
-        <InfoCard label="Garantie" value={app.guarantee_type || '—'} />
+        <InfoCard label="Montant demandé" value={`${(app.amountRequested ?? 0).toLocaleString('fr-FR')} ${app.currency}`} />
+        <InfoCard label="Montant approuvé" value={app.amountApproved ? `${app.amountApproved.toLocaleString('fr-FR')} ${app.currency}` : '—'} />
+        <InfoCard label="Superficie" value={app.areaHa ? `${app.areaHa} ha` : '—'} />
+        <InfoCard label="Garantie" value={app.guaranteeType || '—'} />
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <InfoCard label="Soumis le" value={fmt(app.submittedAt)} />
-        <InfoCard label="Décaissé le" value={fmt(app.disbursedAt)} />
-        <InfoCard label="Montant décaissé" value={app.disbursed_amount ? `${app.disbursed_amount.toLocaleString('fr-FR')} ${app.currency}` : '—'} />
+        <InfoCard
+          label="Décaissé le"
+          value={app.disbursement?.status === 'confirmed' ? fmt(app.disbursement.confirmedAt) : '—'}
+        />
+        <InfoCard
+          label="Montant décaissé"
+          value={
+            app.disbursement?.status === 'confirmed'
+              ? `${app.disbursement.amount.toLocaleString('fr-FR')} ${app.disbursement.currency}`
+              : '—'
+          }
+        />
         <InfoCard label="Créé le" value={fmt(app.createdAt)} />
       </div>
 
@@ -421,18 +428,24 @@ const ApplicationDetail: React.FC = () => {
       )}
 
       {/* Needs sheet */}
-      {app.needs_sheet && (
+      {app.needsSheet && (
         <section className="bg-white/5 border border-white/10 rounded-xl p-6">
           <h3 className="font-bold text-lg mb-4">Feuille de besoins</h3>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <InfoCard label="Total besoins" value={`${(app.needs_sheet.grandTotal ?? 0).toLocaleString('fr-FR')} ${app.needs_sheet.currency}`} />
-            <InfoCard label="Superficie" value={app.needs_sheet.area_ha ? `${app.needs_sheet.area_ha} ha` : '—'} />
-            <InfoCard label="Validée" value={app.needs_sheet.parsedOk ? 'Oui' : 'Non'} />
-            <InfoCard label="Devise" value={app.needs_sheet.currency} />
+            <InfoCard label="Total besoins" value={`${(app.needsSheet.grandTotal ?? 0).toLocaleString('fr-FR')} ${app.needsSheet.currency}`} />
+            {/* La carte « Superficie » lisait `needsSheet.area_ha` : le type le déclare,
+                mais `serialize_application` ne l'émet PAS dans `needsSheet` (clés réelles :
+                id, parsedOk, grandTotal, currency, warnings, anomalies). Elle affichait donc
+                « — » en toutes circonstances. La superficie du dossier est déjà présentée
+                plus haut ; on trace ici la révision parsée, seule information que ce bloc
+                apporte et que rien d'autre ne donne. */}
+            <InfoCard label="Révision parsée" value={app.needsSheet.id != null ? `#${app.needsSheet.id}` : '—'} />
+            <InfoCard label="Validée" value={app.needsSheet.parsedOk ? 'Oui' : 'Non'} />
+            <InfoCard label="Devise" value={app.needsSheet.currency} />
           </div>
-          {app.needs_sheet.warnings && app.needs_sheet.warnings.length > 0 && (
+          {app.needsSheet.warnings && app.needsSheet.warnings.length > 0 && (
             <div className="mt-4 space-y-1">
-              {app.needs_sheet.warnings.map((w, i) => (
+              {app.needsSheet.warnings.map((w, i) => (
                 <p key={i} className="text-xs text-yellow-300 flex gap-2">⚠ {w}</p>
               ))}
             </div>

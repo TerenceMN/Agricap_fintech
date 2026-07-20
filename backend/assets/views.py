@@ -138,10 +138,10 @@ def asset_detail(request, asset_id):
         for field in CLIENT_WRITABLE:
             if field in data:
                 setattr(asset, field, data[field])
-        # Toute modification invalide la vérification précédente
-        if asset.status == Asset.Status.VERIFIE:
-            asset.status = Asset.Status.DECLARE
-            asset.valeur_retenue = None
+        # Toute modification invalide la vérification précédente (`verifie` ET
+        # `libere` — la règle vit dans le service, elle est testée là-bas).
+        from assets.services import invalidate_verification
+        invalidate_verification(asset)
         asset.save()
 
     return Response(_row(asset))

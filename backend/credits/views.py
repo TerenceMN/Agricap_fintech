@@ -120,9 +120,15 @@ def parse_needs_sheet_view(request: Request) -> Response:
     Content-Type: multipart/form-data
 
     Champs requis  : file (xlsx)
-    Champs optionnels : value_chain_code, area_ha, currency (USD|CDF)
+    Champs optionnels : value_chain_code, area_ha, currency (USD|CDF), application_code
 
-    Retourne le résultat du parsing + sauvegarde un NeedsSheet en DB.
+    Avec `application_code` (mode SPEC chantier 1) : le classeur est validé (6
+    contrôles, 422 structuré) puis **ingéré en tables** (`dataio`, kind
+    FEUILLE_BESOINS) et rattaché au dossier. Simulation et scoring liront ensuite
+    ces tables — plus jamais le fichier.
+
+    Sans `application_code` (parcours client avant création du dossier) : parsing
+    en mémoire hérité, conservé pour ne pas casser l'étape 2 du simulateur.
     """
     if not _require_read(request):
         return Response({"detail": "Permission refusée."}, status=403)
@@ -131,11 +137,18 @@ def parse_needs_sheet_view(request: Request) -> Response:
     if not file:
         return Response({"detail": "Fichier manquant (champ 'file' requis)."}, status=400)
 
-    if not file.name.lower().endswith((".xlsx", ".xls")):
+    if not file.name.lower().endswith(".xlsx"):
         return Response(
-            {"detail": "Format invalide. Seuls les fichiers .xlsx / .xls sont acceptés."},
+            {"errors": [{
+                "code": "FORMAT_INVALIDE",
+                "message": "Seuls les classeurs .xlsx sont acceptés (pas de .xls ni .xlsm).",
+            }]},
             status=422,
         )
+
+    application_code: str = (request.data.get("application_code") or "").strip()
+    if application_code:
+        return _ingest_needs_sheet(request, file, application_code)
 
     value_chain_code: str = request.data.get("value_chain_code", "")
     area_ha_raw: str = request.data.get("area_ha", "")
@@ -273,6 +286,52 @@ def _persist_needs_sheet(
         return None
 
 
+def _ingest_needs_sheet(request: Request, file, application_code: str) -> Response:
+    """Validation + ingestion dataio de la feuille de besoins d'un dossier.
+
+    Le dossier doit être en `draft` : après soumission, la base de calcul est figée
+    (une révision de plus changerait rétroactivement ce qui a été instruit).
+    """
+    from credits.models import CreditApplication
+    from credits.needs_sheet import NeedsSheetValidationError, parse_and_ingest
+
+    app = CreditApplication.objects.filter(code=application_code).first()
+    if app is None:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    requester_sub: str = getattr(request.user, "sub", "") or ""
+    if app.client.sub != requester_sub and not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Accès interdit à ce dossier."}, status=403)
+
+    if app.status != CreditApplication.Status.DRAFT:
+        return Response(
+            {"detail": (f"Le dossier {app.code} n'est plus modifiable "
+                        f"(statut « {app.get_status_display()} »)."),
+             "errors": [{"code": "APPLICATION_NOT_DRAFT",
+                         "message": "La feuille de besoins ne peut être remplacée "
+                                    "qu'en brouillon."}]},
+            status=409,
+        )
+
+    try:
+        result = parse_and_ingest(file, app, uploaded_by=requester_sub)
+    except NeedsSheetValidationError as exc:
+        return Response({"errors": exc.errors}, status=422)
+
+    return Response(
+        {
+            "ok": True,
+            "applicationCode": app.code,
+            "needsSourceId": result["needs_source_id"],
+            "revision": result["revision"],
+            "sha256": result["sha256"],
+            "totalByModule": result["totals"],
+            "grandTotal": result["grand_total"],
+        },
+        status=201,
+    )
+
+
 # ── 3. Modèle Excel (template) ───────────────────────────────────────────────
 
 @api_view(["GET"])
@@ -328,9 +387,12 @@ def simulate_scoring(request: Request) -> Response:
     Simule le scoring et le plan de remboursement sans créer de dossier en base.
 
     Corps JSON :
-      client_sub         (str, requis)
+      application_code   (str, optionnel) — mode SPEC : les montants par module sont
+                         LUS dans les DataRecord de `application.needs_source`. Tout
+                         `ns_totals` du payload est alors ignoré (principe 1).
+      client_sub         (str, requis si pas d'application_code)
       value_chain_code   (str, optionnel)
-      needs_sheet_id     (int, optionnel) — ID d'une NeedsSheet déjà parsée
+      needs_sheet_id     (int, optionnel) — legacy, NeedsSheet déjà parsée
       area_ha            (float, optionnel)
       amount_requested   (float, optionnel)
       currency           (str, "USD"|"CDF", défaut "USD")
@@ -339,6 +401,9 @@ def simulate_scoring(request: Request) -> Response:
         return Response({"detail": "Permission refusée."}, status=403)
 
     data = request.data
+    if (application_code := (data.get("application_code") or "").strip()):
+        return _simulate_from_source(request, application_code, data)
+
     client_sub: str = data.get("client_sub", "")
     requester_sub: str = getattr(request.user, "sub", "") or ""
 
@@ -404,6 +469,66 @@ def simulate_scoring(request: Request) -> Response:
     return Response(result)
 
 
+def _load_needs_totals(app):
+    """(totaux par module en float, lignage) depuis la révision courante en base.
+
+    Retourne `(None, {})` si le dossier n'a pas encore de feuille ingérée : c'est
+    au appelant de refuser — on ne calcule jamais un score sur des montants absents
+    ou fournis par le client.
+    """
+    from credits.needs_sheet import extract_module_totals, needs_source_lineage
+
+    source = app.needs_source
+    if source is None:
+        return None, {}
+    totals = extract_module_totals(source)
+    return {k: float(v) for k, v in totals.items()}, needs_source_lineage(source)
+
+
+def _simulate_from_source(request: Request, application_code: str, data) -> Response:
+    """Simulation adossée aux tables du dossier — aucun montant n'est accepté du client."""
+    from credits.models import CreditApplication
+
+    app = (CreditApplication.objects
+           .select_related("client__kyc_profile", "value_chain", "needs_source")
+           .filter(code=application_code).first())
+    if app is None:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    vcs = _vcs(request)
+    if not vcs.can_read_app(app):
+        return Response({"detail": "Accès interdit."}, status=403)
+
+    ns_totals, lineage = _load_needs_totals(app)
+    if ns_totals is None:
+        return Response(
+            {"errors": [{
+                "code": "NEEDS_SOURCE_MISSING",
+                "message": (f"Le dossier {app.code} n'a pas de feuille de besoins ingérée. "
+                            f"Téléversez-la via POST /api/credits/needs-sheet/parse/ "
+                            f"avec application_code={app.code}."),
+            }]},
+            status=422,
+        )
+
+    currency: str = (data.get("currency") or app.currency or "USD").upper()
+    result = dataio_simulate(
+        client=app.client,
+        value_chain_code=app.value_chain.code if app.value_chain else None,
+        needs_sheet=None,
+        ns_totals=ns_totals,
+        area_ha=float(app.area_ha) if app.area_ha else None,
+        amount_requested=float(app.amount_requested) if app.amount_requested else None,
+        currency=currency,
+        guarantees_data=None,
+    )
+    if "error" in result:
+        return Response({"detail": result["error"]}, status=400)
+
+    result["needsSource"] = lineage
+    return Response(result)
+
+
 # ── 5. Re-scoring d'un dossier existant ───────────────────────────────────────
 
 @api_view(["POST"])
@@ -413,6 +538,10 @@ def score_application(request: Request, code: str) -> Response:
 
     Calcule (ou recalcule) le score d'un dossier existant et le persiste dans score_result.
     Réservé au staff (permission 'analyst' ou 'agent').
+
+    Les montants par module sont relus dans les `DataRecord` de la révision courante
+    de la feuille de besoins ; le rapport conserve `needs_source_id + revision +
+    sha256` — une analyse est rejouable à l'identique des mois plus tard.
     """
     if not _require_group(request, CAN_INSTRUCT):
         return Response({"detail": "Permission refusée."}, status=403)
@@ -422,13 +551,17 @@ def score_application(request: Request, code: str) -> Response:
 
     try:
         app = CreditApplication.objects.select_related(
-            "client__kyc_profile", "value_chain", "needs_sheet"
+            "client__kyc_profile", "value_chain", "needs_sheet", "needs_source"
         ).get(code=code)
     except CreditApplication.DoesNotExist:
         return Response({"detail": "Dossier introuvable."}, status=404)
 
-    engine = CreditScoringEngine(app)
+    needs_totals, lineage = _load_needs_totals(app)
+
+    engine = CreditScoringEngine(app, needs_totals=needs_totals)
     result = engine.compute()
+    result["needsSource"] = lineage
+    result["needsTotals"] = needs_totals or {}
 
     app.score_result = result
     app.save(update_fields=["score_result", "updated_at"])
@@ -979,17 +1112,18 @@ def place_asset_guarantee_view(request: Request, code: str) -> Response:
     if not asset_id:
         return Response({"detail": "asset_id requis."}, status=400)
 
-    from credits.guarantees import (
-        GuaranteeError, GuaranteeTypeNotEligible, place_asset_guarantee,
-    )
+    from credits.guarantees import GuaranteeError, place_asset_guarantee
+
     try:
         place_asset_guarantee(app, asset_id=int(asset_id), registered_by_sub=sub)
-    except GuaranteeTypeNotEligible as exc:
-        return Response(
-            {"detail": str(exc), "code": "GUARANTEE_TYPE_NOT_ELIGIBLE"}, status=422,
-        )
     except GuaranteeError as exc:
-        return Response({"detail": str(exc), "code": "ASSET_GUARANTEE_REFUSED"}, status=422)
+        # Chaque règle porte son propre code (cf. `credits.guarantees`) : le front
+        # branche sur `code`, jamais sur la formulation de `detail`.
+        return Response(
+            {"detail": str(exc), "code": exc.code,
+             "errors": [{"code": exc.code, "message": str(exc)}]},
+            status=422,
+        )
     except (TypeError, ValueError):
         return Response({"detail": "asset_id invalide."}, status=400)
 

@@ -15,6 +15,9 @@ import Settings from '@/pages/Settings';
 import CreditAnalysis from '@/pages/credit/CreditAnalysis';
 import Applications from '@/pages/credit/Applications';
 import ApplicationDetail from '@/pages/credit/ApplicationDetail';
+import AssetVerification from '@/pages/credit/AssetVerification';
+import Committee from '@/pages/credit/Committee';
+import AuditJournal from '@/pages/credit/AuditJournal';
 import DataAdmin from '@/pages/admin/DataAdmin';
 
 // Client Specific Pages
@@ -87,6 +90,14 @@ const AppRoutes = () => {
       <Route path="/credit" element={<PrivateRoute><Layout><CreditAnalysis /></Layout></PrivateRoute>} />
       <Route path="/credit/dossiers" element={<PrivateRoute><Layout><Applications /></Layout></PrivateRoute>} />
       <Route path="/credit/dossiers/:code" element={<PrivateRoute><Layout><ApplicationDetail /></Layout></PrivateRoute>} />
+      {/* Backoffice crédit. Volontairement SANS prop `roles` : l'autorisation de ces trois
+          écrans est décidée par le serveur (403 sur /assets/pending, ?view=committee et
+          /audit/entries), et chacun la restitue explicitement. Un garde `roles` côté front
+          reposerait sur `menuKeyFor`, qui écrase les 16 rôles canoniques en 5 clés de menu :
+          il masquerait ces écrans à `gest_zone` ou `aud_fin`, qui y ont pourtant droit. */}
+      <Route path="/credit/actifs" element={<PrivateRoute><Layout><AssetVerification /></Layout></PrivateRoute>} />
+      <Route path="/credit/comite" element={<PrivateRoute><Layout><Committee /></Layout></PrivateRoute>} />
+      <Route path="/credit/journal" element={<PrivateRoute><Layout><AuditJournal /></Layout></PrivateRoute>} />
       <Route path="/admin/data" element={<PrivateRoute roles={['admin']}><Layout><DataAdmin /></Layout></PrivateRoute>} />
       
       {/* Client Routes */}

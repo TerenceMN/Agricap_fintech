@@ -128,10 +128,19 @@ class CreditApplication(models.Model):
     amount_requested = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     amount_approved = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
 
-    # Feuille de besoins attachée
+    # Feuille de besoins attachée (legacy : parse en mémoire, totaux figés)
     needs_sheet = models.OneToOneField(
         NeedsSheet, null=True, blank=True,
         on_delete=models.SET_NULL, related_name="credit_application",
+    )
+
+    # Révision COURANTE de la feuille de besoins ingérée en tables (dataio).
+    # Principe 1 : ce qui est scoré = ce qui est en base. Simulation et scoring
+    # lisent les DataRecord de cette source, jamais un fichier ni un payload.
+    # PROTECT : la pièce probante d'un dossier ne s'efface pas.
+    needs_source = models.ForeignKey(
+        "dataio.DataSource", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="current_for_applications",
     )
 
     # Tracking des overrides par rapport au prefill

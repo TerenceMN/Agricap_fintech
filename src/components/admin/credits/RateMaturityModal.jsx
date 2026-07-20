@@ -151,53 +151,53 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
         setConfirmAction(action);
     };
 
-    const executeAction = () => {
-        let newStatus = config.status;
-        let newRate = config.rate;
-        let actionLabel = "";
+    // Bloquer / suspendre / réactiver — actions RÉELLEMENT persistées par
+    // `POST /api/portfolio/loans/<ref>/action` (`portfolio/services.py::run_action`,
+    // branches `block`, `pause|suspend`, `resume`). C'est le serveur qui écrit le
+    // statut et, pour `block`, met le taux à 0 : le front n'anticipe plus rien.
+    //
+    // Historique — ces trois actions écrivaient dans `localStorage` puis
+    // affichaient « Action effectuée ». L'utilisateur croyait avoir bloqué un
+    // prêt qui restait actif en base, et le mensonge survivait au rechargement
+    // de page tant que le cache local n'était pas vidé.
+    //
+    // Dette croisée assumée et signalée : `/action` écrit `loan.status` sans
+    // passer par `credits/workflow.py`, donc sans maker ≠ checker ni contrôle de
+    // délégation (CREDIT_MODULE_STATUS.md §8.4). L'action est authentiquement
+    // persistée — elle n'est pas pour autant sous le régime de séparation des
+    // tâches du module crédit.
+    const [actionBusy, setActionBusy] = useState(false);
 
-        switch (confirmAction) {
-            case 'block':
-                newStatus = 'Blocked';
-                newRate = 0;
-                actionLabel = "Blocage (Taux 0%)";
-                break;
-            case 'suspend':
-                newStatus = 'Suspended';
-                actionLabel = "Suspension Temporaire";
-                break;
-            case 'resume':
-                newStatus = 'Active';
-                actionLabel = "Réactivation";
-                // Optionally restore rate? For now, user must set rate manually if it was 0
-                break;
-            default:
-                actionLabel = "Modification";
+    const executeAction = async () => {
+        if (!confirmAction) return;
+        setActionBusy(true);
+        try {
+            const res = await api.portfolio.action(credit.id, confirmAction);
+            // On relit la configuration servie par le backend plutôt que de
+            // deviner le nouvel état : le serveur seul sait ce qu'il a écrit.
+            try {
+                const data = await api.portfolio.config(credit.id);
+                const c = data.currentConfig || {};
+                setConfig((prev) => ({
+                    ...prev,
+                    rate: c.rate ?? prev.rate,
+                    duration: c.duration ?? prev.duration,
+                    frequency: c.frequency || prev.frequency,
+                    status: c.status || prev.status,
+                    startDate: c.startDate || prev.startDate,
+                }));
+                setHistory(data.history || []);
+            } catch {
+                // La relecture a échoué : on ne fabrique pas d'état local optimiste.
+                // Le statut affiché reste celui de la dernière lecture serveur réussie.
+            }
+            setConfirmAction(null);
+            toast({ title: 'Action enregistrée', description: res?.detail || 'Le serveur a appliqué la transition.' });
+        } catch (e) {
+            toast({ variant: 'destructive', title: 'Action refusée', description: e.message });
+        } finally {
+            setActionBusy(false);
         }
-
-        setConfig(prev => ({ ...prev, status: newStatus, rate: newRate }));
-        // We need to wait for state update in a real app, but here we can just construct the object to save
-        // Actually saveChanges reads from state 'config', so we need to set state then save. 
-        // Better to pass new config to save function or use useEffect. 
-        // For simplicity, let's just update the local object passed to save.
-        
-        // Hack for synchronous save with new values
-        const nextConfig = { ...config, status: newStatus, rate: newRate };
-        
-        // Manual save logic for action
-         const newEntry = {
-            date: new Date().toISOString(),
-            action: actionLabel,
-            user: 'Admin',
-            details: `Statut changé à ${newStatus}. Taux: ${newRate}%`
-        };
-        const updatedHistory = [newEntry, ...history];
-        localStorage.setItem(`credit_config_${credit.id}`, JSON.stringify({ currentConfig: nextConfig, history: updatedHistory }));
-        
-        setConfig(nextConfig);
-        setHistory(updatedHistory);
-        setConfirmAction(null);
-        toast({ title: "Action effectuée", description: `Le crédit est maintenant: ${newStatus}` });
     };
 
     if (!credit) return null;
@@ -309,9 +309,24 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                                     </div>
                                 </div>
 
+                                {/* Ces trois chiffres et le tableau ci-dessous sont calculés dans le
+                                    navigateur (amortissement constant, intérêt simple) et ne sont PAS
+                                    ceux du moteur d'échéancier serveur. Ils aident à cadrer une
+                                    configuration avant de l'enregistrer ; ils n'engagent personne.
+                                    L'échéancier opposable est servi par
+                                    `GET /api/portfolio/loans/<ref>/schedule` et s'affiche dans
+                                    l'onglet « Échéancier » du détail du crédit. */}
+                                <p className="text-[11px] text-amber-300/80 -mt-2">
+                                    Simulation calculée localement (amortissement constant, intérêt simple)
+                                    pour cadrer la configuration avant enregistrement. L'échéancier opposable
+                                    est celui du serveur, visible dans l'onglet « Échéancier » du dossier.
+                                </p>
+
                                 <div className="rounded-lg border border-slate-700 overflow-hidden h-[300px] flex flex-col">
                                     <div className="bg-slate-800 p-2 text-xs font-semibold text-slate-300 flex justify-between items-center px-4">
-                                        <span>Tableau d'Amortissement Prévisionnel</span>
+                                        <span>
+                                            Tableau d'amortissement — simulation locale, non contractuelle
+                                        </span>
                                         <Badge variant="outline" className="text-[10px] h-5">{schedule.length} échéances</Badge>
                                     </div>
                                     <div className="overflow-auto flex-1 bg-slate-900/30">
@@ -350,7 +365,11 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                                 <Save className="w-4 h-4 mr-2" /> Enregistrer Configuration
                             </Button>
                             <div className="flex-1"></div>
-                            {config.status === 'Active' ? (
+                            {/* Le statut vient du backend et peut être libellé en français
+                                (« En cours », « Suspendu »…) : on teste contre ACTIVE_STATES
+                                plutôt que contre le seul littéral 'Active', sinon un prêt actif
+                                affiche « Réactiver ». */}
+                            {ACTIVE_STATES.includes(config.status) ? (
                                 <>
                                     <Button variant="outline" onClick={() => handleActionClick('suspend')} className="border-amber-500/50 text-amber-400 hover:bg-amber-500/10">
                                         <PauseCircle className="w-4 h-4 mr-2" /> Suspendre
@@ -409,9 +428,16 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                                 Êtes-vous sûr de vouloir <strong>{confirmAction === 'block' ? 'Bloquer' : confirmAction === 'suspend' ? 'Suspendre' : 'Réactiver'}</strong> ce crédit ?
                                 {confirmAction === 'block' && " Cela mettra le taux à 0%."}
                             </p>
+                            <p className="text-xs text-amber-300/70">
+                                La transition est écrite par le serveur (portefeuille). Elle ne passe pas
+                                par la machine à états du module crédit : ni maker ≠ checker, ni contrôle
+                                de délégation ne s'y appliquent.
+                            </p>
                             <div className="flex gap-2 mt-2">
-                                <Button size="sm" variant="ghost" onClick={() => setConfirmAction(null)} className="hover:bg-amber-900/20">Annuler</Button>
-                                <Button size="sm" onClick={executeAction} className="bg-amber-600 hover:bg-amber-700 text-white">Confirmer</Button>
+                                <Button size="sm" variant="ghost" disabled={actionBusy} onClick={() => setConfirmAction(null)} className="hover:bg-amber-900/20">Annuler</Button>
+                                <Button size="sm" disabled={actionBusy} onClick={executeAction} className="bg-amber-600 hover:bg-amber-700 text-white">
+                                    {actionBusy ? 'Enregistrement…' : 'Confirmer'}
+                                </Button>
                             </div>
                         </AlertDescription>
                     </Alert>

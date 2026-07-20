@@ -20,6 +20,8 @@ def _source_dict(s: DataSource) -> dict:
         "revision": s.revision, "is_current": s.is_current, "dataset_key": s.dataset_key,
         "uploaded_at": s.uploaded_at, "committed_at": s.committed_at,
         "supersedes": s.supersedes_id, "n_tables": s.tables.count(),
+        "sha256": s.sha256,
+        "credit_application": s.credit_application.code if s.credit_application_id else None,
     }
 
 
@@ -51,7 +53,13 @@ def source_detail(request, pk):
     if not src:
         return Response({"detail": "Introuvable."}, status=404)
     if request.method == "DELETE":
-        result = services.delete_source(src)
+        try:
+            result = services.delete_source(src)
+        except services.SourceProtected as exc:
+            return Response(
+                {"detail": exc.message, "errors": [{"code": exc.code, "message": exc.message}]},
+                status=status.HTTP_409_CONFLICT,
+            )
         detail = "Source et données supprimées."
         if result.get("typed_removed"):
             detail += f" Version référentiel retirée ({result['typed_removed']})."

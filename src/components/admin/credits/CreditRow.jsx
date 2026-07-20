@@ -3,7 +3,7 @@ import { TableRow, TableCell } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { 
-    MoreHorizontal, Eye, FileText, Banknote, MessageSquare, UserCog, AlertTriangle, Clock, CircleOff, Check, ChevronDown, ChevronUp, Settings2
+    MoreHorizontal, Eye, Banknote, MessageSquare, UserCog, AlertTriangle, Clock, CircleOff, Check, ChevronDown, ChevronUp, Settings2
 } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { motion, AnimatePresence } from 'framer-motion';
@@ -87,10 +87,16 @@ const CreditRow = ({ credit, onAction }) => {
                             <DropdownMenuSeparator className="bg-slate-700"/>
                             <DropdownMenuItem onSelect={() => onAction('details', credit)}><Eye className="mr-2 h-4 w-4" />Détails du Crédit</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => onAction('configure_rate', credit)}><Settings2 className="mr-2 h-4 w-4 text-blue-400" />Config. Taux & Maturité</DropdownMenuItem>
-                            <DropdownMenuItem onSelect={() => onAction('contract', credit)}><FileText className="mr-2 h-4 w-4" />Voir / Télécharger Contrat</DropdownMenuItem>
+                            {/* « Voir / Télécharger Contrat » et « Exporter Dossier » ont été retirés :
+                                aucun endpoint backend ne les sert. Ils ouvraient un toast
+                                « Génération du document — à brancher (gabarit) », c'est-à-dire une
+                                entrée de menu qui promet un document inexistant. Un bouton sans
+                                endpoint protégé n'existe pas (CLAUDE.md §7.2). À réintroduire le jour
+                                où `credits` expose une génération de contrat et un export de dossier
+                                — la route de rapport `GET /api/credits/applications/<code>/rapport`
+                                porte sur le dossier d'instruction, pas sur un prêt du portefeuille. */}
                             <DropdownMenuItem onSelect={() => onAction('disburse', credit)}><Banknote className="mr-2 h-4 w-4" />Décaissement / Paiement</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => onAction('note', credit)}><MessageSquare className="mr-2 h-4 w-4" />Ajouter une note</DropdownMenuItem>
-                            <DropdownMenuItem onSelect={() => onAction('export', credit)}><FileText className="mr-2 h-4 w-4" />Exporter Dossier</DropdownMenuItem>
                             <DropdownMenuSeparator className="bg-slate-700"/>
                             <DropdownMenuLabel>Gestion du Dossier</DropdownMenuLabel>
                             <DropdownMenuSeparator className="bg-slate-700"/>
