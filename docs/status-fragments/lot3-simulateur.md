@@ -117,6 +117,49 @@ re-téléverse après avoir simulé, un bandeau ambre l'annonce (« calculée su
 révision 2, votre feuille est en révision 3 ») plutôt que de laisser un score
 obsolète à l'écran. Un nouveau dépôt réussi efface aussi `simResult`.
 
+### 2.1 Un échec de transport n'est pas un refus du fichier
+
+Défaut trouvé en fin de lot, à l'occasion d'un échange avec `moteur-front-analyse`
+sur le traitement des 401 — et **corrigé**, parce que la panne de transport
+tombait dans le pire cadre possible.
+
+**Ce qui se passait.** Toute exception non-422 passait par `guaranteeErrorList`,
+donc par `NeedsSheetErrorList`, donc sous le titre « *N points à corriger dans
+votre fichier* » et le pied « *Corrigez tous ces points dans le classeur, puis
+téléversez-le à nouveau* ». Rejeu de la chaîne réelle :
+
+| Cas | Message affiché | Cadre |
+|---|---|---|
+| 401 sans `detail` | « Le serveur a refusé cette opération. » | *à corriger dans votre fichier* |
+| 500 | « Le serveur a refusé cette opération. » | *à corriger dans votre fichier* |
+| 401 avec `detail` DRF | « Given token not valid for any token type » | *à corriger dans votre fichier* |
+
+Une session expirée disait donc au client que **son classeur** était en cause,
+et l'invitait à le modifier. Il aurait « corrigé » jusqu'à casser un document qui
+n'avait rien — et la dernière ligne relayait un message technique anglais dans un
+parcours client français.
+
+**Le correctif.** `isFileValidationError()` sépare les deux familles : un refus
+porte sur le contenu s'il a des `errors[]` structurés ou un statut 400 / 409 /
+422 ; tout le reste (401, 403, 404, 5xx, échec réseau) est une panne de
+transport. `transportErrorMessage()` nomme la cause quand le statut la donne et
+reste vague sinon — jamais un motif métier inventé. Le rendu passe par
+`NeedsSheetFailure`, cadre neutre distinct, sans vocabulaire de correction, avec
+un bouton « Réessayer avec le même fichier » (masqué sur 401, où il faut d'abord
+se reconnecter). Chaque message dit explicitement de **ne pas modifier le
+classeur**. Appliqué aux deux appels de l'étape : téléversement et simulation.
+
+Classification vérifiée sur 8 cas (422 pipeline, 409 non-draft, 400 création,
+401, 403, 404, 500, échec réseau sans statut) : trois en « fichier », cinq en
+« transport ».
+
+**Portée.** Ce correctif ne traite pas la déconnexion elle-même — savoir si
+l'application doit rediriger vers l'écran de connexion après un `refresh()`
+échoué est transverse et hors de mon périmètre. Il traite le fait que mon écran
+**désignait le mauvais coupable**, ce qui est local et m'incombe.
+
+---
+
 ---
 
 ## 3. Contrainte d'ordonnancement — la solution retenue et ce qu'elle laisse ouvert
@@ -285,6 +328,24 @@ d'autres agents y travaillent.
   `credits/static/credits/feuille_besoins_template.xlsx` — la dette du **principe
   11** (template versionné maker-checker en base) reste entière côté backend. Le
   front est prêt : il n'a qu'une URL à appeler.
+- **`analyse-resume/` n'a aucun appelant dans le front.** Signalé à l'occasion
+  d'une alerte de `moteur-front-analyse` sur `pointsForts: []` (le critère
+  comportemental neutre ne tombe plus dans les points forts — le client sans
+  historique ne lit plus « votre historique joue en votre faveur »). Vérification
+  faite : le correctif ne peut pas se manifester ici, **parce que rien ne
+  consomme cet endpoint**. `api.credits.analyseResume` existe dans `api.ts`,
+  `CreditAnalyseResume` est typé dans `types/api.ts`, le backend le sert et un
+  payload de référence est livré (`docs/contracts/moteur-analyse-payload-observe.json`,
+  `pointsForts: []` ligne 453) — mais `grep -rn "analyseResume" src` ne remonte
+  **aucun site d'appel**, seulement un commentaire.
+
+  Conséquence : le client ne voit jamais la restitution de son analyse. C'est le
+  cas « endpoint sans bouton » de CLAUDE.md §7.2, qui doit au minimum être
+  documenté. C'est aussi la surface qui servirait `scoreLettre` au client (§4.2)
+  et qui rendrait `SCORE_BANDS` supprimable. Hors périmètre du lot 3 — le
+  simulateur n'est pas l'écran d'analyse — mais c'est un manque plus large que le
+  rendu d'un tableau vide, et il n'a de propriétaire déclaré dans aucun fragment
+  que j'ai lu. **À router.**
 - **Dette croisée, hors de mon périmètre** (signalée à `moteur-front-analyse`) :
   le barème de recommandation à 4 niveaux est défini **deux fois**, dans
   `src/components/analyse/recommandation.js` et dans
@@ -331,5 +392,22 @@ cette session :
   vaudrait mieux que ma lecture ;
 - les 422 ne sont affichés que sur la foi du contrat : aucun classeur invalide
   n'a été téléversé pour voir la liste s'afficher ;
+- ~~un échec de transport s'affichait comme un refus du fichier~~ — **corrigé**,
+  voir §2.1 ci-dessous ;
+- **le transport n'est pas validé** (cadrage repris de `moteur-front-analyse`,
+  plus juste que le mien) : aucun appel HTTP réel n'a été émis depuis ce lot. Ne
+  sont donc vérifiés ni les statuts effectivement reçus, ni le jeton, ni le
+  chemin 401 → `refresh()` → rejeu. Ce dernier mérite une attention
+  particulière ici : `request()` rejoue avec `{ ...opts }`, donc **le même objet
+  `FormData`** pour l'upload de la feuille. Un `FormData` est en principe
+  ré-émissible par `fetch` (ce n'est pas un flux consommé), mais si un jeton
+  expire pendant un téléversement, ce chemin-là n'a jamais tourné. C'est le seul
+  endroit du lot où une erreur de transport produirait un échec silencieux
+  plutôt qu'un 422 affiché ;
 - aucun test automatisé n'a été ajouté — il n'y a pas de harnais de test front
   dans le dépôt.
+
+Ces réserves ne se lèveront qu'en exécutant l'application. Elles ne sont pas des
+formalités : les trois défauts les plus intéressants de cette passe
+(`pointsForts` neutre, colonne de zéros, `analyse-resume` sans appelant) avaient
+tous un contrat honoré, un type correct et aucun test rouge.

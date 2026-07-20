@@ -60,10 +60,10 @@ const ClientDocuments = () => {
                                 <div className="w-20 h-20 rounded-full border-4 border-emerald-500 flex items-center justify-center bg-emerald-500/10">
                                     <span className="text-2xl font-bold text-emerald-400">T{kycLevel}</span>
                                 </div>
-                                <CheckCircle className="absolute bottom-0 right-0 w-6 h-6 text-white bg-emerald-500 rounded-full" />
+                                <CheckCircle className="absolute bottom-0 right-0 w-6 h-6 text-white bg-emerald-500 rounded-full [&>option]:bg-slate-800 [&>option]:text-white" />
                             </div>
                             <div>
-                                <h3 className="text-xl font-bold text-white">Niveau {kycLevel} - Vérifié</h3>
+                                <h3 className="text-xl font-bold text-white [&>option]:bg-slate-800 [&>option]:text-white">Niveau {kycLevel} - Vérifié</h3>
                                 <p className="text-sm text-gray-400">Limites: 50,000 USD / mois</p>
                                 <Button variant="link" className="text-emerald-400 p-0 h-auto">Voir les avantages du Niveau {kycLevel + 1}</Button>
                             </div>
@@ -89,7 +89,7 @@ const ClientDocuments = () => {
                                 <span className="text-gray-300">Valider l'adresse email secondaire.</span>
                             </li>
                         </ul>
-                        <Button size="sm" className="w-full mt-4 bg-yellow-600 hover:bg-yellow-700 text-white">Résoudre</Button>
+                        <Button size="sm" className="w-full mt-4 bg-yellow-600 hover:bg-yellow-700 text-white [&>option]:bg-slate-800 [&>option]:text-white">Résoudre</Button>
                     </CardContent>
                 </Card>
             </div>
@@ -111,7 +111,7 @@ const ClientDocuments = () => {
                             <TableBody>
                                 {documents.map(doc => (
                                     <TableRow key={doc.id}>
-                                        <TableCell className="font-medium text-white">
+                                        <TableCell className="font-medium text-white [&>option]:bg-slate-800 [&>option]:text-white">
                                             <div className="flex items-center gap-2">
                                                 <FileCheck2 className="w-4 h-4 text-blue-400"/> {doc.type}
                                             </div>
@@ -141,7 +141,7 @@ const ClientDocuments = () => {
                                 <select
                                     value={docType}
                                     onChange={e => setDocType(e.target.value)}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-md p-2 text-sm text-white"
+                                    className="w-full bg-slate-900 border border-slate-700 rounded-md p-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
                                 >
                                     {DOC_TYPE_OPTIONS.map((opt, i) => (
                                         <option key={i} value={opt.value}>{opt.label}</option>

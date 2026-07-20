@@ -9,11 +9,41 @@
  * Il ne calcule rien.
  */
 import React, { useRef } from 'react';
-import { AlertTriangle, CheckCircle2, Download, FileSpreadsheet, FileUp, Loader2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Download, FileSpreadsheet, FileUp, Loader2, WifiOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { formatMontant } from '@/components/guarantees/format';
 import { needsSheetHint } from './needsSheetErrors';
+
+/**
+ * Échec NON imputable au fichier (session expirée, service indisponible, réseau).
+ *
+ * Cadre volontairement distinct de `NeedsSheetErrorList` : ni rouge « refus »,
+ * ni vocabulaire de correction. Le client doit repartir avec « réessayez », pas
+ * avec « votre classeur est mauvais » — c'est tout l'objet de la séparation.
+ */
+export const NeedsSheetFailure = ({ failure, onRetry }) => {
+  if (!failure) return null;
+  return (
+    <div className="rounded-2xl border border-slate-500/40 bg-slate-500/[0.08] p-5">
+      <p className="font-semibold text-slate-100 flex items-center gap-2">
+        <WifiOff className="w-4 h-4 shrink-0" aria-hidden="true" />
+        {failure.titre}
+      </p>
+      <p className="text-sm text-slate-300/85 mt-2 leading-relaxed">{failure.message}</p>
+      {!failure.reconnexion && onRetry && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={onRetry}
+          className="mt-3 border-white/20 hover:bg-white/10"
+        >
+          <FileUp className="w-4 h-4 mr-2" aria-hidden="true" /> Réessayer avec le même fichier
+        </Button>
+      )}
+    </div>
+  );
+};
 
 /** Liste de refus 422 : une carte par cause, jamais un message agrégé. */
 export const NeedsSheetErrorList = ({ errors, title }) => {
@@ -71,7 +101,8 @@ export const NeedsSheetErrorList = ({ errors, title }) => {
  * @param {(file: File) => void} props.onUpload
  */
 const NeedsSheetPanel = ({
-  valueChainCode, currency, templateUrl, result, uploading, errors = [], onUpload,
+  valueChainCode, currency, templateUrl, result, uploading, errors = [], failure = null,
+  onUpload, onRetry,
 }) => {
   const inputRef = useRef(null);
 
@@ -219,6 +250,7 @@ const NeedsSheetPanel = ({
         </div>
       )}
 
+      <NeedsSheetFailure failure={failure} onRetry={onRetry} />
       <NeedsSheetErrorList errors={errors} />
     </div>
   );

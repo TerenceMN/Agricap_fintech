@@ -136,7 +136,7 @@ const AuditLog = () => {
         className="mt-4 glass-effect p-6 rounded-2xl"
       >
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-bold text-white">
+          <h2 className="text-xl font-bold text-white [&>option]:bg-slate-800 [&>option]:text-white">
             Entrées {hasFilters && <span className="text-slate-400 text-base font-normal">(filtrées)</span>}
           </h2>
           <span className="text-sm text-slate-500">{auditData.length} résultat{auditData.length !== 1 ? 's' : ''}</span>

@@ -380,18 +380,101 @@ Demande restante au backend, inchangée : voir §3.2, point 7.
 
 ### 4.2 Note de méthode
 
-Ce recensement est passé de 3 à 7 emplacements front en trois itérations, entre
-deux agents. À chaque tour, chacun a vérifié le pointeur de l'autre puis s'est
-arrêté — et le tour suivant a trouvé une pièce de plus, à chaque fois **dans le
-périmètre de celui qui venait de compter**. La cause est identifiable : on a
-compté des *fichiers* au lieu de compter des *échelles*, et on a vérifié ce que
-disait l'autre au lieu de balayer chez soi. Un `grep` unique sur tout `src` en
-fin de chaîne a trouvé plus que les trois recensements successifs réunis.
+Ce recensement a produit **trois affirmations fausses** en cinq itérations entre
+deux agents, dont une **actionnable** — la prescription « aligner 50 → 55 et
+`>` → `>=' », qui aurait cassé la lettre de score si quelqu'un l'avait exécutée.
+Les trois portent une note de correction visible ci-dessus. Aucune n'a été
+trouvée par son auteur.
 
-Pour la prochaine dette de cette famille : balayer d'abord le dépôt entier sur
-le motif, dédupliquer ensuite. L'inventaire complet coûte une commande ; le
-recensement incrémental a coûté trois allers-retours et a produit deux
-affirmations fausses en cours de route (cf. notes de correction ci-dessus).
+Deux causes distinctes, et la seconde est la vraie :
+
+1. **Compter des fichiers au lieu de balayer le dépôt.** Le recensement est
+   passé de 3 à 7 emplacements en trois tours, chacun trouvant une pièce dans le
+   périmètre de celui qui venait de compter. Un `grep -rnE` unique sur tout `src`
+   a trouvé plus que les trois recensements incrémentaux réunis.
+2. **Confondre occurrence d'un motif et divergence.** C'est l'erreur coûteuse, et
+   le balayage exhaustif n'en protège pas : il a bien listé les 7 emplacements,
+   sans rien dire du fait que 4 étaient corrects. Trois des sept « divergences »
+   n'en étaient pas — deux ladders backend qui pilotaient la *tarification* et
+   non le *classement*, une échelle front qui colorait les *critères* et non le
+   *score global*.
+
+   **Le grep trouve les copies ; seule la lecture du code qui fait autorité dit
+   lesquelles sont des divergences.** Cette lecture a été faite pour `c.points`
+   (faux positif écarté) et sautée pour la grille de lettres (prescription
+   fausse publiée). Même journée, même personne, deux issues.
+
+Règle pour la prochaine dette de cette famille : balayer le dépôt d'abord,
+**puis lire la source d'autorité de chaque occurrence avant de la qualifier** —
+et n'écrire une prescription qu'après la seconde étape, jamais après la
+première.
+
+**Ce qui a réellement fonctionné**, et ce n'est pas « chacun vérifie l'autre » :
+les deux agents ont publié leurs corrections **en encadré visible** plutôt qu'en
+réécriture silencieuse. Sans cela, ni le `pipeline.py` inexistant ni le
+50 → 55 n'auraient été rattrapables — une réécriture propre efface l'erreur *et*
+la trace qui permet de la contester. C'est la pratique à retenir, plus que le
+détail des sept emplacements.
+
+### 4.2.1 Une famille de défauts que les tests ne voient pas
+
+> **Correction.** Une version antérieure de cette section citait **trois**
+> exemples, dont « `poidsAppliques` sérialisé en chaînes ». **Faux, et vérifié
+> dans le payload de référence lui-même** : `poidsAppliques` et
+> `criteres[].poids` y sont des flottants (`25.0`, `20.0`, …), pas des chaînes.
+> J'avais repris un défaut auto-signalé par `moteur-backend` sans le confronter
+> au payload — dans la section même qui prescrit de confronter au payload.
+> Signalé par le lot 3. Un argument de méthode illustré par un exemple faux se
+> retourne contre la méthode.
+
+**Deux** défauts de cette passe ont ce profil : **contrat honoré, donnée
+présente, valeur juste — et l'écran ment quand même.**
+
+- la colonne « intérêts capitalisés » pleine de `0.0`, affichée parce que la clé
+  existait (ce lot) ;
+- `pointsForts` contenant le critère comportemental neutre, qui félicitait un
+  client pour un historique inexistant (backend).
+
+Ni l'un ni l'autre n'aurait déclenché un test de type ou de schéma : le type est
+respecté, la valeur est exacte, c'est la **lecture** qui est fausse. Les deux ont
+été trouvés en confrontant le code à une réponse réelle.
+
+C'est l'argument pour que `docs/contracts/*-payload-observe.json` devienne une
+habitude du projet plutôt qu'un artefact de ce lot : un payload de référence
+versionné coûte un fichier et attrape la classe de défauts que le typage laisse
+passer. Accessoirement, c'est aussi lui qui a permis d'infirmer le troisième
+exemple ci-dessus — un payload de référence sert autant à **réfuter** les défauts
+supposés qu'à en trouver de réels.
+
+---
+
+## 4.3 Le client ne voit jamais son analyse — endpoint sans surface
+
+Vérifié : `grep -rn "analyseResume\|analyse-resume" src` ne remonte que la
+définition dans `services/api.ts:201` et des **commentaires**. **Aucun composant
+du dépôt n'appelle `api.credits.analyseResume`.**
+
+L'endpoint est livré côté serveur, typé (`CreditAnalyseResume`), documenté par
+un payload de référence — et sans écran. C'est le cas « endpoint sans bouton »
+de CLAUDE.md §7.2, qui demande qu'il soit au moins documenté : il l'est ici.
+
+Trois conséquences que ce fragment n'avait pas vues :
+
+1. **Le correctif `pointsForts` du backend corrige un affichage qui n'existe
+   pas.** Il reste juste — le jour où l'écran existera, il partira sain — mais
+   personne ne le verra d'ici là.
+2. **C'est la surface qui servirait `scoreLettre` au client**, et qui rendrait
+   `scoreLetterOf` supprimable (§4.1). Tant qu'elle manque, le parcours client
+   dépend de `simulate/`, qui ne sert pas la lettre : la copie front est
+   *nécessaire*, pas seulement tolérée.
+3. **Aucun fragment de statut ne déclare cet écran.** Ni celui-ci (staff), ni
+   `lot3-simulateur.md`, ni `moteur-front-reanalyse.md`. **Sans propriétaire —
+   à router.**
+
+Constat dû au lot 3. Deux commentaires de ce lot ont été corrigés en
+conséquence : `AnalyseTab.jsx` et `ModuleGaps.jsx` écrivaient « la vue client est
+`analyse-resume` », ce qui se lit comme « le client a déjà sa version ». Il ne
+l'a pas.
 
 ---
 
@@ -416,6 +499,18 @@ DevTools. N'ont donc pas été observés :
   4 niveaux, comportement responsive du tableau des critères) ;
 - l'imbrication du dialogue de justification dans le dialogue du modal (Radix la
   supporte, mais le focus trap et l'`Esc` en cascade n'ont pas été testés) ;
+- **Le 401 après échec de rafraîchissement n'a pas d'état dédié.** Vérifié dans
+  `services/api.ts` : sur 401, `request()` tente `refresh()` puis rejoue une fois
+  avec `retry: false` ; si le rafraîchissement échoue, l'erreur remonte en
+  `ApiError(401)`. `useCreditAnalyse` ne mappe que 404 et 403 — un 401 tombe donc
+  dans la branche générique et s'affiche en `ErrorPanel` rouge. Ce n'est pas
+  silencieux (bien), mais une session expirée s'y lit comme une panne technique
+  du moteur. À traiter comme le 403 l'est déjà : un état nommé, pas une erreur.
+  Non corrigé ici — il faudrait vérifier d'abord comment le reste de
+  l'application traite la déconnexion, et c'est transverse.
+  *(Le rejeu lui-même est sain pour ce lot : mes appels passent des objets JS,
+  `JSON.stringify` a lieu à l'émission, donc le second envoi re-sérialise. Le cas
+  `FormData` relevé par le lot 3 ne concerne pas l'onglet Analyse.)*
 - le comportement réel des états 404 / 403 / erreur. **Aucun appel HTTP n'a été
   passé depuis ce lot.** Le branchement a en revanche été confronté au payload
   observé livré par `moteur-backend` (§3.2), ce qui couvre le nommage et

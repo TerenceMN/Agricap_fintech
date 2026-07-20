@@ -14,9 +14,13 @@ import JustifyIndicatorDialog from './JustifyIndicatorDialog';
  *
  * ⚠ **Staff uniquement.** Cet écran expose les barèmes, les tolérances par
  * module et les plages du référentiel : servi à un client, il lui apprendrait
- * à fabriquer un dossier qui passe (principe 7, anti-gaming). La vue destinée
- * au client est `analyse-resume`, volontairement pauvre — aucun composant de ce
- * dossier ne doit être monté dans un écran client.
+ * à fabriquer un dossier qui passe (principe 7, anti-gaming). Aucun composant
+ * de ce dossier ne doit être monté dans un écran client.
+ *
+ * La vue prévue pour le client est `analyse-resume`, volontairement pauvre.
+ * Attention : à ce jour **elle n'a aucune surface** — `api.credits.analyseResume`
+ * n'est appelé par aucun composant du dépôt. Ne pas lire ce commentaire comme
+ * « le client a déjà sa version » : il ne voit pas encore son analyse.
  *
  * L'écran ne recalcule rien : score, DSCR, points et montants de l'échéancier
  * viennent du moteur et sont affichés tels quels.

@@ -94,7 +94,7 @@ const AuditJournal: React.FC = () => {
   const periodFiltered = Boolean(dateFrom || dateTo);
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-5 text-white">
+    <div className="p-6 max-w-7xl mx-auto space-y-5 text-white [&>option]:bg-slate-800 [&>option]:text-white">
       <Helmet><title>Journal & audit — AGRICAP FINTECH</title></Helmet>
 
       <div className="flex items-start justify-between flex-wrap gap-3">
@@ -131,7 +131,7 @@ const AuditJournal: React.FC = () => {
             <select
               value={entityType}
               onChange={(e) => setEntityType(e.target.value)}
-              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white"
+              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
             >
               {ENTITY_TYPES.map((t) => (
                 <option key={t.value} value={t.value}>{t.label}</option>
@@ -146,7 +146,7 @@ const AuditJournal: React.FC = () => {
               value={entityId}
               onChange={(e) => setEntityId(e.target.value)}
               placeholder="ex. : 42 ou LN-2026-0007"
-              className="block mt-1 w-56 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white"
+              className="block mt-1 w-56 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
             />
           </label>
 
@@ -157,7 +157,7 @@ const AuditJournal: React.FC = () => {
               value={actor}
               onChange={(e) => setActor(e.target.value)}
               placeholder="sub de l'utilisateur"
-              className="block mt-1 w-56 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white"
+              className="block mt-1 w-56 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
             />
           </label>
 
@@ -187,7 +187,7 @@ const AuditJournal: React.FC = () => {
               type="date"
               value={dateFrom}
               onChange={(e) => setDateFrom(e.target.value)}
-              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white"
+              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
             />
           </label>
           <label className="text-xs text-slate-400">
@@ -196,7 +196,7 @@ const AuditJournal: React.FC = () => {
               type="date"
               value={dateTo}
               onChange={(e) => setDateTo(e.target.value)}
-              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white"
+              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
             />
           </label>
           {periodFiltered && (
@@ -260,7 +260,7 @@ const AuditJournal: React.FC = () => {
                   <tr key={e.id} className="border-t border-white/5 hover:bg-white/5 align-top">
                     <td className="p-4 text-slate-300 whitespace-nowrap">{fmtDateTime(e.timestamp)}</td>
                     <td className="p-4">
-                      <span className="text-white">{e.userName || e.user || 'Système'}</span>
+                      <span className="text-white [&>option]:bg-slate-800 [&>option]:text-white">{e.userName || e.user || 'Système'}</span>
                       {e.user && e.userName && e.userName !== e.user && (
                         <span className="block font-mono text-[10px] text-slate-500">{e.user}</span>
                       )}

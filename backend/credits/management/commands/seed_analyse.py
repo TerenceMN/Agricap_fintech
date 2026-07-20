@@ -21,6 +21,9 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from credits.models import BaremeScore, ReferentielFiliere
+from credits.referentiel_loader import (
+    ReferentielIntrouvable, charger_depuis_simulateur, simulateurs_disponibles,
+)
 
 #: Les trois barèmes de la SPEC §5, plus le barème de décision.
 #: Abscisses et ordonnées en CHAÎNES : un JSON `float` ferait rentrer le binaire
@@ -81,32 +84,16 @@ BAREMES = [
     },
 ]
 
-#: Référentiel Maïs — AGRICAP_FIN_SIM_01. Coûts par hectare et par module,
-#: avec leurs tolérances asymétriques : sous-estimer un poste (tol_inf) est plus
-#: souvent une omission, le sur-estimer (tol_sup) plus souvent une inflation.
-REFERENTIELS = [
-    {
-        "code": "AGRICAP_FIN_SIM_01_Cereales_Mais",
-        "filiere": "Céréales — Maïs",
-        "value_chain_code": "01",
-        "unite_reference": "ha",
-        "devise": "USD",
-        "couts_modules": {
-            "semences":          {"ref": "850",  "tol_inf": "0.30", "tol_sup": "0.40"},
-            "mecanisation":      {"ref": "1200", "tol_inf": "0.30", "tol_sup": "0.40"},
-            "maindoeuvre":       {"ref": "1450", "tol_inf": "0.30", "tol_sup": "0.40"},
-            "equipements":       {"ref": "1100", "tol_inf": "0.40", "tol_sup": "0.40"},
-            "postrecolte":       {"ref": "1350", "tol_inf": "0.30", "tol_sup": "0.40"},
-            "logistique":        {"ref": "1000", "tol_inf": "0.30", "tol_sup": "0.40"},
-            "commercialisation": {"ref": "1150", "tol_inf": "0.30", "tol_sup": "0.40"},
-            "reserve":           {"ref": "1011", "tol_inf": "0.50", "tol_sup": "0.40"},
-        },
-        "rendement_ref": {"qte_unite": "4.5", "prix_unitaire": "380", "unite": "t"},
-        "n_cas_reels": 0,
-        "source": ReferentielFiliere.Source.INDICATIF,
-    },
-]
-
+#: Les référentiels filière ne sont PLUS écrits ici.
+#:
+#: Ils étaient renseignés à la main, avec des coûts par module répartis pour
+#: retomber sur le total du classeur maïs (9 111 USD). Le total tombait juste,
+#: la répartition non : 850 USD/ha de semences là où le classeur en donne
+#: 126,60 — un facteur 6,7 sur un poste du critère de fiabilité technique,
+#: soit 25 % du score.
+#:
+#: Ils sont désormais lus dans les simulateurs ingérés (`credits.referentiel_loader`).
+#: Principe 1 : ce qui sert à scorer vient de la base, jamais d'une estimation.
 
 class Command(BaseCommand):
     help = ("Crée ou met à jour les barèmes de score et le référentiel filière du "
@@ -152,7 +139,15 @@ class Command(BaseCommand):
             verbe = "créé" if cree else "réécrit (--force)"
             self.stdout.write(self.style.SUCCESS(f"  + {obj.code} : {verbe} v{obj.version}"))
 
-        for spec in REFERENTIELS:
+        for source in simulateurs_disponibles():
+            try:
+                spec = charger_depuis_simulateur(source)
+            except ReferentielIntrouvable as exc:
+                # On n'invente pas ce qui manque : un référentiel partiellement
+                # deviné score sans le dire. On saute et on le signale.
+                self.stdout.write(self.style.WARNING(f"  ! {source.original_name} : {exc}"))
+                continue
+            lignage = spec.pop("_lignage")
             existant = ReferentielFiliere.objects.filter(code=spec["code"]).first()
             if existant and not force:
                 self.stdout.write(f"  = {spec['code']} : déjà présent, inchangé")
@@ -164,7 +159,10 @@ class Command(BaseCommand):
                           "version": (existant.version + 1) if existant else 1},
             )
             verbe = "créé" if cree else "réécrit (--force)"
-            self.stdout.write(self.style.SUCCESS(f"  + {obj.code} : {verbe} v{obj.version}"))
+            self.stdout.write(self.style.SUCCESS(
+                f"  + {obj.code} : {verbe} v{obj.version} — "
+                f"{lignage['totalCycleLu']} USD sur {lignage['superficieReference']} ha "
+                f"(source dataio #{lignage['dataSourceId']} rev {lignage['revision']})"))
 
         self.stdout.write(self.style.SUCCESS(
             f"Moteur d'analyse : {BaremeScore.objects.filter(actif=True).count()} barème(s) "

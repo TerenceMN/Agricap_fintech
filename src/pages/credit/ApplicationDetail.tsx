@@ -206,7 +206,7 @@ const ApplicationDetail: React.FC = () => {
   const actions = app.availableActions ?? [];
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-6 text-white">
+    <div className="p-6 max-w-5xl mx-auto space-y-6 text-white [&>option]:bg-slate-800 [&>option]:text-white">
       <Helmet><title>Dossier {code} — AGRICAP FINTECH</title></Helmet>
 
       {/* Header */}
@@ -217,7 +217,7 @@ const ApplicationDetail: React.FC = () => {
             <span className={`text-xs font-medium px-3 py-1 rounded-full ${st.color}`}>{st.label}</span>
           </div>
           <p className="text-slate-400 text-sm">
-            Client : <span className="text-white font-medium">{app.client.displayName}</span>
+            Client : <span className="text-white font-medium [&>option]:bg-slate-800 [&>option]:text-white">{app.client.displayName}</span>
             {app.valueChain && <> · Filière : <span className="text-emerald-400">{app.valueChain.label}</span></>}
           </p>
         </div>
@@ -351,7 +351,7 @@ const ApplicationDetail: React.FC = () => {
                     <button
                       onClick={() => runAction(action)}
                       disabled={!!actionBusy}
-                      className="w-full py-2 rounded-lg bg-primary text-white text-sm font-medium disabled:opacity-50"
+                      className="w-full py-2 rounded-lg bg-primary text-white text-sm font-medium disabled:opacity-50 [&>option]:bg-slate-800 [&>option]:text-white"
                     >
                       {actionBusy ? 'Traitement…' : 'Confirmer'}
                     </button>
@@ -414,7 +414,7 @@ const ApplicationDetail: React.FC = () => {
               </p>
               <p className="text-sm text-slate-400">{score.valuationNote}</p>
               {score.proposedRate && (
-                <p className="text-sm text-white mt-1">Taux proposé : <span className="font-bold text-blue-300">{score.proposedRate}%</span> / an</p>
+                <p className="text-sm text-white mt-1 [&>option]:bg-slate-800 [&>option]:text-white">Taux proposé : <span className="font-bold text-blue-300">{score.proposedRate}%</span> / an</p>
               )}
             </div>
           </div>
@@ -552,7 +552,7 @@ const ApplicationDetail: React.FC = () => {
 const InfoCard: React.FC<{ label: string; value: string }> = ({ label, value }) => (
   <div className="bg-white/5 border border-white/10 rounded-lg p-3">
     <p className="text-xs text-slate-400 mb-1">{label}</p>
-    <p className="font-semibold text-white text-sm">{value}</p>
+    <p className="font-semibold text-white text-sm [&>option]:bg-slate-800 [&>option]:text-white">{value}</p>
   </div>
 );
 

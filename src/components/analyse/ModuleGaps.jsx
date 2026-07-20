@@ -62,7 +62,8 @@ export function listerEcartsHorsPlage(analyse) {
  *
  * Écran **staff exclusivement** : il expose les valeurs de référence et les
  * tolérances du référentiel (principe 7, anti-gaming). Aucun de ces chiffres ne
- * doit atteindre une vue client — la vue client est `analyse-resume`.
+ * doit atteindre une vue client. La vue prévue pour le client est
+ * `analyse-resume` — non surfacée à ce jour, cf. `AnalyseTab`.
  *
  * @param {{
  *   analyse: import('@/types/api').CreditAnalyse,

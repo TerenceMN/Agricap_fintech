@@ -1,5 +1,39 @@
 {
-  "_note": "Payload REELLEMENT OBSERVE (test API, 200/201). Genere par credits.tests_analyse.",
+  "_note": "Payload REELLEMENT OBSERVE : reponses HTTP effectives des 4 endpoints du moteur d analyse (200/201), capturees par un test API contre les fixtures de credits.tests_analyse (cas de reference 1330 USD / 18 %/an / 8 mois / differe 5). Ce n est pas un exemple redige a la main : toute divergence entre ce fichier et src/types/api.ts est un defaut a corriger, pas une approximation de documentation.",
+  "_capture": {
+    "etat": "POST-CORRECTIF",
+    "commit": "585873b",
+    "avertissement": "Cette capture montre le payload APRES les correctifs listes dans _corrections. Elle atteste donc d un etat sain SANS documenter ce dont il a ete gueri : le prochain lecteur ne peut ni verifier les defauts passes ni s en premunir. Les etats AVANT sont conserves en git — voir _corrections[].avant_visible_dans.",
+    "regeneration": "Capture manuelle (test jetable supprime apres usage). Toute regeneration DOIT reconduire les blocs _note / _capture / _corrections : un fichier regenere sans eux redevient une attestation muette. Mettre a jour _capture.commit."
+  },
+  "_corrections": [
+    {
+      "champ": "poidsAppliques",
+      "defaut": "Serialise en chaines (\"25.0\") alors que criteres.<x>.poids sortait en nombre (25.0) et que api.ts declare Record<string, number>. La meme grandeur dans deux types selon l endroit du payload.",
+      "avant": {
+        "technique": "25.0",
+        "dscr": "20.0"
+      },
+      "apres": {
+        "technique": 25.0,
+        "dscr": 20.0
+      },
+      "avant_visible_dans": "git show 80f595a:\"AGRICAP FINTECH/docs/contracts/moteur-analyse-payload-observe.json\"",
+      "verrouille_par": "credits.tests_analyse.ApiAnalyseTests.test_les_grandeurs_numeriques_sortent_en_number",
+      "invisible_pour": "checkJs: false cote front — aucun outil du depot ne l attrapait."
+    },
+    {
+      "champ": "analyse-resume.pointsForts",
+      "defaut": "Le critere comportemental sans historique vaut 50 (neutre) et tombait dans pointsForts via une comparaison >=. Un client sans aucun credit anterieur lisait « Votre historique avec AGRICAP joue en votre faveur » — sur le critere qui pese 30 %% du score.",
+      "avant": [
+        "Votre historique avec AGRICAP joue en votre faveur."
+      ],
+      "apres": "pointsForts vide ; l absence devient une piste actionnable dans pointsAAmeliorer.",
+      "avant_visible_dans": "git show 80f595a:\"AGRICAP FINTECH/docs/contracts/moteur-analyse-payload-observe.json\"",
+      "verrouille_par": "credits.tests_analyse.AntiGamingTests.test_absence_d_historique_n_est_jamais_un_point_fort",
+      "invisible_pour": "Aucun : phrase grammaticalement correcte, type respecte, valeur juste."
+    }
+  ],
   "GET applications/<code>/analyse/ -> 200 (staff)": {
     "id": 1,
     "reference": "CRED-TEST-ANA-0001",

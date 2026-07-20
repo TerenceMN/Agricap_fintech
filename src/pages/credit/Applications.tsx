@@ -126,7 +126,7 @@ const Applications: React.FC = () => {
   );
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-5 text-white">
+    <div className="p-6 max-w-7xl mx-auto space-y-5 text-white [&>option]:bg-slate-800 [&>option]:text-white">
       <Helmet><title>File d'instruction — AGRICAP FINTECH</title></Helmet>
 
       <div className="flex items-start justify-between flex-wrap gap-3">
@@ -156,7 +156,7 @@ const Applications: React.FC = () => {
           </Link>
           <Link
             to="/credit"
-            className="bg-gradient-to-r from-emerald-500 to-blue-600 text-white font-semibold px-4 py-2 rounded-lg text-sm"
+            className="bg-gradient-to-r from-emerald-500 to-blue-600 text-white font-semibold px-4 py-2 rounded-lg text-sm [&>option]:bg-slate-800 [&>option]:text-white"
           >
             + Nouvelle demande
           </Link>
@@ -170,7 +170,7 @@ const Applications: React.FC = () => {
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
-            className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white"
+            className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
           >
             <option value="">File d'instruction (soumis + analyse + ajournés)</option>
             {Object.entries(STATUS_LABELS).map(([k, v]) => (
@@ -184,7 +184,7 @@ const Applications: React.FC = () => {
           <select
             value={sortKey}
             onChange={(e) => setSortKey(e.target.value as SortKey)}
-            className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white"
+            className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
           >
             {Object.entries(SORT_LABELS).map(([k, v]) => (
               <option key={k} value={k}>{v}</option>
@@ -268,7 +268,7 @@ const Applications: React.FC = () => {
                     )}
                   </td>
                   <td className="p-4">
-                    <span className="text-white">{a.client?.displayName || '—'}</span>
+                    <span className="text-white [&>option]:bg-slate-800 [&>option]:text-white">{a.client?.displayName || '—'}</span>
                     {a.isOnBehalfOf && (
                       <span className="block text-[11px] text-slate-500">déposé pour le compte de</span>
                     )}

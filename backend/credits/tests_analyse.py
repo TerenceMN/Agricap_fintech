@@ -58,9 +58,56 @@ from credits.models import (
 _SEQ = {"n": 0}
 
 
-def _seed():
+#: Référentiel de TEST — valeurs choisies pour exercer les branches de tolérance,
+#: PAS une reproduction du classeur maïs réel.
+#:
+#: `seed_analyse` ne crée plus de référentiel écrit à la main : il les lit dans
+#: les simulateurs ingérés (`credits.referentiel_loader`), correctif juste d'un
+#: défaut que j'avais signalé — mes coûts par module étaient répartis à la main
+#: pour retomber sur un total, avec un facteur 6,7 sur les semences.
+#:
+#: Conséquence pour les tests : sans classeur simulateur ingéré, la commande ne
+#: seede aucun référentiel — c'est délibéré (on n'invente pas ce qui manque).
+#: Les tests du moteur fabriquent donc le leur. Ils testent le MOTEUR, pas le
+#: chargement du référentiel : la couverture du loader appartient à son lot.
+REFERENTIEL_TEST = {
+    "code": "AGRICAP_FIN_SIM_01_Cereales_Mais",
+    "filiere": "Céréales — Maïs",
+    "value_chain_code": "01",
+    "unite_reference": "ha",
+    "devise": "USD",
+    "couts_modules": {
+        # 600 déclarés vs 850 → −29,4 %, DANS la tolérance de 30 %.
+        "semences":          {"ref": "850",  "tol_inf": "0.30", "tol_sup": "0.40"},
+        # 450 déclarés vs 1 200 → −62,5 %, HORS tolérance.
+        "mecanisation":      {"ref": "1200", "tol_inf": "0.30", "tol_sup": "0.40"},
+        "maindoeuvre":       {"ref": "1450", "tol_inf": "0.30", "tol_sup": "0.40"},
+        "equipements":       {"ref": "1100", "tol_inf": "0.40", "tol_sup": "0.40"},
+        "postrecolte":       {"ref": "1350", "tol_inf": "0.30", "tol_sup": "0.40"},
+        "logistique":        {"ref": "1000", "tol_inf": "0.30", "tol_sup": "0.40"},
+        "commercialisation": {"ref": "1150", "tol_inf": "0.30", "tol_sup": "0.40"},
+        "reserve":           {"ref": "1011", "tol_inf": "0.50", "tol_sup": "0.40"},
+    },
+    "rendement_ref": {"qte_unite": "4.5", "prix_unitaire": "380", "unite": "t"},
+    "n_cas_reels": 0,
+    "source": ReferentielFiliere.Source.INDICATIF,
+}
+
+
+def _referentiel(**overrides):
+    """Référentiel filière de test, indépendant de tout classeur ingéré."""
+    donnees = {**REFERENTIEL_TEST, **overrides}
+    ref, _ = ReferentielFiliere.objects.update_or_create(
+        code=donnees.pop("code"), defaults={**donnees, "actif": True})
+    return ref
+
+
+def _seed(avec_referentiel: bool = True):
+    """Barèmes via la commande (leur seule source), référentiel via la fixture."""
     from django.core.management import call_command
     call_command("seed_analyse", verbosity=0)
+    if avec_referentiel:
+        _referentiel()
 
 
 def _user(sub: str, name: str = ""):
@@ -496,6 +543,34 @@ class SeedTests(TestCase):
         self.assertEqual(
             ReferentielFiliere.objects.filter(
                 code="AGRICAP_FIN_SIM_01_Cereales_Mais").count(), 1)
+
+    def test_sans_simulateur_ingere_aucun_referentiel_n_est_invente(self):
+        """La commande ne fabrique plus de référentiel de repli — et c'est voulu.
+
+        Elle les lit dans les simulateurs ingérés (`referentiel_loader`). Sans
+        classeur en base, elle seede les barèmes et s'arrête là. Un référentiel
+        deviné scorerait 25 % du dossier contre des chiffres que personne n'a
+        validés — c'est ce défaut qui a été corrigé, et ce test empêche qu'il
+        revienne par la porte d'un « repli pratique ».
+        """
+        from django.core.management import call_command
+        call_command("seed_analyse", verbosity=0)
+        self.assertEqual(BaremeScore.objects.filter(actif=True).count(), 4)
+        self.assertEqual(ReferentielFiliere.objects.count(), 0)
+
+    def test_le_moteur_refuse_d_analyser_sans_referentiel(self):
+        """Conséquence directe : pas de simulateur ingéré = pas d'analyse.
+
+        Le refus est explicite (`REFERENTIEL_ABSENT`, 422) et non un score
+        technique de 0 — un refus de crédit fabriqué par une configuration
+        manquante ne doit jamais ressembler à un refus mérité.
+        """
+        _seed(avec_referentiel=False)
+        app = _app()
+        _source(app, TOTAUX_REFERENCE)
+        with self.assertRaises(ReferentielAbsent) as ctx:
+            executer_analyse(app, duree_mois=8, differe_mois=5)
+        self.assertEqual(ctx.exception.code, "REFERENTIEL_ABSENT")
 
     def test_ne_reecrit_pas_un_recalibrage_du_comite(self):
         _seed()

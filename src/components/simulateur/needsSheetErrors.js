@@ -99,3 +99,83 @@ export function needsSheetHint(code) {
   if (!code) return null;
   return NEEDS_SHEET_HINTS[code] || null;
 }
+
+// ── Refus du fichier vs panne de transport ───────────────────────────────────
+//
+// Distinction indispensable, et pas cosmétique. Tout échec affiché sous
+// « N points à corriger dans votre fichier » dit au client que SON CLASSEUR est
+// en cause. Si un jeton expire ou si le serveur tombe, ce cadre l'envoie
+// modifier un fichier parfaitement valide — il « corrigera » jusqu'à casser un
+// document qui n'avait rien. Un écran qui se trompe de coupable coûte plus cher
+// qu'un écran qui dit simplement « réessayez ».
+
+/** Statuts par lesquels le serveur met en cause le CONTENU du classeur. */
+const VALIDATION_STATUSES = [400, 409, 422];
+
+/**
+ * L'échec porte-t-il sur le fichier (→ cadre « à corriger ») ou sur le
+ * transport (→ cadre « réessayez, ne touchez pas à votre classeur ») ?
+ *
+ * Un 422 du pipeline porte toujours `errors[]` ; on l'accepte donc même si le
+ * statut évoluait. 401 / 403 / 404 / 5xx / échec réseau ne disent jamais rien
+ * du contenu du classeur.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isFileValidationError(err) {
+  if (!err || typeof err !== 'object') return false;
+  if (Array.isArray(err.errors) && err.errors.length > 0) return true;
+  return VALIDATION_STATUSES.includes(err.status);
+}
+
+/**
+ * Message d'un échec qui n'est PAS imputable au fichier. Nomme la cause quand
+ * le statut la donne, reste vague sinon — jamais un motif métier inventé.
+ *
+ * @param {unknown} err
+ * @returns {{titre: string, message: string, reconnexion?: boolean}}
+ */
+export function transportErrorMessage(err) {
+  const status = err && typeof err.status === 'number' ? err.status : null;
+
+  if (status === 401) {
+    return {
+      titre: 'Votre session a expiré',
+      reconnexion: true,
+      message:
+        "Votre fichier n'a pas été envoyé — il n'a rien à se reprocher. Reconnectez-vous, "
+        + 'puis téléversez-le à nouveau tel quel.',
+    };
+  }
+  if (status === 403) {
+    return {
+      titre: 'Envoi refusé',
+      message:
+        "Vous n'avez pas l'autorisation de déposer une feuille sur ce dossier. Si vous pensez "
+        + 'y avoir droit, contactez votre agence — ne modifiez pas votre classeur.',
+    };
+  }
+  if (status === 404) {
+    return {
+      titre: 'Dossier introuvable',
+      message:
+        'Le dossier rattaché à cette demande est introuvable. Rechargez la page ; votre classeur '
+        + "n'est pas en cause.",
+    };
+  }
+  if (status && status >= 500) {
+    return {
+      titre: 'Le service est momentanément indisponible',
+      message:
+        "L'envoi a échoué côté AGRICAP, pas dans votre fichier. Réessayez dans quelques instants "
+        + 'avec le même classeur.',
+    };
+  }
+  return {
+    titre: "L'envoi n'a pas abouti",
+    message:
+      'Votre feuille n\'a pas pu être transmise — vérifiez votre connexion et réessayez. '
+      + "Ne modifiez pas votre classeur : rien n'indique qu'il soit en cause.",
+  };
+}

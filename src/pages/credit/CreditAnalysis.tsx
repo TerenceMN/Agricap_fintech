@@ -156,7 +156,7 @@ const CreditAnalysis: React.FC = () => {
       <Helmet><title>Nouvelle demande de crédit — AGRICAP FINTECH</title></Helmet>
       <div className="max-w-3xl mx-auto">
         <div className="flex items-center justify-between mb-6">
-          <h1 className="text-2xl font-bold text-white">Nouvelle demande de crédit</h1>
+          <h1 className="text-2xl font-bold text-white [&>option]:bg-slate-800 [&>option]:text-white">Nouvelle demande de crédit</h1>
           <div className="flex gap-3 text-sm">
             <Link to="/credit/dossiers" className="text-primary underline">Mes dossiers</Link>
           </div>
@@ -196,7 +196,7 @@ const CreditAnalysis: React.FC = () => {
               <div>
                 <label className="text-xs text-slate-400 block mb-1">Filière</label>
                 <select
-                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white"
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
                   value={vcCode}
                   onChange={(e) => setVcCode(e.target.value)}
                 >
@@ -232,7 +232,7 @@ const CreditAnalysis: React.FC = () => {
               <div>
                 <label className="text-xs text-slate-400 block mb-1">Devise</label>
                 <select
-                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white"
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
                   value={currency}
                   onChange={(e) => setCurrency(e.target.value)}
                 >
@@ -244,7 +244,7 @@ const CreditAnalysis: React.FC = () => {
 
             <button
               onClick={handleStep0Next}
-              className="w-full py-3 rounded-lg bg-gradient-to-r from-emerald-500 to-blue-600 text-white font-semibold"
+              className="w-full py-3 rounded-lg bg-gradient-to-r from-emerald-500 to-blue-600 text-white font-semibold [&>option]:bg-slate-800 [&>option]:text-white"
             >
               Suivant : Feuille de besoins →
             </button>
@@ -303,7 +303,7 @@ const CreditAnalysis: React.FC = () => {
               <button
                 onClick={handleParseSheet}
                 disabled={busy || !nsFile}
-                className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm disabled:opacity-50"
+                className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm disabled:opacity-50 [&>option]:bg-slate-800 [&>option]:text-white"
               >
                 {busy ? 'Analyse…' : 'Analyser le fichier'}
               </button>
@@ -311,7 +311,7 @@ const CreditAnalysis: React.FC = () => {
                 <button
                   onClick={handleSimulate}
                   disabled={busy}
-                  className="flex-1 py-2 rounded-lg bg-gradient-to-r from-emerald-500 to-blue-600 text-white font-semibold text-sm disabled:opacity-50"
+                  className="flex-1 py-2 rounded-lg bg-gradient-to-r from-emerald-500 to-blue-600 text-white font-semibold text-sm disabled:opacity-50 [&>option]:bg-slate-800 [&>option]:text-white"
                 >
                   {busy ? 'Simulation…' : 'Simuler le scoring →'}
                 </button>
@@ -412,7 +412,7 @@ const CreditAnalysis: React.FC = () => {
               <button
                 onClick={handleCreateAndSubmit}
                 disabled={busy || !simResult.eligible}
-                className="flex-1 py-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-semibold disabled:opacity-50"
+                className="flex-1 py-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-semibold disabled:opacity-50 [&>option]:bg-slate-800 [&>option]:text-white"
               >
                 {busy ? 'Soumission…' : '✓ Créer et soumettre la demande'}
               </button>
@@ -426,10 +426,10 @@ const CreditAnalysis: React.FC = () => {
         {/* ── STEP 3 : Succès ── */}
         {step === 3 && appCode && (
           <div className="bg-white/5 border border-white/10 rounded-xl p-10 text-center space-y-4">
-            <div className="w-16 h-16 rounded-full bg-emerald-500 flex items-center justify-center mx-auto text-3xl text-white">
+            <div className="w-16 h-16 rounded-full bg-emerald-500 flex items-center justify-center mx-auto text-3xl text-white [&>option]:bg-slate-800 [&>option]:text-white">
               ✓
             </div>
-            <h2 className="text-2xl font-bold text-white">Demande soumise !</h2>
+            <h2 className="text-2xl font-bold text-white [&>option]:bg-slate-800 [&>option]:text-white">Demande soumise !</h2>
             <p className="text-slate-400">
               Votre dossier <span className="text-emerald-300 font-mono font-bold">{appCode}</span> est maintenant
               en cours d'analyse. Vous serez notifié par SMS dès qu'une décision est prise.
@@ -437,7 +437,7 @@ const CreditAnalysis: React.FC = () => {
             <div className="flex gap-3 justify-center mt-6">
               <button
                 onClick={() => navigate(`/credit/dossiers/${appCode}`)}
-                className="px-6 py-2 rounded-lg bg-primary text-white font-semibold text-sm"
+                className="px-6 py-2 rounded-lg bg-primary text-white font-semibold text-sm [&>option]:bg-slate-800 [&>option]:text-white"
               >
                 Voir le dossier
               </button>

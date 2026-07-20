@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Helmet } from 'react-helmet';
 import { motion, AnimatePresence } from 'framer-motion';
 import Layout from '@/components/Layout';
+import MesDossiers from '@/components/credits/MesDossiers';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -27,7 +28,8 @@ import { formatDateFr, formatMontant } from '@/components/guarantees/format';
 import GuaranteeCoverage from '@/components/guarantees/GuaranteeCoverage';
 import PledgeableAssets from '@/components/guarantees/PledgeableAssets';
 import { MODULE_CODES, canonicalModule, moduleConfig } from '@/components/simulateur/modules';
-import NeedsSheetPanel, { NeedsSheetErrorList } from '@/components/simulateur/NeedsSheetPanel';
+import NeedsSheetPanel, { NeedsSheetErrorList, NeedsSheetFailure } from '@/components/simulateur/NeedsSheetPanel';
+import { isFileValidationError, transportErrorMessage } from '@/components/simulateur/needsSheetErrors';
 import ModuleGrid from '@/components/simulateur/ModuleGrid';
 import {
   DonutChartScore, ScoreBreakdown, SchedulePreview, scoreLetterOf,
@@ -161,9 +163,14 @@ const SimulateurIntelligent = ({
 
   const [uploading, setUploading] = useState(false);
   const [uploadErrors, setUploadErrors] = useState([]);
+  // Panne de transport (session expirée, service indisponible) : affichée à part
+  // des refus de validation — voir `isFileValidationError`.
+  const [uploadFailure, setUploadFailure] = useState(null);
+  const [lastFile, setLastFile] = useState(null);
 
   const [simLoading, setSimLoading] = useState(false);
   const [simErrors, setSimErrors] = useState([]);
+  const [simFailure, setSimFailure] = useState(null);
   const [simResult, setSimResult] = useState(formData.simResult || null);
 
   // Part demandée à AGRICAP, par module. Seul état réellement saisi par le
@@ -215,6 +222,8 @@ const SimulateurIntelligent = ({
   const handleUpload = async (file) => {
     setUploading(true);
     setUploadErrors([]);
+    setUploadFailure(null);
+    setLastFile(file);
     try {
       const result = await uploadNeedsSheet(file);
       // Nouvelle révision ⇒ la simulation précédente ne vaut plus rien.
@@ -226,6 +235,16 @@ const SimulateurIntelligent = ({
         description: 'Les coûts de vos 8 modules sont maintenant ceux de votre fichier.',
       });
     } catch (e) {
+      // Un échec de transport n'est PAS un refus du fichier. Le confondre
+      // enverrait le client corriger un classeur valide parce que son jeton a
+      // expiré — un écran qui se trompe de coupable coûte plus cher qu'un
+      // écran qui dit « réessayez ».
+      if (!isFileValidationError(e)) {
+        const failure = transportErrorMessage(e);
+        setUploadFailure(failure);
+        toast({ variant: 'destructive', title: failure.titre, description: failure.message });
+        return;
+      }
       // 422 : une entrée par contrôle en échec. Toutes affichées d'un coup —
       // sinon le client les redécouvre une par une, à chaque téléversement.
       const causes = guaranteeErrorList(e);
@@ -247,13 +266,15 @@ const SimulateurIntelligent = ({
   const handleSimulate = async () => {
     setSimLoading(true);
     setSimErrors([]);
+    setSimFailure(null);
     try {
       const result = await runSimulation();
       setSimResult(result);
       setFormData(prev => ({ ...prev, simResult: result }));
     } catch (e) {
       setSimResult(null);
-      setSimErrors(guaranteeErrorList(e));
+      if (isFileValidationError(e)) setSimErrors(guaranteeErrorList(e));
+      else setSimFailure(transportErrorMessage(e));
     } finally {
       setSimLoading(false);
     }
@@ -283,7 +304,9 @@ const SimulateurIntelligent = ({
         result={nsResult}
         uploading={uploading}
         errors={uploadErrors}
+        failure={uploadFailure}
         onUpload={handleUpload}
+        onRetry={lastFile ? () => handleUpload(lastFile) : undefined}
       />
 
       {/* ── Score et montants : tout vient du serveur, sauf la part demandée ── */}
@@ -380,6 +403,7 @@ const SimulateurIntelligent = ({
         </div>
       )}
 
+      <NeedsSheetFailure failure={simFailure} onRetry={handleSimulate} />
       <NeedsSheetErrorList errors={simErrors} title="La simulation n'a pas pu être lancée" />
 
       <ModuleGrid
@@ -1012,6 +1036,10 @@ const Credits = () => {
   });
   // Refs lues par `ensureDraft` : évite de recréer le callback (et donc de
   // relancer les effets enfants) à chaque frappe dans le formulaire.
+  // Toutes les demandes du client, pas seulement celle qui est active :
+  // sans ça, un dossier refusé ou accordé-non-décaissé n'a aucune surface.
+  const [mesDossiers, setMesDossiers] = useState([]);
+  const [dossiersEnChargement, setDossiersEnChargement] = useState(true);
   const draftCodeRef = React.useRef(null);
   const formDataRef = React.useRef(formData);
   useEffect(() => { formDataRef.current = formData; }, [formData]);
@@ -1019,13 +1047,20 @@ const Credits = () => {
   useEffect(() => {
     if (user?.role === 'client') {
       // Charger le crédit actif via le nouveau module credits
-      api.credits.list({ status: 'active' })
-        .then(apps => setApprovedCredit(apps.length ? _appToLoan(apps[0]) : null))
+      // Toutes les demandes du client — le tri par état se fait à l'affichage.
+      api.credits.list()
+        .then(apps => {
+          setMesDossiers(apps);
+          const actif = apps.find(a => a.status === 'active');
+          setApprovedCredit(actif ? _appToLoan(actif) : null);
+        })
+        .finally(() => setDossiersEnChargement(false))
         .catch(() => {
           // Fallback sur portfolio/mine
           api.portfolio.mine.list()
             .then(loans => setApprovedCredit(loans.length ? loans[0] : null))
-            .catch(() => {});
+            .catch(() => {})
+            .finally(() => setDossiersEnChargement(false));
         });
       // Charger les données de préremplissage
       api.credits.prefill()
@@ -1225,7 +1260,13 @@ const Credits = () => {
   const renderClientView = () => (
     <Tabs defaultValue="gestion" className="w-full">
       <TabsList className="grid w-full grid-cols-2 bg-white/5"><TabsTrigger value="gestion">Gérer mes crédits</TabsTrigger><TabsTrigger value="demande">Demander un crédit</TabsTrigger></TabsList>
-      <TabsContent value="gestion" className="pt-6"><GestionCreditsClient approvedCredit={approvedCredit} refreshCredit={refreshCredit} /></TabsContent>
+      <TabsContent value="gestion" className="pt-6 space-y-8">
+        <GestionCreditsClient approvedCredit={approvedCredit} refreshCredit={refreshCredit} />
+        <div>
+          <h2 className="text-lg font-bold text-white mb-3">Mes demandes de crédit</h2>
+          <MesDossiers dossiers={mesDossiers} chargement={dossiersEnChargement} />
+        </div>
+      </TabsContent>
       <TabsContent value="demande" className="pt-6">
           {!(isSubmitted && approvedCredit) && (
               <div className="flex justify-center items-center gap-4 mb-8">

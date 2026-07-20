@@ -76,7 +76,7 @@ const JustifyIndicatorDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="glass-effect text-white max-w-lg border-slate-700">
+      <DialogContent className="glass-effect text-white max-w-lg border-slate-700 [&>option]:bg-slate-800 [&>option]:text-white">
         <DialogHeader>
           <DialogTitle>Justifier un indicateur</DialogTitle>
           <DialogDescription>
@@ -93,7 +93,7 @@ const JustifyIndicatorDialog = ({
                 id="analyse-indicateur"
                 value={indicateur}
                 onChange={(e) => setIndicateur(e.target.value)}
-                className="w-full bg-slate-900/70 border border-slate-700 rounded-md px-3 py-2 text-sm text-white"
+                className="w-full bg-slate-900/70 border border-slate-700 rounded-md px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
               >
                 {indicateurs.map((i) => (
                   <option key={i.indicateur} value={i.indicateur}>
@@ -116,7 +116,7 @@ const JustifyIndicatorDialog = ({
               value={justification}
               onChange={(e) => setJustification(e.target.value)}
               placeholder="Fait constaté, cause la plus probable, et ce que le client a répondu ou doit être questionné."
-              className="bg-slate-900/70 border-slate-700 text-white"
+              className="bg-slate-900/70 border-slate-700 text-white [&>option]:bg-slate-800 [&>option]:text-white"
             />
             <p className="text-[11px] text-slate-500">
               Écrivez pour l'auditeur qui relira ce dossier dans six mois, pas pour vous.
