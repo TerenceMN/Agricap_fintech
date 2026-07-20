@@ -81,7 +81,19 @@ const CreditDetailsModal = ({ isOpen, onOpenChange, credit }) => {
     // Référence du dossier d'instruction (app `credits`) — distincte de l'id du
     // prêt (app `portfolio`). Les deux machines à états ne se mélangent pas :
     // `applicationCode` est la seule clé qui adresse le moteur d'analyse.
-    const applicationCode = credit?.applicationCode || credit?.id;
+    //
+    // `portfolio/serializers.py::loan_row` (l. 44) sert `application.code` pour un
+    // prêt issu du pipeline et la **chaîne vide** pour un prêt saisi à la main.
+    // Un repli `applicationCode || id` sur cette chaîne vide enverrait une
+    // référence de PRÊT au moteur : 404, donc « analyse non encore exécutée » —
+    // un état vide qui ment, puisque le dossier n'existe pas et que l'analyse
+    // n'arrivera jamais. On distingue donc « pas de demande liée » (null) de
+    // « champ absent de la source », seul cas où le repli est légitime
+    // (`portfolio/services.py` pose `reference = app.code`).
+    // Même résolution que `codeDemande()` de RateMaturityModal, à dessein.
+    const applicationCode = credit
+        ? (credit.applicationCode !== undefined ? (credit.applicationCode || null) : (credit.id || null))
+        : null;
     const analyseState = useCreditAnalyse(applicationCode, analyseOuverte);
 
     // Reset when a different loan is opened.

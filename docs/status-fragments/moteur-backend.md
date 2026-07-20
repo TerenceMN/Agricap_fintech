@@ -15,14 +15,14 @@
 | `backend/credits/management/commands/seed_analyse.py` | Fixtures idempotentes (`update_or_create`) |
 | `backend/credits/views.py` (fin de fichier) | 4 endpoints |
 | `backend/credits/urls.py` | Routes |
-| `backend/credits/tests_analyse.py` | **60 tests** |
+| `backend/credits/tests_analyse.py` | **64 tests** |
 
 `credits/echeancier.py` est **réutilisé tel quel**, non réécrit. La convention
 d'exceptions de `credits/workflow.py` (`code`, `http_status`, `as_errors()`) est
 copiée dans `AnalyseError`. Aucun rôle nouveau : tout passe par `credits/roles.py`.
 
-**Tests** : 576 au total (baseline 516 + 60). `OK` hors les **8 échecs
-préexistants de `support/`**, non touchés.
+**Tests** : 580 au total (baseline 516 + 64). `OK` hors les **8 échecs
+préexistants de `support/`**, non touchés. Compte à jour en §5bis.
 
 ---
 
@@ -261,7 +261,7 @@ versionnée. **Deux défauts que seule cette confrontation a révélés :**
 Aucun des deux n'aurait été rattrapé par un test de contrat : le premier passe
 `checkJs: false`, le second était un texte grammaticalement correct.
 
-**Tests : 279 sur `credits` (62 sur le moteur).**
+**Tests : 281 sur `credits` (64 sur le moteur), 580 au total.**
 
 ### La vue client n'est branchée nulle part
 
@@ -302,11 +302,24 @@ Deux conséquences :
   (SPEC §9.5) : non implémentés.
 - **Endpoints d'administration** des référentiels et barèmes (SPEC §7, deux
   dernières lignes) : non livrés — le seed est en ligne de commande.
-- **Référentiel** : seul le maïs (`AGRICAP_FIN_SIM_01`) est seedé, avec des coûts
-  par module **répartis à la main** pour totaliser ≈ 9 111 USD/ha (le total de
-  l'exemple SPEC). Les valeurs par module ne viennent pas du fichier Excel
-  `AGRICAP_FIN_SIM_01` — je ne l'ai pas ouvert. **À recalibrer avant tout usage
-  réel** : elles pilotent le score technique de 25 % du total.
+- **Référentiel — défaut signalé puis CORRIGÉ par le lot simulateur.** Je seedais
+  le maïs avec des coûts par module **répartis à la main** pour retomber sur le
+  total de 9 111 USD/ha, sans avoir ouvert le classeur. Le total tombait juste, la
+  répartition non : 850 USD/ha de semences là où le classeur en donne 126,60 —
+  facteur 6,7 sur un poste du critère qui pèse 25 %.
+
+  `credits/referentiel_loader.py` (lot simulateur) lit désormais les référentiels
+  dans les simulateurs ingérés, et `seed_analyse` ne fabrique plus rien.
+  **Conséquence : sans classeur simulateur en base, aucun référentiel n'est seedé
+  et le moteur refuse d'analyser** (`REFERENTIEL_ABSENT`, 422). C'est le
+  comportement voulu — un référentiel deviné scorerait un quart du dossier contre
+  des chiffres que personne n'a validés.
+
+  J'ai découplé mes tests en conséquence : ils fabriquent leur propre référentiel
+  (`REFERENTIEL_TEST`, valeurs choisies pour exercer les branches de tolérance et
+  **explicitement pas** une reproduction du classeur réel). Deux tests neufs
+  verrouillent le nouveau contrat : `test_sans_simulateur_ingere_aucun_referentiel_n_est_invente`
+  et `test_le_moteur_refuse_d_analyser_sans_referentiel`.
 
 ---
 
