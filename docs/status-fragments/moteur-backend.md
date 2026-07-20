@@ -107,6 +107,23 @@ Le reste du cas de référence est reproduit **au centime** :
 service de la dette 1 469,65 · intérêts 139,65 · CRD final 0,00 · DSCR 0,636 ·
 score global **29,2** · recommandation **refus**.
 
+> **Ces chiffres sont ÉPINGLÉS par des tests** — ils ne peuvent pas se périmer en
+> silence, une dérive casse la suite :
+> `test_echeancier_du_cas_de_reference` (1 469,65 · 139,65 · CRD 0,00) ·
+> `test_dscr_du_cas_de_reference` (0,636) ·
+> `test_agregation_du_cas_de_reference` (29,2 · refus) ·
+> `test_ecart_documente_entre_les_scores_et_les_baremes_de_la_spec` (19,7 · 6,4) ·
+> `test_totaux_servis_par_le_serveur` (les mêmes, via HTTP).
+>
+> La distinction vaut au-delà de cette section. Un fragment de statut ne doit pas
+> citer de valeurs **non épinglées** : ce sont elles qui rotent sans prévenir
+> (mon « 1 ha → 1 710 / 380 » de la §2.2 en est mort). Une valeur qu'un test
+> tient est d'une autre nature — c'est un **contrat de non-régression**, et
+> CLAUDE.md §8.4 l'exige explicitement (« tout calcul financier livré est
+> accompagné d'un cas chiffré exécuté »). La règle utile n'est donc pas
+> « citer des clés, jamais des valeurs », mais : **une valeur citée nomme le test
+> qui la tient, ou ne figure pas dans le document.**
+
 ### 2.4 Décotes de garanties — table en dur supprimée
 
 La SPEC §4 embarque `DECOTES = {"epargne": 1.0, "immobilier": 0.7, ...}` dans le
