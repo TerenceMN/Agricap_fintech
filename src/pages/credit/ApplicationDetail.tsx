@@ -483,6 +483,26 @@ const ApplicationDetail: React.FC = () => {
             <InfoCard label="Validée" value={app.needsSheet.parsedOk ? 'Oui' : 'Non'} />
             <InfoCard label="Devise" value={app.needsSheet.currency} />
           </div>
+          {/* Anomalies AVANT avertissements : une anomalie est un écart relevé par
+              l'analyse documentaire, c'est la première chose qu'un analyste lit sur une
+              feuille de besoins. Le champ est typé `unknown[]` — le backend y met selon
+              les cas une chaîne ou un objet — donc on rend défensivement plutôt que de
+              supposer une forme et d'afficher « [object Object] ». */}
+          {app.needsSheet.anomalies && app.needsSheet.anomalies.length > 0 && (
+            <div className="mt-4">
+              <h4 className="text-xs font-semibold text-red-300 uppercase tracking-wide mb-2">
+                Anomalies relevées ({app.needsSheet.anomalies.length})
+              </h4>
+              <div className="space-y-1">
+                {app.needsSheet.anomalies.map((a, i) => (
+                  <p key={i} className="text-xs text-red-200 bg-red-500/10 border border-red-500/20 rounded px-3 py-2">
+                    {typeof a === 'string' ? a : JSON.stringify(a)}
+                  </p>
+                ))}
+              </div>
+            </div>
+          )}
+
           {app.needsSheet.warnings && app.needsSheet.warnings.length > 0 && (
             <div className="mt-4 space-y-1">
               {app.needsSheet.warnings.map((w, i) => (

@@ -24,7 +24,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import {
   GUARANTEE_CONFIG, guaranteeConfig,
 } from '@/components/guarantees/guaranteeConfig';
-import { guaranteeErrorMessage } from '@/components/guarantees/guaranteeErrors';
+import { guaranteeErrorList, guaranteeErrorMessage } from '@/components/guarantees/guaranteeErrors';
 import { formatMontant } from '@/components/guarantees/format';
 import GuaranteeCoverage from '@/components/guarantees/GuaranteeCoverage';
 import PledgeableAssets from '@/components/guarantees/PledgeableAssets';
@@ -555,7 +555,7 @@ const ConfigurationGaranties = ({ nextStep, prevStep, draftCode, ensureDraft, on
 };
 
 
-const FicheSynthese = ({ formData, prevStep, submitApplication, guaranteeSet }) => (
+const FicheSynthese = ({ formData, prevStep, submitApplication, guaranteeSet, submitErrors = [] }) => (
     <motion.div initial={{ opacity: 0, x: -50 }} animate={{ opacity: 1, x: 0 }} className="space-y-6">
       <div className="glass-effect p-8 rounded-2xl">
         <h3 className="text-2xl font-bold text-white mb-6">Fiche de Synthèse Finale</h3>
@@ -600,6 +600,30 @@ const FicheSynthese = ({ formData, prevStep, submitApplication, guaranteeSet }) 
 
         <div className="mt-6"><h4 className="font-bold text-white mb-2">Répartition du financement</h4><div className="space-y-2">{formData.modules && Object.entries(formData.modules).filter(([,mod]) => mod.active).map(([key, mod]) => {const Icon = MODULES_CONFIG[key].icon;return (<div key={key} className="flex justify-between items-center bg-white/5 p-2 rounded"><span className="flex items-center gap-2 text-sm"><Icon className="w-4 h-4" style={{color: MODULES_CONFIG[key].color}}/> {MODULES_CONFIG[key].label}</span><span className="font-semibold">{(mod.cost * mod.financing / 100).toLocaleString('fr-FR', {maximumFractionDigits: 0})} {formData.currency}</span></div>)})}</div></div>
       </div>
+
+      {/* Refus de soumission : une ligne par cause, jamais un message agrégé. */}
+      {submitErrors.length > 0 && (
+        <div className="glass-effect rounded-2xl border border-red-500/30 p-5">
+          <h4 className="font-bold text-red-200 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4" aria-hidden="true" />
+            {submitErrors.length > 1
+              ? `${submitErrors.length} points à corriger avant de soumettre`
+              : 'Un point à corriger avant de soumettre'}
+          </h4>
+          <ul className="mt-3 space-y-2">
+            {submitErrors.map((cause, i) => (
+              <li key={cause.code ? `${cause.code}-${i}` : i} className="flex items-start gap-2 text-sm text-red-100/90">
+                <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" aria-hidden="true" />
+                <span>{cause.message}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="text-xs text-gray-500 mt-3">
+            Utilisez « Ajuster » pour revenir sur les étapes concernées, puis soumettez à nouveau.
+          </p>
+        </div>
+      )}
+
        <div className="flex justify-between"><Button onClick={() => prevStep(3)} variant="ghost"><ArrowLeft className="w-5 h-5 mr-2"/> Ajuster</Button><Button onClick={submitApplication} className="bg-purple-600 hover:bg-purple-700 py-6 text-lg"><Send className="w-5 h-5 mr-2" /> Soumettre ma demande</Button></div>
     </motion.div>
 );
@@ -871,6 +895,8 @@ const Credits = () => {
   // Code du dossier brouillon : porte les garanties posées avant soumission.
   const [draftCode, setDraftCode] = useState(null);
   const [guaranteeSet, setGuaranteeSet] = useState(null);
+  // Causes d'un refus de soumission, une entrée par cause.
+  const [submitErrors, setSubmitErrors] = useState([]);
   const [formData, setFormData] = useState({
     demandeur: '', localisation: '', superficie: '', culture: '',
     montant: '', currency: 'USD',
@@ -1002,12 +1028,21 @@ const Credits = () => {
         amountApproved: parseFloat(finalFormData.montant) || finalFormData.totalFinanced,
         currency: finalFormData.currency,
       });
+      setSubmitErrors([]);
       toast({ title: '✅ Demande soumise !', description: `Dossier ${code} en cours d'analyse.` });
     } catch (e) {
+      // `submit` renvoie une entrée par cause (`APPLICATION_INCOMPLETE` agrège
+      // superficie manquante, montant manquant, garantie inéligible…). Les
+      // afficher toutes : sinon le client les redécouvre une par une, à chaque
+      // tentative.
+      const causes = guaranteeErrorList(e);
+      setSubmitErrors(causes);
       toast({
         variant: 'destructive',
-        title: 'Soumission refusée',
-        description: guaranteeErrorMessage(e, 'La soumission du dossier a échoué.'),
+        title: causes.length > 1 ? `Soumission refusée — ${causes.length} points à corriger` : 'Soumission refusée',
+        description: causes.length > 1
+          ? 'Le détail est affiché sous la fiche de synthèse.'
+          : causes[0].message,
       });
     }
   };
@@ -1019,6 +1054,7 @@ const Credits = () => {
     draftCodeRef.current = null;
     setDraftCode(null);
     setGuaranteeSet(null);
+    setSubmitErrors([]);
     setFormData({
       demandeur: prefill?.client?.displayName || '',
       localisation: '', superficie: '', culture: '', montant: '',
@@ -1052,7 +1088,7 @@ const Credits = () => {
       case 1: return <DemandeInitiale formData={formData} setFormData={setFormData} nextStep={nextStep} prefill={prefill} />;
       case 2: return <SimulateurIntelligent formData={formData} setFormData={setFormData} nextStep={nextStep} prevStep={prevStep} runSimulation={runSimulation} />;
       case 3: return <ConfigurationGaranties nextStep={nextStep} prevStep={prevStep} draftCode={draftCode} ensureDraft={ensureDraft} onGuaranteesChange={setGuaranteeSet} />;
-      case 4: return <FicheSynthese formData={formData} prevStep={prevStep} submitApplication={() => submitApplication(formData)} guaranteeSet={guaranteeSet} />;
+      case 4: return <FicheSynthese formData={formData} prevStep={prevStep} submitApplication={() => submitApplication(formData)} guaranteeSet={guaranteeSet} submitErrors={submitErrors} />;
       default: return null;
     }
   };

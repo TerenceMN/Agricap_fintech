@@ -218,14 +218,17 @@ de le corriger (`types/api.ts` était en lecture seule dans les deux périmètre
 plusieurs périmètres a besoin d'un propriétaire nommé, sinon le contournement se duplique à
 chaque nouvel écran et finit par paraître normal.
 
-Deux écarts subsistent dans le type migré, mineurs mais silencieux :
+Deux écarts subsistaient dans le type migré, **tous deux comblés depuis** par le propriétaire
+de `types/api.ts` (commits 8cd3946 et 048d2b2) :
 
-- `CreditNeedsSheet.area_ha` est déclaré mais **n'est pas émis** par le sérialiseur (clés
-  réelles de `needsSheet` : `id`, `parsedOk`, `grandTotal`, `currency`, `warnings`,
-  `anomalies`). Toute carte qui le lit affiche « — » en toutes circonstances — c'était le cas
-  dans `ApplicationDetail.tsx` (§4.3) ;
-- `anomalies` est émis mais **absent du type** : inexploitable sans cast, alors que c'est
-  précisément ce qu'un analyste veut voir sur une feuille de besoins.
+- `CreditNeedsSheet.area_ha` — déclaré mais jamais émis, et qui plus est **non optionnel**,
+  ce qui affirmait sa présence systématique : d'où la carte vide sans alerte. Retiré.
+- `CreditNeedsSheet.anomalies` — émis mais absent du type. Ajouté, et désormais affiché
+  (§4.3).
+
+Comblés au même passage, à la demande de `front-garanties` : `CreditGuaranteeSet.coverage`,
+l'objet `asset` par garantie (avec `declaredValue` et `retainedValue` distincts — seule la
+seconde couvre), et `CreditGuaranteeItem.type` élargi aux 4 codes canoniques.
 
 ### 4.3 `ApplicationDetail.tsx` réparé — 27 erreurs et quatre bugs silencieux
 
@@ -244,6 +247,25 @@ Ces quatre défauts vivaient depuis l'origine et **aucun n'était détectable** 
 parce que le type mentait, et un écran qui affiche « — » ne lève aucune alerte. C'est
 l'illustration la plus nette de ce que coûte un type faux — il ne cache pas seulement des
 erreurs de compilation, il rend indétectables des bugs d'affichage.
+
+**Complément, après comblement des types et typage des erreurs de workflow** — deux capacités
+devenues exploitables ont été branchées plutôt que laissées inertes :
+
+- **Refus de transition détaillés.** `credits/workflow.py` lève désormais des `WorkflowError`
+  typées (`INVALID_TRANSITION`, `APPLICATION_INCOMPLETE`, `DELEGATION_EXCEEDED`,
+  `MAKER_CHECKER_VIOLATION`, `CLIENT_CONSENT_MISSING`) dont `as_errors()` alimente
+  `ApiError.errors`. L'écran aplatissait tout en une ligne (« ✗ » + message) ; il passe
+  maintenant par `toFieldErrors` / `ErrorPanel` — une ligne par règle refusée, avec son code.
+  S'y ajoute une **suite à donner** par code (`REFUSAL_GUIDANCE`) : le message du serveur dit
+  ce qui s'est passé, cette phrase dit quoi faire ensuite (un plafond dépassé s'escalade au
+  comité, une violation maker ≠ checker se délègue à un autre profil). Aucun code n'est
+  inventé : la clé vient de `WorkflowError.code`, et un code inconnu n'affiche rien.
+  Sur un écran de décision de crédit, savoir *quelle* règle a bloqué change l'action suivante.
+- **Anomalies de la feuille de besoins** (`needsSheet.anomalies`, désormais typé) affichées,
+  **avant** les avertissements et avec leur effectif. C'est le premier signal que lit un
+  analyste. Rendu défensif (`typeof a === 'string' ? a : JSON.stringify(a)`) : le champ est
+  typé `unknown[]` et le backend y met selon les cas une chaîne ou un objet — supposer une
+  forme produirait des « [object Object] ».
 
 ### 4.4 Édition concurrente non coordonnée — risque d'écrasement
 

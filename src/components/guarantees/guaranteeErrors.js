@@ -132,3 +132,42 @@ export function guaranteeErrorMessage(err, fallback = "Le serveur a refusé cett
   }
   return fallback;
 }
+
+/**
+ * Liste **toutes** les causes d'un refus, une entrée par cause.
+ *
+ * `submit` agrège plusieurs manques (`APPLICATION_INCOMPLETE` avec
+ * `errors: [{SUPERFICIE_MANQUANTE}, {GUARANTEE_TYPE_NOT_ELIGIBLE}, …]`).
+ * N'afficher que la première ferait redécouvrir les autres une par une, à
+ * chaque tentative — CLAUDE.md principe 5 : « une erreur par cause, jamais un
+ * message générique », et le standard frontend « 422 structuré → affichage par
+ * erreur ».
+ *
+ * Chaque entrée est traduite si son code est connu, sinon on relaie le message
+ * serveur. Retourne toujours au moins une entrée.
+ *
+ * @param {unknown} err
+ * @returns {Array<{code: string|null, message: string}>}
+ */
+export function guaranteeErrorList(err) {
+  const body = (err && typeof err === 'object' && (err.payload || err.body || err.data)) || null;
+  const raw =
+    (Array.isArray(err?.errors) && err.errors.length ? err.errors : null)
+    || (Array.isArray(body?.errors) && body.errors.length ? body.errors : null);
+
+  if (!raw) return [{ code: errorCode(err), message: guaranteeErrorMessage(err) }];
+
+  return raw.map((entry) => {
+    const code = entry?.code ? String(entry.code) : null;
+    // Le message serveur prime quand il porte une information que le front ne
+    // peut pas reconstituer — typiquement l'énumération des types de garantie
+    // admis pour la filière, que le client n'a pas le droit de connaître
+    // autrement (principe 7 : `eligible_guarantees` ne descend pas au client).
+    const serverMessage = typeof entry?.message === 'string' ? entry.message.trim() : '';
+    if (serverMessage) return { code, message: serverMessage };
+    return {
+      code,
+      message: (code && GUARANTEE_ERROR_MESSAGES[code]) || "Cause non précisée par le serveur.",
+    };
+  });
+}
