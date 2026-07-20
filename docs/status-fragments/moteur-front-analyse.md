@@ -144,29 +144,40 @@ aller-retour entre onglets.
 (`INDICATEUR_REQUIS`, `JUSTIFICATION_REQUISE`, `INDICATEUR_INCONNU`) rendu ligne
 par ligne via `toFieldErrors`. `reanalyser/` → 201.
 
-### 3.1 ⚠ Le contrat TypeScript ne décrit plus le payload
+### 3.1 Contrat TypeScript — dérive signalée, **résorbée**
 
-**Blocant pour tout consommateur `.ts`/`.tsx`.** Le moteur sert cinq champs
-absents de `CreditAnalyse` dans `src/types/api.ts` :
+Le moteur servait cinq champs absents de `CreditAnalyse` (`devise`, `totaux`,
+`referentielInfo`, `scoreLettre`, `lignage`, `poidsAppliques`). L'onglet ne
+cassait pas — fichiers `.jsx`, `checkJs: false` — ce qui rendait la dérive
+invisible au build et donc durable.
 
-| Champ servi | Présent dans `CreditAnalyse` ? |
-|---|---|
-| `devise` | non |
-| `totaux` | non |
-| `referentielInfo` | non |
-| `scoreLettre` | non — il n'existe que sur `CreditAnalyseResume` (ligne 1202) |
-| `criteres.dscr.details.diagnostic` | toléré par l'index `[k: string]: unknown` |
+`src/types/api.ts` a depuis été mis à jour par son propriétaire : les six champs
+y sont, et `parametres` porte désormais `modeDiffere`, `capital` et `devise`.
+Vérifié ligne à ligne (l. 1181–1248). Plus d'écart connu entre le type et le
+payload observé.
 
-L'onglet Analyse ne casse pas : ses fichiers sont des `.jsx` et `checkJs` est à
-`false`, donc ces accès ne sont pas type-checkés. **C'est précisément ce qui rend
-la dérive dangereuse** — elle est invisible au build tant que personne n'écrit un
-consommateur typé, et le premier qui le fera aura une erreur de compilation sur
-un champ pourtant servi depuis des semaines.
+### 3.2 Confrontation au payload réel
 
-`src/types/api.ts` est en lecture seule pour ce lot (contrat figé). **À porter par
-le propriétaire du contrat**, en même temps que la décision de nommage : le
-payload est francophone (`criteres`, `parametres`, `devise`, `echeancier`) et
-`devise` est cohérent avec ce choix — mais il faut que le type le dise.
+`docs/contracts/moteur-analyse-payload-observe.json` (réponses 200/201
+effectives des 4 endpoints) a été confronté au branchement. Toutes les clés
+lues correspondent : `devise`, `totaux.*`, `referentielInfo.*`, `scoreLettre`,
+`criteres.dscr.details.{facteurDominant,levier,diagnostic.alternativesDiffere}`,
+`ecartsHorsPlage[].{indicateur,valeur,reference,ecartPct,message}`, et la phase
+`"différé"` avec son accent — que `PHASE_CLASS` indexait déjà correctement.
+
+**Un défaut trouvé, corrigé :** `EcheancierTable` affichait la colonne
+« Int. capitalisés » dès que la clé `interetsCapitalises` était **présente**. En
+mode `interets_seuls`, le moteur la sert à `0.0` sur chaque ligne — l'écran
+aurait donc montré une colonne entière de zéros, qui se lit comme une
+information alors qu'elle n'en est pas. La colonne ne s'affiche plus que si une
+ligne porte une valeur non nulle, comme le faisait déjà la carte de total.
+
+Aucun test de contrat ne l'aurait attrapé : le type était respecté, la donnée
+présente, la valeur juste. Il fallait regarder la réponse.
+
+**Ajouté au passage :** `parametres.modeDiffere` est affiché sous le taux
+(« intérêts seuls » / « franchise totale — intérêts capitalisés »). Deux dossiers
+instruits sous deux modes ne se comparent pas, et la mention manquait.
 
 ---
 
@@ -405,14 +416,13 @@ DevTools. N'ont donc pas été observés :
   4 niveaux, comportement responsive du tableau des critères) ;
 - l'imbrication du dialogue de justification dans le dialogue du modal (Radix la
   supporte, mais le focus trap et l'`Esc` en cascade n'ont pas été testés) ;
-- le comportement réel des états 404 / 403 / erreur. Le moteur backend est
-  livré, mais **aucun appel réel n'a été passé depuis ce lot** : le branchement
-  sur les nouveaux champs (`devise`, `totaux`, `referentielInfo`, `scoreLettre`,
-  `diagnostic.alternativesDiffere`) est écrit d'après le contrat annoncé par
-  `moteur-backend`, pas d'après une réponse observée. C'est le point le plus
-  fragile de la livraison — une différence de nommage ou d'imbrication passerait
-  silencieusement (`checkJs: false`, cf. §3.1) et se traduirait par des « — » à
-  l'écran plutôt que par une erreur ;
+- le comportement réel des états 404 / 403 / erreur. **Aucun appel HTTP n'a été
+  passé depuis ce lot.** Le branchement a en revanche été confronté au payload
+  observé livré par `moteur-backend` (§3.2), ce qui couvre le nommage et
+  l'imbrication des champs — mais pas le transport : codes de statut réels,
+  en-têtes d'autorisation, comportement du rafraîchissement de jeton sur 401,
+  latence. Un 403 rendu par `Forbidden` et un 404 rendu par `Empty` n'ont jamais
+  été observés, seulement écrits ;
 - la troncature de l'échéancier au-delà de 24 lignes, faute d'échéancier ;
 - la valeur réelle de `credit.applicationCode` : le modal reprend le repli
   existant `applicationCode || id` déjà utilisé par `AnalysisPanel`. Si cet id de

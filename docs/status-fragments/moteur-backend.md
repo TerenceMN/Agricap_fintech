@@ -263,6 +263,24 @@ Aucun des deux n'aurait été rattrapé par un test de contrat : le premier pass
 
 **Tests : 279 sur `credits` (62 sur le moteur).**
 
+### La vue client n'est branchée nulle part
+
+Vérifié par lecture de `src/` (lecture seule — je n'y écris pas) :
+`analyseResume` est déclaré dans `src/services/api.ts:201` et **aucun composant
+ne l'appelle**. Les usages de `scoreLettre` sont tous sur le chemin staff
+(`AnalyseTab.jsx`, `RecommendationBanner.jsx`), plus une copie locale assumée dans
+`SimulationResult.jsx` pour le chemin `simulate/`.
+
+Deux conséquences :
+
+- le risque d'état vide sur `pointsForts` est **hypothétique**, pas réel : il n'y a
+  pas encore d'écran à casser. À traiter quand le premier consommateur sera écrit ;
+- **la surface anti-gaming que je livre n'est pas encore celle que voit le client.**
+  Tant que `pages/credit/**` et `Credits.jsx` n'appellent pas `analyse-resume`, le
+  demandeur continue de lire ce que produit le chemin historique — dont le score
+  fictif du simulateur. Le principe 7 est tenu côté serveur ; il ne l'est pas encore
+  bout en bout. C'est le prochain branchement utile, et il appartient à un lot front.
+
 ---
 
 ## 6. Ce que je n'ai pas fait / pas pu tester
