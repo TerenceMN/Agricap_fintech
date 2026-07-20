@@ -432,12 +432,17 @@ première.
 
 **Deux règles d'écriture, tirées des dégâts constatés :**
 
-- **Un fragment de statut cite des clés, pas des valeurs.** Ce document a été
-  préservé de la péremption qui a frappé le §2.2 de `moteur-front-backend`
-  (chiffres calculés sur un référentiel depuis supprimé) uniquement parce qu'il
-  ne documente que des noms de champs. C'était de la chance ; c'est désormais la
-  règle. Les valeurs vont dans un artefact **daté**, avec de quoi savoir de quand
-  il parle.
+- **Une valeur citée nomme le test qui la tient, ou ne figure pas dans le
+  document.** J'avais d'abord écrit « un fragment cite des clés, pas des
+  valeurs » ; `moteur-backend` a montré que cette règle, appliquée telle quelle,
+  lui aurait fait supprimer le cas chiffré de non-régression que CLAUDE.md §8.4
+  **exige** de livrer avec un calcul financier. La bonne coupe n'est pas
+  clé/valeur, c'est **épinglé / non épinglé** : son « 1 ha → 1 710 » est mort
+  parce que rien ne le tenait, ses 1 469,65 ne peuvent pas dériver en silence.
+  Formulation retenue : la sienne. Elle protège de la péremption *et* rend la
+  vérification faisable par un lecteur sans contexte — il lance le test.
+  Corollaire pour ce lot, cf. §5 : ne pouvant nommer aucun test, ce fragment ne
+  cite aucune valeur. Ce n'est pas une vertu, c'est une contrainte.
 - **Une vérification s'horodate ou se rejoue.** Un contrôle passé une fois puis
   affirmé au présent n'est plus une vérification, c'est un souvenir (formule de
   `moteur-backend`, qui a repris sa migration réversible pour cette raison). Le
@@ -530,6 +535,31 @@ l'a pas.
 ---
 
 ## 5. Vérifications
+
+> ### ⚠ Aucun test. Et aucune infrastructure pour en écrire.
+>
+> Vérifié, pas supposé : `package.json` n'a **pas de script `test`**, aucune
+> dépendance de test (`vitest`, `jest`, `testing-library`, `playwright`,
+> `cypress` — toutes absentes), et `find src -name "*.test.*" -o -name "*.spec.*"`
+> ne renvoie **rien**. Le dépôt front n'a jamais eu de tests.
+>
+> **Ce fragment ne le disait pas.** Il listait `tsc`, `vite build` et `eslint`
+> sous un titre « Vérifications », à côté d'un fragment backend qui en annonce
+> 285 verts. Un lecteur pouvait raisonnablement supposer un équivalent front.
+> L'omission n'était pas un mensonge — encore la même famille.
+>
+> **Ce que ça coûte concrètement.** Tout ce que ce lot a « vérifié par lecture »
+> l'a été **une fois, sans garde** : la résolution de `applicationCode`
+> (`''` → état distinct), la classification 401/403/404/422, la logique de
+> troncature et ses bords, le garde `crdFinal ≠ 0`, l'affichage conditionnel de
+> la colonne d'intérêts capitalisés. Chacun de ces points a été un défaut réel ou
+> a failli l'être ; **aucun n'est protégé contre une régression.** Le prochain
+> qui touchera `EcheancierTable` remettra la colonne de zéros sans qu'un test
+> rougisse.
+>
+> Je n'ai pas installé de runner : introduire vitest est une décision d'outillage
+> qui engage tout le front, pas un correctif de ce lot. **À router** — c'est, de
+> tout ce fragment, le manque qui rendrait les autres durables.
 
 - `npx tsc --noEmit` : **0 erreur**.
 - `npx vite build` : **vert** (2832 modules, build en ~8 s). C'est le seul vrai
