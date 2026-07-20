@@ -1155,9 +1155,23 @@ const Credits = () => {
       amount_requested: parseFloat(fd.montant) || 0,
       prefill_snapshot: { demandeur: fd.demandeur, localisation: fd.localisation },
     });
-    draftCodeRef.current = app.code;
-    setDraftCode(app.code);
-    return app.code;
+    // Un code vide ne doit JAMAIS circuler. `parse/` teste `if application_code:`
+    // — une chaîne vide y est fausse et fait basculer l'endpoint sur le parse
+    // hérité, en mémoire, sans ingestion `dataio` ni révision. Le client verrait
+    // « feuille enregistrée · révision undefined » sur une feuille que le moteur
+    // ne lira jamais : un état de succès mensonger, exactement le motif que
+    // `moteur-front-analyse` a rencontré avec `applicationCode = ""`.
+    // Et le cache `if (draftCodeRef.current)` étant lui aussi testé en vérité,
+    // un code vide ferait recréer un brouillon à chaque appel.
+    const code = typeof app?.code === 'string' ? app.code.trim() : '';
+    if (!code) {
+      const err = new Error("Le dossier a été créé sans code exploitable.");
+      err.code = 'DRAFT_CODE_MISSING';
+      throw err;
+    }
+    draftCodeRef.current = code;
+    setDraftCode(code);
+    return code;
   }, []);
 
   /**

@@ -12,16 +12,22 @@
 | `backend/credits/models.py` | `ReferentielFiliere`, `BaremeScore`, `AnalyseCredit` (+ `ImmutableAnalyse`) |
 | `backend/credits/migrations/0010_baremescore_referentielfiliere_analysecredit.py` | Migration — **rollback puis re-migration testés** |
 | `backend/credits/analyse.py` | Les 5 scoreurs, l'orchestration, les sérialiseurs staff / client |
-| `backend/credits/management/commands/seed_analyse.py` | Fixtures idempotentes (`update_or_create`) |
+| `backend/credits/management/commands/seed_analyse.py` | Amorçage idempotent des **barèmes** (`update_or_create`) |
 | `backend/credits/views.py` (fin de fichier) | 4 endpoints |
 | `backend/credits/urls.py` | Routes |
-| `backend/credits/tests_analyse.py` | **64 tests** |
+| `backend/credits/tests_analyse.py` | **68 tests** |
 
 `credits/echeancier.py` est **réutilisé tel quel**, non réécrit. La convention
 d'exceptions de `credits/workflow.py` (`code`, `http_status`, `as_errors()`) est
 copiée dans `AnalyseError`. Aucun rôle nouveau : tout passe par `credits/roles.py`.
 
-**Tests** : 580 au total (baseline 516 + 64). `OK` hors les **8 échecs
+**Dépendance hors de ce lot** : `credits/referentiel_loader.py` (lot simulateur)
+est la seule source des `ReferentielFiliere`. Le moteur ne peut analyser aucun
+dossier tant qu'aucun simulateur n'a été ingéré — cf. §6. Ce n'était pas le cas à
+la première livraison : `seed_analyse` amorçait alors un référentiel écrit à la
+main, ce qui était un défaut (§6).
+
+**Tests** : 584 au total (baseline 516 + 68). `OK` hors les **8 échecs
 préexistants de `support/`**, non touchés. Compte à jour en §5bis.
 
 ---
@@ -63,10 +69,16 @@ rendement, les flux sont nuls **et le commentaire le dit** — un DSCR de 0 dû 
 référentiel incomplet doit être lisible comme tel.
 
 **Ce que je n'ai pas pu faire** : reproduire les 935 USD de cash-flows de
-l'exemple de la SPEC. Ils ne se déduisent d'aucune donnée que le système détient
-(avec le référentiel maïs seedé, 1 ha donne un revenu brut de 1 710 et une marge
-de 380). `executer_analyse(..., cash_flows=[...])` permet d'injecter une
-trésorerie connue — c'est par là que passera la future feuille de trésorerie.
+l'exemple de la SPEC. Ils ne se déduisent d'aucune donnée que le système détient.
+
+*(Cette section chiffrait l'écart « 1 ha → revenu brut 1 710, marge 380 ». Ce
+calcul reposait sur le référentiel maïs que j'avais écrit à la main et qui a
+depuis été supprimé — cf. §6. Le rendement vient désormais du simulateur ingéré ;
+je n'ai pas exécuté le moteur contre un classeur réel, donc **je ne connais pas
+l'ordre de grandeur effectif** et je ne le remplace pas par une estimation.)*
+
+`executer_analyse(..., cash_flows=[...])` permet d'injecter une trésorerie connue —
+c'est par là que passera la future feuille de trésorerie.
 
 **Décision demandée** : soit on ajoute une feuille `Tresorerie` au template
 (principe 11 : le schéma se dérive du template actif), soit la projection ci-dessus
@@ -261,7 +273,7 @@ versionnée. **Deux défauts que seule cette confrontation a révélés :**
 Aucun des deux n'aurait été rattrapé par un test de contrat : le premier passe
 `checkJs: false`, le second était un texte grammaticalement correct.
 
-**Tests : 281 sur `credits` (64 sur le moteur), 580 au total.**
+**Tests : 285 sur `credits` (68 sur le moteur), 584 au total.**
 
 ### La vue client n'est branchée nulle part
 
@@ -291,13 +303,23 @@ Deux conséquences :
   validation de la feuille de besoins.
 - **Cash-flows réels** : jamais testés contre une trésorerie déclarée par un client
   (elle n'existe pas — §2.2). La projection est testée sur ses propres hypothèses.
-- **Critère comportemental avec historique** : `_charger_historique()` lit
-  `portfolio.Loan` par `borrower_sub`. Testé uniquement dans sa branche « aucun
-  historique » (50/100 neutre, `historiqueDisponible: false`). La branche avec
-  historique n'a pas de dossier réel pour la calibrer — les coefficients (60 % taux
-  de remboursement, 40 % part soldée, −20 par incident) sont **une proposition**,
-  pas un barème validé. Ils devraient descendre dans `BaremeScore` quand un
-  `COMPORTEMENTAL` sera calibré (le code le cherche déjà : `baremes.get("COMPORTEMENTAL")`).
+- **Critère comportemental avec historique** — entrée **mal classée, corrigée.**
+  Elle figurait ici comme « pas testable faute de dossier réel ». C'est vrai des
+  **coefficients** (60 % taux de remboursement, 40 % part soldée, −20 par incident) :
+  ce sont des paramètres métier, ils appellent une décision du comité et devraient
+  descendre dans `BaremeScore` quand un `COMPORTEMENTAL` sera calibré — le code le
+  cherche déjà (`baremes.get("COMPORTEMENTAL")`).
+
+  Ce n'était **pas** vrai du chemin de code. Rien n'empêchait de vérifier qu'il
+  s'exécute et produit des valeurs sensées ; j'avais rangé « non vérifié » sous
+  « non calibrable », sur le critère qui pèse 30 % du score. 4 tests ajoutés :
+  crédit soldé intégralement (100/100), défaut (borné à 0 — un score négatif
+  casserait l'invariant Σ points = score global), sur-remboursement (borné à 100),
+  et non-lecture de l'historique d'un autre client (rapprochement sur
+  `borrower_sub`). **Aucun défaut trouvé** : le chemin est correct. Il est
+  désormais vérifié plutôt que supposé.
+
+  Ce qui reste non calibré : les coefficients eux-mêmes.
 - **Conversion de devises** (SPEC §9.4) et **échantillonnage de validation humaine**
   (SPEC §9.5) : non implémentés.
 - **Endpoints d'administration** des référentiels et barèmes (SPEC §7, deux

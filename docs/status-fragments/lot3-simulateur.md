@@ -160,6 +160,35 @@ l'application doit rediriger vers l'écran de connexion après un `refresh()`
 
 ---
 
+### 2.2 Un code de dossier vide bascule le backend sur un autre chemin
+
+Second défaut trouvé par lecture, sans serveur — motif signalé par
+`moteur-front-analyse` sur son `applicationCode = ""`, cherché chez moi, trouvé.
+
+`parse_needs_sheet_view` teste `if application_code:`. Une **chaîne vide y est
+fausse** et fait basculer l'endpoint sur le parse hérité : lecture en mémoire,
+**aucune ingestion `dataio`**, aucun `application.needs_source`, et un payload de
+forme différente (`needsSheetId`, pas de `revision`).
+
+Conséquence si `ensureDraft` avait rendu un code vide : mon panneau affichait
+« *Feuille de besoins enregistrée · révision undefined* » — un état de **succès
+vert sur une feuille jamais ingérée**, donc sur une feuille que le moteur ne
+lirait jamais — suivi d'un `NEEDS_SOURCE_MISSING` inexplicable à la simulation.
+Le lot 3 tout entier se serait silencieusement retourné en son contraire : le
+principe 1 contourné par une chaîne vide. Second effet : le cache
+`if (draftCodeRef.current)` étant lui aussi testé en vérité, un code vide aurait
+fait **recréer un brouillon à chaque appel**, semant des dossiers orphelins.
+
+**Atteignable aujourd'hui ?** Non : `CreditApplication.code` a
+`default=_gen_code` et une contrainte d'unicité. Le garde-fou est donc préventif
+— mais son coût est de six lignes, et le coût de son absence est un succès
+mensonger sur l'écran qui décide d'un crédit. `ensureDraft` refuse désormais tout
+code vide, blanc ou absent (`DRAFT_CODE_MISSING`), et le refus s'affiche dans le
+cadre « transport » de §2.1, qui dit de ne pas toucher au classeur. Vérifié sur
+5 entrées (`''`, `'   '`, `null`, `undefined`, code valide).
+
+---
+
 ---
 
 ## 3. Contrainte d'ordonnancement — la solution retenue et ce qu'elle laisse ouvert
@@ -406,6 +435,18 @@ cette session :
   plutôt qu'un 422 affiché ;
 - aucun test automatisé n'a été ajouté — il n'y a pas de harnais de test front
   dans le dépôt.
+
+**Erreur de ma part, rétablie** : j'ai contesté à `moteur-front-analyse` que
+`poidsAppliques` ait jamais été servi en chaînes, en m'appuyant sur l'état
+**courant** de `docs/contracts/moteur-analyse-payload-observe.json` (des
+flottants). Vérification faite dans l'historique : `git show 80f595a` donne
+`"technique": "25.0"` (chaînes), `git show 585873b` donne `25.0` (nombres). Le
+défaut a bien existé ; le fichier avait été committé avant le correctif puis
+régénéré après. J'avais formulé deux hypothèses — « corrigé depuis la capture »
+ou « n'a jamais existé » — et j'ai poussé la seconde sans lancer le `git log` qui
+tranchait, ce qui a fait retirer un exemple fondé. **Un payload de référence est
+un instantané, pas un journal** : statuer sur un défaut passé en lisant l'état
+présent d'un artefact ne marche pas.
 
 Ces réserves ne se lèveront qu'en exécutant l'application. Elles ne sont pas des
 formalités : les trois défauts les plus intéressants de cette passe

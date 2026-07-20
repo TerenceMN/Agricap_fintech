@@ -557,8 +557,17 @@ DevTools. N'ont donc pas été observés :
   en-têtes d'autorisation, comportement du rafraîchissement de jeton sur 401,
   latence. Un 403 rendu par `Forbidden` et un 404 rendu par `Empty` n'ont jamais
   été observés, seulement écrits ;
-- la troncature de l'échéancier au-delà de 24 lignes, faute d'échéancier ;
-- la valeur réelle de `credit.applicationCode` : le modal reprend le repli
-  existant `applicationCode || id` déjà utilisé par `AnalysisPanel`. Si cet id de
-  prêt (`portfolio`) n'est pas une référence de dossier (`credits`), l'appel
-  partira sur une mauvaise clé — à valider dès que le backend répond.
+- le **rendu** de la troncature au-delà de 24 échéances (le cas de référence en
+  compte 8). La **logique**, elle, a été vérifiée par lecture et non laissée en
+  suspens : `visibles = lignes.slice(0, 24)`, `restantes = length − visibles`,
+  bandeau si `restantes > 0`, « Réduire » si `tout && length > 24`. Les bords
+  tiennent (exactement 24 → ni bandeau ni bouton ; « Tout afficher » → bandeau
+  masqué). Ce qui reste inconnu est visuel, pas fonctionnel.
+
+> **Deux entrées ont quitté cette liste** parce qu'elles n'y avaient pas leur
+> place : le repli `applicationCode || id` et le 401 sans état dédié y figuraient
+> comme « à valider quand le backend répondra ». Ils étaient vérifiables par
+> **lecture** — et tous deux défectueux. Corrigés, décrits en §5.1. Une liste de
+> « non observé » est un endroit commode pour ranger ce qu'on n'a pas voulu
+> regarder : elle mérite d'être relue à la fin, pas seulement remplie au fil de
+> l'eau.

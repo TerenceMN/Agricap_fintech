@@ -139,6 +139,19 @@ export function isFileValidationError(err) {
 export function transportErrorMessage(err) {
   const status = err && typeof err.status === 'number' ? err.status : null;
 
+  // Garde-fou local : sans code de dossier utilisable, l'envoi partirait avec
+  // `application_code=""`, que le backend lit comme « pas de dossier » et qui le
+  // fait basculer sur le parse hérité — en mémoire, sans ingestion ni révision.
+  // Le client verrait « feuille enregistrée » sur une feuille jamais ingérée.
+  if (err && err.code === 'DRAFT_CODE_MISSING') {
+    return {
+      titre: "Votre dossier n'a pas pu être ouvert",
+      message:
+        "La feuille n'a pas été envoyée : AGRICAP n'a pas pu créer le dossier qui doit la "
+        + 'recevoir. Rechargez la page et réessayez — votre classeur n\'est pas en cause.',
+    };
+  }
+
   if (status === 401) {
     return {
       titre: 'Votre session a expiré',
