@@ -1,0 +1,1242 @@
+"""
+Vues Crédits Agricoles (Étapes 2-4).
+
+Endpoints :
+  GET  /api/credits/application/prefill/                        → préremplissage
+  POST /api/credits/needs-sheet/parse/                          → parse Feuille de Besoins
+  GET  /api/credits/needs-sheet-template/                       → modèle Excel
+  POST /api/credits/simulate/                                   → simulation scoring
+  POST /api/credits/applications/<code>/score/                  → re-scorer un dossier
+  GET  /api/credits/applications/<code>/guarantees/             → liste garanties
+  POST /api/credits/applications/<code>/guarantees/savings/     → bloc épargne
+  POST /api/credits/applications/<code>/guarantees/moral/       → caution morale
+  POST /api/credits/applications/<code>/guarantees/<id>/confirm/ → confirmer caution morale
+  POST /api/credits/applications/<code>/guarantees/<id>/release/ → libérer garantie
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+
+from django.http import HttpResponse
+from rest_framework import status
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.parsers import MultiPartParser
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from credits.needs_parser import NeedsSheetParseError, parse_needs_sheet
+from credits.needs_template import generate_needs_sheet_template
+from credits.prefill import get_prefill_data
+from credits.dataio_simulator import dataio_simulate
+from credits.roles import (
+    CAN_CONFIRM_DISBURSEMENT,
+    CAN_DECIDE,
+    CAN_INSTRUCT,
+    CAN_REQUEST_DISBURSEMENT,
+    STAFF_ROLES,
+    in_group,
+    roles_of,
+)
+from credits.view_context import ViewContextService
+
+
+def _roles(request: Request) -> list[str]:
+    """Rôles canoniques de la requête — remplace `request.roles`, jamais posé.
+
+    Voir `credits.roles.roles_of` : un middleware ne peut pas remplir cet
+    attribut ici, l'authentification DRF s'exécutant après les middlewares.
+    """
+    return roles_of(request)
+
+
+def _vcs(request: Request) -> ViewContextService:
+    """Construit un ViewContextService depuis la requête courante."""
+    return ViewContextService(
+        sub=getattr(request.user, "sub", "") or "",
+        roles=_roles(request),
+    )
+
+
+def _require_read(request: Request) -> bool:
+    """Tout utilisateur authentifié — les données sont filtrées par ViewContextService."""
+    return bool(request.user and hasattr(request.user, "sub"))
+
+
+def _require_group(request: Request, group) -> bool:
+    """Vérifie l'appartenance à un groupe fonctionnel de `credits.roles`.
+
+    Remplace l'ancien `_require_permission(request, "agent"|"analyst")`, qui
+    comparait `user.role` à des libellés (« agent », « analyst ») n'existant
+    dans aucun registre : seul `admin` franchissait ces gardes, et le workflow
+    crédit était de fait inaccessible à tous les rôles métier.
+    """
+    if not _require_read(request):
+        return False
+    return in_group(request, group)
+
+
+# ── 1. Préremplissage ────────────────────────────────────────────────────────
+
+@api_view(["GET"])
+def prefill_application(request: Request) -> Response:
+    """
+    GET /api/credits/application/prefill/?client_sub=<sub>
+
+    Retourne les données préremplies pour un nouveau dossier de crédit.
+    Si client_sub est omis, utilise le sub du demandeur lui-même.
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    requester_sub: str = getattr(request.user, "sub", "") or ""
+    client_sub: str = request.query_params.get("client_sub", requester_sub)
+
+    if not client_sub:
+        return Response({"detail": "client_sub est requis."}, status=400)
+
+    # Pour créer un dossier pour un tiers, il faut la permission agent
+    if client_sub != requester_sub and not _require_group(request, CAN_INSTRUCT):
+        return Response(
+            {"detail": "Permission 'agent' requise pour créer un dossier au nom d'un client."},
+            status=403,
+        )
+
+    data = get_prefill_data(client_sub=client_sub, requester_sub=requester_sub)
+
+    if "error" in data:
+        return Response({"detail": "Client introuvable.", "code": data["error"]}, status=404)
+
+    return Response(data)
+
+
+# ── 2. Parse Feuille de Besoins ──────────────────────────────────────────────
+
+@api_view(["POST"])
+@parser_classes([MultiPartParser])
+def parse_needs_sheet_view(request: Request) -> Response:
+    """
+    POST /api/credits/needs-sheet/parse/
+    Content-Type: multipart/form-data
+
+    Champs requis  : file (xlsx)
+    Champs optionnels : value_chain_code, area_ha, currency (USD|CDF)
+
+    Retourne le résultat du parsing + sauvegarde un NeedsSheet en DB.
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    file = request.FILES.get("file")
+    if not file:
+        return Response({"detail": "Fichier manquant (champ 'file' requis)."}, status=400)
+
+    if not file.name.lower().endswith((".xlsx", ".xls")):
+        return Response(
+            {"detail": "Format invalide. Seuls les fichiers .xlsx / .xls sont acceptés."},
+            status=422,
+        )
+
+    value_chain_code: str = request.data.get("value_chain_code", "")
+    area_ha_raw: str = request.data.get("area_ha", "")
+    currency: str = request.data.get("currency", "USD").upper()
+
+    if currency not in ("USD", "CDF"):
+        return Response({"detail": "currency doit être USD ou CDF."}, status=400)
+
+    # Résoudre la filière
+    value_chain = None
+    if value_chain_code:
+        try:
+            from reference_data.models import ValueChain
+            value_chain = ValueChain.objects.get(code=value_chain_code, active=True)
+        except Exception:
+            return Response(
+                {"detail": f"Filière '{value_chain_code}' introuvable ou inactive."},
+                status=400,
+            )
+
+    # Convertir area_ha
+    import decimal
+    area_ha = None
+    if area_ha_raw:
+        try:
+            area_ha = decimal.Decimal(area_ha_raw.replace(",", "."))
+        except Exception:
+            return Response({"detail": "area_ha invalide."}, status=400)
+
+    # Sauvegarder temporairement
+    suffix = os.path.splitext(file.name)[1]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        for chunk in file.chunks():
+            tmp.write(chunk)
+        tmp.flush()
+        tmp.close()
+
+        try:
+            result = parse_needs_sheet(
+                file_path=tmp.name,
+                value_chain=value_chain,
+                area_ha=area_ha,
+                currency=currency,
+            )
+        except NeedsSheetParseError as exc:
+            return Response({"detail": str(exc), "code": "parse_error"}, status=422)
+        except Exception as exc:
+            return Response({"detail": f"Erreur de traitement : {exc}"}, status=500)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    # Persister en base
+    sub = getattr(request.user, "sub", "") or ""
+    needs_sheet_id = _persist_needs_sheet(
+        file=file,
+        result=result,
+        value_chain=value_chain,
+        area_ha=area_ha,
+        currency=currency,
+        uploaded_by=sub,
+    )
+
+    # Analyse documentaire (Partie H) — silencieuse, ne bloque pas la réponse
+    analysis_summary = {}
+    if needs_sheet_id:
+        try:
+            from credits.analysis import run_analysis
+            analysis_summary = run_analysis(
+                needs_sheet_id=needs_sheet_id,
+                value_chain=value_chain,
+                area_ha=area_ha,
+                currency=currency,
+            )
+        except Exception:
+            pass
+
+    return Response(
+        {
+            "ok": result["ok"],
+            "needsSheetId": needs_sheet_id,
+            "grandTotal": result["grandTotal"],
+            "totalByModule": result["totalByModule"],
+            "warnings": result["warnings"],
+            "anomalies": result["anomalies"],
+            "items": result["items"],
+            "analysis": analysis_summary or None,
+        },
+        status=201,
+    )
+
+
+def _persist_needs_sheet(
+    file, result: dict, value_chain, area_ha, currency: str, uploaded_by: str
+) -> int | None:
+    """Crée un NeedsSheet + ses NeedItem en base."""
+    try:
+        from credits.models import NeedsSheet, NeedItem
+        import decimal
+
+        ns = NeedsSheet.objects.create(
+            uploaded_by=uploaded_by,
+            raw_file=file,
+            value_chain=value_chain,
+            area_ha=area_ha,
+            currency=currency,
+            parsed_ok=result["ok"],
+            warnings=result["warnings"],
+            anomalies=result["anomalies"],
+            total_by_module=result["totalByModule"],
+            grand_total=decimal.Decimal(str(result["grandTotal"])),
+        )
+
+        NeedItem.objects.bulk_create([
+            NeedItem(
+                sheet=ns,
+                module=item["module"],
+                label=item["label"],
+                quantity=decimal.Decimal(item["quantity"]) if item.get("quantity") else None,
+                unit=item.get("unit", ""),
+                unit_price=decimal.Decimal(item["unit_price"]) if item.get("unit_price") else None,
+                declared_total=decimal.Decimal(item["declared_total"]) if item.get("declared_total") else None,
+                computed_total=decimal.Decimal(item["computed_total"]) if item.get("computed_total") else None,
+                suggested_supplier=item.get("suggested_supplier", ""),
+                supplier_warning=item.get("supplier_warning", ""),
+            )
+            for item in result.get("items", [])
+        ])
+
+        return ns.pk
+    except Exception:
+        return None
+
+
+# ── 3. Modèle Excel (template) ───────────────────────────────────────────────
+
+@api_view(["GET"])
+@permission_classes([])
+def download_needs_sheet_template(request: Request) -> HttpResponse:
+    """ 
+    GET /api/credits/needs-sheet-template/?value_chain_code=<code>
+
+    Endpoint public — retourne le gabarit Excel AGRICAP (pas de données sensibles).
+    Sert le fichier statique embarqué ; le code filière est ajouté au nom du fichier.
+    """
+    import os
+
+    static_path = os.path.join(
+        os.path.dirname(__file__), "static", "credits", "feuille_besoins_template.xlsx",
+    )
+
+    value_chain_code: str = request.query_params.get("value_chain_code", "")
+
+    if os.path.exists(static_path):
+        with open(static_path, "rb") as f:
+            xlsx_bytes = f.read()
+    else:
+        # Fallback : génération dynamique si le fichier statique est absent
+        value_chain = None
+        if value_chain_code:
+            try:
+                from reference_data.models import ValueChain
+                value_chain = ValueChain.objects.get(code=value_chain_code, active=True)
+            except Exception:
+                pass
+        xlsx_bytes = generate_needs_sheet_template(value_chain=value_chain)
+
+    vc_slug = value_chain_code.lower() if value_chain_code else "generic"
+    filename = f"AGRICAP_Feuille_Besoins_{vc_slug}.xlsx"
+
+    response = HttpResponse(
+        xlsx_bytes,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+# ── 4. Simulation scoring ────────────────────────────────────────────────────
+
+@api_view(["POST"])
+def simulate_scoring(request: Request) -> Response:
+    """
+    POST /api/credits/simulate/
+
+    Simule le scoring et le plan de remboursement sans créer de dossier en base.
+
+    Corps JSON :
+      client_sub         (str, requis)
+      value_chain_code   (str, optionnel)
+      needs_sheet_id     (int, optionnel) — ID d'une NeedsSheet déjà parsée
+      area_ha            (float, optionnel)
+      amount_requested   (float, optionnel)
+      currency           (str, "USD"|"CDF", défaut "USD")
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    data = request.data
+    client_sub: str = data.get("client_sub", "")
+    requester_sub: str = getattr(request.user, "sub", "") or ""
+
+    if not client_sub:
+        client_sub = requester_sub
+    if not client_sub:
+        return Response({"detail": "client_sub requis."}, status=400)
+
+    # Agent simulant pour un tiers → permission agent
+    if client_sub != requester_sub and not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission 'agent' requise."}, status=403)
+
+    value_chain_code: str = data.get("value_chain_code", "")
+    needs_sheet_id = data.get("needs_sheet_id")
+    currency: str = data.get("currency", "USD").upper()
+    # ns_totals envoyé directement par le frontend (nsResult.totalByModule)
+    ns_totals_raw = data.get("ns_totals") or {}
+    ns_totals = {k: float(v) for k, v in ns_totals_raw.items() if v} if isinstance(ns_totals_raw, dict) else {}
+
+    try:
+        area_ha = float(data["area_ha"]) if data.get("area_ha") else None
+    except (ValueError, TypeError):
+        return Response({"detail": "area_ha invalide."}, status=400)
+
+    try:
+        amount_requested = float(data["amount_requested"]) if data.get("amount_requested") else None
+    except (ValueError, TypeError):
+        return Response({"detail": "amount_requested invalide."}, status=400)
+
+    # Charger le client et la feuille de besoins depuis la base
+    from accounts.models import FintechUser
+    from credits.models import NeedsSheet
+
+    try:
+        client = FintechUser.objects.select_related("kyc_profile").get(sub=client_sub)
+    except FintechUser.DoesNotExist:
+        return Response({"detail": "Client introuvable.", "code": "client_not_found"}, status=404)
+
+    needs_sheet = None
+    if needs_sheet_id:
+        try:
+            needs_sheet = NeedsSheet.objects.get(pk=int(needs_sheet_id), uploaded_by=client_sub)
+            # Si pas de ns_totals du frontend, utiliser ceux de la feuille
+            if not ns_totals and needs_sheet.total_by_module:
+                ns_totals = {k: float(v) for k, v in needs_sheet.total_by_module.items()}
+        except NeedsSheet.DoesNotExist:
+            pass
+
+    result = dataio_simulate(
+        client=client,
+        value_chain_code=value_chain_code or None,
+        needs_sheet=needs_sheet,
+        ns_totals=ns_totals or None,
+        area_ha=area_ha,
+        amount_requested=amount_requested,
+        currency=currency,
+        guarantees_data=None,
+    )
+
+    if "error" in result:
+        return Response({"detail": result["error"]}, status=400)
+
+    return Response(result)
+
+
+# ── 5. Re-scoring d'un dossier existant ───────────────────────────────────────
+
+@api_view(["POST"])
+def score_application(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/score/
+
+    Calcule (ou recalcule) le score d'un dossier existant et le persiste dans score_result.
+    Réservé au staff (permission 'analyst' ou 'agent').
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    from credits.models import CreditApplication
+    from credits.scoring import CreditScoringEngine
+
+    try:
+        app = CreditApplication.objects.select_related(
+            "client__kyc_profile", "value_chain", "needs_sheet"
+        ).get(code=code)
+    except CreditApplication.DoesNotExist:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    engine = CreditScoringEngine(app)
+    result = engine.compute()
+
+    app.score_result = result
+    app.save(update_fields=["score_result", "updated_at"])
+
+    return Response(result)
+
+
+# ── Dossiers : liste et détail ────────────────────────────────────────────────
+
+@api_view(["GET", "POST"])
+def list_applications(request: Request) -> Response:
+    """
+    GET  /api/credits/applications/           → liste (filtrée par rôle)
+    POST /api/credits/applications/           → crée un dossier DRAFT
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    from credits.models import CreditApplication
+    from credits.workflow import serialize_application
+
+    vcs = _vcs(request)
+    qs = CreditApplication.objects.select_related(
+        "client__kyc_profile", "value_chain", "needs_sheet"
+    ).prefetch_related("guarantees")
+
+    qs = vcs.filter_qs(qs)
+
+    # Filtres query params
+    if status_filter := request.query_params.get("status"):
+        qs = qs.filter(status=status_filter)
+    if client_sub := request.query_params.get("client_sub"):
+        if vcs.is_staff:
+            qs = qs.filter(client__sub=client_sub)
+    if vc_code := request.query_params.get("value_chain_code"):
+        qs = qs.filter(value_chain__code=vc_code)
+
+    if request.method == "POST":
+        return _create_application(request)
+
+    apps = qs.order_by("-created_at")[:100]
+    return Response([vcs.serialize_for_role(a) for a in apps])
+
+
+def _create_application(request: Request) -> Response:
+    """
+    POST /api/credits/applications/
+    Crée un dossier de crédit en DRAFT.
+
+    Corps JSON :
+      client_sub          (str, optionnel — sinon = requester_sub)
+      value_chain_code    (str, optionnel)
+      area_ha             (float, optionnel)
+      currency            (str, défaut USD)
+      amount_requested    (float, requis)
+      needs_sheet_id      (int, optionnel)
+      guarantee_type      (str, optionnel: epargne|morale)
+    """
+    from credits.models import CreditApplication, NeedsSheet
+    from accounts.models import FintechUser
+    from reference_data.models import ValueChain
+
+    data = request.data
+    requester_sub: str = getattr(request.user, "sub", "") or ""
+    client_sub: str = data.get("client_sub") or requester_sub
+
+    if not client_sub:
+        return Response({"detail": "client_sub est requis."}, status=400)
+
+    # Seul un agent peut créer pour un tiers
+    if client_sub != requester_sub and not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission 'agent' requise."}, status=403)
+
+    try:
+        client = FintechUser.objects.get(sub=client_sub)
+    except FintechUser.DoesNotExist:
+        return Response({"detail": "Client introuvable.", "code": "client_not_found"}, status=404)
+
+    try:
+        amount_requested = float(data.get("amount_requested", 0) or 0)
+    except (ValueError, TypeError):
+        return Response({"detail": "amount_requested invalide."}, status=400)
+
+    if amount_requested <= 0:
+        return Response({"detail": "Le montant demandé doit être positif."}, status=400)
+
+    # Filière
+    vc = None
+    if vc_code := data.get("value_chain_code"):
+        try:
+            vc = ValueChain.objects.get(code=vc_code, active=True)
+        except ValueChain.DoesNotExist:
+            return Response({"detail": f"Filière '{vc_code}' introuvable."}, status=404)
+
+    # Feuille de besoins
+    ns = None
+    if ns_id := data.get("needs_sheet_id"):
+        try:
+            ns = NeedsSheet.objects.get(pk=int(ns_id))
+        except (NeedsSheet.DoesNotExist, ValueError):
+            return Response({"detail": "Feuille de besoins introuvable."}, status=404)
+
+    area_ha = None
+    if raw_area := data.get("area_ha"):
+        try:
+            area_ha = float(raw_area)
+        except (ValueError, TypeError):
+            pass
+
+    guarantee_type = data.get("guarantee_type") or ""
+
+    # Génération du code automatique
+    from datetime import date
+    import random, string
+    today = date.today()
+    suffix = ''.join(random.choices(string.digits, k=4))
+    code = f"CRED-{today.strftime('%Y%m%d')}-{suffix}"
+    while CreditApplication.objects.filter(code=code).exists():
+        suffix = ''.join(random.choices(string.digits, k=4))
+        code = f"CRED-{today.strftime('%Y%m%d')}-{suffix}"
+
+    app = CreditApplication.objects.create(
+        code=code,
+        client=client,
+        initiated_by_sub=requester_sub,
+        value_chain=vc,
+        area_ha=area_ha,
+        currency=(data.get("currency") or "USD").upper(),
+        amount_requested=amount_requested,
+        needs_sheet=ns,
+        guarantee_type=guarantee_type if guarantee_type in ("epargne", "morale") else "",
+        status=CreditApplication.Status.DRAFT,
+        prefill_snapshot=data.get("prefill_snapshot") or {},
+    )
+
+    from credits.workflow import serialize_application
+    vcs = _vcs(request)
+    return Response(vcs.serialize_for_role(app), status=201)
+
+
+@api_view(["GET"])
+def application_detail(request: Request, code: str) -> Response:
+    """GET /api/credits/applications/<code>/"""
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    from credits.models import CreditApplication
+    from credits.workflow import serialize_application
+
+    try:
+        app = CreditApplication.objects.select_related(
+            "client__kyc_profile", "value_chain", "needs_sheet"
+        ).prefetch_related("guarantees").get(code=code)
+    except CreditApplication.DoesNotExist:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    vcs = _vcs(request)
+    if not vcs.can_read_app(app):
+        return Response({"detail": "Accès interdit."}, status=403)
+
+    return Response(vcs.serialize_for_role(app))
+
+
+# ── Workflow ──────────────────────────────────────────────────────────────────
+
+def _load_app(code: str, select_related: list[str] | None = None):
+    from credits.models import CreditApplication
+    qs = CreditApplication.objects.select_related(
+        "client__kyc_profile", "value_chain", "needs_sheet",
+        *(select_related or [])
+    )
+    try:
+        return qs.get(code=code)
+    except CreditApplication.DoesNotExist:
+        return None
+
+
+@api_view(["POST"])
+def submit_application(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/submit/"""
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    sub = getattr(request.user, "sub", "") or ""
+    is_owner = str(app.client.sub) == sub
+    is_agent = in_group(request, CAN_INSTRUCT)
+
+    if not (is_owner or is_agent):
+        return Response({"detail": "Accès interdit."}, status=403)
+
+    from credits.workflow import submit, WorkflowError
+    try:
+        submit(app, submitter_sub=sub)
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
+@api_view(["POST"])
+def start_analysis(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/start-analysis/"""
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.workflow import start_analysis as _start, WorkflowError, ConsentError
+    try:
+        _start(app, analyst_sub=getattr(request.user, "sub", "") or "")
+    except ConsentError as exc:
+        return Response({"detail": str(exc), "code": "consent_required"}, status=409)
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
+@api_view(["POST"])
+def approve_application(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/approve/
+    Corps JSON : { amount_approved, comment? }
+    """
+    if not _require_group(request, CAN_DECIDE):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    data = request.data
+    if not data.get("amount_approved"):
+        return Response({"detail": "amount_approved requis."}, status=400)
+
+    import decimal
+    try:
+        amount = decimal.Decimal(str(data["amount_approved"]))
+    except Exception:
+        return Response({"detail": "amount_approved invalide."}, status=400)
+
+    roles = _roles(request)
+    from credits.workflow import approve, WorkflowError, MakerCheckerError, DelegationError
+    try:
+        approve(
+            app,
+            approver_sub=getattr(request.user, "sub", "") or "",
+            amount_approved=amount,
+            comment=data.get("comment", ""),
+            approver_roles=roles,
+        )
+    except MakerCheckerError as exc:
+        return Response({"detail": str(exc), "code": "maker_checker_violation"}, status=409)
+    except DelegationError as exc:
+        return Response({"detail": str(exc), "code": "delegation_exceeded"}, status=403)
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
+@api_view(["POST"])
+def reject_application(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/reject/
+    Corps JSON : { reason_code, comment? }
+    """
+    if not _require_group(request, CAN_DECIDE):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    data = request.data
+    if not data.get("reason_code"):
+        return Response({"detail": "reason_code requis."}, status=400)
+
+    from credits.workflow import reject, WorkflowError, MakerCheckerError
+    try:
+        result = reject(
+            app,
+            rejector_sub=getattr(request.user, "sub", "") or "",
+            reason_code=data["reason_code"],
+            comment=data.get("comment", ""),
+        )
+    except MakerCheckerError as exc:
+        return Response({"detail": str(exc), "code": "maker_checker_violation"}, status=409)
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    return Response(result)
+
+
+@api_view(["POST"])
+def adjourn_application(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/adjourn/
+    Corps JSON : { comment }
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    comment = request.data.get("comment", "")
+    from credits.workflow import adjourn, WorkflowError
+    try:
+        adjourn(app, approver_sub=getattr(request.user, "sub", "") or "", comment=comment)
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
+@api_view(["POST"])
+def reopen_analysis(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/reopen-analysis/"""
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.workflow import reopen_analysis as _reopen, WorkflowError
+    try:
+        _reopen(app, analyst_sub=getattr(request.user, "sub", "") or "")
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
+@api_view(["POST"])
+def client_consent(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/client-consent/
+    Corps JSON : { method? } — "app" | "sms" | "ussd"
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    sub = getattr(request.user, "sub", "") or ""
+    method = request.data.get("method", "app")
+
+    from credits.workflow import record_client_consent, WorkflowError, ConsentError
+    try:
+        record_client_consent(app, client_sub=sub, method=method)
+    except ConsentError as exc:
+        return Response({"detail": str(exc), "code": "consent_expired"}, status=410)
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
+# ── Garanties ─────────────────────────────────────────────────────────────────
+
+def _get_application(code: str):
+    from credits.models import CreditApplication
+    try:
+        return CreditApplication.objects.select_related("client__kyc_profile").get(code=code)
+    except CreditApplication.DoesNotExist:
+        return None
+
+
+@api_view(["GET"])
+def list_guarantees(request: Request, code: str) -> Response:
+    """GET /api/credits/applications/<code>/guarantees/"""
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+    from credits.guarantees import get_guarantee_summary
+    return Response(get_guarantee_summary(app))
+
+
+@api_view(["POST"])
+def place_savings_guarantee(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/guarantees/savings/
+
+    Corps JSON : { savings_plan_id, amount, notes? }
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    data = request.data
+    savings_plan_id = data.get("savings_plan_id")
+    amount_raw = data.get("amount")
+    if not savings_plan_id or not amount_raw:
+        return Response({"detail": "savings_plan_id et amount sont requis."}, status=400)
+
+    import decimal
+    try:
+        amount = decimal.Decimal(str(amount_raw))
+        if amount <= 0:
+            raise ValueError
+    except Exception:
+        return Response({"detail": "amount invalide (doit être > 0)."}, status=400)
+
+    from credits.guarantees import (
+        place_savings_hold, InsufficientSavingsError, GuaranteeError
+    )
+    try:
+        place_savings_hold(
+            application=app,
+            savings_plan_id=int(savings_plan_id),
+            amount=amount,
+            registered_by_sub=getattr(request.user, "sub", "") or "",
+            notes=data.get("notes", ""),
+        )
+    except InsufficientSavingsError as exc:
+        return Response({"detail": str(exc), "code": "insufficient_balance"}, status=422)
+    except GuaranteeError as exc:
+        return Response({"detail": str(exc), "code": "guarantee_error"}, status=400)
+
+    from credits.guarantees import get_guarantee_summary
+    return Response(get_guarantee_summary(app), status=201)
+
+
+@api_view(["POST"])
+def register_moral_guarantee(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/guarantees/moral/
+
+    Corps JSON :
+      guarantor_name, guarantor_phone, guarantor_id_number
+      guarantor_sub? (sub OIDC si le garant a un compte)
+      notes?
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    data = request.data
+    required = ["guarantor_name", "guarantor_phone", "guarantor_id_number"]
+    missing = [f for f in required if not data.get(f, "").strip()]
+    if missing:
+        return Response({"detail": f"Champs requis : {', '.join(missing)}."}, status=400)
+
+    from credits.guarantees import register_moral_guarantee as _register, GuaranteeError
+    try:
+        _register(
+            application=app,
+            guarantor_name=data["guarantor_name"],
+            guarantor_phone=data["guarantor_phone"],
+            guarantor_id_number=data["guarantor_id_number"],
+            registered_by_sub=getattr(request.user, "sub", "") or "",
+            guarantor_sub=data.get("guarantor_sub", ""),
+            notes=data.get("notes", ""),
+        )
+    except GuaranteeError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.guarantees import get_guarantee_summary
+    return Response(get_guarantee_summary(app), status=201)
+
+
+@api_view(["POST"])
+def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Response:
+    """
+    POST /api/credits/applications/<code>/guarantees/<id>/confirm/
+
+    Confirmation par le garant (ou un agent avec preuve physique).
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.models import CreditGuarantee
+    try:
+        guarantee = CreditGuarantee.objects.get(pk=guarantee_id, application=app)
+    except CreditGuarantee.DoesNotExist:
+        return Response({"detail": "Garantie introuvable."}, status=404)
+
+    from credits.guarantees import (
+        GuaranteeError, confirm_asset_guarantee, confirm_moral_guarantee,
+    )
+    confirmer = getattr(request.user, "sub", "") or ""
+    try:
+        if guarantee.guarantee_type in CreditGuarantee.ASSET_BACKED_TYPES:
+            # Le gage effectif de l'actif est posé ici, sous verrou atomique —
+            # réservé au staff : un client ne nantit pas son propre actif.
+            if not _require_group(request, CAN_INSTRUCT):
+                return Response(
+                    {"detail": "La confirmation d'un gage est réservée aux agents."},
+                    status=403,
+                )
+            confirm_asset_guarantee(guarantee, confirmer_sub=confirmer)
+        else:
+            confirm_moral_guarantee(guarantee, confirmer_sub=confirmer)
+    except GuaranteeError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.guarantees import get_guarantee_summary
+    return Response(get_guarantee_summary(app))
+
+
+@api_view(["POST"])
+def place_asset_guarantee_view(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/guarantees/asset/
+    Corps JSON : { asset_id }
+
+    Propose un actif vérifié du client en garantie. L'actif n'est effectivement
+    nanti qu'à la confirmation par un agent.
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    # Le propriétaire du dossier ou un agent qui l'instruit
+    sub = getattr(request.user, "sub", "") or ""
+    if str(app.client.sub) != sub and not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    asset_id = (request.data or {}).get("asset_id")
+    if not asset_id:
+        return Response({"detail": "asset_id requis."}, status=400)
+
+    from credits.guarantees import (
+        GuaranteeError, GuaranteeTypeNotEligible, place_asset_guarantee,
+    )
+    try:
+        place_asset_guarantee(app, asset_id=int(asset_id), registered_by_sub=sub)
+    except GuaranteeTypeNotEligible as exc:
+        return Response(
+            {"detail": str(exc), "code": "GUARANTEE_TYPE_NOT_ELIGIBLE"}, status=422,
+        )
+    except GuaranteeError as exc:
+        return Response({"detail": str(exc), "code": "ASSET_GUARANTEE_REFUSED"}, status=422)
+    except (TypeError, ValueError):
+        return Response({"detail": "asset_id invalide."}, status=400)
+
+    from credits.guarantees import get_guarantee_summary
+    return Response(get_guarantee_summary(app), status=201)
+
+
+@api_view(["POST"])
+def release_guarantee(request: Request, code: str, guarantee_id: int) -> Response:
+    """
+    POST /api/credits/applications/<code>/guarantees/<id>/release/
+
+    Libère une garantie épargne (rejet ou annulation du dossier).
+    Réservé aux agents.
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Permission refusée."}, status=403)
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.models import CreditGuarantee
+    try:
+        guarantee = CreditGuarantee.objects.get(pk=guarantee_id, application=app)
+    except CreditGuarantee.DoesNotExist:
+        return Response({"detail": "Garantie introuvable."}, status=404)
+
+    from credits.guarantees import _do_release, release_savings_hold, GuaranteeError
+    if guarantee.guarantee_type == CreditGuarantee.GuaranteeType.EPARGNE:
+        try:
+            release_savings_hold(guarantee)
+        except GuaranteeError as exc:
+            return Response({"detail": str(exc)}, status=400)
+    else:
+        # Passe par `_do_release` : une écriture directe de `status` laissait
+        # l'actif sous-jacent nanti indéfiniment, donc ingageable ailleurs.
+        _do_release(guarantee)
+
+    from credits.guarantees import get_guarantee_summary
+    return Response(get_guarantee_summary(app))
+
+
+# ── Décaissement (Étape 6) ────────────────────────────────────────────────────
+
+@api_view(["GET"])
+def disbursement_detail(request: Request, code: str) -> Response:
+    """GET /api/credits/applications/<code>/disbursement/"""
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+    from credits.disbursement import serialize_disbursement
+    data = serialize_disbursement(app)
+    if data is None:
+        return Response({"detail": "Aucune demande de décaissement pour ce dossier."}, status=404)
+    return Response(data)
+
+
+@api_view(["POST"])
+def request_disbursement_view(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/disbursement/request/
+    Transition : APPROVED → PENDING_DISBURSEMENT (maker)
+    """
+    if not _require_group(request, CAN_REQUEST_DISBURSEMENT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.disbursement import request_disbursement as _request, DisbursementError
+    from credits.workflow import WorkflowError
+    try:
+        _request(
+            app,
+            requester_sub=getattr(request.user, "sub", "") or "",
+            notes=request.data.get("notes", ""),
+        )
+    except (DisbursementError, WorkflowError) as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app), status=201)
+
+
+@api_view(["POST"])
+def confirm_disbursement_view(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/disbursement/confirm/
+    Transition : PENDING_DISBURSEMENT → ACTIVE (checker, maker≠checker)
+    """
+    if not _require_group(request, CAN_CONFIRM_DISBURSEMENT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.disbursement import confirm_disbursement as _confirm, DisbursementError
+    from credits.workflow import WorkflowError
+    try:
+        result = _confirm(app, confirmer_sub=getattr(request.user, "sub", "") or "")
+    except DisbursementError as exc:
+        is_mkck = "maker" in str(exc).lower()
+        return Response(
+            {"detail": str(exc), "code": "maker_checker_violation" if is_mkck else "disbursement_error"},
+            status=409 if is_mkck else 400,
+        )
+    except WorkflowError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    return Response(result)
+
+
+@api_view(["POST"])
+def cancel_disbursement_view(request: Request, code: str) -> Response:
+    """
+    POST /api/credits/applications/<code>/disbursement/cancel/
+    Annule la demande PENDING (retour à APPROVED).
+    """
+    if not _require_group(request, CAN_REQUEST_DISBURSEMENT):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.disbursement import cancel_disbursement_request, DisbursementError
+    from credits.workflow import WorkflowError
+    try:
+        cancel_disbursement_request(app, cancelled_by_sub=getattr(request.user, "sub", "") or "")
+    except (DisbursementError, WorkflowError) as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
+# ── Tableau de bord — Étape 7 ─────────────────────────────────────────────────
+
+@api_view(["GET"])
+def credits_dashboard(request: Request) -> Response:
+    """
+    GET /api/credits/dashboard/
+
+    Retourne des KPIs adaptés au rôle du demandeur.
+    Chaque rôle reçoit une vue agrégée différente.
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    from credits.dashboard import get_dashboard
+
+    sub: str = getattr(request.user, "sub", "") or ""
+    roles: set[str] = set(_roles(request))
+    view: str = request.query_params.get("view", "")
+
+    try:
+        return Response(get_dashboard(sub=sub, roles=roles, view=view))
+    except PermissionError as exc:
+        return Response({"detail": str(exc)}, status=403)
+
+
+# ── Partie H : Rapport d'analyse documentaire ────────────────────────────────
+
+@api_view(["GET", "POST"])
+def analysis_report(request: Request, code: str) -> Response:
+    """
+    GET  /api/credits/applications/<code>/analysis-report/
+         → Rapport d'analyse complet (findings, module summaries, chaîne de preuve).
+
+    POST /api/credits/applications/<code>/analysis-report/
+         → Décision analyste sur un finding : {finding_id, status, comment}
+           status : justifie | corrige | confirme_anomalie
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    try:
+        from credits.models import CreditApplication
+        app = CreditApplication.objects.get(code=code)
+    except CreditApplication.DoesNotExist:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    # Étanchéité : un client ne voit que son propre dossier
+    sub = getattr(request.user, "sub", "") or ""
+    if not in_group(request, STAFF_ROLES) and app.client.sub != sub:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    ns = app.needs_sheet
+    if ns is None:
+        return Response({"detail": "Aucune feuille de besoins attachée à ce dossier."}, status=404)
+
+    if request.method == "GET":
+        from credits.analysis import serialize_analysis_report
+        return Response(serialize_analysis_report(ns))
+
+    # POST : décision analyste sur un finding
+    # Ancienne garde : role in ("analyste", "admin", "superviseur") — trois libellés
+    # français qui n'existaient dans aucun registre, donc seul "admin" passait.
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response({"detail": "Seul un analyste peut mettre à jour un finding."}, status=403)
+
+    data = request.data
+    finding_id = data.get("finding_id")
+    new_status = data.get("status", "").strip()
+    comment = data.get("comment", "").strip()
+
+    VALID_STATUSES = {"justifie", "corrige", "confirme_anomalie"}
+    if new_status not in VALID_STATUSES:
+        return Response(
+            {"detail": f"status invalide. Valeurs acceptées : {', '.join(sorted(VALID_STATUSES))}."},
+            status=400,
+        )
+    if new_status == "justifie" and len(comment) < 10:
+        return Response(
+            {"detail": "Un commentaire d'au moins 10 caractères est requis pour justifier un finding."},
+            status=400,
+        )
+
+    try:
+        import datetime
+        from credits.models import LineFinding
+        finding = LineFinding.objects.get(pk=finding_id, needs_sheet=ns)
+        finding.analyst_status = new_status
+        finding.analyst_comment = comment
+        finding.analyst_updated_at = datetime.datetime.now(datetime.timezone.utc)
+        finding.save(update_fields=["analyst_status", "analyst_comment", "analyst_updated_at"])
+    except LineFinding.DoesNotExist:
+        return Response({"detail": "Finding introuvable."}, status=404)
+
+    # Recompute document_confidence after analyst override (justifié retire la pénalité)
+    _recompute_confidence_after_override(ns)
+
+    from credits.analysis import serialize_analysis_report
+    return Response(serialize_analysis_report(ns))
+
+
+def _recompute_confidence_after_override(ns) -> None:
+    """Recalcule document_confidence en excluant les findings justifiés/corrigés."""
+    from credits.models import LineFinding
+    _SEV_WEIGHT = {"bloquant": 20, "anomalie": 8, "a_justifier": 3, "info": 0, "point_fort": 0}
+    active_findings = LineFinding.objects.filter(
+        needs_sheet=ns,
+    ).exclude(analyst_status__in=("justifie", "corrige"))
+    penalty = sum(_SEV_WEIGHT.get(f.severity, 0) for f in active_findings)
+    ns.document_confidence = max(0.0, min(100.0, 100.0 - penalty))
+    ns.save(update_fields=["document_confidence"])

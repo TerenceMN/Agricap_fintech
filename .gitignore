@@ -1,0 +1,30 @@
+# Environnements et dépendances réinstallables
+.venv/
+venv/
+node_modules/
+
+# Builds régénérables
+dist/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Base de données locale de développement
+backend/db.sqlite3
+backend/db.sqlite3-journal
+backend/db.sqlite3-wal
+backend/db.sqlite3-shm
+
+# Fichiers uploadés en développement (actifs, référentiels, feuilles de besoins)
+backend/media/
+
+# Secrets — ne doivent jamais être versionnés
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log

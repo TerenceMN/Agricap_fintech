@@ -1,0 +1,287 @@
+import React, { useState, useEffect } from 'react';
+import { motion } from 'framer-motion';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Progress } from '@/components/ui/progress';
+import { useToast } from '@/components/ui/use-toast';
+import {
+  Search, Filter, MapPin, TrendingUp, Shield, Eye, Leaf
+} from 'lucide-react';
+import { api } from '@/services/api';
+import { formatCurrency, getRiskLabel } from '@/lib/investorSpaceUtils';
+import ProjectDetailsModal from './ProjectDetailsModal';
+
+const AvailableProjects = ({ onInvest }) => {
+  const { toast } = useToast();
+  const [projects, setProjects] = useState([]);
+  const [filteredProjects, setFilteredProjects] = useState([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [sectorFilter, setSectorFilter] = useState('all');
+  const [locationFilter, setLocationFilter] = useState('all');
+  const [riskFilter, setRiskFilter] = useState('all');
+  const [selectedProject, setSelectedProject] = useState(null);
+  const [showDetailsModal, setShowDetailsModal] = useState(false);
+
+  useEffect(() => {
+    loadProjects();
+  }, []);
+
+  useEffect(() => {
+    applyFilters();
+  }, [projects, searchQuery, sectorFilter, locationFilter, riskFilter]);
+
+  const loadProjects = async () => {
+    try {
+      const [openOffers, allProjects] = await Promise.all([
+        api.investments.offers.open(),
+        api.investments.projects.list(),
+      ]);
+      const merged = openOffers.map((offer) => {
+        const project = allProjects.find((p) => p.id === offer.projectId);
+        if (!project) return null;
+        return {
+          id: project.id, code: project.code, name: project.title,
+          sector: project.sector, location: project.location, status: project.status,
+          riskScore: project.riskScore,
+          offerId: offer.id, offerCode: offer.code,
+          raisedAmount: offer.fundedAmount, targetAmount: offer.fundingGoal,
+          minimumTicket: offer.minTicket, expectedReturn: offer.couponRate,
+          minBonds: offer.minBonds, maxBonds: offer.maxBonds,
+          availableBonds: offer.availableBonds, bondUnitValue: offer.bondUnitValue,
+        };
+      }).filter(Boolean);
+      setProjects(merged);
+    } catch (err) {
+      toast({ title: 'Erreur', description: err.message || 'Chargement impossible.', variant: 'destructive' });
+    }
+  };
+
+  const applyFilters = () => {
+    let filtered = [...projects];
+
+    if (searchQuery) {
+      filtered = filtered.filter(p =>
+        p.name.toLowerCase().includes(searchQuery.toLowerCase())
+      );
+    }
+
+    if (sectorFilter !== 'all') {
+      filtered = filtered.filter(p => p.sector === sectorFilter);
+    }
+
+    if (locationFilter !== 'all') {
+      filtered = filtered.filter(p => p.location === locationFilter);
+    }
+
+    if (riskFilter !== 'all') {
+      const riskRange = {
+        'low': [0, 3],
+        'medium': [4, 5],
+        'high': [6, 10],
+      };
+      const [min, max] = riskRange[riskFilter];
+      filtered = filtered.filter(p => p.riskScore >= min && p.riskScore <= max);
+    }
+
+    setFilteredProjects(filtered);
+  };
+
+  const handleViewDetails = (project) => {
+    setSelectedProject(project);
+    setShowDetailsModal(true);
+  };
+
+  const uniqueSectors = [...new Set(projects.map(p => p.sector).filter(Boolean))];
+  const uniqueLocations = [...new Set(projects.map(p => p.location).filter(Boolean))];
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-4">
+        <div>
+          <h2 className="text-2xl font-bold text-white">Projets Disponibles</h2>
+          <p className="text-slate-400">Découvrez des opportunités d'investissement à impact</p>
+        </div>
+
+        {/* Filters */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="relative lg:col-span-2">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+            <Input
+              placeholder="Rechercher un projet..."
+              className="pl-10 bg-slate-800 border-slate-700"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+          </div>
+          <Select value={sectorFilter} onValueChange={setSectorFilter}>
+            <SelectTrigger className="bg-slate-800 border-slate-700">
+              <SelectValue placeholder="Secteur" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Tous secteurs</SelectItem>
+              {uniqueSectors.map(sector => (
+                <SelectItem key={sector} value={sector}>{sector}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={locationFilter} onValueChange={setLocationFilter}>
+            <SelectTrigger className="bg-slate-800 border-slate-700">
+              <SelectValue placeholder="Province" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Toutes provinces</SelectItem>
+              {uniqueLocations.map(loc => (
+                <SelectItem key={loc} value={loc}>{loc}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={riskFilter} onValueChange={setRiskFilter}>
+            <SelectTrigger className="bg-slate-800 border-slate-700">
+              <SelectValue placeholder="Risque" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Tous niveaux</SelectItem>
+              <SelectItem value="low">Faible (1-3)</SelectItem>
+              <SelectItem value="medium">Modéré (4-5)</SelectItem>
+              <SelectItem value="high">Élevé (6-10)</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </motion.div>
+
+      {/* Results Count */}
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.1 }}>
+        <p className="text-sm text-slate-400">
+          {filteredProjects.length} projet{filteredProjects.length !== 1 ? 's' : ''} trouvé{filteredProjects.length !== 1 ? 's' : ''}
+        </p>
+      </motion.div>
+
+      {/* Projects Grid */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.2 }}
+        className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+      >
+        {filteredProjects.length === 0 ? (
+          <div className="col-span-full text-center py-16">
+            <div className="text-slate-500 mb-4">
+              <Filter className="w-16 h-16 mx-auto mb-4 opacity-50" />
+              <p className="text-lg">Aucun projet ne correspond à vos critères</p>
+              <p className="text-sm mt-2">Essayez de modifier vos filtres</p>
+            </div>
+          </div>
+        ) : (
+          filteredProjects.map((project, index) => {
+            const fundingProgress = project.targetAmount > 0 ? (project.raisedAmount / project.targetAmount) * 100 : 0;
+            const riskInfo = getRiskLabel(project.riskScore);
+
+            return (
+              <motion.div
+                key={project.id}
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.1 * (index % 6) }}
+              >
+                <Card className="bg-slate-900 border-slate-800 hover:border-slate-600 transition-all hover:-translate-y-1 group h-full flex flex-col">
+                  <div className="relative h-32 overflow-hidden rounded-t-lg bg-gradient-to-br from-emerald-900/60 to-slate-900 flex items-center justify-center">
+                    <Leaf className="w-12 h-12 text-emerald-500/30" />
+                    <div className="absolute top-3 left-3 flex gap-2">
+                      <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30">
+                        Disponible
+                      </Badge>
+                    </div>
+                    <div className="absolute top-3 right-3">
+                      <div className={`px-2 py-1 rounded ${riskInfo.bg} backdrop-blur-sm`}>
+                        <div className="flex items-center gap-1">
+                          <Shield className={`w-3 h-3 ${riskInfo.color}`} />
+                          <span className={`text-xs font-bold ${riskInfo.color}`}>
+                            Risque {riskInfo.label}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <CardHeader className="pb-3">
+                    <CardTitle className="text-white text-lg line-clamp-1">{project.name}</CardTitle>
+                    <CardDescription className="flex items-center gap-4 text-xs">
+                      <span className="flex items-center gap-1">
+                        <Leaf className="w-3 h-3" />
+                        {project.sector || '-'}
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <MapPin className="w-3 h-3" />
+                        {project.location || '-'}
+                      </span>
+                    </CardDescription>
+                  </CardHeader>
+
+                  <CardContent className="space-y-4 flex-1">
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-xs text-slate-400">
+                        <span>Financement</span>
+                        <span className="font-bold text-white">{fundingProgress.toFixed(0)}%</span>
+                      </div>
+                      <Progress value={fundingProgress} className="h-2" />
+                      <div className="flex justify-between text-xs">
+                        <span className="text-emerald-400">{formatCurrency(project.raisedAmount)}</span>
+                        <span className="text-slate-500">/ {formatCurrency(project.targetAmount)}</span>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 pt-2">
+                      <div className="p-3 bg-slate-800/50 rounded border border-slate-700">
+                        <p className="text-xs text-slate-400 mb-1">Ticket Min.</p>
+                        <p className="font-bold text-white text-sm">{formatCurrency(project.minimumTicket)}</p>
+                      </div>
+                      <div className="p-3 bg-slate-800/50 rounded border border-slate-700">
+                        <p className="text-xs text-slate-400 mb-1">Rendement</p>
+                        <p className="font-bold text-emerald-400 text-sm flex items-center gap-1">
+                          <TrendingUp className="w-3 h-3" />
+                          {project.expectedReturn}%
+                        </p>
+                      </div>
+                    </div>
+                  </CardContent>
+
+                  <CardFooter className="pt-4 border-t border-slate-800">
+                    <Button
+                      className="w-full bg-gradient-to-r from-emerald-600 to-blue-600 hover:from-emerald-700 hover:to-blue-700"
+                      onClick={() => handleViewDetails(project)}
+                    >
+                      <Eye className="w-4 h-4 mr-2" />
+                      Voir Détails
+                    </Button>
+                  </CardFooter>
+                </Card>
+              </motion.div>
+            );
+          })
+        )}
+      </motion.div>
+
+      {/* Project Details Modal */}
+      {selectedProject && (
+        <ProjectDetailsModal
+          project={selectedProject}
+          isOpen={showDetailsModal}
+          onClose={() => {
+            setShowDetailsModal(false);
+            setSelectedProject(null);
+          }}
+          onInvest={() => {
+            setShowDetailsModal(false);
+            if (onInvest) onInvest();
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+export default AvailableProjects;

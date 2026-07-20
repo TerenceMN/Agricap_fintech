@@ -1,0 +1,161 @@
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { Helmet } from 'react-helmet';
+import { Toaster } from '@/components/ui/toaster';
+import AuthProvider, { useAuth } from '@/contexts/AuthContext.jsx';
+import Layout, { menuKeyFor } from '@/components/Layout';
+
+// Core Pages
+import Dashboard from '@/pages/Dashboard';
+import Login from '@/pages/Login';
+import AuthCallback from '@/pages/AuthCallback';
+import Settings from '@/pages/Settings';
+
+// Système réel — moteur d'analyse crédit (backend Django)
+import CreditAnalysis from '@/pages/credit/CreditAnalysis';
+import Applications from '@/pages/credit/Applications';
+import ApplicationDetail from '@/pages/credit/ApplicationDetail';
+import DataAdmin from '@/pages/admin/DataAdmin';
+
+// Client Specific Pages
+import ClientWallet from '@/pages/ClientWallet';
+import ClientDocuments from '@/pages/ClientDocuments';
+import ClientNotifications from '@/pages/ClientNotifications';
+import Credits from '@/pages/Credits';
+import Savings from '@/pages/Savings';
+import Transactions from '@/pages/Transactions';
+import Contracts from '@/pages/Contracts';
+import Support from '@/pages/Support';
+import AssetsInventory from '@/pages/AssetsInventory';
+
+// Investor Specific Pages
+import Portfolios from '@/pages/Portfolios';
+import Holdings from '@/pages/Holdings';
+import Opportunities from '@/pages/Opportunities';
+import Conversions from '@/pages/Conversions';
+import FinancialFlows from '@/pages/FinancialFlows';
+import InvestorDocuments from '@/pages/InvestorDocuments';
+import InvestorNotifications from '@/pages/InvestorNotifications';
+import Obligations from '@/pages/Obligations';
+import InvestorSpace from '@/pages/InvestorSpace';
+
+// Admin Pages
+import Users from '@/pages/Users';
+import Wallets from '@/pages/Wallets';
+import Suppliers from '@/pages/Suppliers';
+import Analytics from '@/pages/Analytics';
+import ValidationJournal from '@/pages/ValidationJournal';
+import SpecialCases from '@/pages/SpecialCases';
+import Treasury from '@/pages/Treasury';
+import Accounting from '@/pages/Accounting';
+import Roles from '@/pages/Roles';
+import Compliance from '@/pages/Compliance';
+import AuditLog from '@/pages/AuditLog';
+import ApiPartners from '@/pages/ApiPartners';
+import ApiDocs from '@/pages/ApiDocs';
+import Supervision from '@/pages/Supervision';
+import Investments from '@/pages/Investments';
+import Agencies from '@/pages/Agencies';
+import AdminInvestments from '@/pages/AdminInvestments';
+import AdminConsole from '@/pages/AdminConsole';
+import ApproversConfig from '@/pages/ApproversConfig';
+import SmsTest from '@/pages/SmsTest';
+import CaisseApprobations from '@/pages/CaisseApprobations';
+
+const PrivateRoute = ({ children, roles }) => {
+  const { isAuthenticated, loading, user } = useAuth();
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center text-slate-300 bg-background">Chargement…</div>;
+  }
+  if (!isAuthenticated) {
+    return <Navigate to="/login" />;
+  }
+  if (roles && user && !roles.includes(menuKeyFor(user))) {
+    return <Navigate to="/" />;
+  }
+  return children;
+};
+
+const AppRoutes = () => {
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route path="/auth/callback" element={<AuthCallback />} />
+      <Route path="/" element={<PrivateRoute><Dashboard /></PrivateRoute>} />
+
+      {/* Système réel — moteur d'analyse crédit (backend Django), enveloppé dans le Layout du design */}
+      <Route path="/credit" element={<PrivateRoute><Layout><CreditAnalysis /></Layout></PrivateRoute>} />
+      <Route path="/credit/dossiers" element={<PrivateRoute><Layout><Applications /></Layout></PrivateRoute>} />
+      <Route path="/credit/dossiers/:code" element={<PrivateRoute><Layout><ApplicationDetail /></Layout></PrivateRoute>} />
+      <Route path="/admin/data" element={<PrivateRoute roles={['admin']}><Layout><DataAdmin /></Layout></PrivateRoute>} />
+      
+      {/* Client Routes */}
+      <Route path="/wallet" element={<PrivateRoute roles={['client']}><ClientWallet /></PrivateRoute>} />
+      <Route path="/documents" element={<PrivateRoute roles={['client']}><ClientDocuments /></PrivateRoute>} />
+      <Route path="/notifications" element={<PrivateRoute roles={['client', 'admin']}><ClientNotifications /></PrivateRoute>} />
+      <Route path="/assets" element={<PrivateRoute roles={['client']}><AssetsInventory /></PrivateRoute>} />
+      
+      {/* Investor Routes */}
+      <Route path="/portfolios" element={<PrivateRoute roles={['investor', 'admin']}><Portfolios /></PrivateRoute>} />
+      <Route path="/holdings" element={<PrivateRoute roles={['investor', 'admin']}><Holdings /></PrivateRoute>} />
+      <Route path="/opportunities" element={<PrivateRoute roles={['investor', 'admin']}><Opportunities /></PrivateRoute>} />
+      <Route path="/conversions" element={<PrivateRoute roles={['investor', 'admin']}><Conversions /></PrivateRoute>} />
+      <Route path="/financial-flows" element={<PrivateRoute roles={['investor', 'admin']}><FinancialFlows /></PrivateRoute>} />
+      <Route path="/investor-documents" element={<PrivateRoute roles={['investor', 'admin']}><InvestorDocuments /></PrivateRoute>} />
+      <Route path="/investor-notifications" element={<PrivateRoute roles={['investor', 'admin']}><InvestorNotifications /></PrivateRoute>} />
+      <Route path="/obligations" element={<PrivateRoute roles={['investor', 'admin']}><Obligations /></PrivateRoute>} />
+      <Route path="/investor-space" element={<PrivateRoute roles={['investor', 'admin']}><InvestorSpace /></PrivateRoute>} />
+      
+      {/* Shared / User Routes */}
+      <Route path="/credits" element={<PrivateRoute roles={['admin', 'client']}><Credits /></PrivateRoute>} />
+      <Route path="/savings" element={<PrivateRoute roles={['admin', 'client']}><Savings /></PrivateRoute>} />
+      <Route path="/transactions" element={<PrivateRoute roles={['admin', 'client', 'caissier']}><Transactions /></PrivateRoute>} />
+      <Route path="/contracts" element={<PrivateRoute roles={['admin', 'client']}><Contracts /></PrivateRoute>} />
+      <Route path="/support" element={<PrivateRoute roles={['admin', 'client', 'investor']}><Support /></PrivateRoute>} />
+      <Route path="/settings" element={<PrivateRoute><Settings /></PrivateRoute>} />
+
+      {/* Admin Routes - Protected */}
+      <Route path="/agencies" element={<PrivateRoute roles={['admin', 'caissier', 'auditeur']}><Agencies /></PrivateRoute>} />
+      <Route path="/users" element={<PrivateRoute roles={['admin']}><Users /></PrivateRoute>} />
+      <Route path="/wallets" element={<PrivateRoute roles={['admin']}><Wallets /></PrivateRoute>} />
+      <Route path="/suppliers" element={<PrivateRoute roles={['admin']}><Suppliers /></PrivateRoute>} />
+      <Route path="/analytics" element={<PrivateRoute roles={['admin']}><Analytics /></PrivateRoute>} />
+      <Route path="/supervision" element={<PrivateRoute roles={['admin', 'caissier']}><Supervision /></PrivateRoute>} />
+      <Route path="/validation-journal" element={<PrivateRoute roles={['admin', 'comptable']}><ValidationJournal /></PrivateRoute>} />
+      <Route path="/special-cases" element={<PrivateRoute roles={['admin']}><SpecialCases /></PrivateRoute>} />
+      <Route path="/treasury" element={<PrivateRoute roles={['admin', 'caissier']}><Treasury /></PrivateRoute>} />
+      <Route path="/accounting" element={<PrivateRoute roles={['admin', 'comptable', 'auditeur']}><Accounting /></PrivateRoute>} />
+      <Route path="/roles" element={<PrivateRoute roles={['admin']}><Roles /></PrivateRoute>} />
+      <Route path="/compliance" element={<PrivateRoute roles={['admin', 'auditeur']}><Compliance /></PrivateRoute>} />
+      <Route path="/audit-log" element={<PrivateRoute roles={['admin', 'auditeur']}><AuditLog /></PrivateRoute>} />
+      <Route path="/api-partners" element={<PrivateRoute roles={['admin']}><ApiPartners /></PrivateRoute>} />
+      <Route path="/api-docs" element={<PrivateRoute roles={['admin']}><ApiDocs /></PrivateRoute>} />
+      <Route path="/investments" element={<PrivateRoute roles={['admin']}><Investments /></PrivateRoute>} />
+      <Route path="/admin/investments" element={<PrivateRoute roles={['admin']}><AdminInvestments /></PrivateRoute>} />
+      <Route path="/admin/console" element={<PrivateRoute roles={['admin']}><AdminConsole /></PrivateRoute>} />
+      <Route path="/admin/approvers" element={<PrivateRoute roles={['admin']}><Layout><ApproversConfig /></Layout></PrivateRoute>} />
+      <Route path="/admin/sms-test" element={<PrivateRoute roles={['admin']}><Layout><SmsTest /></Layout></PrivateRoute>} />
+      <Route path="/caisses/approbations" element={<PrivateRoute roles={['admin']}><Layout><CaisseApprobations /></Layout></PrivateRoute>} />
+      
+      <Route path="*" element={<Navigate to="/" />} />
+    </Routes>
+  );
+};
+
+function App() {
+  return (
+    <Router>
+      <Helmet>
+        <title>AGRICAP FINTECH</title>
+      </Helmet>
+      <AuthProvider>
+        <div className="min-h-screen text-slate-100 selection:bg-emerald-500/30">
+          <AppRoutes />
+          <Toaster />
+        </div>
+      </AuthProvider>
+    </Router>
+  );
+}
+
+export default App;

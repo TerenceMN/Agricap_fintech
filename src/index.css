@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root, .dark {
+    /* Deep Navy/Slate Dark Theme */
+    --background: 222 47% 11%;     /* #0f172a */
+    --foreground: 210 40% 98%;     /* #f1f5f9 */
+    
+    --card: 222 47% 17%;           /* #1e293b (slightly lighter dark surface) */
+    --card-foreground: 210 40% 98%;
+
+    --popover: 215 25% 27%;        /* #334155 */
+    --popover-foreground: 210 40% 98%;
+
+    /* Emerald/Teal Green Accent */
+    --primary: 160 84% 39%;        /* #10b981 */
+    --primary-foreground: 0 0% 100%;
+
+    /* Blue Secondary */
+    --secondary: 217 91% 60%;      /* #3b82f6 */
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 215 16% 47%;          /* #64748b */
+    --muted-foreground: 210 40% 98%;
+
+    --accent: 199 89% 48%;         /* #0ea5e9 (Complementary Cyan/Light Blue) */
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;      /* #ef4444 */
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 215 19% 35%;         /* #475569 */
+    --input: 231 38% 16%;          /* #1a1f3a */
+    --ring: 160 84% 39%;           /* #10b981 */
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased selection:bg-primary/30 selection:text-primary-foreground;
+  }
+  h1 { @apply text-4xl font-extrabold tracking-tight; }
+  h2 { @apply text-3xl font-semibold tracking-tight; }
+  h3 { @apply text-2xl font-semibold tracking-tight; }
+}
+
+.glass-effect {
+  @apply bg-card/80 backdrop-blur-md border border-white/10 shadow-xl;
+}
+
+.gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-primary to-secondary;
+}
+
+/* Base resets for light theme hardcodes to match dark system */
+.bg-white {
+  @apply bg-card;
+}
+
+.text-gray-900, .text-black, .text-slate-900 {
+  @apply text-foreground;
+}
+
+.bg-gray-50, .bg-slate-50, .bg-slate-100 {
+  @apply bg-background;
+}

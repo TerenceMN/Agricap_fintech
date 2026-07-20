@@ -1,0 +1,114 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { motion } from 'framer-motion';
+import CreditsTable from './CreditsTable';
+import CreditFormDialog from './CreditFormDialog';
+import { useToast } from '@/components/ui/use-toast';
+import { api } from '@/services/api';
+import { DollarSign, AlertTriangle, Calendar, CheckSquare, BarChart, Repeat, TrendingUp, TrendingDown, Loader2 } from 'lucide-react';
+
+// Icônes du résumé, résolues depuis le nom renvoyé par le backend.
+const ICONS = { DollarSign, AlertTriangle, Calendar, CheckSquare, BarChart, Repeat };
+
+const SummaryCard = ({ title, value, icon, trendValue, trendDirection }) => {
+  const Icon = ICONS[icon] || BarChart;
+  const isUp = trendDirection === 'up';
+  const TrendIcon = isUp ? TrendingUp : TrendingDown;
+  return (
+    <div className="bg-slate-800/50 p-4 rounded-lg flex flex-col justify-between h-full">
+      <div className="flex justify-between items-start">
+        <p className="font-semibold text-sm text-slate-300">{title}</p>
+        <Icon className="w-5 h-5 text-slate-500" />
+      </div>
+      <div>
+        <p className="font-bold text-2xl text-white mt-2">{value}</p>
+        {trendValue && (
+          <p className={`text-xs font-semibold flex items-center gap-1 ${isUp ? 'text-emerald-400' : 'text-red-400'}`}>
+            <TrendIcon className="w-3 h-3" />{trendValue}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const AdminCreditsDashboard = () => {
+  const { toast } = useToast();
+  const [credits, setCredits] = useState([]);
+  const [summaryData, setSummaryData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [rows, cards] = await Promise.all([api.portfolio.loans(), api.portfolio.summary()]);
+      setCredits(rows);
+      setSummaryData(cards);
+    } catch (e) {
+      toast({ variant: 'destructive', title: 'Chargement impossible', description: e.message });
+    } finally { setLoading(false); }
+  }, [toast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Actions nécessitant une saisie rapide (MVP : window.prompt).
+  const PROMPTS = {
+    reassign: () => ({ manager: window.prompt('Nouveau gestionnaire ?') }),
+    extend: () => ({ months: window.prompt('Prolonger de combien de mois ?', '3') }),
+    note: () => ({ text: window.prompt('Note à ajouter :') }),
+    disburse: () => ({ amount: window.prompt('Montant à décaisser ?') }),
+  };
+
+  const handleAction = async (action, credit) => {
+    // Actions globales (barre d'outils).
+    if (action === 'add_manual') { setCreateOpen(true); return; }
+    if (action === 'sync') { await load(); toast({ title: 'Synchronisé', description: 'Portefeuille rechargé.' }); return; }
+    if (action === 'alerts') {
+      try {
+        const a = await api.portfolio.alerts();
+        toast({ title: `Alertes (${a.length})`, description: a.length ? a.map((x) => `• ${x.reference} — ${x.message}`).join('\n') : 'Aucune alerte.' });
+      } catch (e) { toast({ variant: 'destructive', title: 'Erreur', description: e.message }); }
+      return;
+    }
+    if (action === 'calendar_view') { toast({ title: 'Vue Échéancier', description: 'Cliquez sur « Détails » d\'un dossier puis ouvrez l\'onglet « Échéancier ».' }); return; }
+    if (action === 'simulator') { toast({ title: 'Simulateur', description: 'Ouvrez « Config. Taux & Maturité » sur un dossier pour simuler.' }); return; }
+
+    // Actions par dossier → endpoint générique.
+    if (!credit?.id) return;
+    if (action === 'contract' || action === 'export') {
+      toast({ title: action === 'contract' ? 'Contrat' : 'Export', description: 'Génération du document — à brancher (gabarit).' });
+      return;
+    }
+    let params = {};
+    if (PROMPTS[action]) {
+      params = PROMPTS[action]();
+      const key = Object.keys(params)[0];
+      if (params[key] === null) return;               // annulé
+    }
+    try {
+      const res = await api.portfolio.action(credit.id, action, params);
+      toast({ title: 'Action effectuée', description: res.detail });
+      await load();
+    } catch (e) {
+      toast({ variant: 'destructive', title: 'Échec', description: e.message });
+    }
+  };
+
+  return (
+    <div className="space-y-8">
+      <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }}>
+        <h2 className="text-xl font-bold text-white mb-4">Tableau de Bord Résumé</h2>
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+          {summaryData.map((item) => <SummaryCard key={item.title} {...item} />)}
+          {loading && summaryData.length === 0 && (
+            <div className="col-span-full flex items-center gap-2 text-slate-400 text-sm"><Loader2 className="w-4 h-4 animate-spin" /> Chargement…</div>
+          )}
+        </div>
+      </motion.div>
+      <CreditsTable credits={credits} onAction={handleAction} />
+      <CreditFormDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={load} />
+    </div>
+  );
+};
+
+export default AdminCreditsDashboard;
