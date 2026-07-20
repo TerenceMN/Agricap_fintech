@@ -735,9 +735,14 @@ export interface CreditNeedsSheet {
   currency: string;
   parsedOk: boolean;
   warnings?: string[];
-  /** Signaux relevés par l'analyse documentaire — la première chose qu'un
-   *  analyste regarde sur une feuille de besoins. */
-  anomalies?: unknown[];
+  /** Signaux relevés au parsing — la première chose qu'un analyste regarde sur
+   *  une feuille de besoins.
+   *
+   *  Producteur unique : `credits.needs_parser` (`anomalies: list[str]`, que des
+   *  f-strings prêtes à l'affichage). Si un jour une anomalie devient structurée
+   *  (`{code, message}`), c'est ici qu'il faut le déclarer — sinon les écrans
+   *  rendront des « [object Object] » sans qu'aucun outil ne le signale. */
+  anomalies?: string[];
   totalByModule?: Record<string, number>;
   uploadedAt?: string;
 }

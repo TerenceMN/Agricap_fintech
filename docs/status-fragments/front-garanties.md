@@ -207,6 +207,31 @@ est relayé avant le repli) mais faux par construction. Il vient du même réfle
 que le `code: String(err.status)` que *front-backoffice* a corrigé de son côté :
 combler l'absence de contrat par une inférence plausible.
 
+### 3.2 bis ✅ Affichage **par cause** au refus de soumission
+
+Conséquence directe de la correction de `submit` par `backend-credit` :
+`APPLICATION_INCOMPLETE` agrège désormais une entrée par manque
+(`SUPERFICIE_MANQUANTE`, `MONTANT_MANQUANT`, `GUARANTEE_TYPE_NOT_ELIGIBLE`…)
+au lieu d'une phrase à rallonge séparée par des « | ».
+
+Mon front n'en montrait qu'une : le client aurait redécouvert les autres une par
+une, à chaque tentative. Ajouté `guaranteeErrorList()` + un encart sous la fiche
+de synthèse qui liste **toutes** les causes, avec compteur (« 3 points à
+corriger »). C'est le standard frontend « 422 structuré → affichage par erreur »,
+appliqué enfin.
+
+Choix notable : pour chaque cause, **le message serveur prime** sur ma
+traduction. `GUARANTEE_TYPE_NOT_ELIGIBLE` énumère les types admis pour la
+filière — information que le front ne peut pas reconstituer, et ne doit pas
+(principe 7 : `eligible_guarantees` ne descend pas au client). Ma table ne sert
+que de repli quand le serveur n'envoie pas de message.
+
+**Le front est désormais agnostique au statut HTTP** (`REFUSAL_STATUSES =
+[400, 409, 422]`). `submit` répond 400, le gage 422, un conflit d'état 409 ;
+faire passer `submit` en 422 — plus conforme au principe 5 — est donc un
+non-événement côté front. La question ne se décide plus à deux : elle se décide
+côté serveur.
+
 ### 3.3 ✅ Résolu — modifier un actif `libere` le renvoie en vérification
 
 C'était une faille exploitable, pas une nuance : `libere` est `is_pledgeable` et
