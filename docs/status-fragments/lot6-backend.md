@@ -307,8 +307,20 @@ Répartition des exigences, volontairement asymétrique :
 est écrit dans le corps du message, en texte. Ajouter un champ `url` migrerait
 une app partagée et changerait le payload que `ClientNotifications` consomme :
 c'est une décision de contrat entre apps, pas un effet de bord de ce lot. Je ne
-l'ai pas prise unilatéralement. Elle est à arbitrer si l'on veut un lien
-cliquable plutôt qu'un chemin lisible.
+l'ai pas prise unilatéralement, et l'agent front a refusé de l'arbitrer avec moi
+pour la même raison — `notifications/` n'est le périmètre d'aucun de nous deux,
+et un contrat entre apps décidé en fin de chantier entre deux agents est
+exactement le mécanisme qui a produit les quatre vocabulaires de rôles que le
+principe 6 demande de résorber. **À arbitrer par le fondateur** si l'on veut un
+lien cliquable plutôt qu'un chemin lisible ; se porte des deux côtés en une passe.
+
+**Cas du garant staff** (signalé par l'agent front) : l'entrée de menu vers
+l'écran garant n'existe que pour le bucket `client` de `Layout.jsx`. Un salarié
+qui cautionne un membre de son groupe — cas rare mais permis par les règles :
+seul un compte *suspendu* est écarté — n'atteint donc l'écran que par URL. La
+notification in-app portant le chemin est alors son **seul** accès. Vérifié par
+test (`test_un_garant_staff_est_notifie_comme_un_garant_client`) plutôt que
+supposé. Le menu lui-même est hors des périmètres backend et lot 6 front.
 
 **Journalisation** : `credits.guarantee.guarantor_designated`,
 `.consent_accepted`, `.consent_declined`, `.constituted` dans `audit.AuditEntry`,
@@ -339,11 +351,11 @@ test qui vérifie qu'aucune règle ne sort le code générique.
 
 ## 6. Tests
 
-`./.venv/Scripts/python.exe manage.py test` → **512 tests, 8 échecs**, tous dans
+`./.venv/Scripts/python.exe manage.py test` → **513 tests, 8 échecs**, tous dans
 `support/` (7 failures + 1 error) — les préexistants annoncés, non touchés.
-Baseline 427 + **85 nouveaux tests**, tous verts.
+Baseline 427 + **86 nouveaux tests**, tous verts.
 
-- `credits/tests_guarantor.py` (60) — les 7 règles **en refus ET en cas nominal**,
+- `credits/tests_guarantor.py` (61) — les 7 règles **en refus ET en cas nominal**,
   le consentement, l'expiration, la caution croisée, l'immuabilité, la décote,
   le contrat des codes d'erreur, la notification du garant.
 - `credits/tests_guarantee_requests_api.py` (25) — forme exacte des 2 endpoints,
