@@ -355,7 +355,10 @@ L'harmonisation du reste de la surface workflow reste ouverte (cf. §7quinquies)
 
 ---
 
-## 7quinquies. Dette que j'ai CRÉÉE : deux nomenclatures de codes d'erreur
+## 7quinquies. Dette que j'ai créée puis résorbée : deux nomenclatures de codes
+
+> **Statut : RÉSOLU.** Migration faite après vérification factuelle (voir fin de
+> section). Le récit est conservé — c'est un cas d'école du principe 6.
 
 À signaler franchement — c'est ma correction qui a introduit le problème, et
 c'est exactement le motif que le projet a déjà payé cher (principe 6 : le module
