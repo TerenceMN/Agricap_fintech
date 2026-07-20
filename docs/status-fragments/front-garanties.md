@@ -227,10 +227,41 @@ filière — information que le front ne peut pas reconstituer, et ne doit pas
 que de repli quand le serveur n'envoie pas de message.
 
 **Le front est désormais agnostique au statut HTTP** (`REFUSAL_STATUSES =
-[400, 409, 422]`). `submit` répond 400, le gage 422, un conflit d'état 409 ;
-faire passer `submit` en 422 — plus conforme au principe 5 — est donc un
-non-événement côté front. La question ne se décide plus à deux : elle se décide
-côté serveur.
+[400, 409, 422]`). `submit` répond 409 sur `INVALID_TRANSITION` et 422 sur le
+reste, le gage 422, un conflit d'état 409 : aucun écran n'en dépend. La question
+du statut ne se décide plus à deux, elle se décide côté serveur.
+
+**Contrepartie assumée** : en découplant du statut, j'ai supprimé un canal
+d'information réel — la distinction consentement *manquant* (409) / *expiré*
+(410) n'était portée que par lui. C'est ma dette, pas celle du backend :
+`backend-credit` ajoute `CLIENT_CONSENT_EXPIRED` pour la faire passer par le
+`code`. Règle générale qui en découle : **tout ce qui n'est porté que par le
+statut HTTP devient invisible** dès qu'un front se découple ; l'information doit
+migrer dans le `code` au même moment, pas après.
+
+### 3.2 ter ✅ Garde-fou sur les codes renommés
+
+`credits/` migre ses `code` vers une convention MAJUSCULE unique (le correctif
+précédent avait créé un cinquième vocabulaire, cf. leur §7quinquies). Vérifié
+par grep : **aucun code workflow n'est consommé dans mon périmètre** — ma table
+ne contient que les huit codes actifs/garanties, et les codes inconnus tombent
+dans le repli « message serveur relayé ». La migration est donc gratuite pour
+moi, et j'ai répondu « bascule d'un coup, sans `legacyCode` » : un alias de
+transition institutionnaliserait les deux vocabulaires, ce que le principe 6
+interdit — c'est ainsi que le projet s'est retrouvé avec quatre vocabulaires de
+rôles.
+
+**Une seule dépendance à préserver** : `GUARANTEE_TYPE_NOT_ELIGIBLE`, seul code
+de ma table qui transite aussi par le chemin workflow
+(`_ineligible_guarantee_errors`, `workflow.py:170-190`). S'il était renommé ou
+réenveloppé sous un code d'agrégat, je perdrais la traduction **et**
+l'énumération des types admis.
+
+Le trou : mon avertissement ne couvrait que l'*absence* de code, pas un code
+*inconnu* — un renommage m'aurait donc dégradé en silence. Ajouté
+`warnUnknownCode()`, pendant front du test backend qui verrouille le message.
+Il ignore une liste `RELAYED_CODES` de codes volontairement non traduits, pour
+qu'un avertissement qui se déclenche en permanence ne finisse pas ignoré.
 
 ### 3.3 ✅ Résolu — modifier un actif `libere` le renvoie en vérification
 

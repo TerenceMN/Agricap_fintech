@@ -19,11 +19,17 @@ from credits.tests_guarantees import _chain
 from credits.workflow import (
     ApplicationIncomplete,
     ConsentError,
+    ConsentExpired,
     DelegationError,
     InvalidTransition,
     MakerCheckerError,
     WorkflowError,
     submit,
+)
+
+ALL_ERROR_CLASSES = (
+    WorkflowError, InvalidTransition, ApplicationIncomplete, DelegationError,
+    MakerCheckerError, ConsentError, ConsentExpired,
 )
 
 
@@ -118,28 +124,80 @@ class WorkflowErrorContractTests(TestCase):
 
     def test_codes_distincts_et_tous_sous_workflow_error(self):
         classes = [InvalidTransition, ApplicationIncomplete, DelegationError,
-                   MakerCheckerError, ConsentError]
+                   MakerCheckerError, ConsentError, ConsentExpired]
         codes = [c.code for c in classes]
         self.assertEqual(len(set(codes)), len(codes))
         self.assertEqual(sorted(codes), [
-            "APPLICATION_INCOMPLETE", "CLIENT_CONSENT_MISSING",
-            "DELEGATION_EXCEEDED", "INVALID_TRANSITION", "MAKER_CHECKER_VIOLATION",
+            "APPLICATION_INCOMPLETE", "CLIENT_CONSENT_EXPIRED",
+            "CLIENT_CONSENT_MISSING", "DELEGATION_EXCEEDED", "INVALID_TRANSITION",
+            "MAKER_CHECKER_VIOLATION",
         ])
         for cls in classes:
             self.assertTrue(issubclass(cls, WorkflowError))
 
+    def test_les_vues_n_ecrivent_plus_de_code_en_dur(self):
+        """Garde anti-régression du principe 6.
+
+        Les codes en minuscules (`delegation_exceeded`, `consent_required`…)
+        vivaient dans `views.py` en parallèle de ceux des exceptions. Toute
+        réapparition d'un `"code": "<minuscule>"` écrit à la main dans une
+        réponse d'erreur du workflow recrée le vocabulaire parallèle.
+        """
+        import io
+        import pathlib
+        import re
+
+        source = io.open(
+            pathlib.Path(__file__).with_name("views.py"), encoding="utf-8",
+        ).read()
+        interdits = re.findall(r'"code":\s*"([a-z][a-z_]*)"', source)
+        self.assertEqual(
+            interdits, [],
+            f"Codes d'erreur en minuscules écrits en dur dans views.py : {interdits}. "
+            f"Utiliser le `code` porté par l'exception.",
+        )
+
     def test_codes_en_majuscules_convention_du_module(self):
         """Convention unique (principe 6) : `ASSET_NOT_OWNED`, `FEUILLE_MANQUANTE`…
 
-        Les vues `approve` / `reject` / `start-analysis` / `client-consent`
-        émettent encore des codes en minuscules pour les mêmes concepts — dette
-        documentée en §7quinquies du fragment de statut, migration à arbitrer
-        avec les fronts. Ce test fige au moins la convention côté exceptions.
+        Les vues émettaient auparavant des codes en minuscules écrits à la main
+        (`delegation_exceeded`) pour ces mêmes concepts : deux vocabulaires pour
+        une notion. Elles relaient désormais toutes `exc.code`.
         """
-        for cls in (InvalidTransition, ApplicationIncomplete, DelegationError,
-                    MakerCheckerError, ConsentError, WorkflowError):
+        for cls in ALL_ERROR_CLASSES:
             self.assertEqual(cls.code, cls.code.upper())
             self.assertRegex(cls.code, r"^[A-Z][A-Z_]+$")
+
+    def test_chaque_regle_porte_son_statut_http(self):
+        """Code et statut sont définis au même endroit : la règle elle-même.
+
+        Une vue ne réécrit plus de statut ; ajouter une règle ne demande donc
+        aucune modification des vues qui la relaient.
+        """
+        attendu = {
+            WorkflowError: 422,          # refus métier par défaut
+            ApplicationIncomplete: 422,  # entité non traitable
+            InvalidTransition: 409,      # conflit avec l'état de la ressource
+            MakerCheckerError: 409,
+            ConsentError: 409,
+            ConsentExpired: 410,         # la fenêtre de consentement n'existe plus
+            DelegationError: 403,        # refus d'autorisation, pas de validation
+        }
+        for cls, status in attendu.items():
+            with self.subTest(cls=cls.__name__):
+                self.assertEqual(cls.http_status, status)
+
+    def test_consentement_expire_se_distingue_du_consentement_manquant(self):
+        """Les deux appellent des actions différentes : recueillir vs renouveler.
+
+        La distinction ne tenait qu'au statut HTTP (409 vs 410), donc invisible
+        pour un front découplé des statuts. Elle est désormais dans le `code`.
+        """
+        self.assertTrue(issubclass(ConsentExpired, ConsentError))
+        self.assertNotEqual(ConsentExpired.code, ConsentError.code)
+        self.assertEqual(ConsentExpired.code, "CLIENT_CONSENT_EXPIRED")
+        # Un `except ConsentError` continue d'attraper les deux.
+        self.assertIsInstance(ConsentExpired("expiré"), ConsentError)
 
     def test_as_errors_n_est_jamais_vide(self):
         """La vue peut relayer `as_errors()` sans jamais tester le cas vide."""

@@ -63,6 +63,27 @@ def _require_read(request: Request) -> bool:
     return bool(request.user and hasattr(request.user, "sub"))
 
 
+def _workflow_error(exc) -> Response:
+    """Réponse unique pour tout refus du workflow.
+
+    `code` ET statut HTTP viennent de l'exception (`credits.workflow`), jamais
+    d'une valeur réécrite dans la vue : c'est la duplication qui avait produit
+    deux vocabulaires parallèles pour les mêmes concepts (`delegation_exceeded`
+    vs `DELEGATION_EXCEEDED`) — le défaut que le principe 6 interdit. Une règle
+    nouvelle définit son code et son statut à un seul endroit, et toutes les vues
+    la relaient correctement sans être modifiées.
+
+    `errors` détaille cause par cause quand il y en a plusieurs, et préserve les
+    codes et messages d'origine — notamment `GUARANTEE_TYPE_NOT_ELIGIBLE`, dont
+    le message énumère les types admis pour la filière : le front ne peut pas
+    reconstituer cette liste et ne doit pas la connaître autrement (principe 7).
+    """
+    return Response(
+        {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+        status=exc.http_status,
+    )
+
+
 def _require_group(request: Request, group) -> bool:
     """Vérifie l'appartenance à un groupe fonctionnel de `credits.roles`.
 
@@ -195,7 +216,7 @@ def parse_needs_sheet_view(request: Request) -> Response:
                 currency=currency,
             )
         except NeedsSheetParseError as exc:
-            return Response({"detail": str(exc), "code": "parse_error"}, status=422)
+            return Response({"detail": str(exc), "code": "PARSE_ERROR"}, status=422)
         except Exception as exc:
             return Response({"detail": f"Erreur de traitement : {exc}"}, status=500)
     finally:
@@ -440,7 +461,7 @@ def simulate_scoring(request: Request) -> Response:
     try:
         client = FintechUser.objects.select_related("kyc_profile").get(sub=client_sub)
     except FintechUser.DoesNotExist:
-        return Response({"detail": "Client introuvable.", "code": "client_not_found"}, status=404)
+        return Response({"detail": "Client introuvable.", "code": "CLIENT_NOT_FOUND"}, status=404)
 
     needs_sheet = None
     if needs_sheet_id:
@@ -638,7 +659,7 @@ def _create_application(request: Request) -> Response:
     try:
         client = FintechUser.objects.get(sub=client_sub)
     except FintechUser.DoesNotExist:
-        return Response({"detail": "Client introuvable.", "code": "client_not_found"}, status=404)
+        return Response({"detail": "Client introuvable.", "code": "CLIENT_NOT_FOUND"}, status=404)
 
     try:
         amount_requested = float(data.get("amount_requested", 0) or 0)
@@ -756,19 +777,13 @@ def submit_application(request: Request, code: str) -> Response:
     if not (is_owner or is_agent):
         return Response({"detail": "Accès interdit."}, status=403)
 
-    from credits.workflow import InvalidTransition, submit, WorkflowError
+    from credits.workflow import submit, WorkflowError
     try:
         submit(app, submitter_sub=sub)
     except WorkflowError as exc:
-        # Sémantique HTTP, pas un 422 uniforme : un dossier déjà soumis est un
-        # conflit avec l'état de la ressource (409 — même choix que le refus de
-        # remplacer la feuille de besoins hors brouillon), tandis qu'un dossier
-        # incomplet est une entité non traitable (422, principe 5).
-        http_status = 409 if isinstance(exc, InvalidTransition) else 422
-        return Response(
-            {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
-            status=http_status,
-        )
+        # Statut porté par la règle : 409 pour un dossier déjà soumis (conflit
+        # d'état), 422 pour un dossier incomplet (principe 5).
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))
@@ -784,13 +799,11 @@ def start_analysis(request: Request, code: str) -> Response:
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
 
-    from credits.workflow import start_analysis as _start, WorkflowError, ConsentError
+    from credits.workflow import start_analysis as _start, WorkflowError
     try:
         _start(app, analyst_sub=getattr(request.user, "sub", "") or "")
-    except ConsentError as exc:
-        return Response({"detail": str(exc), "code": "consent_required"}, status=409)
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))
@@ -820,7 +833,7 @@ def approve_application(request: Request, code: str) -> Response:
         return Response({"detail": "amount_approved invalide."}, status=400)
 
     roles = _roles(request)
-    from credits.workflow import approve, WorkflowError, MakerCheckerError, DelegationError
+    from credits.workflow import approve, WorkflowError
     try:
         approve(
             app,
@@ -829,12 +842,8 @@ def approve_application(request: Request, code: str) -> Response:
             comment=data.get("comment", ""),
             approver_roles=roles,
         )
-    except MakerCheckerError as exc:
-        return Response({"detail": str(exc), "code": "maker_checker_violation"}, status=409)
-    except DelegationError as exc:
-        return Response({"detail": str(exc), "code": "delegation_exceeded"}, status=403)
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))
@@ -857,7 +866,7 @@ def reject_application(request: Request, code: str) -> Response:
     if not data.get("reason_code"):
         return Response({"detail": "reason_code requis."}, status=400)
 
-    from credits.workflow import reject, WorkflowError, MakerCheckerError
+    from credits.workflow import reject, WorkflowError
     try:
         result = reject(
             app,
@@ -865,10 +874,8 @@ def reject_application(request: Request, code: str) -> Response:
             reason_code=data["reason_code"],
             comment=data.get("comment", ""),
         )
-    except MakerCheckerError as exc:
-        return Response({"detail": str(exc), "code": "maker_checker_violation"}, status=409)
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     return Response(result)
 
@@ -891,7 +898,7 @@ def adjourn_application(request: Request, code: str) -> Response:
     try:
         adjourn(app, approver_sub=getattr(request.user, "sub", "") or "", comment=comment)
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))
@@ -911,7 +918,7 @@ def reopen_analysis(request: Request, code: str) -> Response:
     try:
         _reopen(app, analyst_sub=getattr(request.user, "sub", "") or "")
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))
@@ -933,13 +940,11 @@ def client_consent(request: Request, code: str) -> Response:
     sub = getattr(request.user, "sub", "") or ""
     method = request.data.get("method", "app")
 
-    from credits.workflow import record_client_consent, WorkflowError, ConsentError
+    from credits.workflow import record_client_consent, WorkflowError
     try:
         record_client_consent(app, client_sub=sub, method=method)
-    except ConsentError as exc:
-        return Response({"detail": str(exc), "code": "consent_expired"}, status=410)
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))
@@ -1006,9 +1011,11 @@ def place_savings_guarantee(request: Request, code: str) -> Response:
             notes=data.get("notes", ""),
         )
     except InsufficientSavingsError as exc:
-        return Response({"detail": str(exc), "code": "insufficient_balance"}, status=422)
+        return Response({"detail": str(exc), "code": "INSUFFICIENT_BALANCE",
+                         "errors": [{"code": "INSUFFICIENT_BALANCE", "message": str(exc)}]}, status=422)
     except GuaranteeError as exc:
-        return Response({"detail": str(exc), "code": "guarantee_error"}, status=400)
+        return Response({"detail": str(exc), "code": exc.code,
+                         "errors": [{"code": exc.code, "message": str(exc)}]}, status=400)
 
     from credits.guarantees import get_guarantee_summary
     return Response(get_guarantee_summary(app), status=201)
@@ -1239,11 +1246,11 @@ def confirm_disbursement_view(request: Request, code: str) -> Response:
     except DisbursementError as exc:
         is_mkck = "maker" in str(exc).lower()
         return Response(
-            {"detail": str(exc), "code": "maker_checker_violation" if is_mkck else "disbursement_error"},
+            {"detail": str(exc), "code": "MAKER_CHECKER_VIOLATION" if is_mkck else "DISBURSEMENT_ERROR"},
             status=409 if is_mkck else 400,
         )
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     return Response(result)
 

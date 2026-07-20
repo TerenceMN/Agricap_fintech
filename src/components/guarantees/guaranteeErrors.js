@@ -59,6 +59,36 @@ export const GUARANTEE_ERROR_MESSAGES = {
 const REFUSAL_STATUSES = [400, 409, 422];
 
 /**
+ * Codes émis par d'autres domaines que les actifs/garanties, et volontairement
+ * non traduits ici : leur message serveur est plus précis que ce que le front
+ * écrirait (il énumère, il chiffre). Les lister évite que le garde-fou
+ * `warnUnknownCode` ne crie sur des cas parfaitement normaux — un avertissement
+ * qui se déclenche tout le temps ne signale plus rien.
+ *
+ * Liste indicative et non bloquante : un code absent d'ici n'est pas une erreur,
+ * il déclenche seulement un avertissement en développement.
+ */
+const RELAYED_CODES = new Set([
+  'APPLICATION_INCOMPLETE', 'INVALID_TRANSITION',
+  'MAKER_CHECKER_VIOLATION', 'maker_checker_violation',
+  'DELEGATION_EXCEEDED', 'delegation_exceeded',
+  'CLIENT_CONSENT_MISSING', 'consent_required',
+  'CLIENT_CONSENT_EXPIRED', 'consent_expired',
+  'ASSET_VERIFY_REFUSED', 'ASSET_REJECT_REFUSED',
+  'WORKFLOW_ERROR', 'GUARANTEE_ERROR', 'ERREUR',
+]);
+
+/** Signale un code non traduit qui n'est pas dans la liste des relayés connus. */
+function warnUnknownCode(code, err) {
+  if (RELAYED_CODES.has(code)) return;
+  console.warn(
+    `[garanties] code serveur « ${code} » non traduit et inconnu — code renommé, ` +
+    'ou nouveau code à ajouter à GUARANTEE_ERROR_MESSAGES :',
+    err?.status ?? '', typeof err?.message === 'string' ? err.message : '',
+  );
+}
+
+/**
  * Extrait le code d'erreur d'une `ApiError`. Routage sur le contrat structuré
  * uniquement — jamais sur le texte du message.
  * @param {unknown} err
@@ -103,6 +133,17 @@ export function errorCode(err) {
 export function guaranteeErrorMessage(err, fallback = "Le serveur a refusé cette opération.") {
   const code = errorCode(err);
   if (code && GUARANTEE_ERROR_MESSAGES[code]) return GUARANTEE_ERROR_MESSAGES[code];
+
+  // Code présent mais absent de la table : soit un code métier nouveau (normal,
+  // le repli sur le message serveur convient), soit **un code que je traduisais
+  // et qui a été renommé côté serveur** — ce cas-là fait perdre la traduction
+  // sans que rien ne le signale. On le rend visible en développement.
+  //
+  // Cas sensible connu : `GUARANTEE_TYPE_NOT_ELIGIBLE`, seul code de ma table
+  // qui transite aussi par le chemin workflow (`_ineligible_guarantee_errors`).
+  // `credits/` migre ses codes vers une convention MAJUSCULE unique ; ce garde-
+  // fou est le pendant front de leur test qui verrouille le message.
+  if (code) warnUnknownCode(code, err);
 
   const detail = err && typeof err.message === 'string' ? err.message : '';
   const status = err && typeof err.status === 'number' ? err.status : null;

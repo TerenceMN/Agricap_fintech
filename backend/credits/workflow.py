@@ -39,6 +39,10 @@ class WorkflowError(Exception):
     """
 
     code = "WORKFLOW_ERROR"
+    #: Statut HTTP porte par la regle elle-meme. 422 par defaut : « la requete
+    #: est comprise mais une regle metier la refuse ». Les conflits d'etat de
+    #: ressource (409) et les refus d'autorisation (403) le surchargent.
+    http_status = 422
 
     def __init__(self, message: str, errors: list[dict] | None = None) -> None:
         super().__init__(message)
@@ -54,6 +58,7 @@ class InvalidTransition(WorkflowError):
     """Le statut courant n'autorise pas cette transition."""
 
     code = "INVALID_TRANSITION"
+    http_status = 409   # conflit avec l'etat courant de la ressource
 
 
 class ApplicationIncomplete(WorkflowError):
@@ -66,18 +71,35 @@ class DelegationError(WorkflowError):
     """Montant hors délégation pour ce rôle."""
 
     code = "DELEGATION_EXCEEDED"
+    http_status = 403   # refus d'autorisation, pas de validation
 
 
 class MakerCheckerError(WorkflowError):
     """Soumetteur et approbateur sont la même personne."""
 
     code = "MAKER_CHECKER_VIOLATION"
+    http_status = 409   # conflit : la ressource a deja ete touchee par cet acteur
 
 
 class ConsentError(WorkflowError):
-    """Consentement client manquant ou expiré pour demande on_behalf_of."""
+    """Consentement client manquant pour une demande on_behalf_of."""
 
     code = "CLIENT_CONSENT_MISSING"
+    http_status = 409   # conflit : le consentement manque a l'etat courant
+
+
+class ConsentExpired(ConsentError):
+    """La fenêtre de consentement (72 h) est dépassée.
+
+    Distincte de `ConsentError` parce que l'action attendue diffère : un
+    consentement manquant se recueille, un consentement expiré se renouvelle —
+    et son expiration signale que quelque chose a traîné dans l'instruction.
+    Cette distinction n'était portée que par le statut HTTP (409 vs 410) : elle
+    est devenue invisible pour un front découplé des statuts, d'où le code propre.
+    """
+
+    code = "CLIENT_CONSENT_EXPIRED"
+    http_status = 410   # la fenêtre de consentement n'existe plus, elle a expiré
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -254,7 +276,7 @@ def start_analysis(app, analyst_sub: str) -> None:
     # Vérifier consentement si on_behalf_of
     if app.is_on_behalf_of and not app.client_consent_at:
         if app.client_consent_expires and app.client_consent_expires < timezone.now():
-            raise ConsentError(
+            raise ConsentExpired(
                 "Le consentement client a expiré. "
                 "Le client doit être recontacté pour reformuler la demande."
             )
@@ -418,7 +440,7 @@ def record_client_consent(
         raise WorkflowError("Seul le client bénéficiaire peut confirmer son consentement.")
 
     if app.client_consent_expires and app.client_consent_expires < timezone.now():
-        raise ConsentError(
+        raise ConsentExpired(
             f"Le délai de consentement a expiré le "
             f"{app.client_consent_expires.strftime('%d/%m/%Y à %H:%M')}. "
             "Un nouveau dossier doit être soumis."
