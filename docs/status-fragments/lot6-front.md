@@ -90,10 +90,23 @@ répondre ») — et prend N du serveur. Principe 8 appliqué jusque dans l'affi
 > gonfler un risque pour paraître minutieux.
 >
 > Ce qui vaut d'être tracé est l'emplacement : **un seul point de consommation**,
-> `GuaranteeRequests.jsx` (état vide). Si le fondateur veut un jour distinguer à
-> l'écran une fenêtre *décidée* d'une fenêtre *par défaut* — ce qui relève de la
-> gouvernance, pas de l'information du garant — il faudrait que le backend le
-> dise dans la réponse. Le front ne peut pas l'inventer, et ne doit pas essayer.
+> `GuaranteeRequests.jsx` (état vide). Distinguer à l'écran une fenêtre *décidée*
+> d'une fenêtre *par défaut* relève de la gouvernance, pas de l'information du
+> garant. Le front ne peut pas l'inventer, et ne doit pas essayer.
+>
+> **Suite donnée par `lot6-backend`** : `config_provenance()` (`guarantor.py:234`)
+> expose désormais, pour chacun des quatre paramètres, sa valeur, son repli et
+> `source: "config" | "fallback"`. Vérifié dans le code, ainsi que le fait que
+> `_param` et `config_provenance` lisent la **même** table — sans quoi un écran
+> d'administration pourrait afficher un défaut différent de celui réellement
+> appliqué, ce qui serait pire que pas d'écran du tout.
+>
+> Deux choses à savoir pour la suite : cette information **n'entre pas dans le
+> contrat garant** (elle révèle les seuils du moteur, principe 7 — mon endpoint
+> reste figé, `consent_window_hours` inclus, **rien à retyper côté front**, je
+> l'ai vérifié clé par clé), et elle **n'a aucun endpoint**. Le point de
+> branchement existe ; le consommateur reste à construire, et son lieu est
+> l'onglet Référence du backoffice (CLAUDE.md §7.1.5) — hors périmètre du lot 6.
 
 **Le décompte ne décide de rien.** C'est un affichage. La qualification
 « expirée » vient du statut serveur et de `isExpired`, jamais d'une comparaison
