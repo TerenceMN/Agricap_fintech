@@ -435,7 +435,7 @@ def register_moral_guarantee(
                  "consentWindowHours": window},
     )
 
-    _notify_guarantor_sms(guarantee)
+    _notify_guarantor(guarantee)
     return guarantee
 
 

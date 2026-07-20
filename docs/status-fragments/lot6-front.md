@@ -94,6 +94,26 @@ réponse » et « historique — closes ou caduques ». Une demande caduque gard
 bordure neutre, un badge rouge, aucun bouton, et une phrase qui dit quoi faire
 (« le demandeur doit vous solliciter à nouveau depuis son dossier »).
 
+> **Défaut corrigé après retour de `lot6-backend`.** L'expiration n'est
+> matérialisée en base qu'à la lecture — il n'y a pas d'ordonnanceur qui bascule
+> les demandes en `expired` (pas de Celery dans le projet, limite assumée
+> `lot6-backend.md` §6). Une demande périmée est donc servie avec
+> `status: "pending_consent"` **et** `isExpired: true`.
+>
+> `isActionable()` traitait déjà le cas et retirait les boutons. Le **badge**, lui,
+> lisait `status` seul : la carte affichait « En attente de votre réponse » en
+> ambre sur une demande morte, sans bouton, rangée dans l'historique —
+> contradiction dans la même carte, et exactement le contraire de la consigne.
+> Ajout de `displayStatusMeta()`, où `isExpired` prime sur `status` pour toute
+> présentation d'état. **Aucun écran ne doit lire `status` seul** ; c'est noté sur
+> le champ dans `types/api.ts`.
+>
+> Ce que ça dit du reste : j'avais protégé le chemin qui engage (les boutons) et
+> laissé faux le chemin qui informe (le badge). Un garant lisant « en attente »
+> sur une demande caduque aurait cherché un bouton absent, ou attendu une échéance
+> déjà passée. Même famille que les défauts du §3.2 de `front-garanties.md` — la
+> règle avait été appliquée à un endroit, pas partout où elle valait.
+
 L'écran demande **toutes** les demandes (pas de `?status=pending_consent`).
 Filtrer ferait disparaître silencieusement une demande à laquelle le garant n'a
 pas répondu — et une ligne qui s'évapore est indiscernable d'une ligne qui n'a
@@ -114,13 +134,17 @@ même contenu.
 
 ### 1.7 Erreurs — routage sur `code`, jamais sur le texte
 
-`guarantorErrors.js` traduit les **11 codes** du §1.2, vérifiés un par un contre
-les `code = "…"` de `backend/credits/guarantor.py` :
+`guarantorErrors.js` traduit les **12 codes**, vérifiés un par un contre les
+`code = "…"` de `backend/credits/guarantor.py` :
 
 `ACCEPT_REQUIRED` · `GUARANTOR_NOT_DESIGNATED` · `GUARANTOR_ALREADY_ANSWERED` ·
 `INVALID_GUARANTEE_STATE` · `GUARANTOR_CONSENT_EXPIRED` · `GUARANTOR_OVEREXTENDED` ·
 `GUARANTOR_TOO_MANY_PLEDGES` · `GUARANTOR_IN_DEFAULT` · `CROSS_GUARANTEE_FORBIDDEN` ·
-`GUARANTOR_NOT_IN_GROUP` — plus le **404 sans code**, qui tombe dans le repli.
+`GUARANTOR_NOT_IN_GROUP` · `GUARANTOR_INVALID_AMOUNT` — plus le **404 sans code**,
+qui tombe dans le repli.
+
+`GUARANTOR_INVALID_AMOUNT` sort à la pose (§1.3), pas au consentement : il ne
+devrait jamais atteindre cet écran. Traduit quand même, le coût étant nul.
 
 Choix de conception documentés dans le fichier :
 
@@ -181,6 +205,11 @@ consentie et un dossier bloqué.
 
 ## 3. Divergence relevée — `valueChain` nullable dans le contrat figé
 
+> **Résolu.** `lot6-backend` a corrigé le §1.1 (tableau de nullabilité explicite)
+> et confirmé le typage. Je conserve le constat plutôt que de l'effacer : la trace
+> du défaut et de sa correction vaut mieux qu'une page propre. Réponses obtenues,
+> intégrées ci-dessous.
+
 Le §1.1 du fragment backend est publié comme « figé et typable tel quel », et son
 exemple JSON montre toujours `valueChain` sous forme d'objet. **Le serializer réel
 émet `null`** (`backend/credits/guarantees.py:750`) :
@@ -198,12 +227,24 @@ rattachée. Mon adaptateur les traite (la carte affiche « Filière non
 communiquée »), et `types/api.ts` porte `valueChain: {…} | null` avec la mention
 que **le type suit le code, pas l'exemple de documentation**.
 
-Signalé à `lot6-backend` avec une question de fond restée ouverte :
-`coveredAmount: null` sur une demande `pending_consent` est-il un état
-atteignable ? Aujourd'hui l'écran refuse d'écrire « 0 » ou « — » dans une phrase
-d'engagement juridique et affiche « (montant non communiqué par le serveur) » en
-rouge. Si l'état est atteignable, ce n'est pas au front de le rattraper : une
-demande sans montant couvert ne devrait pas être servie comme consentable.
+**Réponse obtenue sur la question de fond** : `coveredAmount: null` est
+**impossible par construction**. `assert_can_guarantee` refuse un montant ≤ 0
+(nouveau code `GUARANTOR_INVALID_AMOUNT`) *avant* la création de la caution — une
+demande à 0 ou nulle n'existe pas en base. Idem `consentExpiresAt`. À traiter donc
+comme un **défaut pur** : si l'écran en observe un, c'est un bug backend à
+remonter, pas un état à gérer. L'affichage rouge « (montant non communiqué par le
+serveur) » reste comme filet, et `types/api.ts` documente que la nullabilité est
+un filet et non un cas métier.
+
+**Effet de bord utile de mon garde-fou** : le `console.warn` sur
+`GUARANTOR_ERROR` (la classe de base sans code propre) a attrapé un vrai défaut —
+la règle du montant nul levait effectivement le générique, et un code sans
+identité atteignait le client. Corrigé côté backend par
+`GUARANTOR_INVALID_AMOUNT`, avec un test qui vérifie qu'aucune règle ne sort la
+classe de base. **`GUARANTOR_ERROR` reste donc volontairement hors des codes
+relayés** : ce n'est pas une sortie légitime, et le warn est le comportement
+attendu — s'il se déclenche, c'est un bug backend à signaler, pas une entrée à
+ajouter à la table.
 
 **Leçon générale, dans la lignée du §3.2 de `front-garanties.md`** : un contrat
 publié avant implémentation est un contrat que le code peut démentir en silence.
@@ -236,7 +277,11 @@ Restent à valider en conditions réelles :
 - le comportement du compte à rebours au **passage à zéro** pendant que la page
   est ouverte, et la cohérence entre « Délai écoulé » affiché et le refus 410
   effectivement renvoyé ;
-- le rendu d'une demande dont `valueChain` ou `coveredAmount` est `null` (§3) ;
+- le rendu d'une demande dont `valueChain` est `null` (§3) ;
+- **le cas `pending_consent` + `isExpired: true`** — celui qui a révélé le défaut
+  de badge du §1.5. C'est l'état par défaut de toute demande périmée tant que
+  personne ne la relit côté serveur, donc le plus fréquent des états « expirés »,
+  et je ne l'ai jamais vu rendu ;
 - l'**accessibilité clavier** du dialogue de confirmation, et le fait que la case
   à cocher soit atteignable et annoncée correctement — sur un acte juridique, un
   garant qui navigue au clavier doit pouvoir lire l'engagement avant de le
