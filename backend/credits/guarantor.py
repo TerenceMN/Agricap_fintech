@@ -212,13 +212,70 @@ def _active_config():
         return None
 
 
-def _param(field: str, fallback, label: str):
+#: Les paramètres de caution, leur repli et leur libellé — source unique pour
+#: `_param` et pour `config_provenance()`, afin qu'ajouter un paramètre ne puisse
+#: pas l'ajouter à l'un sans l'autre.
+CAUTION_PARAMS: dict[str, tuple] = {
+    "caution_ratio_epargne": (
+        FALLBACK_SAVINGS_MULTIPLE, "multiple d'épargne autorisé en caution",
+    ),
+    "caution_max_actives": (
+        FALLBACK_MAX_LIVE_PLEDGES, "nombre maximal de cautions vivantes par garant",
+    ),
+    "caution_consent_window_hours": (
+        FALLBACK_CONSENT_WINDOW_HOURS, "fenêtre de consentement du garant",
+    ),
+    "decote_caution_morale": (
+        FALLBACK_MORAL_HAIRCUT, "décote de la caution morale",
+    ),
+}
+
+
+def config_provenance() -> dict[str, dict]:
+    """Pour chaque paramètre : sa valeur, et si elle est **décidée** ou subie.
+
+    Un `k = 2` non décidé fonctionne exactement comme un `k = 2` décidé, et le
+    seul garde-fou aujourd'hui est un warning loggé — c'est-à-dire quelque chose
+    que personne ne lit tant que rien ne va mal. Contrairement à une rupture de
+    contrat, une absence de décision ne finit jamais par se voir toute seule.
+
+    Cette fonction rend l'état interrogeable au lieu de seulement traçable. Elle
+    n'est **pas** exposée au garant ni au client (elle révèle les seuils du
+    moteur, principe 7) : elle existe pour l'onglet Référence du backoffice
+    (CLAUDE.md §7.1.5), où un administrateur doit pouvoir distinguer un
+    référentiel arrêté par le comité d'un défaut de secours.
+
+    Volontairement laissée sans endpoint : construire l'écran d'administration
+    des référentiels n'est pas le périmètre de ce lot. Le point de branchement
+    existe pour que celui qui le construira n'ait pas à rétro-concevoir `_param`.
+    """
+    config = _active_config()
+    provenance: dict[str, dict] = {}
+    for field, (fallback, label) in CAUTION_PARAMS.items():
+        value = getattr(config, field, None) if config is not None else None
+        configured = value is not None
+        provenance[field] = {
+            "label": label,
+            "value": value if configured else fallback,
+            "source": "config" if configured else "fallback",
+            "fallback": fallback,
+        }
+    return provenance
+
+
+def _param(field: str):
     """Lit un paramètre dans `InstitutionConfig`, ou retombe avec un warning.
 
     Le principe 8 tolère les valeurs par défaut de secours ; il n'en tolère pas
     l'usage silencieux. Un comité qui croit avoir fixé k = 1,5 doit pouvoir
     constater dans les logs que le code applique encore 2.
+
+    Le repli et le libellé viennent de `CAUTION_PARAMS`, pas des appelants :
+    autrement, `config_provenance()` et cette fonction pourraient diverger, et
+    l'écran d'administration afficherait un défaut différent de celui réellement
+    appliqué — un mensonge pire que l'absence d'écran.
     """
+    fallback, label = CAUTION_PARAMS[field]
     config = _active_config()
     value = getattr(config, field, None) if config is not None else None
     if value is None:
@@ -233,24 +290,15 @@ def _param(field: str, fallback, label: str):
 
 def savings_multiple() -> Decimal:
     """`k` — multiple d'épargne plafonnant l'engagement total du garant."""
-    return Decimal(str(_param(
-        "caution_ratio_epargne", FALLBACK_SAVINGS_MULTIPLE,
-        "multiple d'épargne autorisé en caution",
-    )))
+    return Decimal(str(_param("caution_ratio_epargne")))
 
 
 def max_live_pledges() -> int:
-    return int(_param(
-        "caution_max_actives", FALLBACK_MAX_LIVE_PLEDGES,
-        "nombre maximal de cautions vivantes par garant",
-    ))
+    return int(_param("caution_max_actives"))
 
 
 def consent_window_hours() -> int:
-    return int(_param(
-        "caution_consent_window_hours", FALLBACK_CONSENT_WINDOW_HOURS,
-        "fenêtre de consentement du garant",
-    ))
+    return int(_param("caution_consent_window_hours"))
 
 
 def moral_haircut() -> Decimal:
@@ -261,10 +309,7 @@ def moral_haircut() -> Decimal:
     est une pression de recouvrement. La compter à 100 % reviendrait à
     surestimer la couverture d'un dossier de 3,3 fois.
     """
-    return Decimal(str(_param(
-        "decote_caution_morale", FALLBACK_MORAL_HAIRCUT,
-        "décote de la caution morale",
-    )))
+    return Decimal(str(_param("decote_caution_morale")))
 
 
 def moral_coverage_weight() -> Decimal:

@@ -78,6 +78,23 @@ La durée nominale n'est **jamais écrite en dur**. La fenêtre est paramétrabl
 nomme la durée qu'à un seul endroit — l'écran vide (« vous aurez N heures pour
 répondre ») — et prend N du serveur. Principe 8 appliqué jusque dans l'affichage.
 
+> **Où une valeur de secours backend affleure dans l'UI.** `lot6-backend` signale
+> que `consent_window_hours` peut être servi depuis une valeur de repli (72) quand
+> `InstitutionConfig` n'a rien — repli signalé côté serveur par un warning loggé,
+> invisible du client.
+>
+> **Cet écran n'en est pas faussé** : le repli *est* la fenêtre effectivement
+> appliquée, donc « vous aurez N heures pour répondre » reste vrai dans les deux
+> cas, et le compte à rebours décompte de toute façon sur `consentExpiresAt`. Je
+> le note sans en faire un défaut — ce serait l'erreur inverse de celle du §5,
+> gonfler un risque pour paraître minutieux.
+>
+> Ce qui vaut d'être tracé est l'emplacement : **un seul point de consommation**,
+> `GuaranteeRequests.jsx` (état vide). Si le fondateur veut un jour distinguer à
+> l'écran une fenêtre *décidée* d'une fenêtre *par défaut* — ce qui relève de la
+> gouvernance, pas de l'information du garant — il faudrait que le backend le
+> dise dans la réponse. Le front ne peut pas l'inventer, et ne doit pas essayer.
+
 **Le décompte ne décide de rien.** C'est un affichage. La qualification
 « expirée » vient du statut serveur et de `isExpired`, jamais d'une comparaison
 de dates côté navigateur. Si le front déclarait l'expiration lui-même, un garant

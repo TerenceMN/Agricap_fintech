@@ -169,6 +169,57 @@ class OverextensionRuleTests(GuarantorRulesTestCase):
             self.assertEqual(savings_multiple(), Decimal("2"))
         self.assertIn("caution_ratio_epargne", " ".join(logs.output))
 
+    def test_provenance_distingue_un_seuil_decide_d_un_defaut_subi(self):
+        """Un k = 2 non décidé fonctionne comme un k = 2 décidé, indéfiniment.
+
+        Le seul garde-fou était un warning loggé — quelque chose que personne ne
+        lit tant que rien ne va mal. Contrairement à une rupture de contrat, une
+        absence de décision ne finit jamais par se voir toute seule. La
+        provenance rend l'état interrogeable, donc affichable par l'onglet
+        Référence du backoffice.
+        """
+        from referentiel.models import InstitutionConfig
+        from credits.guarantor import config_provenance
+
+        InstitutionConfig.objects.all().delete()
+        subi = config_provenance()
+        self.assertEqual(subi["caution_ratio_epargne"]["source"], "fallback")
+        self.assertEqual(subi["caution_ratio_epargne"]["value"], Decimal("2"))
+
+        _config(caution_ratio_epargne=1.5)
+        decide = config_provenance()
+        self.assertEqual(decide["caution_ratio_epargne"]["source"], "config")
+        self.assertEqual(decide["caution_ratio_epargne"]["value"], 1.5)
+        self.assertEqual(decide["caution_ratio_epargne"]["fallback"], Decimal("2"))
+
+    def test_provenance_couvre_les_quatre_parametres(self):
+        from credits.guarantor import CAUTION_PARAMS, config_provenance
+        self.assertEqual(set(config_provenance()), set(CAUTION_PARAMS))
+        self.assertEqual(len(CAUTION_PARAMS), 4)
+
+    def test_provenance_ne_diverge_pas_de_la_valeur_appliquee(self):
+        """L'écran d'administration doit montrer ce qui s'applique vraiment.
+
+        Afficher un défaut différent de celui réellement appliqué serait un
+        mensonge pire que l'absence d'écran — d'où la table `CAUTION_PARAMS`
+        partagée entre `_param` et `config_provenance`.
+        """
+        from referentiel.models import InstitutionConfig
+        from credits.guarantor import (
+            config_provenance, consent_window_hours, max_live_pledges,
+            moral_haircut, savings_multiple,
+        )
+        InstitutionConfig.objects.all().delete()
+        prov = config_provenance()
+        self.assertEqual(savings_multiple(),
+                         Decimal(str(prov["caution_ratio_epargne"]["value"])))
+        self.assertEqual(max_live_pledges(),
+                         int(prov["caution_max_actives"]["value"]))
+        self.assertEqual(consent_window_hours(),
+                         int(prov["caution_consent_window_hours"]["value"]))
+        self.assertEqual(moral_haircut(),
+                         Decimal(str(prov["decote_caution_morale"]["value"])))
+
     def test_epargne_nulle_interdit_toute_caution(self):
         sans_epargne = _user("sub-sans-epargne")
         _group("AVEC Sans Epargne", self.demandeur, sans_epargne)

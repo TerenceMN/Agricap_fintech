@@ -261,6 +261,29 @@ Le repli sur les valeurs de secours logge systématiquement un warning nommant l
 champ manquant — un comité qui croit avoir fixé k = 1,5 doit pouvoir constater
 dans les logs que le code applique encore 2. Testé.
 
+**Mais un log est un garde-fou que personne ne lit tant que rien ne va mal**, et
+ce cas-ci ne va jamais mal : un `k = 2` non décidé fonctionne exactement comme un
+`k = 2` décidé, indéfiniment. Contrairement à une rupture de contrat, une absence
+de décision ne finit jamais par se voir toute seule. `config_provenance()` rend
+donc l'état **interrogeable** et pas seulement traçable : pour chacun des quatre
+paramètres, sa valeur, son repli, et `source: "config" | "fallback"`.
+
+Volontairement **sans endpoint** : son lieu d'affichage est l'onglet Référence du
+backoffice (CLAUDE.md §7.1.5, « consultation des plages, versions, config
+institution »), qui n'est pas le périmètre de ce lot. La fonction existe pour que
+celui qui construira cet écran n'ait pas à rétro-concevoir `_param`.
+
+Elle n'est **pas** exposée au garant ni au client : elle révèle les seuils du
+moteur (principe 7). L'agent front l'a confirmé de son côté — son unique
+consommation de `consent_window_hours` (l'état vide, « vous aurez N heures pour
+répondre ») reste vraie que la valeur vienne du comité ou du repli, puisque c'est
+la fenêtre effectivement appliquée. Il n'y a donc aucun défaut client-facing à
+corriger, et le front ne doit surtout pas inventer la distinction.
+
+`_param` et `config_provenance` lisent la même table `CAUTION_PARAMS` : sans ça,
+l'écran d'administration pourrait afficher un défaut différent de celui réellement
+appliqué — un mensonge pire que l'absence d'écran. Testé.
+
 ### 3.5 Décote de 70 %
 
 `CreditGuarantee.retained_coverage` applique la décote aux seules cautions
@@ -351,11 +374,11 @@ test qui vérifie qu'aucune règle ne sort le code générique.
 
 ## 6. Tests
 
-`./.venv/Scripts/python.exe manage.py test` → **513 tests, 8 échecs**, tous dans
+`./.venv/Scripts/python.exe manage.py test` → **516 tests, 8 échecs**, tous dans
 `support/` (7 failures + 1 error) — les préexistants annoncés, non touchés.
-Baseline 427 + **86 nouveaux tests**, tous verts.
+Baseline 427 + **89 nouveaux tests**, tous verts.
 
-- `credits/tests_guarantor.py` (61) — les 7 règles **en refus ET en cas nominal**,
+- `credits/tests_guarantor.py` (64) — les 7 règles **en refus ET en cas nominal**,
   le consentement, l'expiration, la caution croisée, l'immuabilité, la décote,
   le contrat des codes d'erreur, la notification du garant.
 - `credits/tests_guarantee_requests_api.py` (25) — forme exacte des 2 endpoints,
