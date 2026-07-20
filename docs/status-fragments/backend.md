@@ -2,7 +2,7 @@
 
 > Périmètre : `AGRICAP FINTECH/backend/` uniquement. `src/` n'a pas été touché.
 > Dernière exécution : `./.venv/Scripts/python.exe manage.py test credits assets dataio reference_data`
-> → **144 tests, OK** (baseline mesurée à 81, + 63 nouveaux).
+> → **146 tests, OK** (baseline mesurée à 81, + 65 nouveaux).
 
 ---
 
@@ -442,13 +442,53 @@ d'agrégat, ou remplacerait `{"code": exc.code, "message": str(exc)}` par un cod
 générique ferait perdre l'information au client **sans rien casser visiblement**.
 Verrouillé par `test_garantie_devenue_ineligible_garde_son_code_et_ses_types_admis`.
 
-### Reste hors périmètre de cette migration
+### `disbursement` — fait, et il cachait pire qu'une incohérence de casse
 
-`disbursement` (`views.py:1249`) émet encore un code conditionnel construit dans
-la vue (`"MAKER_CHECKER_VIOLATION" if is_mkck else "DISBURSEMENT_ERROR"`). En
-majuscules, donc conforme à la nomenclature, mais le code y est toujours réécrit
-au lieu d'être porté par l'exception de `credits/disbursement.py`. Même
-traitement à appliquer — non fait.
+Documenté d'abord comme simple reste-à-faire (« code réécrit dans la vue »), il
+s'est révélé porteur de l'anti-pattern que je reprochais au front deux échanges
+plus tôt :
+
+```python
+is_mkck = "maker" in str(exc).lower()          # ← dans MA vue
+return Response({..., "code": "MAKER_CHECKER_VIOLATION" if is_mkck
+                       else "DISBURSEMENT_ERROR"},
+                status=409 if is_mkck else 400)
+```
+
+**Le code ET le statut étaient déduits du texte du message.** Reformuler le
+message de maker-checker — sans toucher à aucune règle — dégradait le code en
+`DISBURSEMENT_ERROR` et le statut de 409 à 400, sur le contrôle le plus sensible
+du module (celui qui empêche une même personne de demander et confirmer un
+décaissement). Exactement ce que je reprochais à la regex du front, dans mon
+propre périmètre, et je ne l'ai vu qu'en allant finir un point que j'avais classé
+cosmétique.
+
+Six sous-classes typées dans `credits/disbursement.py`, portant `code` et
+`http_status` comme celles du workflow :
+
+| Classe | Code | Statut |
+|---|---|---|
+| `DisbursementError` (défaut) | `DISBURSEMENT_ERROR` | 422 |
+| `DisbursementMakerChecker` | `MAKER_CHECKER_VIOLATION` | 409 |
+| `DisbursementRequestMissing` | `DISBURSEMENT_REQUEST_MISSING` | 404 |
+| `DisbursementRequestConflict` | `DISBURSEMENT_REQUEST_CONFLICT` | 409 |
+| `DisbursementAlreadyDone` | `DISBURSEMENT_ALREADY_DONE` | 409 |
+| `DisbursementAmountInvalid` | `DISBURSEMENT_AMOUNT_INVALID` | 422 |
+
+Les trois vues de décaissement passent par le même `_workflow_error(exc)` que le
+workflow. Deuxième garde-fou ajouté :
+`test_aucune_vue_ne_deduit_un_code_du_texte_d_une_exception` échoue si un
+`in str(exc)` réapparaît dans `views.py`.
+
+### Correction factuelle pour les fronts : le 410 n'est plus greppable
+
+`front-garanties` a ajouté 410 à son filtre après avoir vérifié que « 410
+n'apparaît qu'une fois dans le backend ». La conclusion est bonne, la
+vérification ne l'est plus : **`status=410` n'apparaît désormais nulle part dans
+les vues** — le statut vit sur `ConsentExpired.http_status`. Un grep de
+`status=410` dans `views.py` renvoie zéro et pourrait faire conclure à tort que
+le cas est mort. Même remarque pour tous les autres statuts du workflow et du
+décaissement : ils se lisent dans les classes d'exception, plus dans les vues.
 
 ---
 

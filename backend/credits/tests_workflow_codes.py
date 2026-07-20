@@ -199,6 +199,57 @@ class WorkflowErrorContractTests(TestCase):
         # Un `except ConsentError` continue d'attraper les deux.
         self.assertIsInstance(ConsentExpired("expiré"), ConsentError)
 
+    def test_decaissement_ne_deduit_plus_son_code_du_texte_du_message(self):
+        """La vue faisait `is_mkck = "maker" in str(exc).lower()`.
+
+        Reformuler le message de maker-checker — sans toucher à aucune règle —
+        aurait dégradé le code en `DISBURSEMENT_ERROR` et le statut de 409 à 400,
+        sur le contrôle le plus sensible du module. Le code vient maintenant de
+        la classe : le message est libre.
+        """
+        from credits.disbursement import (
+            DisbursementAlreadyDone, DisbursementAmountInvalid, DisbursementError,
+            DisbursementMakerChecker, DisbursementRequestConflict,
+            DisbursementRequestMissing,
+        )
+
+        # Un message qui ne contient plus le mot « maker » garde le bon code.
+        exc = DisbursementMakerChecker("Séparation des tâches non respectée.")
+        self.assertEqual(exc.code, "MAKER_CHECKER_VIOLATION")
+        self.assertEqual(exc.http_status, 409)
+        self.assertNotIn("maker", str(exc).lower())
+
+        attendu = {
+            DisbursementError: ("DISBURSEMENT_ERROR", 422),
+            DisbursementMakerChecker: ("MAKER_CHECKER_VIOLATION", 409),
+            DisbursementRequestMissing: ("DISBURSEMENT_REQUEST_MISSING", 404),
+            DisbursementRequestConflict: ("DISBURSEMENT_REQUEST_CONFLICT", 409),
+            DisbursementAlreadyDone: ("DISBURSEMENT_ALREADY_DONE", 409),
+            DisbursementAmountInvalid: ("DISBURSEMENT_AMOUNT_INVALID", 422),
+        }
+        for cls, (code, status) in attendu.items():
+            with self.subTest(cls=cls.__name__):
+                self.assertEqual(cls.code, code)
+                self.assertEqual(cls.http_status, status)
+                self.assertTrue(issubclass(cls, DisbursementError))
+                self.assertEqual(cls.code, cls.code.upper())
+
+    def test_aucune_vue_ne_deduit_un_code_du_texte_d_une_exception(self):
+        """Garde anti-régression : brancher sur `str(exc)` est le motif à bannir."""
+        import io
+        import pathlib
+        import re
+
+        source = io.open(
+            pathlib.Path(__file__).with_name("views.py"), encoding="utf-8",
+        ).read()
+        suspects = re.findall(r'in str\(exc\)(?:\.lower\(\))?', source)
+        self.assertEqual(
+            suspects, [],
+            "Une vue déduit un comportement du TEXTE d'une exception. "
+            "Utiliser une sous-classe typée portant son `code`.",
+        )
+
     def test_as_errors_n_est_jamais_vide(self):
         """La vue peut relayer `as_errors()` sans jamais tester le cas vide."""
         self.assertEqual(

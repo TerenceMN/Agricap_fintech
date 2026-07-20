@@ -259,8 +259,24 @@ devenues exploitables ont été branchées plutôt que laissées inertes :
   S'y ajoute une **suite à donner** par code (`REFUSAL_GUIDANCE`) : le message du serveur dit
   ce qui s'est passé, cette phrase dit quoi faire ensuite (un plafond dépassé s'escalade au
   comité, une violation maker ≠ checker se délègue à un autre profil). Aucun code n'est
-  inventé : la clé vient de `WorkflowError.code`, et un code inconnu n'affiche rien.
+  inventé : la clé vient de `WorkflowError.code`.
   Sur un écran de décision de crédit, savoir *quelle* règle a bloqué change l'action suivante.
+
+  **Correctif d'un défaut que j'avais moi-même introduit**, signalé par `front-garanties` :
+  la première version faisait `.map(code => REFUSAL_GUIDANCE[code]).filter(Boolean)`, donc
+  **un code inconnu disparaissait sans trace**. Exactement la classe de bug que ce fragment
+  reproche par ailleurs — silencieux, sans erreur de compilation ni test rouge. Corrigé par
+  `lookupGuidance()` : `console.warn` en développement sur tout code sans suite à donner,
+  plus un ensemble `NO_GUIDANCE_NEEDED` listant les codes volontairement relayés tels quels
+  (un avertissement qui crie en permanence finit ignoré, et rate alors le vrai cas).
+  L'utilisateur, lui, ne perd jamais rien : `ErrorPanel` affiche le message serveur de chaque
+  entrée `errors[]`, code connu ou non — seule la suite à donner manque.
+
+  `CLIENT_CONSENT_EXPIRED` (410) est traité **distinctement** de `CLIENT_CONSENT_MISSING`
+  (409) : le backend sépare les deux sous-classes parce que l'acte attendu diffère — un
+  consentement manquant se recueille, un consentement expiré se renouvelle. Le message
+  initial disait « absent ou expiré », contournement légitime tant que le backend
+  confondait les deux, devenu une perte d'information dès qu'il les a séparés.
 - **Anomalies de la feuille de besoins** (`needsSheet.anomalies`, désormais typé) affichées,
   **avant** les avertissements et avec leur effectif. C'est le premier signal que lit un
   analyste. Rendu défensif (`typeof a === 'string' ? a : JSON.stringify(a)`) : le champ est
