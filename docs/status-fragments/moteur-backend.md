@@ -237,6 +237,34 @@ la `valuationNote` de `scoring.py` sur la bande 50–54.
 
 ---
 
+## 5 bis. Payload réellement observé — `docs/contracts/moteur-analyse-payload-observe.json`
+
+Le front avait branché l'onglet Analyse **d'après ma description, sans appel réel**.
+J'ai donc généré la réponse HTTP effective des 4 endpoints (200 / 201) et l'ai
+versionnée. **Deux défauts que seule cette confrontation a révélés :**
+
+1. **`poidsAppliques` sortait en chaînes** (`"25.0"`) alors que `criteres.<x>.poids`
+   sortait en nombre — la même grandeur dans deux types selon l'endroit du payload,
+   et `api.ts` la déclare `Record<string, number>`. Corrigé : émis en `number`.
+   Le **stockage** reste une chaîne (trace d'audit, pas de binaire flottant).
+   Verrouillé par `test_les_grandeurs_numeriques_sortent_en_number`.
+
+2. **Le résumé client félicitait un client pour un historique qu'il n'a pas.**
+   Le score neutre de 50 du critère comportemental sans historique tombait dans
+   « points forts » (comparaison `>=`), et le client lisait « Votre historique
+   avec AGRICAP joue en votre faveur » sans aucun crédit antérieur. Trompeur pour
+   lui, faux pour l'institution, et c'est le critère qui pèse 30 %. Corrigé :
+   comparaison stricte des deux côtés, et l'absence d'historique devient une
+   **piste actionnable** (« un historique de remboursement renforce un dossier »).
+   Verrouillé par `test_absence_d_historique_n_est_jamais_un_point_fort`.
+
+Aucun des deux n'aurait été rattrapé par un test de contrat : le premier passe
+`checkJs: false`, le second était un texte grammaticalement correct.
+
+**Tests : 279 sur `credits` (62 sur le moteur).**
+
+---
+
 ## 6. Ce que je n'ai pas fait / pas pu tester
 
 - **Intégration au pipeline (SPEC §6)** : non livrée. `credits/pipeline.py` n'existe

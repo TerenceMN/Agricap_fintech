@@ -268,54 +268,70 @@ locaux au simulateur, ils lui sont propres.
 > négatif) et corrigé après signalement du lot 3. Les vrais emplacements sont
 > ci-dessous.
 
-Le front ne porte pas *une* grille divergente du backend : il en porte **deux,
-incompatibles entre elles**, pour le même concept — la classe de risque d'un
-score global.
+> **⚠ CORRECTION MAJEURE — une version antérieure de ce §4.1 était fausse, et
+> elle était *actionnable*.** Elle prescrivait d'aligner le front de 50 → 55 et
+> de `>` vers `>=`. **Exécuter cette prescription aurait cassé la lettre de
+> score**, en faisant diverger le front d'une grille avec laquelle il était déjà
+> d'accord. J'avais comparé la grille de **classement** du front aux bandes de
+> **tarification** du backend — deux concepts différents. C'est exactement
+> l'erreur que j'avais évitée sur `c.points` en allant vérifier la sémantique,
+> et que je n'ai pas évitée ici. Erreur signalée par le lot 3, vérifiée
+> directement dans `backend/credits/analyse.py` avant réécriture.
 
-| Emplacement | Grille | Opérateur | Usage |
-|---|---|---|---|
-| `src/components/simulateur/SimulationResult.jsx` (lot 3) | 85 / 70 / **50** | `>` | lettre A/B/C/D + couleur du donut |
-| `src/pages/Credits.jsx` | ré-importe `scoreLetterOf` | `>` | lettre, vue client |
-| `src/components/admin/credits/CreditDetailsModal.jsx:109` | 85 / 70 / **50** | `>` | `scoreColor` (pastille) |
-| `src/components/admin/credits/CreditRow.jsx:20` | 85 / 70 / **50** | `>` | `ScoreBadge` (liste) |
-| `src/pages/credit/ApplicationDetail.tsx:406` | **70 / 50**, 3 bandes | `>=` | couleur du score du dossier |
-| `src/pages/credit/Applications.tsx:285` | **70 / 50**, 3 bandes | `>=` | couleur du score en liste |
-| `src/pages/credit/CreditAnalysis.tsx:152` | **70 / 50**, 3 bandes | `>=` | couleur du score |
-| `backend/credits/scoring.py:332` | 85 / 70 / **55** | `>=` | taux (−2 / 0 / **+2,5** / +5) |
-| `backend/credits/scoring.py:397` | 85 / 70 / **55** | `>=` | `_valuation_note` |
-| `backend/credits/dataio_simulator.py:343` | 85 / 70 / **55** | `>=` | `_valuation_note` |
-| `backend/credits/dataio_simulator.py:580` | 85 / 70 / **55** | `>=` | taux (−2 / 0 / **+2,0** / +5) |
+**La grille canonique de classement** (`analyse.py:717`, servie via
+`BaremeScore.DECISION.parametres.lettres`) :
 
-Ce n'est donc pas une duplication, ce sont **quatre contradictions** :
+```
+LETTRES_DEFAUT = [A min 85, B min 70, C min 50, D min 0]
+if score > borne or borne == 0        # comparaison STRICTE
+```
 
-1. **Deux grilles front incompatibles.** Les écrans d'instruction
-   (`pages/credit/**` — la file analyste, le détail de dossier, l'analyse)
-   classent en **3 bandes 70/50** ; les écrans portefeuille et le simulateur
-   classent en **4 bandes 85/70/50**. Un dossier à 90 est « vert, 1ᵉʳ niveau sur
-   3 » d'un côté et « vert, 1ᵉʳ niveau sur 4 » de l'autre ; à 60, il est rouge
-   dans la file analyste et jaune dans la liste portefeuille. Ce sont les écrans
-   où la décision se prend.
-2. **Front contre backend, sur la bande 50–54.** Un score de 52 s'affiche « C »
-   en jaune, à côté d'une `valuationNote` serveur « Dossier à risque élevé —
-   analyse approfondie requise » et d'un taux majoré de +5. La couleur dit 3ᵉ
-   niveau, le reste de l'écran dit 4ᵉ.
-3. **Opérateur `>` contre `>=`.** Un score valant **exactement 85 ou 70** tombe
-   dans la bande haute pour le moteur et dans la bande suivante pour le front
-   4-bandes. Bug de bord silencieux : corriger 50 → 55 sans corriger `>` → `>=`
-   le laisserait intact, et il est plus discret donc plus durable. (Relevé par
-   le lot 3.)
-4. **Backend contre lui-même, sur la 3ᵉ bande.** `scoring.py` majore de +2,5,
-   `dataio_simulator.py` de +2,0. Deux modules, deux taux pour le même score.
+Le commentaire du serveur est explicite : bornes strictes « conservées telles
+quelles pour ne pas déplacer silencieusement la frontière d'un dossier à 85,0 ».
+Rejoué aux bornes exactes : à 85 → B des deux côtés ; à 70 → C ; à 50 → D. **Le
+front 4-bandes 85/70/50 en `>` est identique au moteur.**
 
-**Hors périmètre de ce constat, vérifié pour éviter un faux positif :**
-`SimulationResult.jsx:112` (`c.points >= 70 / 50`) colore les **critères** d'un
-dossier, pas le score global — `c.points` est un score sur 100 par critère.
-Concept distinct, échelle légitimement différente. Ce n'est **pas** une copie de
-plus.
+| Emplacement | Grille | Verdict |
+|---|---|---|
+| `src/components/simulateur/SimulationResult.jsx` (`SCORE_BANDS`) | 85/70/50 `>` | **conforme** — dé-dupliqué par le lot 3 |
+| `src/pages/Credits.jsx` (ré-import) | 85/70/50 `>` | **conforme** |
+| `src/components/admin/credits/CreditRow.jsx:20` | 85/70/50 `>` | **conforme** — duplication seule |
+| `src/components/admin/credits/CreditDetailsModal.jsx:109` | 85/70/50 `>` | **conforme** — duplication seule |
+| `src/pages/credit/ApplicationDetail.tsx:406` | **70/50**, 3 bandes, `>=` | **divergent** |
+| `src/pages/credit/Applications.tsx:285` | **70/50**, 3 bandes, `>=` | **divergent** |
+| `src/pages/credit/CreditAnalysis.tsx:152` | **70/50**, 3 bandes, `>=` | **divergent** |
 
-Diagnostic initial dû au lot 3 (`CreditRow.jsx`, la 4 backend, l'opérateur) ;
-les trois écrans de `pages/credit/**` et la vérification de `c.points` ajoutés
-par un balayage `grep -rnE "(>|>=) ?(85|70|55|50)"` sur tout `src`.
+**Ce qui reste vrai, et ce qui ne l'était pas :**
+
+1. **Vrai — les 3 écrans de `pages/credit/**` divergent.** Ils classent en 3
+   bandes 70/50 là où le moteur classe en 4 bandes 85/70/50. Un dossier à 90 est
+   « 1ᵉʳ niveau sur 3 » d'un côté, « sur 4 » de l'autre ; à 60, rouge dans la
+   file analyste et jaune dans la liste portefeuille. Ce sont les écrans
+   d'instruction — ceux où la décision se prend.
+2. **Vrai — duplication sur les 4 emplacements conformes.** À résorber, mais
+   sans urgence de correction : ils affichent la bonne classe.
+3. **Faux — « front contre backend sur la bande 50–54 ».** Comparait le
+   classement à la tarification.
+4. **Faux — « opérateur `>` contre `>=` ».** Le moteur utilise `>` strict sur la
+   grille de lettres, comme le front. Le `>=` des ladders backend appartient aux
+   bandes de tarification.
+5. **Vrai mais sans rapport — backend contre lui-même.** `scoring.py:332` majore
+   de +2,5, `dataio_simulator.py:580` de +2,0 sur la même bande de tarification.
+   Défaut backend réel, **à dissocier** de la question de la lettre.
+
+**Deux faux positifs écartés par vérification de la sémantique** — la seule
+étape qui distingue une copie d'une divergence :
+- `SimulationResult.jsx:112` (`c.points >= 70/50`) colore les **critères**, pas le
+  score global. Concept distinct.
+- `scoring.py` / `dataio_simulator.py` en 85/70/**55** `>=` pilotent
+  l'**ajustement du taux** et la note de valorisation. Bandes de tarification,
+  pas grille de classement.
+
+**Correctif restant, et il ne dépend de personne :** les 3 écrans de
+`pages/credit/**` consomment déjà `analyse/`, donc reçoivent déjà `scoreLettre`.
+Ils peuvent afficher la lettre servie sans rien attendre du backend. C'est le
+correctif le plus rentable du lot. `src/pages/credit/**` est hors du périmètre de
+ce chantier — **à router**, pas à exécuter ici.
 
 **Pourquoi `scoreColor` n'a pas été corrigé unilatéralement.** Aligner 50 → 55
 dans `CreditDetailsModal.jsx` seul ferait diverger la pastille du modal du badge

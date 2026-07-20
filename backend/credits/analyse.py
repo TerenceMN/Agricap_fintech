@@ -1105,7 +1105,12 @@ def serialiser_analyse_staff(analyse: AnalyseCredit) -> dict:
             "revision": analyse.needs_source_revision,
             "sha256": analyse.needs_source_sha256,
         },
-        "poidsAppliques": analyse.poids_appliques or {},
+        # Émis en `number`, comme `criteres.<x>.poids` — la même grandeur ne peut
+        # pas sortir en chaîne à un endroit et en nombre à l'autre. Le STOCKAGE
+        # reste une chaîne (`poids_appliques`) : c'est la trace d'audit, elle ne
+        # passe pas par un binaire flottant.
+        "poidsAppliques": {k: float(Decimal(str(v)))
+                           for k, v in (analyse.poids_appliques or {}).items()},
     }
 
 

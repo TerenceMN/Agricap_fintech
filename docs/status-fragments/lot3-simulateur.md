@@ -194,72 +194,85 @@ serveur (donc auditable et rejouable), elle réutilise `ModuleAllocation.financi
 qui existe déjà avec la bonne sémantique, et elle est la seule qui rende le
 curseur honnête. **Question ouverte pour l'agent backend crédit.**
 
-### 4.2 Le barème de la lettre de score est côté front — et il ne dit pas la même chose que le serveur
+### 4.2 La lettre de score est recopiée côté front alors que le serveur la sert
 
-`scoreLetterOf` applique des seuils **85 / 70 / 50** codés dans
-`SimulationResult.jsx`. C'est la dernière règle métier résiduelle du navigateur —
-et, au sens du principe 7, un fragment de barème exposé au client.
+> **Correction — cette section disait le contraire dans une version antérieure.**
+> J'y écrivais que le front « contredit le moteur » et prescrivais d'aligner le
+> 3ᵉ palier de 50 sur 55 et `>` sur `>=`. **C'était faux, et le correctif aurait
+> introduit le bug qu'il prétendait réparer.** J'avais comparé la grille de la
+> *lettre* aux échelles d'ajustement du *taux* — deux concepts distincts qui ont
+> légitimement des bornes différentes. La prescription erronée ayant été relayée
+> à `moteur-backend` et à `main`, elle est corrigée ici en clair plutôt que
+> réécrite en silence.
 
-**Vérification faite après échange avec `moteur-front-analyse` : ce n'est pas
-qu'une duplication, c'est une contradiction.** Le backend applique une grille à
-4 niveaux dont le troisième seuil est **55**, pas 50 :
+**L'état réel, vérifié dans le code.**
 
-| Emplacement | Seuils | Usage |
+`credits/analyse.py::score_lettre` applique la grille A>85 / B>70 / C>50 / D,
+en comparaison **stricte**, lue depuis `BaremeScore.DECISION.parametres.lettres`
+avec `LETTRES_DEFAUT` en secours. Les bornes strictes sont un choix documenté
+(SPEC §6) et verrouillé par `test_lettre_de_score` : 85 → **B**, 70 → **C**,
+50 → **D**.
+
+`SCORE_BANDS` dans `SimulationResult.jsx` produit exactement le même résultat :
+vérifié sur 15 scores, dont les bornes exactes 50 / 70 / 85. **Les chiffres du
+front sont corrects.** Le défaut est la duplication, pas les valeurs.
+
+**Ce que je comparais par erreur.** Les échelles 85 / 70 / **55** en `>=` de
+`scoring.py` et `dataio_simulator.py` pilotent l'ajustement du taux (−2 / 0 /
++2 ou +2,5 / +5) et la note de valorisation. Ce sont les bandes de *tarification*,
+pas la grille de *classement*. Les confondre est la même faute que
+`moteur-front-analyse` a évitée sur `SimulationResult.jsx:112` (`c.points`, score
+par critère) : deux échelles voisines, deux concepts. Reste vrai en revanche, et
+indépendamment du front : ces deux ladders Python sont dupliqués entre les deux
+modules et **divergent déjà entre eux** (+2,0 contre +2,5 sur la 3ᵉ bande). C'est
+un défaut backend réel, sans rapport avec la lettre.
+
+**Le vrai problème, qui subsiste.** Le serveur sait servir la lettre —
+`scoreLettre` est exposé sur `analyse/` et `analyse-resume/` — mais **pas sur
+`simulate/`**, le seul endpoint qu'utilise le parcours client. Tant que c'est le
+cas, `SCORE_BANDS` reste nécessaire. Sa nocivité n'est pas de mentir aujourd'hui,
+c'est de **dériver demain** : la grille est recalibrable en base par le comité
+sans redéploiement (principe 8), et ce jour-là la copie front divergera en
+silence, sans test rouge.
+
+**Demande à `moteur-backend`, reformulée :** que `POST /credits/simulate/` serve
+`scoreLettre` comme les endpoints d'analyse. Le front supprime alors
+`SCORE_BANDS` et se contente d'afficher. C'est une extension d'un mécanisme déjà
+livré, pas une conception nouvelle.
+
+**Recensement des grilles front** (balayage
+`grep -rnE "(>|>=) ?(85|70|55|50)" src`, après trois recensements incrémentaux
+qui en avaient chacun manqué une) :
+
+| Emplacement | Grille | Verdict |
 |---|---|---|
-| `SimulationResult.jsx` (front) | 85 / 70 / **50** | lettre A / B / C / D |
-| `credits/dataio_simulator.py:342` | 85 / 70 / **55** | `_valuation_note` |
-| `credits/dataio_simulator.py:580` | 85 / 70 / **55** | ajustement du taux (−2 / 0 / +2 / +5) |
-| `credits/scoring.py:332` | 85 / 70 / **55** | ajustement du taux (−2 / 0 / +2,5 / +5) |
-| `credits/scoring.py:397` | 85 / 70 / **55** | `_valuation_note` |
+| `simulateur/SimulationResult.jsx` — `SCORE_BANDS` | 85/70/50 `>` | conforme au moteur · dé-dupliqué (lettre + couleur fusionnées) |
+| `admin/credits/CreditRow.jsx:20` | 85/70/50 `>` | conforme · duplication · hors périmètre |
+| `admin/credits/CreditDetailsModal.jsx:109` | 85/70/50 `>` | conforme · duplication · hors périmètre |
+| `pages/credit/ApplicationDetail.tsx:406` | **70/50 `>=`, 3 bandes** | **divergent** · hors périmètre |
+| `pages/credit/Applications.tsx:285` | **70/50 `>=`, 3 bandes** | **divergent** · hors périmètre |
+| `pages/credit/CreditAnalysis.tsx:152` | **70/50 `>=`, 3 bandes** | **divergent** · hors périmètre |
 
-Conséquence concrète sur la bande 50–54 : un score de 52 s'affiche **« C »** au
-client, à côté d'une `valuationNote` (« Dossier à risque élevé — analyse
-approfondie requise ») et d'un taux majoré de +5 points qui appartiennent tous
-deux à la bande du **bas**. La lettre dit C, tout le reste de l'écran dit D. Ce
-n'est pas un écart cosmétique : c'est le front qui contredit le moteur sur la
-classe de risque d'un dossier.
+`SimulationResult.jsx:112` (`c.points >= 70 / 50`) n'est **pas** une copie :
+c'est le score *par critère*, autre concept. `Credits.jsx` ré-importe
+`scoreLetterOf`, ce n'est pas une copie non plus.
 
-À noter aussi, indépendamment du front : ces seuils sont codés en dur **dans le
-Python**, et dupliqués entre `scoring.py` et `dataio_simulator.py` (avec des
-ajustements de taux qui divergent déjà : +2,0 contre +2,5 sur la 3ᵉ bande).
-C'est le principe 8 qui est en cause — les barèmes doivent vivre en base
-(`BaremeScore`), modifiables par le comité sans redéploiement.
+**La divergence réelle est donc dans `pages/credit/**`** : trois bandes au lieu
+de quatre, seuils 70/50 en `>=`. Un dossier à 60 y est rouge alors qu'il est
+« C » partout ailleurs ; à 90 il est premier niveau sur trois au lieu de premier
+sur quatre. Ce sont les écrans d'instruction — file analyste, détail, analyse.
+Ces trois-là consomment déjà `analyse/`, **donc déjà `scoreLettre`** : ils
+peuvent l'afficher sans attendre quoi que ce soit du backend. Hors de mon
+périmètre ; signalé à `moteur-front-analyse` et routé vers `main`.
 
-**Demande portée conjointement avec `moteur-front-analyse` à l'agent backend :**
-que le moteur serve `scoreLettre` (ou la grille) avec le score, en la lisant
-depuis `BaremeScore` plutôt que depuis une échelle `if` recopiée. Tant que ce
-n'est pas fait, ajouter un 4ᵉ point de vérité côté front n'aiderait personne :
-le comportement reste inchangé et le point est signalé dans le code. Je ne l'ai
-pas supprimé unilatéralement — la lettre est aussi affichée dans `FicheSynthese`,
-et la retirer serait une régression d'affichage sans contrepartie.
+**Ce que j'ai fait dans mon fichier, et pourquoi pas plus.** `SimulationResult.jsx`
+portait *deux* échelles pour la même règle (lettre l.18, couleur du donut l.41),
+à vingt lignes d'écart. Fusionnées en une table unique, **sans toucher aux
+seuils** — non-régression vérifiée sur 15 cas. Je n'ai pas supprimé la copie :
+`simulate/` ne sert pas encore la lettre. Je n'ai pas touché aux 5 autres
+emplacements : `admin/**` et `pages/credit/**` sont hors de mon périmètre et
+d'autres agents y travaillent.
 
-**Recensement complet côté front** (balayage `grep` de tout `src/`, après
-signalement d'une 5ᵉ copie par `moteur-front-analyse`) :
-
-| Emplacement | Sortie | État |
-|---|---|---|
-| `simulateur/SimulationResult.jsx` — `SCORE_BANDS` | lettre **et** couleur du donut | **dé-dupliqué** (voir ci-dessous) |
-| `admin/credits/CreditRow.jsx:20` — `ScoreBadge` | couleur du badge de la **liste** | hors périmètre |
-| `admin/credits/CreditDetailsModal.jsx:109` — `scoreColor` | couleur du **détail** | hors périmètre |
-
-`Credits.jsx` n'est pas une copie : il ré-importe `scoreLetterOf`.
-
-**Une 5ᵉ échelle se cachait dans mon propre fichier** et aucun des deux
-recensements ne l'avait vue : `SimulationResult.jsx` portait *deux* ternaires
-distincts pour la même règle — la lettre (ligne 18) et la couleur du donut
-(ligne 41), à vingt lignes d'écart. Elles dérivent désormais d'une table unique
-`SCORE_BANDS`. **Aucun seuil n'a été modifié** : c'est un dé-doublonnage à
-comportement strictement identique (vérifié sur 15 cas, dont les bornes exactes
-50 / 70 / 85 et les entrées `null` / `NaN`). Le front passe de 5 échelles à 3.
-
-**Pourquoi je n'ai pas aligné 50 → 55 dans mon fichier.** Corriger la valeur ici
-seul ferait diverger le simulateur du badge de liste et du modal de détail : le
-même dossier changerait de couleur entre deux écrans. C'est le mode de
-défaillance que ce rapport dénonce par ailleurs — le reproduire pour en réparer
-une moitié serait absurde. Le réalignement (50 → 55 **et** `>` → `>=`) doit être
-atomique sur les 3 fichiers restants, dont 2 sont dans `src/components/admin/**`,
-hors de mon périmètre. C'est une tâche transverse à router, pas une dette
-dormante — la raison du blocage est écrite en tête de `SimulationResult.jsx`.
 
 ### 4.3 Divers
 

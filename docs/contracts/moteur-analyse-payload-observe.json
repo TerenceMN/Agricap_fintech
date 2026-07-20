@@ -1,5 +1,6 @@
 {
-  "GET analyse/ (200, staff)": {
+  "_note": "Payload REELLEMENT OBSERVE (test API, 200/201). Genere par credits.tests_analyse.",
+  "GET applications/<code>/analyse/ -> 200 (staff)": {
     "id": 1,
     "reference": "CRED-TEST-ANA-0001",
     "referentiel": "AGRICAP_FIN_SIM_01_Cereales_Mais",
@@ -400,7 +401,7 @@
       "nCasReels": 0,
       "version": 1
     },
-    "executeLe": "2026-07-20T16:54:07.528705+00:00",
+    "executeLe": "2026-07-20T16:56:57.434597+00:00",
     "versionMoteur": "4.0",
     "lignage": {
       "needsSourceId": 1,
@@ -408,25 +409,23 @@
       "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     "poidsAppliques": {
-      "technique": "25.0",
-      "dscr": "20.0",
-      "stress": "10.0",
-      "comportemental": "30.0",
-      "garanties": "15.0"
+      "technique": 25.0,
+      "dscr": 20.0,
+      "stress": 10.0,
+      "comportemental": 30.0,
+      "garanties": 15.0
     }
   },
-  "POST analyse/justifier/ (200) — justifications uniquement": {
-    "justifications": [
-      {
-        "indicateur": "cout_module:mecanisation",
-        "justification": "Semences fournies par la coopérative.",
-        "agent": "sub-dump-analyste",
-        "date": "2026-07-20T16:54:07.541476+00:00"
-      }
-    ]
-  },
-  "POST reanalyser/ (201) — extrait": {
-    "status": 201,
+  "POST applications/<code>/analyse/justifier/ -> 200 : justifications": [
+    {
+      "indicateur": "cout_module:mecanisation",
+      "justification": "Semences fournies par la cooperative.",
+      "agent": "sub-dump-analyste",
+      "date": "2026-07-20T16:56:57.445399+00:00"
+    }
+  ],
+  "POST applications/<code>/reanalyser/ -> 201 (extrait)": {
+    "httpStatus": 201,
     "id": 2,
     "parametres": {
       "dureeMois": 8,
@@ -437,6 +436,7 @@
       "devise": "USD"
     },
     "scoreGlobal": 15.0,
+    "scoreLettre": "D",
     "dscr": 0.264,
     "totaux": {
       "totalInterets": 109.71,
@@ -447,7 +447,7 @@
       "nbEcheances": 8
     }
   },
-  "GET analyse-resume/ (200, client)": {
+  "GET applications/<code>/analyse-resume/ -> 200 (client)": {
     "reference": "CRED-TEST-ANA-0001",
     "scoreLettre": "D",
     "pointsForts": [],
@@ -458,6 +458,6 @@
       "Un historique de remboursement au sein d'AGRICAP renforce un dossier. Une épargne régulière y contribue aussi.",
       "Constituez vos garanties : une garantie confirmée pèse davantage qu'une garantie annoncée."
     ],
-    "analyseLe": "2026-07-20T16:54:07.548818+00:00"
+    "analyseLe": "2026-07-20T16:56:57.451724+00:00"
   }
 }

@@ -16,6 +16,17 @@ function detail(details, ...cles) {
   return undefined;
 }
 
+/**
+ * Le mode de différé change la lecture du DSCR : en franchise totale, rien
+ * n'est payé pendant le différé et les intérêts sont capitalisés, donc le
+ * service de la dette se concentre encore plus. L'afficher évite que l'analyste
+ * compare deux dossiers instruits sous deux modes sans le savoir.
+ */
+const MODE_DIFFERE_LIBELLE = {
+  interets_seuls: 'Différé : intérêts seuls',
+  franchise_totale: 'Différé : franchise totale (intérêts capitalisés)',
+};
+
 const Stat = ({ label, value, tone = 'text-white', hint }) => (
   <div className="bg-slate-900/50 rounded-lg p-3">
     <p className="text-[11px] uppercase tracking-wide text-slate-500">{label}</p>
@@ -88,7 +99,11 @@ const DscrPanel = ({ analyse }) => {
               : undefined
           }
         />
-        <Stat label="Taux annuel" value={formatTaux(params.tauxAnnuel)} />
+        <Stat
+          label="Taux annuel"
+          value={formatTaux(params.tauxAnnuel)}
+          hint={MODE_DIFFERE_LIBELLE[params.modeDiffere] || undefined}
+        />
       </div>
 
       {facteurDominant ? (

@@ -49,9 +49,15 @@ const EcheancierTable = ({ lignes = [], currency = '', totaux = null }) => {
     );
   }
 
-  const avecCapitalises = lignes.some(
-    (l) => l?.interetsCapitalises !== undefined && l?.interetsCapitalises !== null,
-  );
+  // La colonne n'apparaît que si des intérêts ont RÉELLEMENT été capitalisés.
+  // En mode `interets_seuls`, le moteur sert `interetsCapitalises: 0.0` sur
+  // chaque ligne : tester la seule présence de la clé afficherait une colonne
+  // entière de zéros, qui se lit comme une information alors qu'elle n'en est
+  // pas. Défaut trouvé en confrontant le branchement au payload observé.
+  const avecCapitalises = lignes.some((l) => {
+    const v = l?.interetsCapitalises;
+    return v !== undefined && v !== null && Number(v) !== 0;
+  });
   const visibles = tout ? lignes : lignes.slice(0, APERCU);
   const restantes = lignes.length - visibles.length;
 

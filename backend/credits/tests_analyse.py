@@ -616,6 +616,23 @@ class ApiAnalyseTests(AuthedAPITestCase):
                 self.assertIsInstance(ligne[cle], float, f"{cle} n'est pas un number")
         self.assertEqual(lignes[-1]["crd"], 0.0)
 
+    def test_les_grandeurs_numeriques_sortent_en_number(self):
+        """`poidsAppliques` typé `Record<string, number>` dans `api.ts`.
+
+        Il sortait en chaînes (`"25.0"`) alors que `criteres.<x>.poids` sortait
+        en nombre : la même grandeur dans deux types selon l'endroit du payload.
+        Invisible au build (`checkJs: false`) et invisible à l'écran jusqu'au
+        premier calcul ou tri côté front.
+        """
+        self.login(role="gest_credit", sub="sub-analyste")
+        data = self.client.get(self.url).data
+        for cle, valeur in data["poidsAppliques"].items():
+            self.assertIsInstance(valeur, float, f"poidsAppliques.{cle} = {valeur!r}")
+        self.assertEqual(sum(data["poidsAppliques"].values()), 100.0)
+        for nom, bloc in data["criteres"].items():
+            self.assertIsInstance(bloc["poids"], float, nom)
+            self.assertEqual(bloc["poids"], data["poidsAppliques"][nom])
+
     def test_totaux_servis_par_le_serveur(self):
         self.login(role="gest_credit", sub="sub-analyste")
         totaux = self.client.get(self.url).data["totaux"]

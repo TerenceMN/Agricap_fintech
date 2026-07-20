@@ -1178,7 +1178,17 @@ export interface CreditAnalyse {
   id: number;
   reference: string;
   referentiel: string;
-  parametres: { dureeMois: number; differeMois: number; tauxAnnuel: number };
+  /** Paramètres du crédit tel qu'analysé. `modeDiffere` est indispensable pour
+   *  relire une analyse passée : sans lui, on ne sait pas si les intérêts du
+   *  différé ont été payés ou capitalisés — deux échéanciers très différents. */
+  parametres: {
+    dureeMois: number;
+    differeMois: number;
+    tauxAnnuel: number;
+    modeDiffere: 'interets_seuls' | 'franchise_totale';
+    capital: number;
+    devise: string;
+  };
   scoreGlobal: number;
   recommandation: CreditRecommandation;
   dscr: number | null;
