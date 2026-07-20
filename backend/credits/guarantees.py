@@ -333,8 +333,11 @@ def confirm_asset_guarantee(guarantee, confirmer_sub: str):
     return guarantee
 
 
-# ── Garantie morale ────────────────────────────────────────────────────────────
-
+# ── Caution solidaire (garantie morale) ───────────────────────────────────────
+#
+# Délai historique de confirmation par un AGENT, conservé pour les cautions
+# déclaratives d'avant le consentement opposable. La fenêtre qui compte
+# désormais est celle du GARANT (`credits.guarantor.consent_window_hours`).
 MORAL_GUARANTEE_EXPIRY_DAYS = 7
 
 
@@ -346,13 +349,23 @@ def register_moral_guarantee(
     guarantor_id_number: str,
     registered_by_sub: str,
     guarantor_sub: str = "",
+    montant_couvert: Decimal | None = None,
     notes: str = "",
 ) -> "credits.models.CreditGuarantee":
+    """Désigne un garant — la caution reste inopposable tant qu'il n'a pas consenti.
+
+    Ce qui change par rapport à la version déclarative : le garant doit être un
+    utilisateur AGRICAP identifié (`guarantor_sub`), il doit passer les sept
+    contrôles de `credits.guarantor`, et la caution naît en `PENDING_CONSENT`
+    avec une fenêtre de consentement — pas en `PENDING` avec une simple attente
+    de contre-signature d'agent.
+
+    Les trois champs déclaratifs restent requis : ils portent la pièce
+    d'identité relevée en agence, qui reste la trace physique de l'engagement.
     """
-    Enregistre une caution morale.
-    Le garant a MORAL_GUARANTEE_EXPIRY_DAYS jours pour confirmer.
-    Pendant ce délai le statut est PENDING.
-    """
+    from credits.guarantor import (
+        GuarantorUnknown, assert_can_guarantee, consent_window_hours,
+    )
     from credits.models import CreditGuarantee
 
     if not guarantor_name.strip():
@@ -364,24 +377,50 @@ def register_moral_guarantee(
 
     assert_type_eligible(application, CreditGuarantee.GuaranteeType.MORALE)
 
-    # Invalider toute caution morale PENDING ou ACTIVE précédente sur ce dossier
+    guarantor = _resolve_guarantor(guarantor_sub)
+    if guarantor is None:
+        raise GuarantorUnknown(
+            "Le garant doit disposer d'un compte AGRICAP : sans compte, il ne "
+            "peut pas consentir lui-même, et la caution reste déclarative."
+        )
+
+    montant = Decimal(str(
+        montant_couvert
+        if montant_couvert is not None
+        else (application.amount_approved or application.amount_requested or 0)
+    ))
+    assert_can_guarantee(application, guarantor, montant)
+
+    # Une nouvelle désignation éteint la précédente : on ne laisse jamais deux
+    # cautions vivantes sur un même dossier, sans quoi la couverture serait
+    # comptée deux fois et deux garants s'estimeraient engagés pour le tout.
     CreditGuarantee.objects.filter(
         application=application,
         guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
-        status__in=[CreditGuarantee.Status.PENDING, CreditGuarantee.Status.ACTIVE],
+        status__in=[
+            CreditGuarantee.Status.PENDING,
+            CreditGuarantee.Status.PENDING_CONSENT,
+            CreditGuarantee.Status.CONSENTED,
+            CreditGuarantee.Status.ACTIVE,
+        ],
     ).update(status=CreditGuarantee.Status.RELEASED, updated_at=timezone.now())
 
-    expires = timezone.now() + timezone.timedelta(days=MORAL_GUARANTEE_EXPIRY_DAYS)
+    now = timezone.now()
+    window = consent_window_hours()
 
     guarantee = CreditGuarantee.objects.create(
         application=application,
         guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
-        status=CreditGuarantee.Status.PENDING,
+        status=CreditGuarantee.Status.PENDING_CONSENT,
+        guarantor=guarantor,
         guarantor_sub=guarantor_sub,
         guarantor_name=guarantor_name,
         guarantor_phone=guarantor_phone,
         guarantor_id_number=guarantor_id_number,
-        expires_at=expires,
+        covered_amount=montant,
+        hold_currency=application.currency,
+        consent_expires_at=now + timezone.timedelta(hours=window),
+        expires_at=now + timezone.timedelta(days=MORAL_GUARANTEE_EXPIRY_DAYS),
         registered_by_sub=registered_by_sub,
         notes=notes,
     )
@@ -389,20 +428,144 @@ def register_moral_guarantee(
     application.guarantee_type = "morale"
     application.save(update_fields=["guarantee_type", "updated_at"])
 
-    # Notifier le garant par SMS si le module SMS est disponible
-    _notify_guarantor_sms(guarantee)
+    _audit(
+        actor=registered_by_sub, action="credit.guarantee.guarantor_designated",
+        guarantee=guarantee,
+        details={"guarantorSub": str(guarantor.pk), "coveredAmount": str(montant),
+                 "consentWindowHours": window},
+    )
 
+    _notify_guarantor_sms(guarantee)
+    return guarantee
+
+
+def _resolve_guarantor(guarantor_sub: str):
+    if not (guarantor_sub or "").strip():
+        return None
+    from accounts.models import FintechUser
+    return FintechUser.objects.filter(pk=guarantor_sub.strip()).first()
+
+
+def record_guarantor_consent(
+    guarantee,
+    responder_sub: str,
+    accept: bool,
+    channel: str = "app",
+    ip: str | None = None,
+) -> "credits.models.CreditGuarantee":
+    """Le garant accepte ou refuse sa caution — acte unique et horodaté.
+
+    Calqué sur `workflow.record_client_consent` : même contrôle d'identité (seul
+    le bénéficiaire de l'acte le pose), même contrôle de fenêtre, même
+    horodatage. Ce qui s'y ajoute est la re-vérification intégrale de la
+    capacité d'engagement : entre la désignation et le clic, le garant a pu
+    s'engager ailleurs, tomber en défaut ou quitter le groupe. L'engagement se
+    forme ici, donc c'est ici que les règles doivent tenir.
+
+    La fonction n'est **pas** atomique dans son ensemble, volontairement : les
+    contrôles doivent pouvoir écrire (le passage en `expired` d'une demande dont
+    la fenêtre est dépassée) puis lever une exception. Sous un `@atomic` global,
+    ce `raise` annulait l'écriture d'expiration — la demande restait
+    éternellement `pending_consent`, et chaque nouvelle tentative reconstatait la
+    même expiration sans jamais la matérialiser. L'atomicité est posée là où elle
+    a un sens : autour de la transition ET de sa journalisation, indissociables
+    (une preuve de consentement sans entrée d'audit, ou l'inverse, ne vaut rien).
+    """
+    from credits.guarantor import (
+        GuarantorAlreadyAnswered, GuarantorConsentExpired, GuarantorNotDesignated,
+        InvalidGuaranteeState, assert_can_guarantee, consent_window_hours,
+    )
+    from credits.models import CreditGuarantee
+
+    if guarantee.guarantee_type != CreditGuarantee.GuaranteeType.MORALE:
+        raise InvalidGuaranteeState("Cette garantie n'est pas une caution solidaire.")
+
+    if not guarantee.guarantor_id or str(guarantee.guarantor_id) != str(responder_sub):
+        raise GuarantorNotDesignated(
+            "Seul le garant désigné peut consentir à cette caution."
+        )
+
+    if guarantee.status in (
+        CreditGuarantee.Status.CONSENTED,
+        CreditGuarantee.Status.DECLINED,
+    ):
+        raise GuarantorAlreadyAnswered(
+            "Vous avez déjà répondu à cette demande de caution. Un consentement "
+            "ne se rejoue pas : une nouvelle désignation est nécessaire."
+        )
+
+    if guarantee.status != CreditGuarantee.Status.PENDING_CONSENT:
+        raise InvalidGuaranteeState(
+            f"Cette demande de caution n'attend plus de réponse "
+            f"(statut « {guarantee.get_status_display()} »)."
+        )
+
+    if guarantee.is_consent_expired:
+        # La lecture constate l'expiration : on ne laisse pas une demande morte
+        # traîner en `pending_consent` jusqu'au passage de la tâche périodique.
+        guarantee.status = CreditGuarantee.Status.EXPIRED
+        guarantee.save(update_fields=["status", "updated_at"])
+        raise GuarantorConsentExpired(
+            f"Le délai de réponse a expiré le "
+            f"{guarantee.consent_expires_at.strftime('%d/%m/%Y à %H:%M')}. "
+            "Le demandeur doit vous désigner à nouveau."
+        )
+
+    if accept:
+        # Re-vérification complète : la capacité au moment de l'engagement, pas
+        # au moment de la demande. `exclude_pk` évite que la caution en cours
+        # d'acceptation ne se compte elle-même dans le cumul et ne se refuse.
+        assert_can_guarantee(
+            guarantee.application, guarantee.guarantor,
+            guarantee.covered_amount, exclude_pk=guarantee.pk,
+        )
+
+    now = timezone.now()
+    with transaction.atomic():
+        guarantee.status = (
+            CreditGuarantee.Status.CONSENTED if accept
+            else CreditGuarantee.Status.DECLINED
+        )
+        guarantee.consent_meta = {
+            "decision": "accepted" if accept else "declined",
+            "at": now.isoformat(),
+            "channel": channel,
+            "ip": ip,
+            "bySub": str(responder_sub),
+            "coveredAmount": str(guarantee.covered_amount or 0),
+            "currency": guarantee.hold_currency or guarantee.application.currency,
+            "consentWindowHours": consent_window_hours(),
+            "consentExpiresAt": (
+                guarantee.consent_expires_at.isoformat()
+                if guarantee.consent_expires_at else None
+            ),
+        }
+        guarantee.save(update_fields=["status", "consent_meta", "updated_at"])
+
+        _audit(
+            actor=str(responder_sub),
+            action="credit.guarantee.consent_accepted" if accept
+            else "credit.guarantee.consent_declined",
+            guarantee=guarantee, ip=ip,
+            details={"channel": channel,
+                     "coveredAmount": str(guarantee.covered_amount or 0)},
+        )
     return guarantee
 
 
 def confirm_moral_guarantee(
     guarantee, confirmer_sub: str
 ) -> "credits.models.CreditGuarantee":
+    """Constitution de la caution par l'agent — `consented` → `active`.
+
+    C'est le `constituted` de la SPEC : l'agent acte que la caution consentie est
+    formalisée (pièces relevées, engagement signé). Il ne peut plus se substituer
+    au garant : sans consentement préalable, il n'y a rien à constituer.
+
+    Les cautions déclaratives antérieures (statut `pending`, sans garant lié)
+    conservent l'ancien chemin — on ne réécrit pas l'historique (principe 3).
     """
-    Le garant confirme sa caution morale.
-    `confirmer_sub` doit correspondre à guarantor_sub (si renseigné)
-    ou être un agent autorisé avec preuve physique.
-    """
+    from credits.guarantor import GuarantorConsentMissing
     from credits.models import CreditGuarantee
 
     if guarantee.guarantee_type != CreditGuarantee.GuaranteeType.MORALE:
@@ -411,41 +574,99 @@ def confirm_moral_guarantee(
         raise GuaranteeError("Déjà confirmée.")
     if guarantee.status == CreditGuarantee.Status.RELEASED:
         raise GuaranteeError("Garantie déjà levée.")
-    if guarantee.is_expired:
-        guarantee.status = CreditGuarantee.Status.EXPIRED
-        guarantee.save(update_fields=["status", "updated_at"])
-        raise GuaranteeError(
-            f"Délai de confirmation expiré le {guarantee.expires_at.strftime('%d/%m/%Y')}."
+    if guarantee.status == CreditGuarantee.Status.DECLINED:
+        raise GuarantorConsentMissing(
+            "Le garant a refusé cette caution : elle ne peut pas être constituée."
         )
 
-    # Si un sub garant est renseigné, seul lui peut confirmer
-    if guarantee.guarantor_sub and guarantee.guarantor_sub != confirmer_sub:
-        raise GuaranteeError(
-            "Le confirmateur doit être le garant enregistré "
-            f"({guarantee.guarantor_name})."
+    if guarantee.status == CreditGuarantee.Status.PENDING_CONSENT:
+        if guarantee.is_consent_expired:
+            guarantee.status = CreditGuarantee.Status.EXPIRED
+            guarantee.save(update_fields=["status", "updated_at"])
+        raise GuarantorConsentMissing(
+            "Le garant n'a pas encore consenti : une caution ne se constitue pas "
+            "sans l'accord explicite de la personne qu'elle engage."
         )
+
+    if guarantee.status == CreditGuarantee.Status.EXPIRED:
+        raise GuarantorConsentMissing(
+            "La fenêtre de consentement du garant a expiré : le garant doit être "
+            "désigné à nouveau."
+        )
+
+    # — Chemin historique : caution déclarative d'avant le consentement opposable
+    if guarantee.status == CreditGuarantee.Status.PENDING:
+        if guarantee.is_expired:
+            guarantee.status = CreditGuarantee.Status.EXPIRED
+            guarantee.save(update_fields=["status", "updated_at"])
+            raise GuaranteeError(
+                f"Délai de confirmation expiré le "
+                f"{guarantee.expires_at.strftime('%d/%m/%Y')}."
+            )
+        if guarantee.guarantor_sub and guarantee.guarantor_sub != confirmer_sub:
+            raise GuaranteeError(
+                "Le confirmateur doit être le garant enregistré "
+                f"({guarantee.guarantor_name})."
+            )
 
     guarantee.status = CreditGuarantee.Status.ACTIVE
     guarantee.confirmed_by_sub = confirmer_sub
     guarantee.confirmed_at = timezone.now()
     guarantee.save(update_fields=["status", "confirmed_by_sub", "confirmed_at", "updated_at"])
+
+    _audit(actor=confirmer_sub, action="credit.guarantee.constituted",
+           guarantee=guarantee)
     return guarantee
 
 
 def expire_pending_moral_guarantees() -> int:
-    """
-    Passe en EXPIRED toutes les cautions morales PENDING dont le délai est dépassé.
-    À appeler depuis une tâche Celery périodique (quotidienne).
-    Retourne le nombre d'enregistrements mis à jour.
+    """Passe en EXPIRED les cautions dont un délai est dépassé.
+
+    Deux fenêtres, deux motifs d'expiration : le consentement du garant
+    (`consent_expires_at`, statut `pending_consent`) et la confirmation par
+    l'agent des cautions déclaratives historiques (`expires_at`, statut
+    `pending`). À appeler depuis une tâche périodique quotidienne.
     """
     from credits.models import CreditGuarantee
     now = timezone.now()
-    updated = CreditGuarantee.objects.filter(
+
+    consentements = CreditGuarantee.objects.filter(
+        guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
+        status=CreditGuarantee.Status.PENDING_CONSENT,
+        consent_expires_at__lt=now,
+    ).update(status=CreditGuarantee.Status.EXPIRED, updated_at=now)
+
+    declaratives = CreditGuarantee.objects.filter(
         guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
         status=CreditGuarantee.Status.PENDING,
         expires_at__lt=now,
     ).update(status=CreditGuarantee.Status.EXPIRED, updated_at=now)
-    return updated
+
+    return consentements + declaratives
+
+
+# ── Journalisation ────────────────────────────────────────────────────────────
+
+def _audit(*, actor: str, action: str, guarantee, details: dict | None = None,
+           ip: str | None = None) -> None:
+    """Trace une transition de garantie (SPEC §2.7).
+
+    Volontairement non « best-effort » : contrairement au SMS, une transition de
+    caution non journalisée est une perte de preuve. L'appel vit dans la
+    transaction atomique de l'appelant — si l'audit échoue, la transition est
+    annulée avec lui.
+    """
+    from audit.services import record
+    payload = {
+        "applicationCode": guarantee.application.code,
+        "guaranteeType": guarantee.guarantee_type,
+        "status": guarantee.status,
+    }
+    payload.update(details or {})
+    record(
+        actor=actor or "", action=action, entity_type="CreditGuarantee",
+        entity_id=guarantee.pk, details=payload, ip=ip,
+    )
 
 
 # ── Notification SMS garant ────────────────────────────────────────────────────
@@ -456,16 +677,104 @@ def _notify_guarantor_sms(guarantee) -> None:
         from common.sms import send_sms
         phone = guarantee.guarantor_phone
         app = guarantee.application
-        expires = guarantee.expires_at.strftime("%d/%m/%Y")
+        deadline = guarantee.consent_expires_at or guarantee.expires_at
+        expires = deadline.strftime("%d/%m/%Y à %H:%M")
         message = (
-            f"AGRICAP : Vous êtes désigné garant du dossier crédit {app.code} "
-            f"(client : {app.client.full_name}). "
-            f"Confirmez votre caution avant le {expires} via l'application ou "
-            f"auprès de votre agence."
+            f"AGRICAP : {app.client.full_name} vous désigne comme garant du "
+            f"dossier crédit {app.code}, à hauteur de "
+            f"{guarantee.covered_amount} {guarantee.hold_currency}. "
+            f"Vous devez accepter ou refuser avant le {expires} dans "
+            f"l'application ou auprès de votre agence. Sans réponse, la demande "
+            f"expire."
         )
         send_sms(phone, message)
     except Exception:
         pass  # SMS non bloquant
+
+
+# ── Vue « demandes de caution » du garant ─────────────────────────────────────
+
+def guarantee_requests_for(user, status: str = ""):
+    """Les cautions dont `user` est le garant désigné — et rien d'autre.
+
+    Le filtre porte sur la FK `guarantor`, jamais sur `guarantor_sub` : ce
+    dernier est une chaîne déclarative que n'importe quel enregistrement
+    historique peut porter sans qu'aucun compte n'y corresponde.
+    """
+    from credits.models import CreditGuarantee
+
+    qs = (
+        CreditGuarantee.objects
+        .filter(guarantor=user, guarantee_type=CreditGuarantee.GuaranteeType.MORALE)
+        .select_related("application__client", "application__value_chain")
+    )
+    if status:
+        qs = qs.filter(status=status)
+    # Les demandes qui appellent une action d'abord, puis les plus urgentes.
+    return qs.order_by(
+        models_case_pending_first(), "consent_expires_at", "-created_at",
+    )
+
+
+def models_case_pending_first():
+    """Tri : `pending_consent` en tête, le reste ensuite."""
+    from django.db.models import Case, IntegerField, Value, When
+    from credits.models import CreditGuarantee
+    return Case(
+        When(status=CreditGuarantee.Status.PENDING_CONSENT, then=Value(0)),
+        default=Value(1), output_field=IntegerField(),
+    ).asc()
+
+
+def serialize_guarantee_request(guarantee) -> dict[str, Any]:
+    """Forme servie au GARANT — contrat figé (`docs/status-fragments/lot6-backend.md`).
+
+    Principe 7 appliqué à un tiers : le garant voit son engagement (qui, combien,
+    jusqu'à quand) et le lien de groupe qui le justifie. Il ne voit ni la décote,
+    ni sa contribution à la couverture, ni le score du demandeur, ni ses propres
+    plafonds d'engagement — ce sont les règles du moteur, et un garant qui les
+    connaît est un garant qui peut aider à les contourner.
+    """
+    from credits.guarantor import shared_groups
+
+    app = guarantee.application
+    client = app.client
+    chain = app.value_chain
+    consent = guarantee.consent_meta or {}
+    montant = app.amount_approved or app.amount_requested
+
+    return {
+        "id": guarantee.pk,
+        "applicationCode": app.code,
+        "status": guarantee.status,
+        "applicant": {
+            "displayName": client.full_name or client.pk,
+            "sharedGroups": [
+                {"id": g.pk, "name": g.name, "type": g.type}
+                for g in shared_groups(client, guarantee.guarantor)
+            ],
+        },
+        "valueChain": {"code": chain.code, "label": chain.label} if chain else None,
+        "loanAmount": float(montant) if montant is not None else None,
+        "loanCurrency": app.currency,
+        "coveredAmount": (
+            float(guarantee.covered_amount)
+            if guarantee.covered_amount is not None else None
+        ),
+        "coveredCurrency": guarantee.hold_currency or app.currency,
+        "consentExpiresAt": (
+            guarantee.consent_expires_at.isoformat()
+            if guarantee.consent_expires_at else None
+        ),
+        "consentedAt": (
+            consent.get("at") if consent.get("decision") == "accepted" else None
+        ),
+        "declinedAt": (
+            consent.get("at") if consent.get("decision") == "declined" else None
+        ),
+        "isExpired": guarantee.is_consent_expired,
+        "createdAt": guarantee.created_at.isoformat(),
+    }
 
 
 # ── Vue synthèse des garanties d'un dossier ───────────────────────────────────
@@ -484,8 +793,9 @@ def get_guarantee_summary(application) -> dict[str, Any]:
         "items": [],
     }
 
-    # Couverture = somme des montants retenus des garanties ACTIVES uniquement.
-    # Une garantie en attente de confirmation ne couvre rien.
+    # Couverture = somme des montants RETENUS des garanties ACTIVES uniquement.
+    # Une garantie en attente de confirmation — ou de consentement — ne couvre
+    # rien. Une caution morale n'y entre qu'après sa décote (`retained_coverage`).
     couverture = Decimal("0")
 
     for g in guarantees:
@@ -497,7 +807,7 @@ def get_guarantee_summary(application) -> dict[str, Any]:
             "createdAt": g.created_at.isoformat(),
         }
         if g.status == CreditGuarantee.Status.ACTIVE:
-            couverture += g.covered_amount or g.hold_amount or Decimal("0")
+            couverture += g.retained_coverage
 
         if g.guarantee_type in CreditGuarantee.ASSET_BACKED_TYPES and g.asset_id:
             item.update({
@@ -532,16 +842,35 @@ def get_guarantee_summary(application) -> dict[str, Any]:
                 ),
             })
         elif g.guarantee_type == CreditGuarantee.GuaranteeType.MORALE:
+            consent = g.consent_meta or {}
             item.update({
                 "guarantorName": g.guarantor_name,
                 "guarantorPhone": g.guarantor_phone,
                 "guarantorIdNumber": g.guarantor_id_number,
+                "guarantorSub": str(g.guarantor_id) if g.guarantor_id else None,
                 "confirmedAt": g.confirmed_at.isoformat() if g.confirmed_at else None,
                 "expiresAt": g.expires_at.isoformat() if g.expires_at else None,
                 "isExpired": g.is_expired,
+                # Consentement du garant — c'est ce qui rend la caution opposable.
+                "consentExpiresAt": (
+                    g.consent_expires_at.isoformat() if g.consent_expires_at else None
+                ),
+                "isConsentExpired": g.is_consent_expired,
+                "consentedAt": (
+                    consent.get("at") if consent.get("decision") == "accepted" else None
+                ),
+                "declinedAt": (
+                    consent.get("at") if consent.get("decision") == "declined" else None
+                ),
+                "consentChannel": consent.get("channel"),
+                # Contribution réelle à la couverture, après décote : la lire ici
+                # évite que l'analyste ne recalcule 30 % de tête, et que le front
+                # ne le calcule du tout (aucun chiffre métier côté client).
+                "retainedCoverage": float(g.retained_coverage),
                 "daysLeft": (
-                    max(0, (g.expires_at - timezone.now()).days)
-                    if g.expires_at and g.status == CreditGuarantee.Status.PENDING
+                    max(0, (g.consent_expires_at - timezone.now()).days)
+                    if g.consent_expires_at
+                    and g.status == CreditGuarantee.Status.PENDING_CONSENT
                     else None
                 ),
             })

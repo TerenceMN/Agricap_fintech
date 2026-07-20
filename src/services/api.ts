@@ -138,6 +138,10 @@ export const api = {
 
     // Simulation sans sauvegarde
     simulate: (data: {
+      /** Depuis le lot 2 : le backend lit les DataRecord de la feuille ingeree
+       *  et IGNORE les montants du payload. C'est le principe 1 — ce qui est
+       *  score est ce qui est en base. */
+      application_code?: string;
       client_sub?: string;
       value_chain_code?: string;
       needs_sheet_id?: number;
@@ -213,6 +217,38 @@ export const api = {
       request<import('@/types/api').CreditGuaranteeSet>(`/credits/applications/${code}/guarantees/asset/`, { method: 'POST', body: { asset_id: assetId } }),
     releaseGuarantee: (code: string, guaranteeId: number) =>
       request<import('@/types/api').CreditGuaranteeSet>(`/credits/applications/${code}/guarantees/${guaranteeId}/release/`, { method: 'POST', body: {} }),
+
+    // ── Caution solidaire, côté garant (lot 6) ────────────────────────────
+    // Contrat : `docs/status-fragments/lot6-backend.md` §1.
+    //
+    // Ces deux appels ne sont PAS sous `/applications/<code>/` : le garant est un
+    // tiers, il n'a pas accès au dossier du demandeur. Il ne voit que les lignes
+    // dont il est le garant désigné — le serveur filtre sur `guarantor ==
+    // request.user`, y compris pour un admin.
+
+    /** Demandes de caution adressées au garant connecté.
+     *  Sans `status`, **toutes** sont servies, expirées comprises : l'écran doit
+     *  pouvoir afficher « expirée » sans l'inférer d'une date passée. */
+    guaranteeRequests: (params?: { status?: string }) => {
+      const qs = params?.status ? `?status=${encodeURIComponent(params.status)}` : '';
+      return request<import('@/types/api').GuaranteeRequestList>(`/credits/guarantee-requests/${qs}`);
+    },
+
+    /** Consentement du garant — acte juridique, journalisé et irréversible.
+     *
+     *  `accept: false` est un refus explicite, pas une absence de réponse : il
+     *  ferme la demande (`declined`) au lieu de la laisser expirer. Les deux
+     *  valeurs passent par le même appel, d'où le booléen obligatoire.
+     *
+     *  Refus possibles (§1.2) : `ACCEPT_REQUIRED` 400, `GUARANTOR_NOT_DESIGNATED`
+     *  403, 404 sans code, `GUARANTOR_ALREADY_ANSWERED` / `INVALID_GUARANTEE_STATE`
+     *  409, `GUARANTOR_CONSENT_EXPIRED` 410, et les cinq règles de capacité en 422
+     *  — intégralement re-vérifiées à ce moment, pas seulement à la désignation. */
+    consentGuaranteeRequest: (requestId: number, accept: boolean) =>
+      request<import('@/types/api').GuaranteeConsentResult>(
+        `/credits/guarantee-requests/${requestId}/consent/`,
+        { method: 'POST', body: { accept } },
+      ),
   },
 
   // Référentiel (transparence).

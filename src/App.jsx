@@ -30,6 +30,7 @@ import Transactions from '@/pages/Transactions';
 import Contracts from '@/pages/Contracts';
 import Support from '@/pages/Support';
 import AssetsInventory from '@/pages/AssetsInventory';
+import GuaranteeRequests from '@/pages/GuaranteeRequests';
 
 // Investor Specific Pages
 import Portfolios from '@/pages/Portfolios';
@@ -105,7 +106,19 @@ const AppRoutes = () => {
       <Route path="/documents" element={<PrivateRoute roles={['client']}><ClientDocuments /></PrivateRoute>} />
       <Route path="/notifications" element={<PrivateRoute roles={['client', 'admin']}><ClientNotifications /></PrivateRoute>} />
       <Route path="/assets" element={<PrivateRoute roles={['client']}><AssetsInventory /></PrivateRoute>} />
-      
+      {/* Écran du garant (SPEC §2.5). Volontairement SANS prop `roles`, pour une
+          raison différente de celle des écrans backoffice ci-dessus : il n'y a ici
+          aucun privilège à garder. `GET /credits/guarantee-requests/` ne sert que
+          les lignes dont l'utilisateur connecté est le garant désigné — y compris
+          pour un admin. La liste est donc vide par construction pour qui n'est
+          garant de rien, et l'écran vide dit exactement cela.
+          Un garde `roles={['client']}` serait au contraire nuisible : il repose sur
+          `menuKeyFor`, qui écrase les 16 rôles canoniques en 5 clés de menu, et
+          fermerait la porte à un salarié ou un agent qui se porte caution d'un
+          membre de son groupe — un cas parfaitement légitime, dont le refus se
+          traduirait par une caution jamais consentie et un dossier bloqué. */}
+      <Route path="/guarantee-requests" element={<PrivateRoute><GuaranteeRequests /></PrivateRoute>} />
+
       {/* Investor Routes */}
       <Route path="/portfolios" element={<PrivateRoute roles={['investor', 'admin']}><Portfolios /></PrivateRoute>} />
       <Route path="/holdings" element={<PrivateRoute roles={['investor', 'admin']}><Holdings /></PrivateRoute>} />

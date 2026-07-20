@@ -212,6 +212,56 @@ def _ineligible_guarantee_errors(app) -> list[dict]:
     return errors
 
 
+def _missing_guarantor_consent_errors(app) -> list[dict]:
+    """Cautions morales du dossier que leur garant n'a pas (encore) consenties.
+
+    C'est le verrou qui rend la caution opposable : un dossier ne franchit pas
+    l'étape de soumission tant qu'une personne y est engagée sans avoir dit oui.
+    Sans lui, tout le mécanisme de consentement resterait décoratif — on
+    pourrait l'ignorer et instruire quand même.
+
+    Le code remonte dans `errors[]` plutôt qu'en racine : la soumission agrège
+    toutes les causes de l'étape (principe 5), et `APPLICATION_INCOMPLETE` reste
+    le code de la transition. Contrat publié dans `docs/status-fragments/`.
+    """
+    from credits.guarantor import GuarantorConsentMissing
+    from credits.models import CreditGuarantee
+
+    en_attente = app.guarantees.filter(
+        guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
+        status__in=[
+            CreditGuarantee.Status.PENDING,
+            CreditGuarantee.Status.PENDING_CONSENT,
+            CreditGuarantee.Status.DECLINED,
+            CreditGuarantee.Status.EXPIRED,
+        ],
+    )
+
+    messages = {
+        CreditGuarantee.Status.DECLINED:
+            "Le garant {nom} a refusé la caution : le dossier ne peut pas être "
+            "soumis avec cette garantie.",
+        CreditGuarantee.Status.EXPIRED:
+            "Le délai de réponse du garant {nom} a expiré : désignez à nouveau "
+            "un garant avant de soumettre.",
+    }
+    defaut = (
+        "Le garant {nom} n'a pas encore consenti à sa caution. Une caution "
+        "solidaire n'engage personne tant que la personne n'a pas accepté."
+    )
+
+    errors: list[dict] = []
+    for g in en_attente:
+        nom = g.guarantor_name or (
+            g.guarantor.full_name if g.guarantor_id else "désigné"
+        )
+        errors.append({
+            "code": GuarantorConsentMissing.code,
+            "message": messages.get(g.status, defaut).format(nom=nom),
+        })
+    return errors
+
+
 # ── Transitions ───────────────────────────────────────────────────────────────
 
 def submit(app, submitter_sub: str) -> None:
@@ -241,6 +291,10 @@ def submit(app, submitter_sub: str) -> None:
     # référentiel filière. Le contrôle existe déjà à la pose ; on le refait ici
     # plutôt que de laisser passer une garantie non opposable.
     errors.extend(_ineligible_guarantee_errors(app))
+
+    # Principe 9 : une caution que son garant n'a pas acceptée n'est pas une
+    # garantie. Elle ne franchit pas la soumission.
+    errors.extend(_missing_guarantor_consent_errors(app))
 
     if errors:
         # Le message agrégé reste pour les appelants qui n'affichent que `detail` ;

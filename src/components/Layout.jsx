@@ -53,6 +53,11 @@ const allMenuItems = {
       { icon: CreditCard, label: 'Analyse de crédit', path: '/credit' },
       { icon: PiggyBank, label: 'Mon Épargne', path: '/savings' },
       { icon: Package, label: 'Mes Actifs', path: '/assets' },
+      // Surface du GARANT, pas du demandeur : un membre sollicité comme caution
+      // dispose de 72 h pour consentir. Sans cette entrée, l'écran n'était
+      // atteignable qu'en tapant l'URL — la fenêtre aurait expiré faute d'accès,
+      // pas faute de décision.
+      { icon: ShieldCheck, label: 'Demandes de caution', path: '/guarantee-requests' },
       { section: 'Gestion & Aide' },
       { icon: FileText, label: 'Mes Contrats', path: '/contracts' },
       { icon: Folder, label: 'Documents & KYC', path: '/documents' },

@@ -22,8 +22,11 @@ from django.http import HttpResponse
 from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import MultiPartParser
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
+
+from credits.permissions import IsDesignatedGuarantor
 
 from credits.needs_parser import NeedsSheetParseError, parse_needs_sheet
 from credits.needs_template import generate_needs_sheet_template
@@ -1027,9 +1030,15 @@ def register_moral_guarantee(request: Request, code: str) -> Response:
     POST /api/credits/applications/<code>/guarantees/moral/
 
     Corps JSON :
+      guarantor_sub                (sub du garant — REQUIS, il doit pouvoir consentir)
       guarantor_name, guarantor_phone, guarantor_id_number
-      guarantor_sub? (sub OIDC si le garant a un compte)
+      montant_couvert?             (défaut : le montant du dossier)
       notes?
+
+    Les permissions de cet endpoint sont INCHANGÉES (`CAN_INSTRUCT`) : qui, du
+    client ou de l'agent, désigne le garant est une décision de gouvernance qui
+    n'appartient pas au backend — cf. le rapport de lot. Le mécanisme fonctionne
+    des deux côtés ; seul ce garde-fou tranche aujourd'hui.
     """
     if not _require_group(request, CAN_INSTRUCT):
         return Response({"detail": "Permission refusée."}, status=403)
@@ -1039,11 +1048,22 @@ def register_moral_guarantee(request: Request, code: str) -> Response:
 
     data = request.data
     required = ["guarantor_name", "guarantor_phone", "guarantor_id_number"]
-    missing = [f for f in required if not data.get(f, "").strip()]
+    missing = [f for f in required if not (data.get(f) or "").strip()]
     if missing:
         return Response({"detail": f"Champs requis : {', '.join(missing)}."}, status=400)
 
+    montant_raw = data.get("montant_couvert")
+    montant = None
+    if montant_raw is not None:
+        import decimal
+        try:
+            montant = decimal.Decimal(str(montant_raw))
+        except Exception:
+            return Response({"detail": "montant_couvert invalide."}, status=400)
+
     from credits.guarantees import register_moral_guarantee as _register, GuaranteeError
+    from credits.guarantor import GuarantorError
+
     try:
         _register(
             application=app,
@@ -1052,13 +1072,124 @@ def register_moral_guarantee(request: Request, code: str) -> Response:
             guarantor_id_number=data["guarantor_id_number"],
             registered_by_sub=getattr(request.user, "sub", "") or "",
             guarantor_sub=data.get("guarantor_sub", ""),
+            montant_couvert=montant,
             notes=data.get("notes", ""),
         )
+    except GuarantorError as exc:
+        # Chaque règle de capacité porte son code et son statut (cf.
+        # `credits.guarantor`) : le front guide le client au lieu d'afficher
+        # « erreur », et une reformulation de message ne casse rien.
+        return Response(
+            {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+            status=exc.http_status,
+        )
     except GuaranteeError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return Response(
+            {"detail": str(exc), "code": exc.code,
+             "errors": [{"code": exc.code, "message": str(exc)}]},
+            status=422,
+        )
 
     from credits.guarantees import get_guarantee_summary
     return Response(get_guarantee_summary(app), status=201)
+
+
+# ── Demandes de caution du garant (SPEC §2.5) ─────────────────────────────────
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_guarantee_requests(request: Request) -> Response:
+    """GET /api/credits/guarantee-requests/
+
+    Les demandes de caution dont l'utilisateur connecté est le garant désigné.
+    Aucun rôle n'élargit ce périmètre : la liste est celle de SES engagements.
+
+    Les demandes expirées, consenties et refusées sont servies avec les autres —
+    le front doit pouvoir afficher « expirée » sans l'inférer d'une date passée
+    (aucun chiffre ni statut métier calculé côté client).
+    """
+    from credits.guarantees import guarantee_requests_for, serialize_guarantee_request
+    from credits.guarantor import consent_window_hours
+
+    status_filter = request.query_params.get("status", "")
+    requests_qs = guarantee_requests_for(request.user, status=status_filter)
+    items = [serialize_guarantee_request(g) for g in requests_qs]
+
+    return Response({
+        "total_rows": len(items),
+        # Fenêtre CONFIGURÉE, jamais une constante : le front décompte dessus et
+        # n'écrit « 72 h » nulle part (principe 8 jusque dans l'affichage).
+        "consent_window_hours": consent_window_hours(),
+        "items": items,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, IsDesignatedGuarantor])
+def consent_guarantee_request(request: Request, guarantee_id: int) -> Response:
+    """POST /api/credits/guarantee-requests/<id>/consent/  {"accept": bool}
+
+    L'acte par lequel une caution devient opposable. La permission
+    `IsDesignatedGuarantor` est déclarative et s'exécute avant ce corps : le
+    contrôle d'identité ne dépend pas de l'ordre des `return` ci-dessous.
+    """
+    from credits.guarantees import record_guarantor_consent, serialize_guarantee_request
+    from credits.guarantor import GuarantorError, GuarantorNotDesignated
+    from credits.models import CreditGuarantee
+
+    accept = (request.data or {}).get("accept")
+    if not isinstance(accept, bool):
+        return Response(
+            {"detail": "Le champ `accept` est requis et doit valoir true ou false.",
+             "code": "ACCEPT_REQUIRED",
+             "errors": [{"code": "ACCEPT_REQUIRED",
+                         "message": "Réponse attendue : accepter ou refuser."}]},
+            status=400,
+        )
+
+    guarantee = (
+        CreditGuarantee.objects
+        .select_related("application__client", "application__value_chain", "guarantor")
+        .filter(pk=guarantee_id,
+                guarantee_type=CreditGuarantee.GuaranteeType.MORALE)
+        .first()
+    )
+    if guarantee is None:
+        return Response({"detail": "Demande de caution introuvable."}, status=404)
+
+    try:
+        record_guarantor_consent(
+            guarantee,
+            responder_sub=str(getattr(request.user, "pk", "")),
+            accept=accept,
+            channel="app",
+            ip=_client_ip(request),
+        )
+    except GuarantorError as exc:
+        # `code` et statut HTTP viennent de la règle, jamais de la vue —
+        # même discipline que `_workflow_error`.
+        return Response(
+            {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+            status=exc.http_status,
+        )
+
+    guarantee.refresh_from_db()
+    return Response({
+        "detail": "Consentement enregistré." if accept else "Refus enregistré.",
+        "item": serialize_guarantee_request(guarantee),
+    })
+
+
+def _client_ip(request: Request) -> str | None:
+    """IP d'origine, journalisée dans `consent_meta` comme preuve d'origine.
+
+    `X-Forwarded-For` est renseigné par le reverse proxy du VPS ; on prend la
+    première entrée (le client), pas la dernière (le proxy).
+    """
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    return request.META.get("REMOTE_ADDR") or None
 
 
 @api_view(["POST"])
@@ -1083,6 +1214,8 @@ def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
     from credits.guarantees import (
         GuaranteeError, confirm_asset_guarantee, confirm_moral_guarantee,
     )
+    from credits.guarantor import GuarantorError
+
     confirmer = getattr(request.user, "sub", "") or ""
     try:
         if guarantee.guarantee_type in CreditGuarantee.ASSET_BACKED_TYPES:
@@ -1096,6 +1229,11 @@ def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
             confirm_asset_guarantee(guarantee, confirmer_sub=confirmer)
         else:
             confirm_moral_guarantee(guarantee, confirmer_sub=confirmer)
+    except GuarantorError as exc:
+        return Response(
+            {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+            status=exc.http_status,
+        )
     except GuaranteeError as exc:
         return Response({"detail": str(exc)}, status=400)
 

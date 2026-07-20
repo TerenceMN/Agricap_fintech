@@ -5,8 +5,6 @@ import Layout from '@/components/Layout';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Slider } from '@/components/ui/slider';
-import { Switch } from '@/components/ui/switch';
 import { useToast } from '@/components/ui/use-toast';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
@@ -15,8 +13,8 @@ import { useAuth } from '@/contexts/AuthContext.jsx';
 import AdminCreditsDashboard from '@/components/admin/credits/CreditsDashboard.jsx';
 import { api, ApiError } from '@/services/api';
 
-import { 
-    BarChart, Check, ChevronsRight, FileText, Leaf, Send, Shield, Sparkles, TrendingUp, Users, ArrowLeft, RefreshCw, Info, FileUp, Banknote, History, Shuffle, Plus, Car, FileSignature, User, Landmark, Repeat, CalendarDays, AlertTriangle, Package, ShieldCheck
+import {
+    Check, Send, Shield, ArrowLeft, RefreshCw, Info, Banknote, History, Shuffle, FileSignature, User, Landmark, CalendarDays, AlertTriangle, Package, ShieldCheck, Loader2
 } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import { Badge } from '@/components/ui/badge';
@@ -25,9 +23,15 @@ import {
   GUARANTEE_CONFIG, guaranteeConfig,
 } from '@/components/guarantees/guaranteeConfig';
 import { guaranteeErrorList, guaranteeErrorMessage } from '@/components/guarantees/guaranteeErrors';
-import { formatMontant } from '@/components/guarantees/format';
+import { formatDateFr, formatMontant } from '@/components/guarantees/format';
 import GuaranteeCoverage from '@/components/guarantees/GuaranteeCoverage';
 import PledgeableAssets from '@/components/guarantees/PledgeableAssets';
+import { MODULE_CODES, canonicalModule, moduleConfig } from '@/components/simulateur/modules';
+import NeedsSheetPanel, { NeedsSheetErrorList } from '@/components/simulateur/NeedsSheetPanel';
+import ModuleGrid from '@/components/simulateur/ModuleGrid';
+import {
+  DonutChartScore, ScoreBreakdown, SchedulePreview, scoreLetterOf,
+} from '@/components/simulateur/SimulationResult';
 
 // =================================================================
 // ===== CLIENT VIEW COMPONENTS (EXISTING & UPDATED) ===============
@@ -40,16 +44,10 @@ const STEPS = [
   { id: 4, name: 'Synthèse & Soumission' },
 ];
 
-const MODULES_CONFIG = {
-  semences: { label: 'Semences & Intrants', icon: Leaf, color: '#34d399' },
-  mecanisation: { label: 'Opérations mécanisées', icon: Sparkles, color: '#60a5fa' },
-  mainDoeuvre: { label: 'Main-d\'œuvre', icon: Users, color: '#f87171' },
-  equipements: { label: 'Équipements & Machines', icon: TrendingUp, color: '#fbbf24' },
-  postRecolte: { label: 'Récolte & Post-récolte', icon: ChevronsRight, color: '#c084fc' },
-  logistique: { label: 'Logistique', icon: Car, color: '#fdba74' },
-  commercialisation: { label: 'Commercialisation', icon: BarChart, color: '#a78bfa' },
-  reserve: { label: 'Réserve d\'exploitation', icon: Shield, color: '#9ca3af' },
-};
+// La table d'affichage des 8 modules vit dans `@/components/simulateur/modules` :
+// codes canoniques du backend (`maindoeuvre`, `postrecolte`…), alias hérités
+// résolus par `moduleConfig()`. La table locale précédente était indexée en
+// camelCase et faisait disparaître deux modules des totaux affichés.
 
 const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
   const handleChange = (e) => {
@@ -59,30 +57,16 @@ const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
   const handleCurrencyChange = (value) => setFormData(prev => ({ ...prev, currency: value }));
   const handleVcChange = (value) => setFormData(prev => ({ ...prev, vcCode: value }));
 
-  const handleFileChange = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setFormData(prev => ({ ...prev, nsFile: file, nsResult: null }));
-    // Parse immédiatement si un fichier est sélectionné
-    try {
-      const fd = new FormData();
-      fd.append('file', file);
-      if (formData.vcCode) fd.append('value_chain_code', formData.vcCode);
-      if (formData.superficie) fd.append('area_ha', formData.superficie);
-      if (formData.currency) fd.append('currency', formData.currency);
-      const result = await api.credits.parseNeedsSheet(fd);
-      setFormData(prev => ({
-        ...prev,
-        nsFile: file,
-        nsResult: result,
-        // La feuille de besoins est la source de vérité pour le montant
-        montant: String(Math.round(result.grandTotal)),
-        superficie: prev.superficie || (result.area_ha ? String(result.area_ha) : prev.superficie),
-      }));
-    } catch (_) { /* silencieux */ }
-  };
-
-  const isValid = formData.montant && parseFloat(formData.montant) > 0;
+  // Filière et superficie sont exigées ici, pas au moment de soumettre : le
+  // dossier brouillon est créé dès l'étape 2 (le téléversement de la feuille en
+  // a besoin), et `submit` les refuserait de toute façon
+  // (`FILIERE_MANQUANTE`, `SUPERFICIE_MANQUANTE`). Autant le dire tout de suite.
+  const hasChainChoice = prefill?.valueChains?.length > 0;
+  const isValid = Boolean(
+    formData.montant && parseFloat(formData.montant) > 0
+    && formData.superficie && parseFloat(formData.superficie) > 0
+    && (hasChainChoice ? formData.vcCode : true),
+  );
 
   return (
     <motion.div initial={{ opacity: 0, x: -50 }} animate={{ opacity: 1, x: 0 }} className="space-y-6">
@@ -106,11 +90,18 @@ const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
             <Input id="culture" name="culture" value={formData.culture} onChange={handleChange} placeholder="Ex: Café, Maïs..." className="bg-white/5" />
           )}
         </div>
-        <div><Label htmlFor="superficie">Superficie (ha)</Label><Input type="number" id="superficie" name="superficie" value={formData.superficie} onChange={handleChange} className="bg-white/5" /></div>
+        <div><Label htmlFor="superficie">Superficie (ha) *</Label><Input type="number" id="superficie" name="superficie" value={formData.superficie} onChange={handleChange} className="bg-white/5" /></div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="md:col-span-2"><Label htmlFor="montant">Montant total souhaité *</Label><Input type="number" id="montant" name="montant" value={formData.montant} onChange={handleChange} className="bg-white/5" /></div>
+        <div className="md:col-span-2">
+          <Label htmlFor="montant">Montant souhaité *</Label>
+          <Input type="number" id="montant" name="montant" value={formData.montant} onChange={handleChange} className="bg-white/5" />
+          <p className="text-xs text-gray-500 mt-1.5">
+            Ordre de grandeur de votre demande. Le détail chiffré, poste par poste, viendra de
+            votre feuille de besoins à l'étape suivante.
+          </p>
+        </div>
         <div><Label htmlFor="currency">Devise</Label>
           <Select onValueChange={handleCurrencyChange} value={formData.currency}>
             <SelectTrigger id="currency" className="bg-white/5"><SelectValue placeholder="Devise..." /></SelectTrigger>
@@ -119,94 +110,186 @@ const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
         </div>
       </div>
 
-      <div className="space-y-2">
-        <Label htmlFor="financialPlan">Feuille de besoins (Excel, optionnel)</Label>
-        <div className="relative">
-          <Input id="financialPlan" type="file" onChange={handleFileChange}
-            className="bg-white/5 file:bg-emerald-500/20 file:text-emerald-300 file:border-none file:px-4 file:py-2 file:rounded-lg file:mr-4 hover:file:bg-emerald-500/30 cursor-pointer" accept=".xls,.xlsx" />
-          <FileUp className="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-        </div>
-        {formData.vcCode && (
-          <a href={api.credits.templateUrl(formData.vcCode)} target="_blank" rel="noreferrer" className="text-xs text-primary underline">
-            ↓ Télécharger le gabarit {formData.vcCode}
-          </a>
-        )}
-        {formData.nsResult && (
-          <p className="text-xs text-emerald-300">✓ Feuille parsée — Total : {formData.nsResult.grandTotal?.toLocaleString('fr-FR')} {formData.nsResult.currency}</p>
-        )}
+      {/* Le dépôt de la feuille de besoins a rejoint l'étape 2 : il exige un
+          dossier existant côté serveur (`dataset_key = fb__<code>`), donc les
+          informations ci-dessus. */}
+      <div className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.03] p-4">
+        <Info className="w-4 h-4 text-blue-300 mt-0.5 shrink-0" aria-hidden="true" />
+        <p className="text-sm text-gray-400 leading-relaxed">
+          À l'étape suivante, vous téléchargerez le template officiel AGRICAP et téléverserez
+          votre feuille de besoins remplie. Ce sont ses montants — et eux seuls — qui alimentent
+          la simulation et l'analyse de votre dossier.
+        </p>
       </div>
 
       <Button onClick={nextStep} disabled={!isValid} className="w-full bg-gradient-to-r from-emerald-500 to-blue-600 py-6 text-lg disabled:opacity-50">
-        Simuler mon crédit <ArrowLeft className="w-5 h-5 ml-2 transform rotate-180" />
+        Passer à ma feuille de besoins <ArrowLeft className="w-5 h-5 ml-2 transform rotate-180" />
       </Button>
     </motion.div>
   );
 };
+/**
+ * Étape 2 — le simulateur est un **calque strict** de la feuille de besoins.
+ *
+ * SPEC §1.4, les 5 points :
+ *  1. sans feuille ingérée, les 8 modules sont vides et désactivés, et un
+ *     encart renvoie vers le template officiel ;
+ *  2. après téléversement, chaque module affiche son coût en LECTURE SEULE,
+ *     issu de `5_Synthese_Besoins` — les modules à 0 sont grisés ;
+ *  3. le seul réglage restant est « Financement demandé % » par module ;
+ *  4. « Simuler » appelle `POST /credits/simulate/` avec le seul
+ *     `application_code` : le backend lit les `DataRecord` et ignorerait de
+ *     toute façon tout montant du payload (lot 2, principe 1) ;
+ *  5. pour changer un coût, le client change son classeur et le re-téléverse.
+ *
+ * Ce qui a disparu avec cette version : l'initialisation des coûts au
+ * `Math.random()`, les champs de saisie de coût, les interrupteurs
+ * d'activation par module, et l'envoi de `ns_totals` dans le payload de
+ * simulation. Aucun score ni taux n'est calculé ici.
+ *
+ * Reste un unique calcul côté navigateur, explicitement voulu par la SPEC
+ * (point 3) : « Montant total financé » = Σ (coût du fichier × part demandée).
+ * Ce n'est pas un chiffre du moteur mais l'expression de la demande du client.
+ * Voir le rapport de lot pour la limite qui s'y attache (aucun endpoint ne
+ * permet aujourd'hui de le renvoyer au dossier).
+ */
+const SimulateurIntelligent = ({
+  formData, setFormData, nextStep, prevStep, uploadNeedsSheet, runSimulation,
+}) => {
+  const { toast } = useToast();
+  const nsResult = formData.nsResult || null;
 
-/** Lettre correspondant à un score renvoyé par le moteur. Présentation d'un
- *  chiffre serveur — le front n'invente ni le score ni le seuil d'éligibilité. */
-const scoreLetterOf = (score) => (score > 85 ? 'A' : score > 70 ? 'B' : score > 50 ? 'C' : 'D');
+  const [uploading, setUploading] = useState(false);
+  const [uploadErrors, setUploadErrors] = useState([]);
 
-const DonutChartScore = ({ score }) => {
-    const radius = 60; const circumference = 2 * Math.PI * radius;
-    // Tant que le moteur n'a pas répondu, on n'affiche pas de score : le
-    // fallback client précédent fabriquait une note à partir du montant et de
-    // la superficie, sans rapport avec le scoring réel.
-    if (score == null || !Number.isFinite(Number(score))) {
-      return (<div className="relative flex items-center justify-center w-48 h-48"><svg className="w-full h-full" viewBox="0 0 150 150"><circle cx="75" cy="75" r={radius} fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="15"/></svg><div className="absolute flex flex-col items-center justify-center text-center px-6"><span className="text-sm text-gray-400">Score</span><span className="text-4xl font-black text-gray-600">—</span><span className="text-[11px] text-gray-500 mt-1">Lancez la simulation pour obtenir votre score</span></div></div>);
-    }
-    const value = Number(score);
-    const offset = circumference - (value / 100) * circumference;
-    const scoreColor = value > 85 ? '#34d399' : value > 70 ? '#60a5fa' : value > 50 ? '#fbbf24' : '#f87171';
-    return (<div className="relative flex items-center justify-center w-48 h-48"><svg className="w-full h-full" viewBox="0 0 150 150"><circle cx="75" cy="75" r={radius} fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="15"/><motion.circle cx="75" cy="75" r={radius} fill="none" stroke={scoreColor} strokeWidth="15" strokeDasharray={circumference} strokeDashoffset={offset} strokeLinecap="round" transform="rotate(-90 75 75)" initial={{ strokeDashoffset: circumference }} animate={{ strokeDashoffset: offset }} transition={{ duration: 1.5, ease: "easeOut" }}/></svg><div className="absolute flex flex-col items-center justify-center"><span className="text-sm text-gray-400">Score</span><span className="text-5xl font-black" style={{ color: scoreColor }}>{scoreLetterOf(value)}</span><span className="font-bold">{value.toFixed(0)}/100</span></div></div>);
-};
-
-const SimulateurIntelligent = ({ formData, setFormData, nextStep, prevStep, runSimulation }) => {
   const [simLoading, setSimLoading] = useState(false);
+  const [simErrors, setSimErrors] = useState([]);
   const [simResult, setSimResult] = useState(formData.simResult || null);
-  const [modules, setModules] = useState(() => {
-    const init = {};
-    Object.keys(MODULES_CONFIG).forEach(key => {
-      init[key] = { cost: 0, financing: 100, active: false };
+
+  // Part demandée à AGRICAP, par module. Seul état réellement saisi par le
+  // client sur cet écran ; conservé d'un téléversement à l'autre.
+  const [financing, setFinancing] = useState(
+    () => Object.fromEntries(MODULE_CODES.map(code => [code, 100])),
+  );
+
+  /** Coûts par module, tels que l'API les a extraits des `DataRecord`. */
+  const costs = useMemo(() => {
+    const raw = nsResult?.totalByModule;
+    if (!raw) return null;
+    const out = Object.fromEntries(MODULE_CODES.map(code => [code, 0]));
+    Object.entries(raw).forEach(([key, value]) => {
+      const code = canonicalModule(key);
+      // Le backend sert des chaînes décimales (`"1330.00"`) : pas de `parseInt`,
+      // qui tronquerait les centimes sans le dire.
+      if (code) out[code] = Number(value) || 0;
     });
-    // Peupler depuis la feuille de besoins parsée (données réelles)
-    if (formData.nsResult?.totalByModule) {
-      Object.entries(formData.nsResult.totalByModule).forEach(([mod, cost]) => {
-        if (MODULES_CONFIG[mod]) init[mod] = { cost: Math.round(cost), financing: 100, active: cost > 0 };
+    return out;
+  }, [nsResult]);
+
+  const { totalNeeds, totalFinanced, pieData } = useMemo(() => {
+    if (!costs) return { totalNeeds: 0, totalFinanced: 0, pieData: [] };
+    let needs = 0;
+    let financed = 0;
+    const slices = [];
+    MODULE_CODES.forEach((code) => {
+      const cost = costs[code] || 0;
+      if (cost <= 0) return;
+      const share = (cost * (financing[code] ?? 100)) / 100;
+      needs += cost;
+      financed += share;
+      if (share > 0) {
+        slices.push({ name: moduleConfig(code).label, value: share, color: moduleConfig(code).color });
+      }
+    });
+    return { totalNeeds: needs, totalFinanced: financed, pieData: slices };
+  }, [costs, financing]);
+
+  // Le lot 2 rattache la simulation à une révision précise. Si le client
+  // re-téléverse après avoir simulé, le score affiché ne décrit plus le
+  // fichier courant : on le dit au lieu de laisser un chiffre périmé à l'écran.
+  const simulatedRevision = simResult?.needsSource?.revision ?? null;
+  const staleSimulation = Boolean(
+    simResult && nsResult && simulatedRevision != null && simulatedRevision !== nsResult.revision,
+  );
+
+  const handleUpload = async (file) => {
+    setUploading(true);
+    setUploadErrors([]);
+    try {
+      const result = await uploadNeedsSheet(file);
+      // Nouvelle révision ⇒ la simulation précédente ne vaut plus rien.
+      setSimResult(null);
+      setSimErrors([]);
+      setFormData(prev => ({ ...prev, nsResult: result, simResult: null }));
+      toast({
+        title: `Feuille validée — révision ${result.revision}`,
+        description: 'Les coûts de vos 8 modules sont maintenant ceux de votre fichier.',
       });
+    } catch (e) {
+      // 422 : une entrée par contrôle en échec. Toutes affichées d'un coup —
+      // sinon le client les redécouvre une par une, à chaque téléversement.
+      const causes = guaranteeErrorList(e);
+      setUploadErrors(causes);
+      toast({
+        variant: 'destructive',
+        title: causes.length > 1
+          ? `Feuille refusée — ${causes.length} points à corriger`
+          : 'Feuille refusée',
+        description: causes.length > 1
+          ? 'Le détail est affiché sous le formulaire de dépôt.'
+          : causes[0].message,
+      });
+    } finally {
+      setUploading(false);
     }
-    return init;
-  });
-
-  const handleModuleChange = (key, field, value) => setModules(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
-
-  const { totalFinanced, scoreLocal, pieData } = useMemo(() => {
-    const totalFinanced = Object.values(modules).reduce((s, m) => s + (m.active ? m.cost * m.financing / 100 : 0), 0);
-    // Aucun score avant la réponse du moteur : le front affiche ce que
-    // l'API retourne, il ne l'estime pas (CLAUDE.md, standards frontend).
-    const scoreLocal = simResult ? simResult.score : null;
-    const pieData = Object.entries(modules)
-      .filter(([, m]) => m.active)
-      .map(([k, v]) => ({ name: MODULES_CONFIG[k].label, value: v.cost * v.financing / 100, color: MODULES_CONFIG[k].color }));
-    return { totalFinanced, scoreLocal, pieData };
-  }, [modules, simResult]);
+  };
 
   const handleSimulate = async () => {
     setSimLoading(true);
-    const result = await runSimulation(formData);
-    if (result) setSimResult(result);
-    setSimLoading(false);
+    setSimErrors([]);
+    try {
+      const result = await runSimulation();
+      setSimResult(result);
+      setFormData(prev => ({ ...prev, simResult: result }));
+    } catch (e) {
+      setSimResult(null);
+      setSimErrors(guaranteeErrorList(e));
+    } finally {
+      setSimLoading(false);
+    }
   };
 
+  const handleFinancingChange = (code, pct) => setFinancing(prev => ({ ...prev, [code]: pct }));
+
   const handleSubmit = () => {
-    setFormData(prev => ({ ...prev, modules, totalFinanced, score: scoreLocal, simResult }));
+    // Forme conservée pour l'étape 4 : `{module: {cost, financing, active}}`.
+    // `cost` vient du fichier, `active` en découle — ce n'est plus un choix.
+    const modules = Object.fromEntries(
+      MODULE_CODES.map((code) => {
+        const cost = costs?.[code] ?? 0;
+        return [code, { cost, financing: financing[code] ?? 100, active: cost > 0 }];
+      }),
+    );
+    setFormData(prev => ({ ...prev, modules, totalFinanced, simResult }));
     nextStep();
   };
 
   return (
     <motion.div initial={{ opacity: 0, x: -50 }} animate={{ opacity: 1, x: 0 }} className="space-y-8">
+      <NeedsSheetPanel
+        valueChainCode={formData.vcCode}
+        currency={formData.currency}
+        templateUrl={api.credits.templateUrl(formData.vcCode || undefined)}
+        result={nsResult}
+        uploading={uploading}
+        errors={uploadErrors}
+        onUpload={handleUpload}
+      />
+
+      {/* ── Score et montants : tout vient du serveur, sauf la part demandée ── */}
       <div className="flex flex-col lg:flex-row items-center justify-around gap-8 glass-effect p-6 rounded-2xl">
-        <DonutChartScore score={scoreLocal} />
+        <DonutChartScore score={simResult?.score ?? null} />
+
         <div className="text-center lg:text-left">
           <h3 className="text-2xl font-bold text-white">Simulation de crédit</h3>
           {simResult ? (
@@ -215,122 +298,119 @@ const SimulateurIntelligent = ({ formData, setFormData, nextStep, prevStep, runS
                 {simResult.eligible ? '✓ Éligible' : '✗ Non éligible'}
               </p>
               <p className="text-sm text-gray-400">{simResult.valuationNote}</p>
-              {simResult.proposedRate && (
-                <p className="text-sm">Taux indicatif : <b className="text-blue-300">{simResult.proposedRate}%/an</b></p>
+              {simResult.proposedRate != null && (
+                <p className="text-sm">Taux indicatif : <b className="text-blue-300">{simResult.proposedRate} %/an</b></p>
               )}
             </div>
           ) : (
-            <p className="text-gray-400 mt-1">Cliquez sur « Simuler via l'API » pour obtenir une simulation réelle.</p>
+            <p className="text-gray-400 mt-1 max-w-sm">
+              {nsResult
+                ? 'Lancez la simulation : le score est calculé par AGRICAP à partir des montants de votre feuille.'
+                : 'Le score ne peut être calculé qu\'à partir de votre feuille de besoins.'}
+            </p>
           )}
-          <div className="mt-4 glass-effect p-4 rounded-lg inline-block">
+
+          <div className="mt-4 glass-effect p-4 rounded-lg inline-block text-left">
             <p className="text-sm text-gray-400">Montant total financé</p>
-            <p className="text-3xl font-bold text-emerald-400">{totalFinanced.toLocaleString('fr-FR', { maximumFractionDigits: 0 })} {formData.currency}</p>
+            <p className="text-3xl font-bold text-emerald-400 tabular-nums">
+              {costs ? formatMontant(totalFinanced, formData.currency, { decimals: 0 }) : '—'}
+            </p>
+            {costs && (
+              <p className="text-xs text-gray-500 mt-1">
+                sur un besoin total de {formatMontant(totalNeeds, formData.currency, { decimals: 0 })}
+              </p>
+            )}
           </div>
+
           <div className="mt-3">
-            <Button size="sm" variant="outline" onClick={handleSimulate} disabled={simLoading} className="border-blue-500/30 text-blue-300 hover:bg-blue-500/10">
-              {simLoading ? 'Simulation en cours…' : '↻ Simuler via l\'API'}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleSimulate}
+              disabled={simLoading || !nsResult}
+              className="border-blue-500/30 text-blue-300 hover:bg-blue-500/10 disabled:opacity-40"
+            >
+              {simLoading ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" aria-hidden="true" />
+                  Simulation en cours…
+                </>
+              ) : (
+                <><RefreshCw className="w-4 h-4 mr-2" aria-hidden="true" /> Simuler via l'API</>
+              )}
             </Button>
+            {!nsResult && (
+              <p className="text-[11px] text-gray-600 mt-2">Téléversez d'abord votre feuille de besoins.</p>
+            )}
           </div>
         </div>
+
         <div className="glass-effect p-4 rounded-2xl w-full lg:w-72">
-          <h4 className="font-bold text-white text-center mb-2">Répartition</h4>
-          <ResponsiveContainer width="100%" height={150}>
-            <PieChart><Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={30} outerRadius={50} fill="#8884d8" paddingAngle={5}>
-              {pieData.map((entry, index) => <Cell key={`cell-${index}`} fill={entry.color} />)}
-            </Pie><RechartsTooltip contentStyle={{ backgroundColor: 'rgba(30,41,59,0.8)', border: 'none', borderRadius: '0.5rem' }}/></PieChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {Object.entries(modules).map(([key, mod]) => {
-          const Icon = MODULES_CONFIG[key].icon;
-          return (
-            <div key={key} className={`glass-effect p-4 rounded-lg transition-all duration-300 ${!mod.active && 'opacity-50'}`}>
-              <div className="flex justify-between items-center mb-2">
-                <Label className="flex items-center gap-2 text-white"><Icon className="w-4 h-4" style={{color: MODULES_CONFIG[key].color}}/>{MODULES_CONFIG[key].label}</Label>
-                <Switch checked={mod.active} onCheckedChange={(val) => handleModuleChange(key, 'active', val)} />
-              </div>
-              <div className={`space-y-3 mt-2 transition-all duration-300 ${!mod.active ? 'max-h-0 overflow-hidden opacity-0' : 'max-h-40 opacity-100'}`}>
-                <div className="flex justify-between items-center">
-                  <Label htmlFor={`cost-${key}`} className="text-sm">Coût estimé</Label>
-                  <Input id={`cost-${key}`} type="number" value={mod.cost} onChange={(e) => handleModuleChange(key, 'cost', parseInt(e.target.value) || 0)} className="w-32 bg-white/5 h-8 text-right" disabled={!mod.active} />
-                </div>
-                <div>
-                  <Label className="text-sm">Financement : <span className="font-bold text-emerald-400">{mod.financing}%</span></Label>
-                  <Slider value={[mod.financing]} onValueChange={(val) => handleModuleChange(key, 'financing', val[0])} max={100} step={1} disabled={!mod.active} />
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Détail du scoring par critère */}
-      {simResult?.breakdown?.length > 0 && (
-        <div className="glass-effect p-5 rounded-2xl space-y-3">
-          <h4 className="font-bold text-white mb-1">Analyse par critère</h4>
-          {simResult.breakdown.map(c => (
-            <div key={c.code}>
-              <div className="flex justify-between text-sm mb-1">
-                <span className="text-gray-300">{c.label}</span>
-                <span className="font-semibold text-white">{c.points}/100 <span className="text-gray-500 font-normal">× {Math.round(c.weight * 100)}% = {c.weightedScore.toFixed(1)} pts</span></span>
-              </div>
-              <div className="w-full bg-white/10 rounded-full h-1.5">
-                <div className="h-1.5 rounded-full" style={{ width: `${c.points}%`, background: c.points >= 70 ? '#10b981' : c.points >= 50 ? '#f59e0b' : '#ef4444' }} />
-              </div>
-              {c.detail && <p className="text-xs text-gray-500 mt-0.5">{c.detail}</p>}
-            </div>
-          ))}
-          {simResult.refData && (
-            <div className="mt-2 pt-2 border-t border-white/10 text-xs text-gray-500 space-y-0.5">
-              <p>Référentiel : <span className="text-gray-400">{simResult.refData.source}</span></p>
-              {simResult.refData.dscr && <p>DSCR calculé : <span className="text-blue-300">{simResult.refData.dscr}</span></p>}
-              <p>Durée : {simResult.refData.durationMonths} mois · Différé : {simResult.refData.deferredMonths} mois · Taux : {(simResult.refData.rateAnnual * 100).toFixed(1)}%/an</p>
+          <h4 className="font-bold text-white text-center mb-2">Répartition demandée</h4>
+          {pieData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={150}>
+              <PieChart>
+                <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius={30} outerRadius={50} paddingAngle={5}>
+                  {pieData.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
+                </Pie>
+                <RechartsTooltip
+                  formatter={(value, name) => [formatMontant(value, formData.currency, { decimals: 0 }), name]}
+                  contentStyle={{ backgroundColor: 'rgba(30,41,59,0.9)', border: 'none', borderRadius: '0.5rem' }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[150px] flex items-center justify-center text-center px-4">
+              <p className="text-xs text-gray-600">
+                La répartition s'affichera dès que votre feuille de besoins sera déposée.
+              </p>
             </div>
           )}
         </div>
-      )}
+      </div>
 
-      {/* Tableau d'amortissement (5 premières échéances) */}
-      {simResult?.scheduleDraft?.length > 0 && (
-        <div className="glass-effect p-5 rounded-2xl overflow-x-auto">
-          <h4 className="font-bold text-white mb-3">Échéancier prévisionnel</h4>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-gray-400 border-b border-white/10">
-                <th className="text-left pb-2">Mois</th>
-                <th className="text-right pb-2">Principal</th>
-                <th className="text-right pb-2">Intérêts</th>
-                <th className="text-right pb-2">Mensualité</th>
-                <th className="text-right pb-2">Solde</th>
-              </tr>
-            </thead>
-            <tbody>
-              {simResult.scheduleDraft.slice(0, 6).map(row => (
-                <tr key={row.month} className="border-b border-white/5 text-gray-300">
-                  <td className="py-1">{row.month}</td>
-                  <td className="py-1 text-right">{row.principal.toLocaleString('fr-FR', { maximumFractionDigits: 0 })}</td>
-                  <td className="py-1 text-right text-amber-400">{row.interest.toLocaleString('fr-FR', { maximumFractionDigits: 0 })}</td>
-                  <td className="py-1 text-right font-semibold text-emerald-400">{row.payment.toLocaleString('fr-FR', { maximumFractionDigits: 0 })}</td>
-                  <td className="py-1 text-right text-gray-400">{row.balance.toLocaleString('fr-FR', { maximumFractionDigits: 0 })}</td>
-                </tr>
-              ))}
-              {simResult.scheduleDraft.length > 6 && (
-                <tr className="text-gray-500 text-xs">
-                  <td colSpan={5} className="pt-2">… {simResult.scheduleDraft.length - 6} échéances supplémentaires</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+      {staleSimulation && (
+        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/[0.08] p-4 flex items-start gap-3">
+          <AlertTriangle className="w-4 h-4 text-amber-300 mt-0.5 shrink-0" aria-hidden="true" />
+          <p className="text-sm text-amber-100/90">
+            Votre feuille a été mise à jour (révision {nsResult.revision}) depuis cette simulation,
+            calculée sur la révision {simulatedRevision}. Relancez la simulation pour obtenir le
+            score correspondant à votre fichier actuel.
+          </p>
         </div>
       )}
 
-      <div className="flex justify-between">
-        <Button onClick={prevStep} variant="ghost"><ArrowLeft className="w-5 h-5 mr-2"/> Retour</Button>
-        <Button onClick={handleSubmit} className="bg-gradient-to-r from-emerald-500 to-blue-600 py-6 text-lg">
-          Choisir mes garanties <ArrowLeft className="w-5 h-5 ml-2 transform rotate-180" />
+      <NeedsSheetErrorList errors={simErrors} title="La simulation n'a pas pu être lancée" />
+
+      <ModuleGrid
+        costs={costs}
+        financing={financing}
+        onFinancingChange={handleFinancingChange}
+        currency={formData.currency}
+      />
+
+      <ScoreBreakdown simResult={simResult} />
+      <SchedulePreview simResult={simResult} currency={formData.currency} />
+
+      <div className="flex flex-col sm:flex-row justify-between items-stretch sm:items-end gap-3">
+        <Button onClick={prevStep} variant="ghost">
+          <ArrowLeft className="w-5 h-5 mr-2" aria-hidden="true" /> Retour
         </Button>
+        <div className="flex flex-col items-end gap-2">
+          {!nsResult && (
+            <p className="text-xs text-gray-500 text-right max-w-md">
+              Votre feuille de besoins est indispensable pour continuer : c'est elle qui définit
+              le plan de financement soumis à l'analyse.
+            </p>
+          )}
+          <Button
+            onClick={handleSubmit}
+            disabled={!nsResult}
+            className="bg-gradient-to-r from-emerald-500 to-blue-600 py-6 text-lg disabled:opacity-40"
+          >
+            Choisir mes garanties <ArrowLeft className="w-5 h-5 ml-2 transform rotate-180" aria-hidden="true" />
+          </Button>
+        </div>
       </div>
     </motion.div>
   );
@@ -598,7 +678,34 @@ const FicheSynthese = ({ formData, prevStep, submitApplication, guaranteeSet, su
           </div>
         )}
 
-        <div className="mt-6"><h4 className="font-bold text-white mb-2">Répartition du financement</h4><div className="space-y-2">{formData.modules && Object.entries(formData.modules).filter(([,mod]) => mod.active).map(([key, mod]) => {const Icon = MODULES_CONFIG[key].icon;return (<div key={key} className="flex justify-between items-center bg-white/5 p-2 rounded"><span className="flex items-center gap-2 text-sm"><Icon className="w-4 h-4" style={{color: MODULES_CONFIG[key].color}}/> {MODULES_CONFIG[key].label}</span><span className="font-semibold">{(mod.cost * mod.financing / 100).toLocaleString('fr-FR', {maximumFractionDigits: 0})} {formData.currency}</span></div>)})}</div></div>
+        <div className="mt-6">
+          <h4 className="font-bold text-white mb-2">Répartition du financement demandé</h4>
+          <p className="text-xs text-gray-500 mb-2">
+            Coûts issus de votre feuille de besoins
+            {formData.nsResult?.revision != null ? ` (révision ${formData.nsResult.revision})` : ''} ·
+            part demandée à AGRICAP.
+          </p>
+          <div className="space-y-2">
+            {formData.modules && Object.entries(formData.modules)
+              .filter(([, mod]) => mod.active)
+              .map(([key, mod]) => {
+                const cfg = moduleConfig(key);
+                const Icon = cfg.icon;
+                return (
+                  <div key={key} className="flex justify-between items-center bg-white/5 p-2 rounded gap-3">
+                    <span className="flex items-center gap-2 text-sm">
+                      <Icon className="w-4 h-4 shrink-0" style={{ color: cfg.color }} aria-hidden="true" />
+                      {cfg.label}
+                      <span className="text-xs text-gray-500">({mod.financing} %)</span>
+                    </span>
+                    <span className="font-semibold tabular-nums shrink-0">
+                      {formatMontant((mod.cost * mod.financing) / 100, formData.currency, { decimals: 0 })}
+                    </span>
+                  </div>
+                );
+              })}
+          </div>
+        </div>
       </div>
 
       {/* Refus de soumission : une ligne par cause, jamais un message agrégé. */}
@@ -627,7 +734,7 @@ const FicheSynthese = ({ formData, prevStep, submitApplication, guaranteeSet, su
        <div className="flex justify-between"><Button onClick={() => prevStep(3)} variant="ghost"><ArrowLeft className="w-5 h-5 mr-2"/> Ajuster</Button><Button onClick={submitApplication} className="bg-purple-600 hover:bg-purple-700 py-6 text-lg"><Send className="w-5 h-5 mr-2" /> Soumettre ma demande</Button></div>
     </motion.div>
 );
-const SuccessMessage = ({ loan, reset }) => ( <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="text-center glass-effect p-12 rounded-2xl"><Check className="w-16 h-16 mx-auto bg-emerald-500 text-white rounded-full p-2 mb-4" /><h2 className="text-3xl font-bold text-white">Demande Soumise !</h2><p className="text-gray-300 mt-2 mb-6">Bonjour {loan.operator}, votre demande de {loan.amountApproved?.toLocaleString('fr-FR', { maximumFractionDigits: 0 })} {loan.currency} a été envoyée. <br/> Nous vous notifierons dans 3 à 5 jours ouvrables.</p><Button onClick={reset}><RefreshCw className="w-4 h-4 mr-2"/> Nouvelle Demande</Button></motion.div>);
+const SuccessMessage = ({ loan, reset }) => ( <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="text-center glass-effect p-12 rounded-2xl"><Check className="w-16 h-16 mx-auto bg-emerald-500 text-white rounded-full p-2 mb-4" /><h2 className="text-3xl font-bold text-white">Demande Soumise !</h2><p className="text-gray-300 mt-2 mb-6">Bonjour {loan.operator}, votre demande de {formatMontant(loan.amountApproved, loan.currency, { decimals: 0 })} a été envoyée. <br/> Nous vous notifierons dans 3 à 5 jours ouvrables.</p><Button onClick={reset}><RefreshCw className="w-4 h-4 mr-2"/> Nouvelle Demande</Button></motion.div>);
 
 // La nomenclature des garanties vit désormais dans
 // `@/components/guarantees/guaranteeConfig` : 4 codes canoniques
@@ -651,7 +758,7 @@ const TransferDialog = ({ open, onOpenChange, subwallet, onTransfer, currency, s
       <DialogContent className="glass-effect text-white"><DialogHeader><DialogTitle className="gradient-text">Transférer / Payer</DialogTitle></DialogHeader>
         <div className="space-y-4">
           <div><Label>Depuis le portefeuille</Label><Input value={subwallet?.label} disabled className="bg-white/10" /></div>
-          <div><Label>Solde disponible</Label><Input value={`${subwallet?.balance.toLocaleString()} ${currency}`} disabled className="bg-white/10" /></div>
+          <div><Label>Solde disponible</Label><Input value={formatMontant(subwallet?.balance, currency, { decimals: 2 })} disabled className="bg-white/10" /></div>
           <div><Label>Vers le fournisseur</Label><Select onValueChange={setSupplier} value={supplier}><SelectTrigger className="bg-white/5"><SelectValue placeholder="Sélectionner un fournisseur..." /></SelectTrigger><SelectContent className="glass-effect">{suppliers.map(s => <SelectItem key={s.id} value={s.name}>{s.name}</SelectItem>)}</SelectContent></Select></div>
           <div><Label>Montant ({currency})</Label><Input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" className="bg-white/5" /></div>
           <div><Label>Motif / Description</Label><Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Ex: Achat semences de maïs" className="bg-white/5" /></div>
@@ -670,7 +777,7 @@ const ContractDialog = ({ open, onOpenChange, contract }) => (
           <div className="bg-white/5 p-3 rounded-lg"><p className="text-xs text-gray-400">Parties</p><p className="font-semibold">{contract.parties}</p></div>
           <div className="bg-white/5 p-3 rounded-lg"><p className="text-xs text-gray-400">Date d'effet</p><p className="font-semibold">{contract.date}</p></div>
         </div>
-        <p className="text-sm text-gray-300 leading-relaxed">Ce contrat lie les parties susmentionnées pour un crédit de <span className="font-bold text-emerald-400">{contract.amount.toLocaleString()} {contract.currency}</span>. Les fonds sont débloqués selon les sous-portefeuilles définis. Le remboursement est attendu selon les termes convenus. Les garanties listées sont engagées pour la durée du contrat.</p>
+        <p className="text-sm text-gray-300 leading-relaxed">Ce contrat lie les parties susmentionnées pour un crédit de <span className="font-bold text-emerald-400">{formatMontant(contract.amount, contract.currency, { decimals: 0 })}</span>. Les fonds sont débloqués selon les sous-portefeuilles définis. Le remboursement est attendu selon les termes convenus. Les garanties listées sont engagées pour la durée du contrat.</p>
       </div>
       <DialogFooter><Button onClick={() => onOpenChange(false)} variant="outline">Fermer</Button></DialogFooter>
     </DialogContent>
@@ -693,10 +800,10 @@ const RepaymentSchedule = ({ schedule, currency }) => (
                 {schedule.map((row) => (
                     <tr key={row.number} className="border-b border-white/10 hover:bg-white/5">
                         <td className="px-6 py-4">{row.date}</td>
-                        <td className="px-6 py-4">{row.principal.toLocaleString()} {currency}</td>
-                        <td className="px-6 py-4">{row.interest.toLocaleString()} {currency}</td>
-                        <td className="px-6 py-4 text-right font-bold text-white">{row.total.toLocaleString()} {currency}</td>
-                        <td className="px-6 py-4 text-right text-gray-400">{row.balance.toLocaleString()} {currency}</td>
+                        <td className="px-6 py-4 tabular-nums">{formatMontant(row.principal, currency, { decimals: 2 })}</td>
+                        <td className="px-6 py-4 tabular-nums">{formatMontant(row.interest, currency, { decimals: 2 })}</td>
+                        <td className="px-6 py-4 text-right font-bold text-white tabular-nums">{formatMontant(row.total, currency, { decimals: 2 })}</td>
+                        <td className="px-6 py-4 text-right text-gray-400 tabular-nums">{formatMontant(row.balance, currency, { decimals: 2 })}</td>
                     </tr>
                 ))}
                 {schedule.length === 0 && (
@@ -730,7 +837,7 @@ const RebalanceDialog = ({ open, onOpenChange, subwallet, subwallets, onRebalanc
         <DialogHeader><DialogTitle className="gradient-text">Réajuster entre modules</DialogTitle></DialogHeader>
         <div className="space-y-4">
           <div><Label>Depuis</Label><Input value={subwallet?.label} disabled className="bg-white/10" /></div>
-          <div><Label>Solde disponible</Label><Input value={`${subwallet?.balance.toLocaleString()} ${currency}`} disabled className="bg-white/10" /></div>
+          <div><Label>Solde disponible</Label><Input value={formatMontant(subwallet?.balance, currency, { decimals: 2 })} disabled className="bg-white/10" /></div>
           <div><Label>Vers le module</Label><Select onValueChange={setToId} value={toId}><SelectTrigger className="bg-white/5"><SelectValue placeholder="Sélectionner un module..." /></SelectTrigger><SelectContent className="glass-effect">{others.map(sw => <SelectItem key={sw.id} value={String(sw.id)}>{sw.label}</SelectItem>)}</SelectContent></Select></div>
           <div><Label>Montant ({currency})</Label><Input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" className="bg-white/5" /></div>
         </div>
@@ -812,7 +919,7 @@ const GestionCreditsClient = ({ approvedCredit, refreshCredit }) => {
             <div className="flex justify-between items-start">
               <div>
                 <h3 className="text-2xl font-bold text-white mb-1">Crédit: {approvedCredit.type}</h3>
-                <p className="text-gray-400 mb-4">Total Approuvé: <span className="font-bold text-emerald-400">{approvedCredit.amountApproved.toLocaleString()} {approvedCredit.currency}</span></p>
+                <p className="text-gray-400 mb-4">Total Approuvé: <span className="font-bold text-emerald-400">{formatMontant(approvedCredit.amountApproved, approvedCredit.currency, { decimals: 0 })}</span></p>
               </div>
               <Button size="sm" variant="outline" className="border-white/20 hover:bg-white/10" onClick={() => setContractDialogOpen(true)}>
                   <FileSignature className="w-4 h-4 mr-2" /> Voir Contrat
@@ -826,12 +933,13 @@ const GestionCreditsClient = ({ approvedCredit, refreshCredit }) => {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {approvedCredit.subwallets.map((sub) => {
-                const Icon = MODULES_CONFIG[sub.moduleKey]?.icon || FileText;
+                const cfg = moduleConfig(sub.moduleKey);
+                const Icon = cfg.icon;
                 return (
                   <div key={sub.id} className="bg-white/5 p-4 rounded-lg space-y-3 flex flex-col justify-between">
                     <div>
-                      <div className="flex items-center gap-2"><Icon className="w-5 h-5" style={{ color: MODULES_CONFIG[sub.moduleKey]?.color }} /><h4 className="font-semibold text-white">{sub.label}</h4></div>
-                      <p className="text-2xl font-bold">{sub.balance.toLocaleString()} {approvedCredit.currency}</p>
+                      <div className="flex items-center gap-2"><Icon className="w-5 h-5" style={{ color: cfg.color }} aria-hidden="true" /><h4 className="font-semibold text-white">{cfg.label}</h4></div>
+                      <p className="text-2xl font-bold tabular-nums">{formatMontant(sub.balance, approvedCredit.currency, { decimals: 0 })}</p>
                     </div>
                     <div className="flex gap-2">
                       <Button size="sm" className="bg-emerald-600/80 hover:bg-emerald-600 text-xs flex-1" onClick={() => handleOpenTransferDialog(sub)}><Banknote className="w-3 h-3 mr-1"/>Payer</Button>
@@ -867,7 +975,7 @@ const GestionCreditsClient = ({ approvedCredit, refreshCredit }) => {
       </div>
       <div className="glass-effect p-6 rounded-2xl">
         <h3 className="text-2xl font-bold text-white mb-4 flex items-center gap-2"><History/> Historique des Transactions</h3>
-        <div className="overflow-x-auto"><table className="w-full text-sm text-left"><thead className="text-xs text-gray-400 uppercase bg-white/5"><tr><th scope="col" className="px-6 py-3">Date</th><th scope="col" className="px-6 py-3">Module</th><th scope="col" className="px-6 py-3">Bénéficiaire</th><th scope="col" className="px-6 py-3 text-right">Montant</th><th scope="col" className="px-6 py-3 text-center">Statut</th></tr></thead><tbody>{approvedCredit.transactions.map(t => (<tr key={t.id} className="border-b border-white/10 hover:bg-white/5"><td className="px-6 py-4">{new Date(t.date).toLocaleDateString()}</td><td className="px-6 py-4">{t.subwalletId ? subwalletLabel(t.subwalletId) : t.type}</td><td className="px-6 py-4">{t.ref || '—'}</td><td className="px-6 py-4 text-right font-mono">{(t.amount ?? 0).toLocaleString()} {approvedCredit.currency}</td><td className="px-6 py-4 text-center"><span className="bg-emerald-500/20 text-emerald-300 text-xs font-medium px-2.5 py-0.5 rounded-full">{t.status}</span></td></tr>))}{approvedCredit.transactions.length === 0 && (<tr><td colSpan="5" className="text-center py-8 text-gray-500">Aucune transaction pour le moment.</td></tr>)}</tbody></table></div>
+        <div className="overflow-x-auto"><table className="w-full text-sm text-left"><thead className="text-xs text-gray-400 uppercase bg-white/5"><tr><th scope="col" className="px-6 py-3">Date</th><th scope="col" className="px-6 py-3">Module</th><th scope="col" className="px-6 py-3">Bénéficiaire</th><th scope="col" className="px-6 py-3 text-right">Montant</th><th scope="col" className="px-6 py-3 text-center">Statut</th></tr></thead><tbody>{approvedCredit.transactions.map(t => (<tr key={t.id} className="border-b border-white/10 hover:bg-white/5"><td className="px-6 py-4">{formatDateFr(t.date)}</td><td className="px-6 py-4">{t.subwalletId ? subwalletLabel(t.subwalletId) : t.type}</td><td className="px-6 py-4">{t.ref || '—'}</td><td className="px-6 py-4 text-right font-mono">{formatMontant(t.amount ?? 0, approvedCredit.currency, { decimals: 2 })}</td><td className="px-6 py-4 text-center"><span className="bg-emerald-500/20 text-emerald-300 text-xs font-medium px-2.5 py-0.5 rounded-full">{t.status}</span></td></tr>))}{approvedCredit.transactions.length === 0 && (<tr><td colSpan="5" className="text-center py-8 text-gray-500">Aucune transaction pour le moment.</td></tr>)}</tbody></table></div>
       </div>
       {activeSubwallet && <TransferDialog open={transferDialogOpen} onOpenChange={setTransferDialogOpen} subwallet={activeSubwallet} onTransfer={handleTransfer} currency={approvedCredit.currency} suppliers={suppliers} />}
       {activeSubwallet && <RebalanceDialog open={rebalanceDialogOpen} onOpenChange={setRebalanceDialogOpen} subwallet={activeSubwallet} subwallets={approvedCredit.subwallets} onRebalance={handleRebalance} currency={approvedCredit.currency} />}
@@ -900,7 +1008,7 @@ const Credits = () => {
   const [formData, setFormData] = useState({
     demandeur: '', localisation: '', superficie: '', culture: '',
     montant: '', currency: 'USD',
-    vcCode: '', nsFile: null, nsResult: null, simResult: null,
+    vcCode: '', nsResult: null, simResult: null, modules: null, totalFinanced: 0,
   });
   // Refs lues par `ensureDraft` : évite de recréer le callback (et donc de
   // relancer les effets enfants) à chaque frappe dans le formulaire.
@@ -990,11 +1098,17 @@ const Credits = () => {
   /**
    * Crée le dossier en DRAFT au plus tard, et une seule fois.
    *
-   * Poser une garantie exige un dossier existant côté serveur
-   * (`POST /credits/applications/<code>/guarantees/asset/`). Le brouillon est
-   * donc créé à la première mobilisation d'actif — pas à l'ouverture de
-   * l'étape, pour ne pas semer des dossiers vides — puis réutilisé à la
-   * soumission.
+   * Ce mécanisme existait pour les garanties (poser un gage exige un dossier
+   * côté serveur). Le lot 3 le réutilise tel quel : l'ingestion de la feuille
+   * de besoins a la même exigence, `dataset_key = fb__{code}` n'ayant de sens
+   * qu'attaché à un dossier. Le brouillon est donc créé au premier
+   * téléversement — pas à l'ouverture de l'étape, pour ne pas semer des
+   * dossiers vides — puis réutilisé par les garanties et la soumission.
+   *
+   * `needs_sheet_id` a été retiré du corps : il lisait `nsResult.id`, clé que
+   * l'API n'a jamais servie (elle renvoie `needsSheetId`, et désormais
+   * `needsSourceId`). Le rattachement de la feuille au dossier est fait côté
+   * serveur par `parse_and_ingest` (`application.needs_source`).
    */
   const ensureDraft = useCallback(async () => {
     if (draftCodeRef.current) return draftCodeRef.current;
@@ -1003,14 +1117,29 @@ const Credits = () => {
       value_chain_code: fd.vcCode || undefined,
       area_ha: fd.superficie ? parseFloat(fd.superficie) : undefined,
       currency: fd.currency,
-      amount_requested: parseFloat(fd.montant) || fd.totalFinanced || 0,
-      needs_sheet_id: fd.nsResult?.id,
+      amount_requested: parseFloat(fd.montant) || 0,
       prefill_snapshot: { demandeur: fd.demandeur, localisation: fd.localisation },
     });
     draftCodeRef.current = app.code;
     setDraftCode(app.code);
     return app.code;
   }, []);
+
+  /**
+   * Téléverse la feuille de besoins du dossier courant (SPEC §1.4, points 1 et 5).
+   *
+   * `application_code` bascule l'endpoint en mode SPEC : validation des 6
+   * contrôles, ingestion `dataio` (kind `FEUILLE_BESOINS`), nouvelle révision,
+   * puis extraction des totaux depuis les `DataRecord`. Les erreurs remontent
+   * telles quelles — c'est l'appelant qui les affiche, toutes.
+   */
+  const uploadNeedsSheet = useCallback(async (file) => {
+    const code = await ensureDraft();
+    const body = new FormData();
+    body.append('file', file);
+    body.append('application_code', code);
+    return api.credits.parseNeedsSheet(body);
+  }, [ensureDraft]);
 
   const submitApplication = async (finalFormData) => {
     try {
@@ -1060,33 +1189,33 @@ const Credits = () => {
       localisation: '', superficie: '', culture: '', montant: '',
       currency: prefill?.defaults?.currency || 'USD',
       vcCode: prefill?.defaults?.value_chain_code || '',
-      nsFile: null, nsResult: null, simResult: null,
+      nsResult: null, simResult: null, modules: null, totalFinanced: 0,
     });
   };
 
-  // Simuler le scoring via l'API réelle
-  const runSimulation = async (fd) => {
-    try {
-      const result = await api.credits.simulate({
-        value_chain_code: fd.vcCode || undefined,
-        needs_sheet_id: fd.nsResult?.id,
-        area_ha: fd.superficie ? parseFloat(fd.superficie) : undefined,
-        amount_requested: parseFloat(fd.montant) || undefined,
-        currency: fd.currency,
-        // Totaux par module depuis la feuille de besoins parsée
-        ns_totals: fd.nsResult?.totalByModule || undefined,
-      });
-      return result;
-    } catch (e) {
-      return null;
-    }
-  };
+  /**
+   * Simulation adossée aux tables du dossier (SPEC §1.4 point 4).
+   *
+   * Le corps ne porte plus que `application_code` : depuis le lot 2, le backend
+   * charge `application.needs_source`, relit les `DataRecord` de la révision
+   * courante et **ignore** tout montant du payload. Continuer à envoyer
+   * `ns_totals`, `amount_requested` ou `area_ha` entretiendrait l'illusion que
+   * le front pèse sur le score — principe 1, ce qui est scoré est ce qui est en
+   * base.
+   *
+   * Les erreurs ne sont plus avalées : un 422 `NEEDS_SOURCE_MISSING` doit se
+   * voir à l'écran, pas produire un score vide sans explication.
+   */
+  const runSimulation = useCallback(async () => {
+    const code = await ensureDraft();
+    return api.credits.simulate({ application_code: code });
+  }, [ensureDraft]);
 
   const renderClientApplicationFlow = () => {
     if (isSubmitted && approvedCredit) { return <SuccessMessage loan={approvedCredit} reset={resetProcess} />; }
     switch (currentStep) {
       case 1: return <DemandeInitiale formData={formData} setFormData={setFormData} nextStep={nextStep} prefill={prefill} />;
-      case 2: return <SimulateurIntelligent formData={formData} setFormData={setFormData} nextStep={nextStep} prevStep={prevStep} runSimulation={runSimulation} />;
+      case 2: return <SimulateurIntelligent formData={formData} setFormData={setFormData} nextStep={nextStep} prevStep={prevStep} uploadNeedsSheet={uploadNeedsSheet} runSimulation={runSimulation} />;
       case 3: return <ConfigurationGaranties nextStep={nextStep} prevStep={prevStep} draftCode={draftCode} ensureDraft={ensureDraft} onGuaranteesChange={setGuaranteeSet} />;
       case 4: return <FicheSynthese formData={formData} prevStep={prevStep} submitApplication={() => submitApplication(formData)} guaranteeSet={guaranteeSet} submitErrors={submitErrors} />;
       default: return null;

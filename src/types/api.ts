@@ -1015,3 +1015,102 @@ export interface AssetRow {
   gageApplication?: string | null;
   owner?: { sub: string; displayName: string; phone: string };
 }
+
+// ─── Caution solidaire — parcours du garant (lot 6) ─────────────────────────
+// Contrat : `docs/status-fragments/lot6-backend.md` §1, publié figé par
+// `lot6-backend`. Ajout strict : aucun type existant n'est modifié ici.
+//
+// Enveloppe hybride assumée côté serveur, et reproduite telle quelle : clés de
+// **liste** en snake_case (comme `assets/mine`), clés d'**item** en camelCase
+// (comme `serialize_application`). Ce n'est pas une incohérence introduite par
+// le lot 6, c'est la convention déjà en place dans les deux fichiers.
+
+/** Groupe ou coopérative **commun** au demandeur et au garant — ce qui justifie
+ *  la sollicitation. La caution solidaire n'existe qu'entre membres d'un même
+ *  groupe (SPEC §2.5, règle 1). */
+export interface GuaranteeRequestGroup {
+  id: number;
+  name: string;
+  /** Nature du groupement : `AVEC`, `COOPERATIVE`… (libellé serveur). */
+  type: string;
+}
+
+export interface GuaranteeRequestApplicant {
+  displayName: string;
+  sharedGroups: GuaranteeRequestGroup[];
+}
+
+/** Statuts servis par le contrat §1.1. `active` est l'équivalent backend du
+ *  `constituted` de la SPEC — la caution constituée par l'agent après consentement. */
+export type GuaranteeRequestStatus =
+  | 'pending_consent' | 'consented' | 'declined' | 'expired'
+  | 'active' | 'released' | 'called';
+
+/** Une demande de caution adressée au garant connecté.
+ *
+ *  Ce que ce type **ne porte pas**, volontairement (principe 7, anti-gaming) :
+ *  la décote de 70 %, la contribution de la caution à la couverture du dossier,
+ *  le score du demandeur, les plafonds d'engagement du garant. Le garant voit
+ *  son engagement, pas les règles du moteur. */
+export interface GuaranteeRequest {
+  /** Identifiant à passer dans `POST /guarantee-requests/<id>/consent/`. */
+  id: number;
+  applicationCode: string;
+  status: GuaranteeRequestStatus;
+  applicant: GuaranteeRequestApplicant;
+  /** `code` canonique du référentiel (`MAIS`, `RIZ`…), `label` prêt à afficher.
+   *
+   *  **Nullable**, contrairement à l'exemple du contrat §1.1 : le serializer réel
+   *  émet `null` quand le dossier n'a pas encore de filière rattachée
+   *  (`credits/guarantees.py`, `… if chain else None`). Divergence signalée à
+   *  `lot6-backend` ; le type suit le code, pas l'exemple de documentation. */
+  valueChain: { code: string; label: string } | null;
+  /** Montant du crédit demandé — contexte, ce n'est PAS l'engagement du garant.
+   *  Nullable : le serializer sert `amount_approved or amount_requested`, tous
+   *  deux facultatifs sur un dossier en cours de constitution. */
+  loanAmount: number | null;
+  loanCurrency: string;
+  /** Montant de l'engagement solidaire du garant. Arrêté par le serveur ; jamais
+   *  dérivé de `loanAmount` côté client.
+   *
+   *  **Impossible à `null` par construction**, confirmé par `lot6-backend` :
+   *  `assert_can_guarantee` refuse un montant ≤ 0 (`GUARANTOR_INVALID_AMOUNT`)
+   *  *avant* la création de la caution — une demande à 0 ou nulle n'existe pas
+   *  en base. Le type reste nullable comme **filet**, pas comme cas métier : si
+   *  `null` était observé, c'est un défaut backend à remonter, pas un état à
+   *  gérer. L'écran ne met alors ni 0 ni tiret dans la phrase d'engagement — il
+   *  dit que le montant manque (en rouge) et le signale en console
+   *  (`guaranteeRequestShape.js`, `warnMissing`). */
+  coveredAmount: number | null;
+  coveredCurrency: string;
+  /** ISO 8601 avec offset. Le compte à rebours s'affiche depuis cette date.
+   *  Jamais nul sur une caution créée par ce flux (confirmé `lot6-backend`) ;
+   *  nullable ici comme filet, au même titre que `coveredAmount`. */
+  consentExpiresAt: string | null;
+  consentedAt: string | null;
+  declinedAt: string | null;
+  /** Expiration constatée par le serveur — jamais déduite de l'horloge du client.
+   *
+   *  **À privilégier sur `status`** pour tout affichage d'état : l'expiration
+   *  n'est matérialisée en base qu'à la lecture (pas d'ordonnanceur dans le
+   *  projet), donc une demande périmée reste servie en `pending_consent` avec
+   *  `isExpired: true`. Côté front, `displayStatusMeta()` et `isActionable()`
+   *  font cet arbitrage — aucun écran ne doit lire `status` seul. */
+  isExpired: boolean;
+  createdAt: string;
+}
+
+export interface GuaranteeRequestList {
+  total_rows: number;
+  /** Fenêtre de consentement **configurée** (`InstitutionConfig`), en heures.
+   *  Sert à nommer la durée sans jamais écrire « 72 h » en dur : le comité peut
+   *  la changer sans redéploiement (principe 8). */
+  consent_window_hours: number;
+  items: GuaranteeRequest[];
+}
+
+/** Réponse de `POST /guarantee-requests/<id>/consent/` — l'item mis à jour. */
+export interface GuaranteeConsentResult {
+  detail: string;
+  item: GuaranteeRequest;
+}

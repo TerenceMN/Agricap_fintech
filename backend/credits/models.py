@@ -10,10 +10,20 @@ Architecture :
 """
 from __future__ import annotations
 
+import copy
 import uuid
 
 from django.db import models
 from django.utils import timezone
+
+
+class ImmutableConsentMeta(Exception):
+    """Tentative de réécriture d'une preuve de consentement déjà enregistrée.
+
+    Définie ici plutôt que dans `credits.guarantor` pour que `models` n'importe
+    aucun module de règles (le sens des dépendances resterait discutable, et
+    l'import circulaire certain).
+    """
 
 
 def _gen_code() -> str:
@@ -291,19 +301,56 @@ class CreditGuarantee(models.Model):
     ASSET_BACKED_TYPES = ("materiel", "foncier")
 
     class Status(models.TextChoices):
+        """Cycle de vie d'une garantie — quatre statuts historiques, quatre ajouts.
+
+        La SPEC §2.5 proposait un jeu complet
+        (`pending_consent/consented/declined/expired/constituted/called`) pour la
+        seule caution solidaire. Le remplacer aurait cassé les garanties épargne
+        et les gages qui utilisent déjà `pending/active/released/expired` — et
+        surtout aurait créé un sixième vocabulaire là où le principe 6 en exige
+        un seul. Choix retenu : **extension, pas substitution.**
+
+        Correspondances avec la SPEC :
+          - `constituted` → `ACTIVE` : une garantie confirmée par l'agent était
+            déjà « active » pour l'épargne et les gages. Deux mots pour un état
+            identique auraient obligé chaque lecteur à connaître le type de la
+            garantie pour interpréter son statut.
+          - `expired`, `released` : déjà présents, sémantique inchangée.
+          - `pending_consent`, `consented`, `declined`, `called` : réellement
+            nouveaux, ils décrivent des états qui n'existaient nulle part.
+
+        `PENDING` reste le « en attente de confirmation par un agent » des
+        garanties épargne et des gages. Une caution morale n'y passe plus :
+        elle naît en `PENDING_CONSENT`.
+        """
+
         PENDING = "pending", "En attente de confirmation"
-        ACTIVE = "active", "Active"
+        PENDING_CONSENT = "pending_consent", "En attente du consentement du garant"
+        CONSENTED = "consented", "Consentie par le garant"
+        DECLINED = "declined", "Refusée par le garant"
+        ACTIVE = "active", "Active / constituée"
         RELEASED = "released", "Levée / libérée"
         EXPIRED = "expired", "Expirée (délai dépassé)"
+        CALLED = "called", "Appelée (défaut du débiteur)"
+
+    #: Statuts à partir desquels une caution morale est opposable au garant.
+    #: La soumission du dossier l'exige (`GUARANTOR_CONSENT_MISSING`).
+    CONSENTED_OR_BEYOND = ("consented", "active", "called")
 
     application = models.ForeignKey(
         CreditApplication, on_delete=models.CASCADE, related_name="guarantees",
     )
     guarantee_type = models.CharField(max_length=10, choices=GuaranteeType.choices)
-    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
 
     # Montant réellement couvert par cette garantie, après décote. C'est ce
     # montant — jamais une valeur déclarée — qui entre dans le ratio de couverture.
+    #
+    # C'est aussi le `montant_couvert` de la SPEC §2.5 : le champ existait déjà,
+    # avec exactement cette sémantique et cette précision. En ajouter un second
+    # sous un nom français aurait donné deux colonnes pour un seul concept — le
+    # défaut que le principe 6 interdit, et la première chose qu'un auditeur
+    # aurait à démêler. Le nom canonique reste `covered_amount`.
     covered_amount = models.DecimalField(
         max_digits=15, decimal_places=2, null=True, blank=True,
     )
@@ -326,6 +373,16 @@ class CreditGuarantee(models.Model):
     hold_released_at = models.DateTimeField(null=True, blank=True)
 
     # ── Champs caution morale ────────────────────────────────────────────────
+    # Le garant est désormais une PERSONNE DU SYSTÈME, pas trois chaînes de
+    # caractères. PROTECT : on ne supprime pas un utilisateur qui porte un
+    # engagement de caution, même éteint — c'est une pièce probante (principe 9).
+    guarantor = models.ForeignKey(
+        "accounts.FintechUser", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="cautions_donnees",
+    )
+    # Champs déclaratifs historiques : conservés pour la trace des cautions
+    # enregistrées avant le consentement opposable, et pour la pièce d'identité
+    # relevée en agence. Ils ne suffisent plus à eux seuls à créer une caution.
     guarantor_sub = models.CharField(max_length=255, blank=True)   # sub OIDC du garant
     guarantor_name = models.CharField(max_length=200, blank=True)
     guarantor_phone = models.CharField(max_length=40, blank=True)
@@ -335,6 +392,18 @@ class CreditGuarantee(models.Model):
     expires_at = models.DateTimeField(null=True, blank=True)  # J+7 depuis création
     expiry_notified = models.BooleanField(default=False)
 
+    # ── Consentement du garant ───────────────────────────────────────────────
+    # Fenêtre distincte de `expires_at` : celle-ci borne l'acte du GARANT
+    # (72 h par défaut, `InstitutionConfig`), `expires_at` bornait la
+    # confirmation par un AGENT. Deux acteurs, deux délais, deux colonnes.
+    consent_expires_at = models.DateTimeField(null=True, blank=True)
+
+    # Preuve du consentement : horodatage, canal, IP, sub de l'auteur, fenêtre
+    # appliquée. IMMUABLE une fois écrite (cf. `save`) — en cas de contentieux
+    # sur une caution appelée, c'est la seule pièce qui établit que le garant a
+    # bien consenti, quand, et depuis où.
+    consent_meta = models.JSONField(default=dict, blank=True)
+
     # ── Audit ────────────────────────────────────────────────────────────────
     registered_by_sub = models.CharField(max_length=255, blank=True)
     notes = models.TextField(blank=True)
@@ -343,6 +412,11 @@ class CreditGuarantee(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            # L'écran garant filtre sur (garant, type) à chaque affichage, et les
+            # règles de capacité comptent les cautions vivantes du garant.
+            models.Index(fields=["guarantor", "guarantee_type", "status"]),
+        ]
 
     def __str__(self) -> str:
         return (
@@ -350,12 +424,70 @@ class CreditGuarantee(models.Model):
             f"— dossier {self.application.code}"
         )
 
+    # ── Immuabilité de la preuve de consentement (principe 3) ────────────────
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        if "consent_meta" in field_names:
+            instance._db_consent_meta = copy.deepcopy(instance.consent_meta)
+        return instance
+
+    def save(self, *args, **kwargs):
+        """Refuse toute réécriture d'un `consent_meta` déjà constitué.
+
+        Un consentement est probant : on ne le corrige pas, on en recueille un
+        nouveau sur une nouvelle désignation. Sans ce garde-fou, un `save()`
+        anodin ailleurs dans le code suffirait à effacer la seule pièce qui
+        prouve l'engagement du garant.
+
+        Limite honnête : `QuerySet.update()` court-circuite `save()` et n'est
+        donc pas couvert. Le module n'utilise `update()` sur les garanties que
+        pour des transitions de statut de masse (expiration), qui ne touchent
+        pas `consent_meta`.
+        """
+        previous = getattr(self, "_db_consent_meta", None)
+        if previous and self.consent_meta != previous:
+            raise ImmutableConsentMeta(
+                "consent_meta est la preuve du consentement du garant : elle ne "
+                "peut être ni modifiée ni effacée après son enregistrement."
+            )
+        super().save(*args, **kwargs)
+        self._db_consent_meta = copy.deepcopy(self.consent_meta)
+
+    # ── Dérivés ──────────────────────────────────────────────────────────────
+
     @property
     def is_expired(self) -> bool:
         from django.utils import timezone
         if self.expires_at and self.status == self.Status.PENDING:
             return timezone.now() > self.expires_at
         return False
+
+    @property
+    def is_consent_expired(self) -> bool:
+        """Fenêtre de consentement du garant dépassée sans réponse."""
+        from django.utils import timezone
+        if self.consent_expires_at and self.status == self.Status.PENDING_CONSENT:
+            return timezone.now() > self.consent_expires_at
+        return False
+
+    @property
+    def retained_coverage(self):
+        """Montant réellement porté au ratio de couverture du dossier.
+
+        Une caution morale n'y entre qu'après décote : elle n'apporte aucun actif
+        réalisable, seulement une pression sociale de recouvrement. Les autres
+        types entrent pour leur montant retenu, déjà déprécié à la vérification
+        de l'actif ou bloqué en épargne.
+        """
+        from decimal import Decimal
+
+        base = self.covered_amount or self.hold_amount or Decimal("0")
+        if self.guarantee_type == self.GuaranteeType.MORALE:
+            from credits.guarantor import moral_coverage_weight
+            return (base * moral_coverage_weight()).quantize(Decimal("0.01"))
+        return base
 
 
 class ModuleAllocation(models.Model):

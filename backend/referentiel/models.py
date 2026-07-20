@@ -136,6 +136,17 @@ class InstitutionConfig(models.Model):
     plafond_delegue = models.FloatField(default=25000.0)      # USD
     decote_garantie = models.FloatField(default=0.30)
 
+    # Caution solidaire (SPEC §2.5). Principe 8 : ces seuils gouvernent qui peut
+    # engager quoi — ils appartiennent au comité, pas à un déploiement. Lus par
+    # `credits.guarantor`, qui logge un warning s'il doit retomber sur ses
+    # valeurs de secours.
+    caution_ratio_epargne = models.FloatField(default=2.0)        # k : Σ cautions ≤ k × épargne
+    caution_max_actives = models.IntegerField(default=3)          # cautions vivantes par garant
+    caution_consent_window_hours = models.IntegerField(default=72)  # fenêtre de consentement
+    # Décote de la caution morale : elle sécurise socialement, pas financièrement.
+    # Distincte de `decote_garantie`, qui s'applique aux actifs gagés.
+    decote_caution_morale = models.FloatField(default=0.70)
+
     # Phase de déploiement (§9 : validation humaine échantillonnée).
     phase_deploiement = models.CharField(max_length=20, default="PHASE_1")  # PHASE_1|2|3
 

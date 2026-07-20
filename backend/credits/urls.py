@@ -27,6 +27,11 @@ urlpatterns = [
     path("applications/<str:code>/disbursement/request/", views.request_disbursement_view),
     path("applications/<str:code>/disbursement/confirm/", views.confirm_disbursement_view),
     path("applications/<str:code>/disbursement/cancel/", views.cancel_disbursement_view),
+    # Demandes de caution — surface du GARANT, pas du dossier (SPEC §2.5).
+    # Volontairement hors de `applications/<code>/` : le garant n'a pas accès au
+    # dossier, il a accès à SON engagement.
+    path("guarantee-requests/", views.list_guarantee_requests),
+    path("guarantee-requests/<int:guarantee_id>/consent/", views.consent_guarantee_request),
     # Garanties (Étape 4)
     path("applications/<str:code>/guarantees/", views.list_guarantees),
     path("applications/<str:code>/guarantees/savings/", views.place_savings_guarantee),
