@@ -37,7 +37,8 @@ const fmtDt = (d: string | null) => d ? new Date(d).toLocaleString('fr-FR') : '�
 /** Un refus de transition n'est pas un message : c'est une ou plusieurs règles
  *  nommées. `credits/workflow.py` lève des `WorkflowError` typées
  *  (`INVALID_TRANSITION`, `APPLICATION_INCOMPLETE`, `DELEGATION_EXCEEDED`,
- *  `MAKER_CHECKER_VIOLATION`, `CLIENT_CONSENT_MISSING`) dont `as_errors()`
+ *  `MAKER_CHECKER_VIOLATION`, `CLIENT_CONSENT_MISSING`, `CLIENT_CONSENT_EXPIRED`)
+ *  dont `as_errors()`
  *  alimente `ApiError.errors`. Sur un écran de décision de crédit, savoir
  *  QUELLE règle a bloqué change ce que l'analyste fait ensuite — un plafond de
  *  délégation dépassé s'escalade, une violation maker ≠ checker se délègue. */
@@ -52,12 +53,44 @@ const REFUSAL_GUIDANCE: Record<string, string> = {
   MAKER_CHECKER_VIOLATION:
     'Séparation des tâches : vous avez initié cet acte, un autre profil doit le confirmer.',
   CLIENT_CONSENT_MISSING:
-    "Le consentement du client est absent ou expiré. Il doit être recueilli avant l'instruction.",
+    "Le consentement du client n'a pas encore été recueilli. Contactez-le pour "
+    + "qu'il confirme sa demande avant d'instruire le dossier.",
+  // Distinct de MISSING : l'action attendue n'est pas la même — un consentement
+  // manquant se recueille, un consentement expiré se renouvelle. Le backend les
+  // sépare en deux sous-classes (`ConsentError` / `ConsentExpired`, 409 / 410) ;
+  // les fondre dans un « absent ou expiré » reperdrait la distinction côté écran.
+  CLIENT_CONSENT_EXPIRED:
+    "La fenêtre de consentement de 72 h est dépassée. Le client doit être "
+    + "recontacté pour reformuler sa demande — l'ancien accord ne vaut plus.",
   APPLICATION_INCOMPLETE:
     'Le dossier ne réunit pas les pièces requises pour cette transition.',
   INVALID_TRANSITION:
     "Cette transition n'est pas permise depuis le statut actuel du dossier.",
 };
+
+/** Codes qu'on relaie volontairement sans suite à donner : le message du
+ *  serveur se suffit à lui-même. Les lister empêche l'avertissement ci-dessous
+ *  de se déclencher en permanence — un warning qui crie tout le temps finit
+ *  ignoré, et c'est alors qu'il rate le vrai cas. */
+const NO_GUIDANCE_NEEDED = new Set(['WORKFLOW_ERROR', 'PARSE_ERROR', 'CLIENT_NOT_FOUND']);
+
+/** Suite à donner pour un code de refus, ou `undefined`.
+ *
+ *  Un code inconnu doit être bruyant en développement. Ce dictionnaire est
+ *  resté silencieusement mort pendant tout un lot : il était écrit en
+ *  MAJUSCULES alors que le backend émettait des codes en minuscules, le lookup
+ *  rendait `undefined`, et le `.filter(Boolean)` supprimait la guidance sans
+ *  que rien ne le signale. Une clé manquante ne doit plus disparaître en silence. */
+function lookupGuidance(code: string): string | undefined {
+  const guidance = REFUSAL_GUIDANCE[code];
+  if (!guidance && !NO_GUIDANCE_NEEDED.has(code) && import.meta.env.DEV) {
+    console.warn(
+      `[credit] Code de refus « ${code} » sans suite à donner — ajouter une entrée `
+      + 'dans REFUSAL_GUIDANCE, ou dans NO_GUIDANCE_NEEDED si le message serveur suffit.',
+    );
+  }
+  return guidance;
+}
 
 const ApplicationDetail: React.FC = () => {
   const { code = '' } = useParams();
@@ -208,7 +241,7 @@ const ApplicationDetail: React.FC = () => {
           {/* Suite à donner, quand le code de refus en appelle une. Le message du
               serveur dit ce qui s'est passé ; ceci dit quoi faire ensuite. */}
           {(actionResult.errors ?? [])
-            .map((e) => (e.code ? REFUSAL_GUIDANCE[e.code] : undefined))
+            .map((e) => (e.code ? lookupGuidance(e.code) : undefined))
             .filter((g): g is string => Boolean(g))
             .map((guidance, i) => (
               <p key={i} className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3">

@@ -51,12 +51,23 @@ export const GUARANTEE_ERROR_MESSAGES = {
 /**
  * Statuts par lesquels le serveur exprime un refus métier structuré.
  *
- * Le front est **volontairement agnostique au statut** : `submit` répond 400,
- * le gage sur actif 422, un conflit d'état 409. Ces choix peuvent évoluer côté
- * serveur (passer `submit` en 422 serait plus conforme au principe 5) sans
- * qu'aucun écran n'ait à changer. C'est le `code` qui porte le sens.
+ * Le front est **volontairement agnostique au statut** : le statut voyage
+ * maintenant avec la règle (`WorkflowError.http_status`) — 422 par défaut,
+ * 409 pour les conflits d'état, 410 pour un consentement expiré. Ces choix
+ * peuvent évoluer côté serveur sans qu'aucun écran n'ait à changer : c'est le
+ * `code` qui porte le sens.
+ *
+ * Cette liste ne sert qu'à décider **quand avertir** qu'un refus arrive sans
+ * `code` — un endpoint non migré. Elle n'influence aucun message client.
+ *
+ * `403` en est volontairement absent bien que `DELEGATION_EXCEEDED` l'utilise :
+ * l'écrasante majorité des 403 sont de simples refus de permission
+ * (`{"detail": "Permission refusée."}`, sans code, et c'est normal). Les y
+ * inclure ferait crier l'avertissement en permanence — et une alerte qui se
+ * déclenche toujours ne signale plus rien. `DELEGATION_EXCEEDED` porte un code,
+ * il passe donc par le chemin nominal.
  */
-const REFUSAL_STATUSES = [400, 409, 422];
+const REFUSAL_STATUSES = [400, 409, 410, 422];
 
 /**
  * Codes émis par d'autres domaines que les actifs/garanties, et volontairement

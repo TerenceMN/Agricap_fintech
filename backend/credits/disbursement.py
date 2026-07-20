@@ -32,7 +32,60 @@ _DEFAULT_FINANCING_PCT = Decimal("80")  # % financé par module (standard)
 
 
 class DisbursementError(Exception):
-    pass
+    """Refus d'une opération de décaissement.
+
+    Même contrat que `credits.workflow.WorkflowError` : chaque sous-classe porte
+    son `code` et son `http_status`, et la vue se contente de relayer. La vue
+    déduisait auparavant le code du TEXTE du message
+    (``is_mkck = "maker" in str(exc).lower()``) — une reformulation du message de
+    maker-checker aurait silencieusement dégradé le code en `DISBURSEMENT_ERROR`
+    et le statut de 409 à 400, sur le contrôle le plus sensible du module.
+    """
+
+    code = "DISBURSEMENT_ERROR"
+    http_status = 422
+
+    def __init__(self, message: str, errors: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.errors = errors or []
+
+    def as_errors(self) -> list[dict]:
+        return self.errors or [{"code": self.code, "message": str(self)}]
+
+
+class DisbursementMakerChecker(DisbursementError):
+    """Le demandeur et le confirmateur sont la même personne."""
+
+    code = "MAKER_CHECKER_VIOLATION"
+    http_status = 409
+
+
+class DisbursementRequestMissing(DisbursementError):
+    """Aucune demande de décaissement n'existe pour ce dossier."""
+
+    code = "DISBURSEMENT_REQUEST_MISSING"
+    http_status = 404
+
+
+class DisbursementRequestConflict(DisbursementError):
+    """La demande existe mais son statut interdit l'opération demandée."""
+
+    code = "DISBURSEMENT_REQUEST_CONFLICT"
+    http_status = 409
+
+
+class DisbursementAlreadyDone(DisbursementError):
+    """Le dossier a déjà été décaissé — jamais deux fois."""
+
+    code = "DISBURSEMENT_ALREADY_DONE"
+    http_status = 409
+
+
+class DisbursementAmountInvalid(DisbursementError):
+    """Montant approuvé absent ou nul."""
+
+    code = "DISBURSEMENT_AMOUNT_INVALID"
+    http_status = 422
 
 
 # ── Étape 1 : demande de décaissement ─────────────────────────────────────────
@@ -53,14 +106,14 @@ def request_disbursement(
     _assert_status(app, "approved")
 
     if not app.amount_approved or app.amount_approved <= 0:
-        raise DisbursementError("Montant approuvé manquant ou nul.")
+        raise DisbursementAmountInvalid("Montant approuvé manquant ou nul.")
 
     if hasattr(app, "disbursement_request"):
         dr = app.disbursement_request
         if dr.status == DisbursementRequest.Status.CONFIRMED:
-            raise DisbursementError("Ce dossier a déjà été décaissé.")
+            raise DisbursementAlreadyDone("Ce dossier a déjà été décaissé.")
         if dr.status == DisbursementRequest.Status.PENDING:
-            raise DisbursementError(
+            raise DisbursementRequestConflict(
                 "Une demande de décaissement est déjà en attente. "
                 "Confirmez ou annulez-la avant d'en créer une nouvelle."
             )
@@ -101,16 +154,16 @@ def confirm_disbursement(
     try:
         dr = app.disbursement_request
     except DisbursementRequest.DoesNotExist:
-        raise DisbursementError("Aucune demande de décaissement trouvée pour ce dossier.")
+        raise DisbursementRequestMissing("Aucune demande de décaissement trouvée pour ce dossier.")
 
     if dr.status != DisbursementRequest.Status.PENDING:
-        raise DisbursementError(
+        raise DisbursementRequestConflict(
             f"La demande de décaissement est dans le statut «{dr.status}» — impossible de confirmer."
         )
 
     # Maker ≠ checker
     if dr.requested_by_sub == confirmer_sub:
-        raise DisbursementError(
+        raise DisbursementMakerChecker(
             "La même personne ne peut pas demander et confirmer un décaissement "
             "(principe maker ≠ checker)."
         )
@@ -178,10 +231,10 @@ def cancel_disbursement_request(app, cancelled_by_sub: str) -> None:
     try:
         dr = app.disbursement_request
     except DisbursementRequest.DoesNotExist:
-        raise DisbursementError("Aucune demande de décaissement trouvée.")
+        raise DisbursementRequestMissing("Aucune demande de décaissement trouvée.")
 
     if dr.status != DisbursementRequest.Status.PENDING:
-        raise DisbursementError("Impossible d'annuler — statut non PENDING.")
+        raise DisbursementRequestConflict("Impossible d'annuler — statut non PENDING.")
 
     dr.status = DisbursementRequest.Status.CANCELLED
     dr.save(update_fields=["status", "updated_at"])

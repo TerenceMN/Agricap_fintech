@@ -1220,7 +1220,7 @@ def request_disbursement_view(request: Request, code: str) -> Response:
             notes=request.data.get("notes", ""),
         )
     except (DisbursementError, WorkflowError) as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app), status=201)
@@ -1244,11 +1244,7 @@ def confirm_disbursement_view(request: Request, code: str) -> Response:
     try:
         result = _confirm(app, confirmer_sub=getattr(request.user, "sub", "") or "")
     except DisbursementError as exc:
-        is_mkck = "maker" in str(exc).lower()
-        return Response(
-            {"detail": str(exc), "code": "MAKER_CHECKER_VIOLATION" if is_mkck else "DISBURSEMENT_ERROR"},
-            status=409 if is_mkck else 400,
-        )
+        return _workflow_error(exc)
     except WorkflowError as exc:
         return _workflow_error(exc)
 
@@ -1273,7 +1269,7 @@ def cancel_disbursement_view(request: Request, code: str) -> Response:
     try:
         cancel_disbursement_request(app, cancelled_by_sub=getattr(request.user, "sub", "") or "")
     except (DisbursementError, WorkflowError) as exc:
-        return Response({"detail": str(exc)}, status=400)
+        return _workflow_error(exc)
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))

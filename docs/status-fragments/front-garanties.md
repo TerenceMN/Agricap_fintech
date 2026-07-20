@@ -263,6 +263,42 @@ Le trou : mon avertissement ne couvrait que l'*absence* de code, pas un code
 Il ignore une liste `RELAYED_CODES` de codes volontairement non traduits, pour
 qu'un avertissement qui se déclenche en permanence ne finisse pas ignoré.
 
+**Migration effectuée depuis, vérifiée** : `guarantees.py:163` porte toujours
+`GUARANTEE_TYPE_NOT_ELIGIBLE`, et `_ineligible_guarantee_errors` conserve
+`{"code": exc.code, "message": str(exc)}`. Ma dépendance est intacte.
+
+Le statut voyage maintenant avec la règle (`WorkflowError.http_status`) : 422 par
+défaut, 409 pour les conflits d'état, **410 pour `CLIENT_CONSENT_EXPIRED`**,
+403 pour `DELEGATION_EXCEEDED`. `REFUSAL_STATUSES` est passé à
+`[400, 409, 410, 422]` — le 410 serait sinon sorti de mon garde-fou. **403 est
+volontairement exclu** : la quasi-totalité des 403 sont de simples refus de
+permission sans code, et les inclure ferait crier l'avertissement en continu.
+C'est commenté dans le fichier pour que l'omission ne soit pas « corrigée » plus
+tard par méprise.
+
+### 3.2 quater ⚠ Signalé à `front-backoffice` — trou silencieux dans `REFUSAL_GUIDANCE`
+
+Hors de mon périmètre, vérifié dans leur fichier avant relais.
+`ApplicationDetail.tsx:212` fait `.map(code => REFUSAL_GUIDANCE[code]).filter(Boolean)` :
+**un code inconnu est supprimé sans trace**. C'est ce mécanisme qui a rendu leur
+guidance entièrement morte pendant la période où le backend émettait des codes
+en minuscules et leur table en MAJUSCULES — découvert par `backend-credit` en
+migrant. Leur prudence protégeait un bug, pas un contrat.
+
+Deux conséquences ouvertes :
+1. `CLIENT_CONSENT_EXPIRED` n'a pas de clé → le cas expiré retombe dans le trou ;
+2. leur message `CLIENT_CONSENT_MISSING` dit « absent **ou** expiré » —
+   contournement légitime avant la distinction, faux depuis. À scinder.
+
+Le pattern lui-même reste : ajouter la clé corrige l'instance, pas la classe.
+
+**Motif récurrent de la session, à retenir au-delà de ces fichiers** : trois fois
+le même schéma — un garde-fou posé contre un risque théorique pendant qu'un
+défaut réel était déjà en place et invisible (mon repli 409 → « cet actif est
+nanti » ; mon garde-fou aveugle aux codes renommés ; leur `filter(Boolean)`).
+À chaque fois, deux `grep` sur l'état réel ont tranché plus vite que
+l'argumentation. **Vérifier l'existant avant de débattre du risque.**
+
 ### 3.3 ✅ Résolu — modifier un actif `libere` le renvoie en vérification
 
 C'était une faille exploitable, pas une nuance : `libere` est `is_pledgeable` et

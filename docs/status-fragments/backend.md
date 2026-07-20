@@ -2,7 +2,7 @@
 
 > Périmètre : `AGRICAP FINTECH/backend/` uniquement. `src/` n'a pas été touché.
 > Dernière exécution : `./.venv/Scripts/python.exe manage.py test credits assets dataio reference_data`
-> → **140 tests, OK** (baseline mesurée à 81, + 59 nouveaux).
+> → **144 tests, OK** (baseline mesurée à 81, + 63 nouveaux).
 
 ---
 
@@ -381,16 +381,74 @@ les outliers. **Mais je n'ai pas fait la migration.** Renommer un `code`
 déjà consommé par un front est précisément le changement silencieux que je
 reproche aux autres ; `front-garanties` a construit sa table de codes dessus.
 
-**Proposition à arbitrer avec les deux fronts** (aucune ligne écrite) :
-1. les vues workflow passent au helper unique qui émet `exc.code` + `errors[]` ;
-2. ajout d'une sous-classe `ConsentExpired` (code `CLIENT_CONSENT_EXPIRED`) pour
-   ne pas perdre la distinction manquant / expiré, aujourd'hui portée par le
-   seul statut HTTP (409 vs 410) ;
-3. période de transition avec `legacyCode` en minuscule si un front en a besoin.
+### Ce qui a levé le blocage : une vérification, pas un accord
 
-En attendant, **l'état est incohérent et documenté comme tel** : `submit` émet
-en majuscules, `approve` / `reject` / `start-analysis` / `client-consent` en
-minuscules.
+`front-garanties` a confirmé par grep que son périmètre ne consomme aucun de ces
+codes, tout en signalant honnêtement qu'il ne pouvait pas répondre pour
+`front-backoffice`. **J'ai vérifié moi-même plutôt que de migrer sur cette
+réserve** — et le résultat inverse complètement le risque :
+
+`src/pages/credit/ApplicationDetail.tsx:49` contient déjà un dictionnaire
+`REFUSAL_GUIDANCE` **clé en MAJUSCULES** : `DELEGATION_EXCEEDED`,
+`MAKER_CHECKER_VIOLATION`, `CLIENT_CONSENT_MISSING`, `APPLICATION_INCOMPLETE`,
+`INVALID_TRANSITION`. Comme le backend émettait `delegation_exceeded`, le lookup
+retournait `undefined` et `.filter(Boolean)` supprimait silencieusement le
+message. **La guidance du backoffice sur `approve` / `reject` / `start-analysis`
+était donc du code mort.** La migration ne cassait rien : elle réactivait une UI
+déjà écrite.
+
+Leçon : sur ce coup, ma prudence protégeait un bug plutôt qu'un contrat. Vérifier
+coûtait deux greps.
+
+### Migration effectuée
+
+1. **Un seul point d'émission** : `_workflow_error(exc)` dans `views.py`. Le
+   `code` **et** le statut HTTP viennent de l'exception ; aucune vue ne réécrit
+   ni l'un ni l'autre. Quatre clauses `except` devenues redondantes supprimées.
+2. **Le statut voyage avec la règle** (`WorkflowError.http_status`) :
+
+   | Règle | Statut | Raison |
+   |---|---|---|
+   | `WorkflowError` (défaut), `ApplicationIncomplete` | 422 | refus métier / entité non traitable |
+   | `InvalidTransition`, `MakerCheckerError`, `ConsentError` | 409 | conflit avec l'état de la ressource |
+   | `ConsentExpired` | 410 | la fenêtre de consentement n'existe plus |
+   | `DelegationError` | 403 | refus d'autorisation, pas de validation |
+
+   Ajouter une règle ne demande donc **aucune modification des vues**.
+3. **`ConsentExpired`** créé (code `CLIENT_CONSENT_EXPIRED`), sous-classe de
+   `ConsentError` — un `except ConsentError` attrape toujours les deux. La
+   distinction manquant/expiré ne tenait qu'au statut HTTP, donc invisible pour
+   un front découplé des statuts ; elle est maintenant dans le `code`. Les deux
+   appellent des actions différentes : recueillir vs renouveler.
+4. **Pas de `legacyCode`.** L'argument de `front-garanties` est juste : le projet
+   a quatre vocabulaires de rôles parce que chaque transition a survécu à sa
+   cause. Une bascule qui casse bruyamment vaut mieux qu'un doublon officialisé.
+
+### Garde-fou anti-régression
+
+`test_les_vues_n_ecrivent_plus_de_code_en_dur` scanne `views.py` et échoue si un
+`"code": "<minuscule>"` réapparaît dans une réponse. **Testé en injectant un faux
+code : le test échoue bien** — ce n'est pas une garde vide (cf. §7quater, un test
+qui ne peut pas échouer ne teste rien).
+
+### ⚠ Point à préserver, signalé par `front-garanties`
+
+`GUARANTEE_TYPE_NOT_ELIGIBLE` est le seul code qui traverse à la fois le chemin
+garanties et le chemin workflow (réémis par `_ineligible_guarantee_errors` à la
+soumission). Son message **énumère les types admis pour la filière** — le front
+ne peut pas reconstituer cette liste et ne doit pas la connaître autrement
+(principe 7). Toute refonte qui le renommerait, l'envelopperait sous un code
+d'agrégat, ou remplacerait `{"code": exc.code, "message": str(exc)}` par un code
+générique ferait perdre l'information au client **sans rien casser visiblement**.
+Verrouillé par `test_garantie_devenue_ineligible_garde_son_code_et_ses_types_admis`.
+
+### Reste hors périmètre de cette migration
+
+`disbursement` (`views.py:1249`) émet encore un code conditionnel construit dans
+la vue (`"MAKER_CHECKER_VIOLATION" if is_mkck else "DISBURSEMENT_ERROR"`). En
+majuscules, donc conforme à la nomenclature, mais le code y est toujours réécrit
+au lieu d'être porté par l'exception de `credits/disbursement.py`. Même
+traitement à appliquer — non fait.
 
 ---
 
