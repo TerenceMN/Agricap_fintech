@@ -936,7 +936,16 @@ def get_guarantee_summary(application) -> dict[str, Any]:
             })
         result["items"].append(item)
 
+    # Défense en profondeur : un dossier fraîchement créé peut porter un `float`
+    # dans `amount_requested` si un appelant l'a passé tel quel à `create()`
+    # (Django ne convertit qu'au rechargement). `Decimal / float` lève un
+    # TypeError et faisait tomber la réponse entière en 500. La cause est
+    # corrigée à la source dans `views.py` ; ce garde évite qu'un futur appelant
+    # ne rouvre la même brèche depuis un autre chemin.
     montant = application.amount_approved or application.amount_requested
+    if montant is not None and not isinstance(montant, Decimal):
+        montant = Decimal(str(montant))
+
     result["coverage"] = {
         "retainedTotal": float(couverture),
         "currency": application.currency,

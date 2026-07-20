@@ -746,6 +746,26 @@ class AntiGamingTests(AuthedAPITestCase):
                   if cle in self.CLES_INTERDITES]
         self.assertEqual(fuites, [])
 
+    def test_absence_d_historique_n_est_jamais_un_point_fort(self):
+        """Le moteur ne félicite pas un client pour une donnée qu'il n'a pas.
+
+        Régression réelle : avec un `>=` sur la médiane, le score neutre de 50
+        du critère comportemental sans historique tombait dans « points forts »,
+        et le client lisait « votre historique avec AGRICAP joue en votre
+        faveur » alors qu'il n'a aucun crédit antérieur. Trompeur pour lui, et
+        faux pour l'institution.
+        """
+        resume = serialiser_analyse_resume(self.analyse)
+        self.assertIs(
+            self.analyse.criteres["comportemental"]["details"]["historiqueDisponible"],
+            False)
+        self.assertNotIn(
+            "Votre historique avec AGRICAP joue en votre faveur.",
+            resume["pointsForts"])
+        self.assertTrue(
+            any("historique de remboursement" in p for p in resume["pointsAAmeliorer"]),
+            "L'absence d'historique doit être une piste actionnable.")
+
     def test_pistes_client_sont_des_actions_pas_des_seuils(self):
         resume = serialiser_analyse_resume(self.analyse)
         self.assertTrue(resume["pointsAAmeliorer"])

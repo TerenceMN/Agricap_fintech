@@ -1,0 +1,463 @@
+{
+  "GET analyse/ (200, staff)": {
+    "id": 1,
+    "reference": "CRED-TEST-ANA-0001",
+    "referentiel": "AGRICAP_FIN_SIM_01_Cereales_Mais",
+    "parametres": {
+      "dureeMois": 8,
+      "differeMois": 5,
+      "tauxAnnuel": 18.0,
+      "modeDiffere": "interets_seuls",
+      "capital": 1330.0,
+      "devise": "USD"
+    },
+    "scoreGlobal": 15.0,
+    "scoreLettre": "D",
+    "recommandation": "refus",
+    "dscr": 0.259,
+    "dscrStress": 0.194,
+    "criteres": {
+      "technique": {
+        "score": 0.0,
+        "poids": 25.0,
+        "points": 0.0,
+        "details": {
+          "totalPlan": 1330.0,
+          "totalReferentiel": 9111.0,
+          "ecartMoyenPct": 84.1,
+          "referentiel": "AGRICAP_FIN_SIM_01_Cereales_Mais",
+          "referentielSource": "indicatif",
+          "superficieHa": 1.0,
+          "uniteReference": "ha",
+          "parModule": [
+            {
+              "indicateur": "cout_module:semences",
+              "module": "semences",
+              "valeur": 600.0,
+              "reference": 850.0,
+              "ecartPct": -29.4,
+              "message": "semences : -29.4 % vs référentiel",
+              "horsPlage": false
+            },
+            {
+              "indicateur": "cout_module:mecanisation",
+              "module": "mecanisation",
+              "valeur": 450.0,
+              "reference": 1200.0,
+              "ecartPct": -62.5,
+              "message": "mecanisation : -62.5 % vs référentiel",
+              "horsPlage": true
+            },
+            {
+              "indicateur": "cout_module:maindoeuvre",
+              "module": "maindoeuvre",
+              "valeur": 280.0,
+              "reference": 1450.0,
+              "ecartPct": -80.7,
+              "message": "maindoeuvre : -80.7 % vs référentiel",
+              "horsPlage": true
+            },
+            {
+              "indicateur": "cout_module:equipements",
+              "module": "equipements",
+              "valeur": 0.0,
+              "reference": 1100.0,
+              "ecartPct": -100.0,
+              "message": "equipements : -100.0 % vs référentiel",
+              "horsPlage": true
+            },
+            {
+              "indicateur": "cout_module:postrecolte",
+              "module": "postrecolte",
+              "valeur": 0.0,
+              "reference": 1350.0,
+              "ecartPct": -100.0,
+              "message": "postrecolte : -100.0 % vs référentiel",
+              "horsPlage": true
+            },
+            {
+              "indicateur": "cout_module:logistique",
+              "module": "logistique",
+              "valeur": 0.0,
+              "reference": 1000.0,
+              "ecartPct": -100.0,
+              "message": "logistique : -100.0 % vs référentiel",
+              "horsPlage": true
+            },
+            {
+              "indicateur": "cout_module:commercialisation",
+              "module": "commercialisation",
+              "valeur": 0.0,
+              "reference": 1150.0,
+              "ecartPct": -100.0,
+              "message": "commercialisation : -100.0 % vs référentiel",
+              "horsPlage": true
+            },
+            {
+              "indicateur": "cout_module:reserve",
+              "module": "reserve",
+              "valeur": 0.0,
+              "reference": 1011.0,
+              "ecartPct": -100.0,
+              "message": "reserve : -100.0 % vs référentiel",
+              "horsPlage": true
+            }
+          ],
+          "modulesNonReferences": [],
+          "ecartsHorsPlage": [
+            {
+              "indicateur": "cout_module:mecanisation",
+              "module": "mecanisation",
+              "valeur": 450.0,
+              "reference": 1200.0,
+              "ecartPct": -62.5,
+              "message": "mecanisation : -62.5 % vs référentiel"
+            },
+            {
+              "indicateur": "cout_module:maindoeuvre",
+              "module": "maindoeuvre",
+              "valeur": 280.0,
+              "reference": 1450.0,
+              "ecartPct": -80.7,
+              "message": "maindoeuvre : -80.7 % vs référentiel"
+            },
+            {
+              "indicateur": "cout_module:equipements",
+              "module": "equipements",
+              "valeur": 0.0,
+              "reference": 1100.0,
+              "ecartPct": -100.0,
+              "message": "equipements : -100.0 % vs référentiel"
+            },
+            {
+              "indicateur": "cout_module:postrecolte",
+              "module": "postrecolte",
+              "valeur": 0.0,
+              "reference": 1350.0,
+              "ecartPct": -100.0,
+              "message": "postrecolte : -100.0 % vs référentiel"
+            },
+            {
+              "indicateur": "cout_module:logistique",
+              "module": "logistique",
+              "valeur": 0.0,
+              "reference": 1000.0,
+              "ecartPct": -100.0,
+              "message": "logistique : -100.0 % vs référentiel"
+            },
+            {
+              "indicateur": "cout_module:commercialisation",
+              "module": "commercialisation",
+              "valeur": 0.0,
+              "reference": 1150.0,
+              "ecartPct": -100.0,
+              "message": "commercialisation : -100.0 % vs référentiel"
+            },
+            {
+              "indicateur": "cout_module:reserve",
+              "module": "reserve",
+              "valeur": 0.0,
+              "reference": 1011.0,
+              "ecartPct": -100.0,
+              "message": "reserve : -100.0 % vs référentiel"
+            }
+          ],
+          "commentaire": "Total de la feuille de besoins (1330.00) nettement inférieur au référentiel (9111.00) : le plan ne couvre pas le cycle décrit. Comparaison faite contre un référentiel indicatif (N = 0 dossiers réels) — fiabilité limitée."
+        }
+      },
+      "dscr": {
+        "score": 0.0,
+        "poids": 20.0,
+        "points": 0.0,
+        "details": {
+          "dscr": 0.259,
+          "commentaire": "DSCR = 0.26 (insuffisante)",
+          "facteurDominant": "Différé de 5 mois sur 8 : le capital s'amortit sur 3 mois, ce qui concentre le service de la dette et dégrade mécaniquement le DSCR.",
+          "levier": "Un différé de 0 mois au lieu de 5 porterait le DSCR à 0.268 (service de la dette étalé sur 8 mois au lieu de 3).",
+          "diagnostic": {
+            "hypotheseCashFlows": {
+              "origine": "projection_referentiel",
+              "referentiel": "AGRICAP_FIN_SIM_01_Cereales_Mais",
+              "referentielSource": "indicatif",
+              "rendementUnitaire": 4.5,
+              "prixUnitaire": 380.0,
+              "uniteRendement": "t",
+              "superficieHa": 1.0,
+              "revenuBrut": 1710.0,
+              "chargesPlan": 1330.0,
+              "margeNetteCycle": 380.0,
+              "moisAmortissement": 3,
+              "commentaire": "Cash-flows PROJETÉS depuis le référentiel filière : le classeur ingéré ne comporte pas de trésorerie prévisionnelle déclarée (feuilles 4 et 5 uniquement). Hypothèse à valider avec le client."
+            },
+            "moisLePlusTendu": {
+              "mois": 1,
+              "dscr": 0.0,
+              "echeance": 19.95,
+              "cashFlow": 0.0
+            },
+            "serviceDette": 1469.65,
+            "cashFlowTotal": 380.01,
+            "alternativesDiffere": [
+              {
+                "differeMois": 0,
+                "dscr": 0.268,
+                "serviceDette": 1419.78
+              },
+              {
+                "differeMois": 2,
+                "dscr": 0.264,
+                "serviceDette": 1439.71
+              },
+              {
+                "differeMois": 3,
+                "dscr": 0.262,
+                "serviceDette": 1449.7
+              }
+            ]
+          }
+        }
+      },
+      "stress": {
+        "score": 0.0,
+        "poids": 10.0,
+        "points": 0.0,
+        "details": {
+          "dscrStress": 0.194,
+          "chocPct": 25.0,
+          "commentaire": "Stress test −25.0 % sur les revenus → DSCR = 0.19"
+        }
+      },
+      "comportemental": {
+        "score": 50.0,
+        "poids": 30.0,
+        "points": 15.0,
+        "details": {
+          "historiqueDisponible": false,
+          "commentaire": "Historique comportemental non disponible : aucun crédit antérieur au nom de ce client. Score neutre de 50/100 appliqué — ce critère pèse 30.0 % du score global sans être documenté."
+        }
+      },
+      "garanties": {
+        "score": 0.0,
+        "poids": 15.0,
+        "points": 0.0,
+        "details": {
+          "ratioCouverture": 0.0,
+          "couvertureRetenue": 0.0,
+          "montantFinance": 1330.0,
+          "constituees": false,
+          "garanties": [],
+          "commentaire": "Aucune garantie déclarée — score indicatif plafonné en attente de constitution."
+        }
+      }
+    },
+    "indicateursHorsPlage": [
+      {
+        "indicateur": "cout_module:mecanisation",
+        "module": "mecanisation",
+        "valeur": 450.0,
+        "reference": 1200.0,
+        "ecartPct": -62.5,
+        "message": "mecanisation : -62.5 % vs référentiel"
+      },
+      {
+        "indicateur": "cout_module:maindoeuvre",
+        "module": "maindoeuvre",
+        "valeur": 280.0,
+        "reference": 1450.0,
+        "ecartPct": -80.7,
+        "message": "maindoeuvre : -80.7 % vs référentiel"
+      },
+      {
+        "indicateur": "cout_module:equipements",
+        "module": "equipements",
+        "valeur": 0.0,
+        "reference": 1100.0,
+        "ecartPct": -100.0,
+        "message": "equipements : -100.0 % vs référentiel"
+      },
+      {
+        "indicateur": "cout_module:postrecolte",
+        "module": "postrecolte",
+        "valeur": 0.0,
+        "reference": 1350.0,
+        "ecartPct": -100.0,
+        "message": "postrecolte : -100.0 % vs référentiel"
+      },
+      {
+        "indicateur": "cout_module:logistique",
+        "module": "logistique",
+        "valeur": 0.0,
+        "reference": 1000.0,
+        "ecartPct": -100.0,
+        "message": "logistique : -100.0 % vs référentiel"
+      },
+      {
+        "indicateur": "cout_module:commercialisation",
+        "module": "commercialisation",
+        "valeur": 0.0,
+        "reference": 1150.0,
+        "ecartPct": -100.0,
+        "message": "commercialisation : -100.0 % vs référentiel"
+      },
+      {
+        "indicateur": "cout_module:reserve",
+        "module": "reserve",
+        "valeur": 0.0,
+        "reference": 1011.0,
+        "ecartPct": -100.0,
+        "message": "reserve : -100.0 % vs référentiel"
+      }
+    ],
+    "justifications": [],
+    "echeancier": [
+      {
+        "mois": 1,
+        "phase": "différé",
+        "capital": 0.0,
+        "interets": 19.95,
+        "interetsCapitalises": 0.0,
+        "echeance": 19.95,
+        "crd": 1330.0
+      },
+      {
+        "mois": 2,
+        "phase": "différé",
+        "capital": 0.0,
+        "interets": 19.95,
+        "interetsCapitalises": 0.0,
+        "echeance": 19.95,
+        "crd": 1330.0
+      },
+      {
+        "mois": 3,
+        "phase": "différé",
+        "capital": 0.0,
+        "interets": 19.95,
+        "interetsCapitalises": 0.0,
+        "echeance": 19.95,
+        "crd": 1330.0
+      },
+      {
+        "mois": 4,
+        "phase": "différé",
+        "capital": 0.0,
+        "interets": 19.95,
+        "interetsCapitalises": 0.0,
+        "echeance": 19.95,
+        "crd": 1330.0
+      },
+      {
+        "mois": 5,
+        "phase": "différé",
+        "capital": 0.0,
+        "interets": 19.95,
+        "interetsCapitalises": 0.0,
+        "echeance": 19.95,
+        "crd": 1330.0
+      },
+      {
+        "mois": 6,
+        "phase": "amortissement",
+        "capital": 443.33,
+        "interets": 19.95,
+        "interetsCapitalises": 0.0,
+        "echeance": 463.28,
+        "crd": 886.67
+      },
+      {
+        "mois": 7,
+        "phase": "amortissement",
+        "capital": 443.33,
+        "interets": 13.3,
+        "interetsCapitalises": 0.0,
+        "echeance": 456.63,
+        "crd": 443.34
+      },
+      {
+        "mois": 8,
+        "phase": "amortissement",
+        "capital": 443.34,
+        "interets": 6.65,
+        "interetsCapitalises": 0.0,
+        "echeance": 449.99,
+        "crd": 0.0
+      }
+    ],
+    "totaux": {
+      "totalInterets": 139.65,
+      "totalInteretsCapitalises": 0.0,
+      "totalCapital": 1330.0,
+      "serviceDette": 1469.65,
+      "crdFinal": 0.0,
+      "nbEcheances": 8
+    },
+    "devise": "USD",
+    "referentielInfo": {
+      "code": "AGRICAP_FIN_SIM_01_Cereales_Mais",
+      "filiere": "Céréales — Maïs",
+      "source": "indicatif",
+      "estIndicatif": true,
+      "nCasReels": 0,
+      "version": 1
+    },
+    "executeLe": "2026-07-20T16:54:07.528705+00:00",
+    "versionMoteur": "4.0",
+    "lignage": {
+      "needsSourceId": 1,
+      "revision": 1,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "poidsAppliques": {
+      "technique": "25.0",
+      "dscr": "20.0",
+      "stress": "10.0",
+      "comportemental": "30.0",
+      "garanties": "15.0"
+    }
+  },
+  "POST analyse/justifier/ (200) — justifications uniquement": {
+    "justifications": [
+      {
+        "indicateur": "cout_module:mecanisation",
+        "justification": "Semences fournies par la coopérative.",
+        "agent": "sub-dump-analyste",
+        "date": "2026-07-20T16:54:07.541476+00:00"
+      }
+    ]
+  },
+  "POST reanalyser/ (201) — extrait": {
+    "status": 201,
+    "id": 2,
+    "parametres": {
+      "dureeMois": 8,
+      "differeMois": 2,
+      "tauxAnnuel": 18.0,
+      "modeDiffere": "interets_seuls",
+      "capital": 1330.0,
+      "devise": "USD"
+    },
+    "scoreGlobal": 15.0,
+    "dscr": 0.264,
+    "totaux": {
+      "totalInterets": 109.71,
+      "totalInteretsCapitalises": 0.0,
+      "totalCapital": 1330.0,
+      "serviceDette": 1439.71,
+      "crdFinal": 0.0,
+      "nbEcheances": 8
+    }
+  },
+  "GET analyse-resume/ (200, client)": {
+    "reference": "CRED-TEST-ANA-0001",
+    "scoreLettre": "D",
+    "pointsForts": [],
+    "pointsAAmeliorer": [
+      "Détaillez votre feuille de besoins poste par poste : plusieurs rubriques s'écartent de ce qui est observé sur des projets comparables.",
+      "Les revenus attendus couvrent difficilement les remboursements. Une durée plus longue ou un montant plus mesuré améliorerait cet équilibre.",
+      "Votre projet résiste mal à une baisse des revenus. Prévoir une réserve d'exploitation renforcerait sa solidité.",
+      "Un historique de remboursement au sein d'AGRICAP renforce un dossier. Une épargne régulière y contribue aussi.",
+      "Constituez vos garanties : une garantie confirmée pèse davantage qu'une garantie annoncée."
+    ],
+    "analyseLe": "2026-07-20T16:54:07.548818+00:00"
+  }
+}

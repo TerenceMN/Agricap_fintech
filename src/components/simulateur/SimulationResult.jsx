@@ -6,16 +6,24 @@
  * n'affiche rien tant que le moteur n'a pas répondu (le fallback historique
  * qui fabriquait une note à partir du montant et de la superficie a été retiré).
  *
- * Réserve connue et signalée : la grille de classement du score est encore
- * codée ici (cf. `SCORE_BANDS` et le rapport de lot 3 §4.2). Elle doit descendre
- * du serveur, lue depuis `BaremeScore` — et elle **contredit aujourd'hui le
- * moteur** sur deux points : 3ᵉ palier à 50 côté front contre 55 côté backend,
- * et comparaison stricte (`>`) contre `>=` côté backend, ce qui déclasse les
- * scores valant exactement 85 ou 70. Ne pas corriger ces valeurs ici seul : les
- * mêmes seuils vivent dans `admin/credits/CreditRow.jsx` et
- * `admin/credits/CreditDetailsModal.jsx`. Un alignement partiel ferait diverger
- * la liste, le détail et le simulateur — correctif atomique sur les 4 fichiers,
- * ou rien.
+ * Réserve connue : `SCORE_BANDS` recopie une grille qui vit désormais en base
+ * (`BaremeScore.DECISION.parametres.lettres`) et que le serveur sait servir —
+ * `credits/analyse.py::score_lettre`, exposé en `scoreLettre` sur `analyse/` et
+ * `analyse-resume/`. `simulate/` ne le sert pas encore : d'ici là, cette copie
+ * reste nécessaire.
+ *
+ * ⚠ NE PAS « aligner » ces seuils sur les échelles 85/70/**55** en `>=` que l'on
+ * trouve dans `scoring.py` et `dataio_simulator.py` : ce sont les bandes
+ * d'ajustement du TAUX et de la note de valorisation, un concept distinct. La
+ * grille de la LETTRE est bien 85/70/50 en `>` strict, bornes de la SPEC §6
+ * conservées délibérément côté serveur (cf. `LETTRES_DEFAUT` et le test
+ * `test_lettre_de_score` : 85 → B, 70 → C, 50 → D). Les valeurs ci-dessous sont
+ * donc CORRECTES et identiques au moteur ; le défaut est la duplication, pas les
+ * chiffres. Une version antérieure de ce commentaire prescrivait l'inverse.
+ *
+ * Le vrai correctif : que `simulate/` serve `scoreLettre` comme `analyse/`, puis
+ * supprimer `SCORE_BANDS` — sinon cette copie dérivera le jour où le comité
+ * recalibrera la grille en base, silencieusement.
  */
 import React from 'react';
 import { motion } from 'framer-motion';

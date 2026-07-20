@@ -100,6 +100,23 @@ def _require_group(request: Request, group) -> bool:
     return in_group(request, group)
 
 
+def _to_decimal(value) -> "decimal.Decimal":
+    """Convertit une valeur de payload en `Decimal` — jamais en `float`.
+
+    Principe 4 : aucun `float` ne doit entrer dans un champ financier. Django ne
+    convertit pas à la création (`objects.create(...)`), donc l'instance en
+    mémoire conserve le type reçu jusqu'au prochain rechargement. Un `float`
+    passé ici produisait un `TypeError` dès qu'un calcul le croisait — c'est ce
+    qui faisait échouer `POST /api/credits/applications/` en 500 sur le calcul
+    du ratio de couverture.
+
+    `Decimal(str(...))` et non `Decimal(float)` : le second reporte l'erreur de
+    représentation binaire dans le décimal (0.1 → 0.1000000000000000055…).
+    """
+    import decimal
+    return decimal.Decimal(str(value).replace(",", "."))
+
+
 # ── 1. Préremplissage ────────────────────────────────────────────────────────
 
 @api_view(["GET"])
@@ -448,12 +465,14 @@ def simulate_scoring(request: Request) -> Response:
     ns_totals = {k: float(v) for k, v in ns_totals_raw.items() if v} if isinstance(ns_totals_raw, dict) else {}
 
     try:
-        area_ha = float(data["area_ha"]) if data.get("area_ha") else None
+        area_ha = _to_decimal(data["area_ha"]) if data.get("area_ha") else None
     except (ValueError, TypeError):
         return Response({"detail": "area_ha invalide."}, status=400)
 
     try:
-        amount_requested = float(data["amount_requested"]) if data.get("amount_requested") else None
+        amount_requested = (
+            _to_decimal(data["amount_requested"]) if data.get("amount_requested") else None
+        )
     except (ValueError, TypeError):
         return Response({"detail": "amount_requested invalide."}, status=400)
 
@@ -665,7 +684,7 @@ def _create_application(request: Request) -> Response:
         return Response({"detail": "Client introuvable.", "code": "CLIENT_NOT_FOUND"}, status=404)
 
     try:
-        amount_requested = float(data.get("amount_requested", 0) or 0)
+        amount_requested = _to_decimal(data.get("amount_requested", 0) or 0)
     except (ValueError, TypeError):
         return Response({"detail": "amount_requested invalide."}, status=400)
 
@@ -691,7 +710,7 @@ def _create_application(request: Request) -> Response:
     area_ha = None
     if raw_area := data.get("area_ha"):
         try:
-            area_ha = float(raw_area)
+            area_ha = _to_decimal(raw_area)
         except (ValueError, TypeError):
             pass
 

@@ -103,16 +103,16 @@ aller-retour entre onglets.
 
 ## 2. Ce que l'écran ne fait pas (et pourquoi)
 
-- **Aucun calcul financier côté client.** Score, points par critère, score
-  global, DSCR, DSCR stressé et tous les montants de l'échéancier sont affichés
-  tels que le serveur les a arrêtés en `Decimal` (principe 4). En particulier :
+- **Aucun calcul financier côté client.** Score, lettre, points par critère,
+  score global, DSCR, DSCR stressé, leviers de différé et tous les montants de
+  l'échéancier sont affichés tels que le serveur les a arrêtés en `Decimal`
+  (principe 4). En particulier :
   - la somme des points n'est **pas** recomposée pour vérifier le score global.
     Si un critère manque dans la réponse, un bandeau ambre le signale et le score
     global reste celui du serveur ;
-  - **les totaux de l'échéancier ne sont pas affichés** (coût du crédit,
-    service de la dette). La SPEC §A.4 les demande, mais le contrat
-    `CreditAnalyse` ne les porte pas — les sommer en JavaScript créerait une
-    seconde vérité financière en `float`. Voir §3.
+  - les totaux de l'échéancier viennent du bloc `totaux` du serveur, ils ne sont
+    pas sommés en JavaScript ;
+  - la lettre de score n'est **pas** dérivée du score numérique : elle est servie.
 - **Onglet staff uniquement.** Il expose barèmes, tolérances et plages du
   référentiel (principe 7). La surface est admin : `Credits.jsx` ne monte
   `AdminCreditsDashboard` → `CreditsTable` → `CreditDetailsModal` que pour
@@ -125,11 +125,55 @@ aller-retour entre onglets.
 
 ---
 
-## 3. Demandes au backend (`moteur-backend`)
+## 3. Contrat serveur — **répondu et consommé**
 
-Champs lus **de façon défensive** (absents = message explicite, jamais de valeur
-inventée). Les aligner côté serveur ferait passer l'écran de « correct » à
-« conforme §4.6 » :
+> Le moteur a livré. Les 6 demandes ci-dessous ont reçu une réponse et l'écran
+> les consomme. Conservé en l'état pour la trace, avec le statut de chacune.
+
+| # | Demande | Réponse | Consommé |
+|---|---|---|---|
+| 1 | `facteurDominant` | servi, racine de `criteres.dscr.details` | oui |
+| 2 | `levier` chiffré | servi, **réellement calculé** (`diagnostiquer_levier()`), + `details.diagnostic.alternativesDiffere` | oui — leviers affichés en pastilles, le différé courant marqué |
+| 3 | Totaux d'échéancier | `totaux = {totalInterets, totalCapital, totalInteretsCapitalises, serviceDette, crdFinal, nbEcheances}` | oui — 4 cartes. `crdFinal ≠ 0` s'affiche en rouge avec « devrait être nul » (propriété invariante, CLAUDE.md §5) |
+| 3b | `totalCommissions` | **volontairement absent** tant que l'écart 25 vs 19,95 (SPEC §A.3) n'est pas tranché | aucune ligne commission affichée — absence de clé ≠ zéro |
+| 4 | Devise | servie sous **`devise`** (pas `currency` — payload francophone de bout en bout), aussi en `parametres.devise` | oui, **et le repli sur `credit.currency` a été supprimé** |
+| 5 | Statut du référentiel | `referentielInfo = {code, filiere, source, estIndicatif, nCasReels, version}` | oui — bandeau ambre « référentiel indicatif (N dossiers réels) » quand `estIndicatif` |
+| 6 | Convention d'absence | **404** + `code: ANALYSE_ABSENTE`, jamais de 200 vide | oui |
+
+`justifier/` → 200 avec le `CreditAnalyse` complet ; 422 `{detail, code, errors[]}`
+(`INDICATEUR_REQUIS`, `JUSTIFICATION_REQUISE`, `INDICATEUR_INCONNU`) rendu ligne
+par ligne via `toFieldErrors`. `reanalyser/` → 201.
+
+### 3.1 ⚠ Le contrat TypeScript ne décrit plus le payload
+
+**Blocant pour tout consommateur `.ts`/`.tsx`.** Le moteur sert cinq champs
+absents de `CreditAnalyse` dans `src/types/api.ts` :
+
+| Champ servi | Présent dans `CreditAnalyse` ? |
+|---|---|
+| `devise` | non |
+| `totaux` | non |
+| `referentielInfo` | non |
+| `scoreLettre` | non — il n'existe que sur `CreditAnalyseResume` (ligne 1202) |
+| `criteres.dscr.details.diagnostic` | toléré par l'index `[k: string]: unknown` |
+
+L'onglet Analyse ne casse pas : ses fichiers sont des `.jsx` et `checkJs` est à
+`false`, donc ces accès ne sont pas type-checkés. **C'est précisément ce qui rend
+la dérive dangereuse** — elle est invisible au build tant que personne n'écrit un
+consommateur typé, et le premier qui le fera aura une erreur de compilation sur
+un champ pourtant servi depuis des semaines.
+
+`src/types/api.ts` est en lecture seule pour ce lot (contrat figé). **À porter par
+le propriétaire du contrat**, en même temps que la décision de nommage : le
+payload est francophone (`criteres`, `parametres`, `devise`, `echeancier`) et
+`devise` est cohérent avec ce choix — mais il faut que le type le dise.
+
+---
+
+### 3.2 Demandes initiales (archive)
+
+Champs alors lus **de façon défensive** (absents = message explicite, jamais de
+valeur inventée) :
 
 1. `criteres.dscr.details.facteurDominant` (string) — la cause dominante du
    DSCR, ex. « différé 5/8 : le capital s'amortit sur 3 mois ».
@@ -288,7 +332,24 @@ doit porter sur les **trois** écarts à la fois — palier (50 → 55), opérat
 quatre périmètres d'agents (`admin/credits`, `pages/credit`, `pages/Credits.jsx`,
 `components/simulateur`) : **à router comme une tâche unique**, pas à distribuer.
 
-Demande commune au backend, reformulée en deux temps : voir §3, point 7.
+**Ce que la livraison backend ferme, et ce qu'elle ne ferme pas.** Le moteur sert
+désormais `scoreLettre` sur `CreditAnalyse` et `CreditAnalyseResume`, depuis un
+**troisième** module (`analyse.py`) qui lit sa grille dans
+`BaremeScore.DECISION.parametres.lettres` — donc en base, principe 8 tenu — et
+qui fige la grille appliquée sur chaque analyse pour qu'un recalibrage ne
+réécrive pas rétroactivement la lettre d'un client. L'onglet Analyse affiche
+cette lettre **telle que servie**, sans la dériver du score.
+
+Cela ferme la fuite principe 7 sur les deux endpoints d'analyse. Cela ne ferme
+**ni** la contradiction 50/55, **ni** l'opérateur, **ni** les deux grilles front :
+- la réponse de `simulate/` vient toujours de `dataio_simulator.py` et ne porte
+  pas de lettre — `scoreLetterOf` doit rester sur ce chemin ;
+- `scoreColor` de `CreditDetailsModal.jsx` colore `credit.score`, qui vient de la
+  **liste portefeuille**, pas des endpoints d'analyse. La lettre servie ne le
+  concerne donc pas, et il reste inchangé — l'autorisation du backend ne s'y
+  applique pas.
+
+Demande restante au backend, inchangée : voir §3.2, point 7.
 
 ### 4.2 Note de méthode
 
@@ -328,9 +389,14 @@ DevTools. N'ont donc pas été observés :
   4 niveaux, comportement responsive du tableau des critères) ;
 - l'imbrication du dialogue de justification dans le dialogue du modal (Radix la
   supporte, mais le focus trap et l'`Esc` en cascade n'ont pas été testés) ;
-- le comportement réel des états 404 / 403 / erreur : les endpoints du moteur
-  n'existent pas encore, aucune réponse serveur n'a été reçue. Le chemin
-  « analyse chargée » n'a jamais été exercé sur des données réelles ;
+- le comportement réel des états 404 / 403 / erreur. Le moteur backend est
+  livré, mais **aucun appel réel n'a été passé depuis ce lot** : le branchement
+  sur les nouveaux champs (`devise`, `totaux`, `referentielInfo`, `scoreLettre`,
+  `diagnostic.alternativesDiffere`) est écrit d'après le contrat annoncé par
+  `moteur-backend`, pas d'après une réponse observée. C'est le point le plus
+  fragile de la livraison — une différence de nommage ou d'imbrication passerait
+  silencieusement (`checkJs: false`, cf. §3.1) et se traduirait par des « — » à
+  l'écran plutôt que par une erreur ;
 - la troncature de l'échéancier au-delà de 24 lignes, faute d'échéancier ;
 - la valeur réelle de `credit.applicationCode` : le modal reprend le repli
   existant `applicationCode || id` déjà utilisé par `AnalysisPanel`. Si cet id de

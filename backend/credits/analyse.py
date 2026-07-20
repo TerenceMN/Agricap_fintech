@@ -1135,9 +1135,15 @@ _FORTS_CLIENT = {
     "garanties": "Vos garanties sont solides et bien constituées.",
 }
 
-#: Un critère au-dessus est un point fort, en dessous une piste d'amélioration.
-#: Ce n'est PAS un seuil de barème : c'est la moitié de l'échelle 0–100, une
-#: information que le client déduit déjà de sa propre lettre.
+#: Un critère STRICTEMENT au-dessus est un point fort, strictement en dessous une
+#: piste d'amélioration. Ce n'est PAS un seuil de barème : c'est la moitié de
+#: l'échelle 0–100, une information que le client déduit déjà de sa propre lettre.
+#:
+#: Comparaison stricte des deux côtés : un critère à exactement 50 n'est ni un
+#: point fort ni une faiblesse, il est NEUTRE — et le seul critère qui vaut
+#: exactement 50 est le comportemental sans historique. Avec un `>=`, l'absence
+#: d'historique était annoncée au client comme « votre historique joue en votre
+#: faveur » : le moteur félicitait un client pour une donnée qu'il n'a pas.
 _MEDIANE = Decimal(50)
 
 
@@ -1161,7 +1167,16 @@ def serialiser_analyse_resume(analyse: AnalyseCredit) -> dict:
         if not bloc:
             continue
         score = Decimal(str(bloc.get("score", 0)))
-        if score >= _MEDIANE and cle in _FORTS_CLIENT:
+        details = bloc.get("details") or {}
+
+        # Absence d'historique : jamais un point fort. C'est une piste — le
+        # client peut agir dessus (épargner, rembourser un premier crédit),
+        # alors qu'il ne peut rien faire d'une félicitation imméritée.
+        if cle == "comportemental" and details.get("historiqueDisponible") is False:
+            ameliorer.append(_PISTES_CLIENT[cle])
+            continue
+
+        if score > _MEDIANE and cle in _FORTS_CLIENT:
             forts.append(_FORTS_CLIENT[cle])
         elif score < _MEDIANE and cle in _PISTES_CLIENT:
             ameliorer.append(_PISTES_CLIENT[cle])

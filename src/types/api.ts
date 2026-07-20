@@ -1144,6 +1144,11 @@ export interface CreditAnalyseCritere {
     }>;
     dscr?: number;
     dscrStress?: number;
+    /** Le §4.6 exige qu'un DSCR soit livré avec son facteur dominant, pas seul. */
+    facteurDominant?: string;
+    levier?: string;
+    /** Courbe « différé N mois → DSCR X » : le levier chiffré, pas une phrase. */
+    alternativesDiffere?: Array<{ differeMois: number; dscr: number; serviceDette: number }>;
     ratioCouverture?: number;
     constituees?: boolean;
     [k: string]: unknown;
@@ -1190,6 +1195,48 @@ export interface CreditAnalyse {
     indicateur: string; justification: string; agent: string; date: string;
   }>;
   echeancier: CreditEcheancierLigne[];
+
+  /** Totaux de l'échéancier, calculés côté serveur.
+   *  `crdFinal` DOIT valoir 0 — c'est une propriété invariante (CLAUDE.md §5).
+   *  Un écran qui le lisse au lieu de le signaler masque un défaut du moteur. */
+  totaux: {
+    totalInterets: number;
+    totalInteretsCapitalises: number;
+    totalCapital: number;
+    serviceDette: number;
+    crdFinal: number;
+    nbEcheances: number;
+  };
+
+  /** Devise de l'analyse. Ne PAS emprunter celle du prêt portefeuille : c'est
+   *  un autre agrégat, et le repli serait une erreur de lignage. */
+  devise: string;
+
+  /** Provenance du référentiel utilisé.
+   *  `estIndicatif` distingue une plage estimée d'une plage apprise sur des
+   *  dossiers réels — on ne donne pas la même autorité aux deux (principe 10). */
+  referentielInfo: {
+    code: string;
+    filiere: string;
+    source: string;
+    estIndicatif: boolean;
+    nCasReels: number;
+    version: number;
+  };
+
+  /** Lettre servie par le moteur, dérivée de `BaremeScore` et **figée par
+   *  analyse** : un recalibrage ultérieur ne réécrit pas la lettre d'un dossier
+   *  déjà instruit. Ne la dérive jamais côté front — c'est la grille en dur du
+   *  navigateur qui a produit les divergences 50/55 et `>`/`>=`. */
+  scoreLettre: 'A' | 'B' | 'C' | 'D';
+
+  /** Traçabilité : identifie la révision exacte de la feuille de besoins scorée.
+   *  Deux analyses successives sont comparables par ces trois champs (principe 3). */
+  lignage: { needsSourceId: number | null; revision: number | null; sha256: string };
+
+  /** Poids effectivement appliqués, tels que lus en base au moment du calcul. */
+  poidsAppliques: Record<string, number>;
+
   executeLe: string;
   versionMoteur: string;
 }
