@@ -16,10 +16,11 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Helmet } from 'react-helmet';
 import { Link } from 'react-router-dom';
 import { api } from '@/services/api';
+import type { CreditApplication } from '@/types/api';
 import { Empty, ErrorPanel, Loading, toFieldErrors, type FieldError } from '@/components/backoffice/States';
 import {
   ageInDays, consentState, fmtAmount, fmtDate, statusOf, STATUS_LABELS,
-  type ConsentState, type WireApplication,
+  type ConsentState,
 } from './wire';
 
 /** Statuts composant la file d'instruction (`_PENDING_ANALYSIS` côté backend). */
@@ -51,10 +52,10 @@ const CONSENT_BADGE: Record<ConsentState, { label: string; className: string } |
 };
 
 /** Date de référence pour l'ancienneté : la soumission fait foi, la création à défaut. */
-const referenceDate = (a: WireApplication): string => a.submittedAt || a.createdAt;
+const referenceDate = (a: CreditApplication): string => a.submittedAt || a.createdAt;
 
 const Applications: React.FC = () => {
-  const [apps, setApps] = useState<WireApplication[]>([]);
+  const [apps, setApps] = useState<CreditApplication[]>([]);
   const [loading, setLoading] = useState(true);
   const [errors, setErrors] = useState<FieldError[]>([]);
   /** '' = file d'instruction (3 statuts) ; sinon un statut unique. */
@@ -74,7 +75,7 @@ const Applications: React.FC = () => {
       // Le serveur plafonne chaque appel à 100 lignes : si un seau est plein,
       // la file affichée est incomplète et doit le dire.
       setMaybeTruncated(results.some((r) => r.length >= SERVER_PAGE_CAP));
-      setApps(results.flat() as unknown as WireApplication[]);
+      setApps(results.flat());
     } catch (e) {
       setApps([]);
       setErrors(toFieldErrors(e));

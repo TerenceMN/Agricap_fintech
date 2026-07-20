@@ -719,13 +719,25 @@ export interface CreditValueChain {
   base_rate?: number;
 }
 
+/** Feuille de besoins telle que sérialisée dans `CreditApplication.needsSheet`.
+ *
+ *  Le sérialiseur (`workflow.serialize_application`) n'émet que six clés :
+ *  `id, parsedOk, grandTotal, currency, warnings, anomalies`. `area_ha` y était
+ *  déclaré **non optionnel** alors qu'il n'est jamais émis — l'écran analyste
+ *  affichait donc une superficie vide en toutes circonstances, sans qu'aucun
+ *  outil ne puisse le signaler.
+ *
+ *  `totalByModule` et `uploadedAt` restent optionnels : ils proviennent de la
+ *  réponse de `needs-sheet/parse/`, pas de ce sérialiseur. */
 export interface CreditNeedsSheet {
   id?: number;
   grandTotal: number;
-  area_ha: number | null;
   currency: string;
   parsedOk: boolean;
   warnings?: string[];
+  /** Signaux relevés par l'analyse documentaire — la première chose qu'un
+   *  analyste regarde sur une feuille de besoins. */
+  anomalies?: unknown[];
   totalByModule?: Record<string, number>;
   uploadedAt?: string;
 }

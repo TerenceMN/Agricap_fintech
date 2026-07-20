@@ -103,28 +103,23 @@ Nouveaux fichiers : `assetMeta.js`, `AssetCard.jsx`, `AssetFormDialog.jsx`.
 
 | Vérification | Résultat |
 |---|---|
-| `npx tsc --noEmit` | **0 erreur dans mon périmètre** ; 27 erreurs dans `src/pages/credit/ApplicationDetail.tsx`, apparues pendant ma session — voir l'encadré ci-dessous |
+| `npx tsc --noEmit` | **0 erreur** (dépôt entier) |
 | `npx vite build` | **OK** (2 805 modules, 5,4 s) |
 | `npx eslint` sur mes fichiers | 0 warning ; seule reste l'erreur `import/no-unresolved` sur `@/services/api`, **pré-existante et générale** (reproduite sur `src/pages/Contracts.jsx`, non modifié) : le resolver eslint n'attrape pas l'extension `.ts` |
 | `grep localStorage` sur mes fichiers | 0 occurrence de code (2 mentions en commentaire, documentaires) |
 
-> **Le gate `tsc` du dépôt n'est plus vert, et ce n'est pas de mon fait.**
-> `src/types/api.ts` a été migré en camelCase pendant ma session (modification
-> non commitée, +52/−9, horodatée 13:47). `src/pages/credit/ApplicationDetail.tsx`
-> lit encore les anciennes clés snake_case et porte les **27 erreurs** ; il a été
-> touché à 16:29, donc après la migration — c'est très probablement un chantier
-> en cours, pas un oubli. Les deux fichiers sont en **lecture seule** dans mon
-> périmètre : je ne les corrige pas, je les signale (à `front-backoffice`, qui
-> travaille dessus).
-> Ventilation vérifiée : `npx tsc --noEmit | sed 's/(.*//' | sort | uniq -c`
-> ⇒ 27 occurrences, toutes dans `ApplicationDetail.tsx`, **aucune** dans
-> `Credits.jsx`, `AssetsInventory.jsx`, `components/assets/**` ou
-> `components/guarantees/**`. `npx vite build` passe (Vite ne type-checke pas).
+> **Épisode transitoire, consigné pour mémoire.** En cours de session,
+> `src/types/api.ts` a été migré en camelCase et `src/pages/credit/ApplicationDetail.tsx`
+> a porté 27 erreurs `tsc` le temps d'être aligné. Ventilation faite sur le
+> moment (`npx tsc --noEmit | sed 's/(.*//' | sort -u`) : une seule origine,
+> **aucune** erreur dans `Credits.jsx`, `AssetsInventory.jsx`,
+> `components/assets/**` ni `components/guarantees/**`. Résorbé depuis.
 >
-> Bonne nouvelle au passage : la migration a élargi `guaranteeType` aux
-> 4 codes canoniques `'epargne' | 'morale' | 'materiel' | 'foncier'` — le §3.5
-> ci-dessous est donc partiellement résorbé. `coverage` et l'objet `asset` par
-> garantie restent absents de `CreditGuaranteeSet`.
+> La leçon d'outillage, elle, reste : `npx vite build` passait pendant tout
+> l'épisode — Vite ne type-checke pas. **Un build vert ne dit rien de la
+> cohérence des types**, et un `tsc` vert ne dit rien de mes écrans `.jsx`
+> (`checkJs: false`). Les deux gates ont chacun leur angle mort ; c'est le §2
+> « ce que je n'ai pas pu tester » qui porte la vraie mesure de confiance.
 
 **Je n'ai pas de navigateur : rien de ce qui suit n'a été exécuté.** Je ne peux
 pas affirmer que ces écrans fonctionnent, seulement qu'ils compilent et que les
@@ -143,73 +138,108 @@ conditions réelles :
 
 ---
 
-## 3. Divergences code / SPEC relevées (non corrigées — hors de mon périmètre)
+## 3. Divergences relevées — état en fin de session
 
-### 3.1 Les 5 codes d'erreur du gage ne sortent pas du backend
+Les §3.1 à §3.3 ont été **signalés puis corrigés** par `backend-credit` et
+`front-backoffice` pendant la session. Je les conserve avec leur résolution
+plutôt que de les effacer : la trace du défaut et de sa correction vaut mieux
+qu'une page propre.
 
-`credits/guarantees.py::place_asset_guarantee` **documente** cinq codes distincts
-(`ASSET_NOT_OWNED`, `ASSET_NOT_VERIFIED`, `ASSET_ALREADY_PLEDGED`,
-`ASSET_CATEGORY_MISMATCH`, `ASSET_NO_RETAINED_VALUE`) mais lève un
-`GuaranteeError` générique pour les cinq. `credits/views.py:992` les aplatit tous
-en `code: "ASSET_GUARANTEE_REFUSED"`. Seul `GUARANTEE_TYPE_NOT_ELIGIBLE` remonte
-son code propre. La SPEC §2.4 attend cinq codes distincts.
+### 3.1 ✅ Résolu — les 5 codes d'erreur du gage sortent maintenant
 
-### 3.2 `ApiError` perd le champ `code`
+`place_asset_guarantee` levait un `GuaranteeError` générique pour cinq règles
+distinctes, aplati en `ASSET_GUARANTEE_REFUSED` par la vue.
 
-`src/services/api.ts:52` construit `new ApiError(status, detail)` : le `code` du
-corps 422/409 est **jeté avant d'arriver au front**. Aucun écran ne peut donc
-router sur un code d'erreur aujourd'hui. Fichier hors de mon périmètre.
+Corrigé : sous-classes typées portant chacune son `code`
+(`AssetNotOwned`, `AssetNotVerified`, `AssetAlreadyPledged`,
+`AssetCategoryMismatch`, `AssetNoRetainedValue`), toutes dérivées de
+`GuaranteeError` pour que la vue les relaie d'un `except` unique. La 422 porte
+`{detail, code, errors:[{code, message}]}`. Vérifié dans le code
+(`guarantees.py:195-222`, `views.py:1123-1124`) ; `tests_guarantee_codes.py`
+verrouille le contrat : **le code est stable, le message est libre**.
 
-**Contournement en place** dans
-[`guaranteeErrors.js`](../../src/components/guarantees/guaranteeErrors.js) : on
-lit `err.code` s'il existe un jour (compatibilité ascendante), sinon on retrouve
-la règle par la **signature du `detail`** backend, qui est déjà spécifique par
-règle. À défaut, on relaie le `detail` tel quel — jamais « une erreur est
-survenue ». C'est fonctionnel mais fragile : une reformulation d'un message
-backend casse silencieusement la correspondance.
+### 3.2 ✅ Résolu — `ApiError` porte `code` et `errors[]`, contournement supprimé
 
-**Correctif propre, dans cet ordre** : (a) `ApiError` porte `code` et le corps
-JSON complet ; (b) `place_asset_guarantee` lève des exceptions typées par règle ;
-(c) `guaranteeErrors.js` supprime `DETAIL_SIGNATURES`.
+`api.ts` jetait le corps JSON d'erreur ; aucun écran ne pouvait router sur un
+code. `ApiError` expose désormais `code: string | null` et
+`errors: Array<{code, message}>` (`api.ts:32-40, 84`).
 
-### 3.3 Modifier un actif `libere` ne le renvoie pas en vérification
+Les trois étapes du correctif que j'avais posées sont faites — (a) `ApiError`
+conserve le corps, (b) exceptions typées côté serveur, (c) **`DETAIL_SIGNATURES`
+supprimé de `guaranteeErrors.js`**. Le routage se fait uniquement sur `code`.
 
-`assets/views.py:142` remet en `declare` et efface `valeur_retenue` **uniquement**
-si `status == VERIFIE`. Un actif `libere` est pourtant `is_pledgeable` (models.py:94)
-et conserve sa valeur retenue : il peut donc être modifié après coup et
-re-mobilisé avec une valeur certifiée sur un bien qui a changé. La règle du §9.6
-(« toute modification d'un actif déjà vérifié le remet en file de vérification »)
-devrait couvrir `LIBERE` aussi. Côté front, je n'avertis que sur `verifie` —
-avertir sur `libere` serait mentir sur ce que le serveur fait réellement.
+Deux raisons de l'avoir retiré plutôt que gardé « en filet » :
 
-### 3.4 Le client ne peut pas demander épargne / caution solidaire
+1. `front-backoffice` avait raison sur le fond — router sur le texte casse au
+   premier reformulage, sans erreur de compilation ni test rouge. Du code jamais
+   exercé qui s'active sur un cas limite est pire que pas de code du tout.
+2. **Il dégradait un cas réel.** `submit` renvoie `{detail}` sans `code`
+   (`views.py:763`), avec un message du type « Dossier incomplet : la garantie
+   « materiel » n'est pas admise pour la filière X (types admis : epargne,
+   morale) ». La regex l'attrapait et le remplaçait par ma phrase générique,
+   **qui ne liste pas les types admis**. Relayer le `detail` backend est
+   strictement meilleur.
+
+Comportement retenu : `code` connu → message enrichi ; sinon → `detail` backend
+tel quel (jamais « une erreur est survenue ») ; et un `console.warn` sur tout
+422/409 dépourvu de `code`, pour que l'endpoint non migré se voie en
+développement au lieu de se découvrir en production.
+
+### 3.3 ✅ Résolu — modifier un actif `libere` le renvoie en vérification
+
+C'était une faille exploitable, pas une nuance : `libere` est `is_pledgeable` et
+conserve sa `valeur_retenue`, donc gage levé → redésignation de l'actif →
+remobilisation immédiate avec une valeur certifiée portant sur un autre bien.
+
+La règle vit maintenant dans `assets/services.invalidate_verification()` :
+`verifie` **et** `libere` retombent en `declare`, `valeur_retenue`,
+`verifie_par_sub` et `verifie_le` effacés. Vérifié dans le code
+(`services.py:150-172`, appelé en `views.py:143`).
+
+**Conséquence front appliquée** : l'avertissement avant modification couvre
+désormais `libere` au même titre que `verifie`, avec une formulation adaptée
+(« a été vérifié puis libéré »). Il décrit à nouveau exactement ce que fait le
+serveur.
+### 3.4 ⏸ Le client ne peut pas demander épargne / caution solidaire
 
 Constat, pas un bug : `place_savings_guarantee` et `register_moral_guarantee`
 sont derrière `CAN_INSTRUCT`. La SPEC §2.5 décrit pourtant un parcours où « le
-client (étape 3) désigne un garant ». Deux lectures possibles — soit la SPEC
-anticipe le lot 6 (consentement 72 h) qui ouvrira l'endpoint au client, soit la
-désignation reste un acte d'agence. **Question ouverte, non tranchée ici** : j'ai
-codé l'état actuel du serveur.
+client (étape 3) désigne un garant ». Deux lectures — soit la SPEC anticipe le
+lot 6 (consentement 72 h) qui ouvrira l'endpoint au client, soit la désignation
+reste un acte d'agence.
 
-### 3.5 `types/api.ts` — partiellement résorbé en cours de session
+**Question métier ouverte, remontée au fondateur** (par `backend-credit`, son
+fragment §7bis(4)). Aucun des deux agents ne la tranche : ouvrir l'endpoint
+engage un tiers financièrement.
 
-État à la rédaction (migration camelCase non commitée déjà appliquée) :
+Argument décisif en faveur du statu quo, indépendamment de l'arbitrage : le lot 6
+n'est pas implémenté. Ouvrir `guarantees/moral/` au client aujourd'hui
+produirait des cautions **sans consentement du garant** — précisément ce que la
+SPEC veut empêcher. D'ici la réponse, l'écran garde « constitués avec votre
+agent » : il décrit le serveur réel.
 
-- ✅ `CreditApplication` passé en camelCase, conforme à `serialize_application` ;
-- ✅ `guaranteeType` élargi à `'epargne' | 'morale' | 'materiel' | 'foncier'` —
-  la nomenclature canonique est désormais dans les types ;
-- ❌ `CreditGuaranteeSet` n'a toujours ni `coverage` ni objet `asset` par
-  garantie, et `CreditGuaranteeItem.type` reste `'epargne' | 'morale'`.
+### 3.5 ⚠ `types/api.ts` — largement résorbé, un trou restant
 
-Mes écrans consomment `coverage` et `asset` malgré leur absence des types : ils
-sont en `.jsx` et `checkJs: false`, donc non type-checkés. **Le vert de `tsc` ne
-prouve rien sur eux** — c'est pourquoi je fais tourner `vite build` + `eslint` en
-plus, et pourquoi la liste de ce qui n'a pas été testé (§2) doit être lue comme
-la vraie mesure de confiance.
+Beaucoup a été corrigé en cours de session (par d'autres agents) :
 
-Fichier hors de mon périmètre comme de celui de *front-backoffice* : aucun des
-deux agents n'a le droit de réparer un type qui ment. Arbitrage d'attribution
-demandé à `main`.
+- ✅ `CreditApplication` en camelCase, conforme à `serialize_application` ;
+- ✅ `guaranteeType` élargi aux 4 codes canoniques ;
+- ✅ `NeedsSheet` recalé sur les clés réellement émises, `anomalies` ajouté,
+  `area_ha` documenté comme n'ayant jamais été servi ;
+- ❌ **`CreditGuaranteeSet` n'a toujours ni `coverage` ni objet `asset` par
+  garantie**, et `CreditGuaranteeItem.type` reste `'epargne' | 'morale'` sans
+  `materiel` / `foncier`.
+
+C'est le seul écart qui me concerne directement, et il est structurel : mes
+écrans consomment `coverage` et `asset` (les deux apports centraux du lot 5)
+sans qu'aucun type ne les décrive. Ils passent parce qu'ils sont en `.jsx` avec
+`checkJs: false`. **Le vert de `tsc` ne prouve donc rien sur eux** — c'est
+pourquoi je fais tourner `vite build` + `eslint` en plus, et pourquoi le §2
+(« ce que je n'ai pas pu tester ») porte la vraie mesure de confiance.
+
+Le fichier est hors périmètre pour moi comme pour *front-backoffice*. Reste à
+attribuer — c'est le dernier morceau du chantier garanties qui n'a pas de
+propriétaire.
 
 ---
 

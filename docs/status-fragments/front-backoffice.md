@@ -11,15 +11,17 @@
 | Écran | Route | Fichier | Endpoint(s) |
 |---|---|---|---|
 | File d'instruction analyste | `/credit/dossiers` | [src/pages/credit/Applications.tsx](../../src/pages/credit/Applications.tsx) | `GET /api/credits/applications/?status=` |
+| Détail du dossier (réparé, cf. §4.3) | `/credit/dossiers/<code>` | [src/pages/credit/ApplicationDetail.tsx](../../src/pages/credit/ApplicationDetail.tsx) | `GET /api/credits/applications/<code>/` + transitions |
 | File de vérification des actifs | `/credit/actifs` | [src/pages/credit/AssetVerification.tsx](../../src/pages/credit/AssetVerification.tsx) | `GET /api/assets/pending`, `POST /api/assets/<id>/verify`, `POST /api/assets/<id>/reject` |
 | Corbeille du comité de crédit | `/credit/comite` | [src/pages/credit/Committee.tsx](../../src/pages/credit/Committee.tsx) | `GET /api/credits/dashboard/?view=committee` |
 | Journal & audit (lecture seule) | `/credit/journal` | [src/pages/credit/AuditJournal.tsx](../../src/pages/credit/AuditJournal.tsx) | `GET /api/audit/entries` |
 
 Fichiers d'appui créés :
 
-- [src/pages/credit/wire.ts](../../src/pages/credit/wire.ts) — contrat de sérialisation réel,
-  formateurs de montants/dates, libellés de statuts, état de consentement. **Temporaire** :
-  voir §4.1.
+- [src/pages/credit/wire.ts](../../src/pages/credit/wire.ts) — formes non couvertes par
+  `types/api.ts` (corbeille comité, entrée d'audit), plafonds de troncature serveur,
+  formateurs et libellés partagés. Les types de dossier qu'il contenait ont été **supprimés**
+  après migration de `types/api.ts` en camelCase : voir §4.1.
 - [src/components/backoffice/States.tsx](../../src/components/backoffice/States.tsx) —
   `Loading` / `Empty` / `ErrorPanel` / `Forbidden` / `KpiCard` / `TruncationNotice`.
   `KpiCard` exige `scope` et `period` : le §7.2 « KPI honnêtes » est rendu structurel plutôt
@@ -166,7 +168,13 @@ Correctif attendu dans `api.ts` : conserver le corps d'erreur complet sur `ApiEr
 
 ## 4. Dettes croisées rencontrées
 
-### 4.1 `types/api.ts` ment sur le contrat `CreditApplication` — corrigé par contournement
+### 4.1 `types/api.ts` mentait sur le contrat `CreditApplication` — ✅ RÉSOLU
+
+> **Mise à jour.** Le type partagé a été migré en camelCase par un tiers pendant ce lot.
+> La divergence décrite ci-dessous n'existe plus, le contournement a été démonté :
+> `wire.ts` ne contient plus aucun type de dossier, et `Applications.tsx` consomme
+> désormais `CreditApplication` directement, sans cast. Section conservée pour l'historique
+> et parce que sa retombée — §4.3 — a demandé un vrai travail de réparation.
 
 `credits/workflow.py::serialize_application` émet du camelCase ; `src/types/api.ts` déclare du
 snake_case. Les clés ne se croisent jamais :
@@ -198,22 +206,48 @@ TypeScript ne peut rien signaler puisque le type ment sur le contrat. **`Applica
 est concerné** (montants, filière, superficie, scoring, feuille de besoins, décaissement) —
 il n'est pas dans mon périmètre de correction et reste donc affecté.
 
-J'ai décrit le contrat observé dans `src/pages/credit/wire.ts` et j'y cast. **Ce fichier est
-explicitement temporaire** : il disparaît le jour où `CreditApplication` est aligné sur le
-backend.
+Ce qu'il reste de `wire.ts` après démontage, et qui est légitime : la corbeille du comité
+(la branche comité de l'union `CreditDashboard` n'est pas typée), l'entrée de journal d'audit
+(le type inline de `api.ts` omet `userName`, que le backend résout pourtant), les plafonds de
+troncature serveur, et les formateurs/libellés partagés par les quatre écrans.
 
-**⚠️ Personne ne peut réparer ce type — à arbitrer.** `src/types/api.ts` est déclaré en
-**lecture seule dans le périmètre de `front-backoffice` (moi) et dans celui de
-`front-garanties`**, qui me l'a confirmé. Deux agents lisent donc un type qui ment sur le
-contrat, chacun le contourne de son côté, et aucun n'a le droit de le corriger. Il faut qu'un
-propriétaire soit désigné, sinon le contournement devient permanent et se duplique à chaque
-nouvel écran. C'est un point de coordination, pas une dette technique : le correctif lui-même
-est mécanique (aligner les 9 clés sur le camelCase, ajouter les 3 champs manquants).
+`AssetRow` était déjà correct et conforme à `assets/views.py::_row`.
 
-`AssetRow` est en revanche correct et conforme à `assets/views.py::_row` — il est utilisé
-directement, sans contournement.
+**Ce que l'épisode a coûté, et ce qu'il faut en retenir.** Pendant plusieurs heures, deux
+agents ont lu un type qui mentait, chacun le contournant de son côté, aucun n'ayant le droit
+de le corriger (`types/api.ts` était en lecture seule dans les deux périmètres). Le correctif
+était mécanique ; c'est l'attribution qui bloquait. Un fichier de contrat partagé par
+plusieurs périmètres a besoin d'un propriétaire nommé, sinon le contournement se duplique à
+chaque nouvel écran et finit par paraître normal.
 
-### 4.2 Build — cassé pendant le développement, réparé depuis
+Deux écarts subsistent dans le type migré, mineurs mais silencieux :
+
+- `CreditNeedsSheet.area_ha` est déclaré mais **n'est pas émis** par le sérialiseur (clés
+  réelles de `needsSheet` : `id`, `parsedOk`, `grandTotal`, `currency`, `warnings`,
+  `anomalies`). Toute carte qui le lit affiche « — » en toutes circonstances — c'était le cas
+  dans `ApplicationDetail.tsx` (§4.3) ;
+- `anomalies` est émis mais **absent du type** : inexploitable sans cast, alors que c'est
+  précisément ce qu'un analyste veut voir sur une feuille de besoins.
+
+### 4.3 `ApplicationDetail.tsx` réparé — 27 erreurs et quatre bugs silencieux
+
+La migration du type a rendu visibles 27 erreurs `tsc` dans ce fichier, **qui est dans mon
+périmètre** : il lisait encore l'ancien contrat. Signalé par `front-garanties`, réparé ici.
+Au-delà des renommages mécaniques, quatre défauts que le typage a mis au jour :
+
+| Défaut | Effet réel | Correctif |
+|---|---|---|
+| `app.disbursedAt` et `app.disbursed_amount` lus à la racine | Ces champs **n'existent dans aucun contrat**. Les cartes « Décaissé le » et « Montant décaissé » affichaient « — » quel que soit l'état du dossier, y compris sur un crédit décaissé. | Lecture de `app.disbursement.confirmedAt` / `.amount`, conditionnée à `status === 'confirmed'` |
+| `app.needsSheet.area_ha` | Déclaré au type, jamais émis : carte « Superficie » vide en toutes circonstances (la superficie du dossier est déjà affichée plus haut) | Remplacée par « Révision parsée » (`needsSheet.id`), seule information que ce bloc apporte et que rien d'autre ne donne |
+| `setApp(result)` après une transition | Les réponses de transition viennent de `serialize_application`, qui **n'ajoute pas** `availableActions` (seul `serialize_for_role` le fait). La barre d'actions se vidait après chaque acte, laissant croire qu'il n'y avait plus rien à faire. | `reload()` — on relit le dossier complet |
+| Deux blocs de code mort | Le premier finissait par `&& null` (rien rendu), le second produisait des `<button className="hidden" />` sans libellé, donc invisibles et inatteignables | Supprimés |
+
+Ces quatre défauts vivaient depuis l'origine et **aucun n'était détectable** : `tsc` était vert
+parce que le type mentait, et un écran qui affiche « — » ne lève aucune alerte. C'est
+l'illustration la plus nette de ce que coûte un type faux — il ne cache pas seulement des
+erreurs de compilation, il rend indétectables des bugs d'affichage.
+
+### 4.4 Build — cassé pendant le développement, réparé depuis
 
 `npx vite build` a échoué pendant tout mon développement sur
 `src/pages/Credits.jsx:572 — "The symbol GUARANTEE_CONFIG has already been declared"`
@@ -263,7 +297,7 @@ toute la durée où le build était cassé. Le garde-fou de merge doit être
 |---|---|---|
 | 1 | Dashboard role-aware réel | ❌ non traité — `api.credits.dashboard()` sert 5 formes de réponse différentes selon le rôle ; nécessite un écran par lentille |
 | 2 | File d'instruction analyste | ✅ livré |
-| 3 | Onglet Analyse du dossier (5 critères, écarts, DSCR, stress, révisions, SHA-256) | ❌ non traité — le plus gros morceau restant ; dépend de `analysis-report/` et d'un sélecteur de révision côté serveur |
+| 3 | Onglet Analyse du dossier (5 critères, écarts, DSCR, stress, révisions, SHA-256) | ❌ non traité — le plus gros morceau restant ; dépend de `analysis-report/` et d'un sélecteur de révision côté serveur. `ApplicationDetail.tsx` affiche le scoring brut, pas l'analyse (§4.3) |
 | 4 | Vue comité de crédit | ⚠️ corbeille livrée ; quorum et procès-verbal sans backend |
 | 5 | Onglet Référence (templates, `reference-data`, barèmes) | ❌ non traité — `api.ranges()`/`chains()`/`config()` restent du code mort côté UI |
 | 6 | File de vérification des actifs | ✅ livré |

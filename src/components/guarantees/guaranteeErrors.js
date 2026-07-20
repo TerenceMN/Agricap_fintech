@@ -7,14 +7,20 @@
  * ça a échoué.
  *
  * ── État du contrat (résolu en juillet 2026) ───────────────────────────────
- * `ApiError` porte désormais `code` et `errors[]`, et `credits/guarantees.py`
- * donne à chaque règle sa propre classe d'exception avec son code. Le chemin
- * nominal est donc `err.code` — routage sur un contrat stable.
+ * `ApiError` porte `code` et `errors[]` ; `credits/guarantees.py` donne à
+ * chaque règle sa propre classe d'exception avec son code. Le routage se fait
+ * donc **uniquement** sur `code` : contrat stable, message libre.
  *
- * `DETAIL_SIGNATURES` reste en filet de sécurité pour les endpoints qui
- * n'émettraient pas encore de `code`, mais ce n'est plus le chemin normal :
- * ne l'étends pas, ajoute le `code` côté serveur. Router sur le texte casse
- * silencieusement au premier reformulage d'un message.
+ * Le contournement provisoire qui déduisait le code de la *signature textuelle*
+ * du `detail` a été **supprimé** dès que le contrat a été livré. Il ne doit pas
+ * revenir : router sur le texte casse en silence au premier reformulage, sans
+ * erreur de compilation ni test rouge. Il dégradait même certains messages —
+ * sur `submit`, le `detail` backend liste les types de garantie admis pour la
+ * filière, là où la traduction générique ci-dessous ne le fait pas.
+ *
+ * Endpoint qui refuse sans `code` ⇒ on relaie son `detail` (rédigé pour
+ * l'utilisateur) et on loggue un avertissement : c'est l'endpoint qu'il faut
+ * migrer, pas ce fichier qu'il faut étendre.
  */
 
 /** Messages par code canonique. */
@@ -38,52 +44,30 @@ export const GUARANTEE_ERROR_MESSAGES = {
 };
 
 /**
- * Signatures des `detail` backend → code, faute de `code` exposé par ApiError.
- * L'ordre compte : les motifs les plus spécifiques d'abord.
- */
-const DETAIL_SIGNATURES = [
-  [/n['’]appartenant pas|introuvable ou n/i, 'ASSET_NOT_OWNED'],
-  [/déjà nanti|deja nanti/i, 'ASSET_ALREADY_PLEDGED'],
-  [/nanti/i, 'ASSET_PLEDGED'],
-  [/pas été vérifié|pas ete verifie/i, 'ASSET_NOT_VERIFIED'],
-  [/aucun type de garantie/i, 'ASSET_CATEGORY_MISMATCH'],
-  [/n['’]est pas admise pour la filière|pas admise pour la filiere/i, 'GUARANTEE_TYPE_NOT_ELIGIBLE'],
-  [/valeur retenue/i, 'ASSET_NO_RETAINED_VALUE'],
-  [/non modifiables par le client/i, 'FIELD_NOT_WRITABLE'],
-];
-
-/**
- * Extrait le code d'erreur d'une ApiError, par le champ `code` s'il existe,
- * sinon par la signature du message backend.
+ * Extrait le code d'erreur d'une `ApiError`. Routage sur le contrat structuré
+ * uniquement — jamais sur le texte du message.
  * @param {unknown} err
  * @returns {string|null}
  */
 export function errorCode(err) {
   if (!err || typeof err !== 'object') return null;
-  // `credits/views.py` sert désormais `{detail, code, errors:[{code, message}]}`.
-  // On accepte les deux formes : `code` scalaire et première entrée d'`errors`.
+  // `credits/views.py` sert `{detail, code, errors:[{code, message}]}` ;
+  // `ApiError` expose `code` et `errors`. On accepte les deux formes, plus le
+  // corps brut au cas où un appelant le transporterait autrement.
   const body = err.payload || err.body || err.data || null;
   const direct =
     err.code || body?.code
     || (Array.isArray(err.errors) ? err.errors[0]?.code : null)
     || (Array.isArray(body?.errors) ? body.errors[0]?.code : null);
   if (direct) return String(direct);
-  const detail = typeof err.message === 'string' ? err.message : '';
-  if (!detail) return null;
-  for (const [pattern, code] of DETAIL_SIGNATURES) {
-    if (pattern.test(detail)) return code;
-  }
-  // Un 422/409 dont aucune signature ne reconnaît le motif = soit une règle
-  // serveur nouvelle, soit un message backend reformulé qui a désaccordé la
-  // table ci-dessus. La dégradation reste correcte pour le client (on relaie
-  // le `detail`, qui est rédigé pour lui), mais elle serait silencieuse pour
-  // le développeur : on la rend bruyante. C'est le garde-fou du contournement,
-  // pas sa justification — le correctif reste de faire porter le `code` par
-  // `ApiError` (voir l'en-tête de ce fichier).
+
+  // Un 422/409 sans `code` = un endpoint qui n'a pas encore migré vers le
+  // format structuré. Le client n'en souffre pas (on relaie le `detail`, qui
+  // est rédigé pour lui), mais le trou doit se voir en développement.
   if (err.status === 422 || err.status === 409) {
     console.warn(
-      '[garanties] refus serveur non reconnu — vérifier DETAIL_SIGNATURES ' +
-      'vs les messages de credits/guarantees.py :', err.status, detail,
+      '[garanties] refus serveur sans `code` structuré — endpoint à migrer :',
+      err.status, typeof err.message === 'string' ? err.message : '',
     );
   }
   return null;
