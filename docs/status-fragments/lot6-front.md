@@ -313,13 +313,34 @@ Restent à valider en conditions réelles :
    distinction de rôle, et un test le verrouille
    (`test_un_garant_staff_est_notifie_comme_un_garant_client`).
 
-   Conséquence pour le front : l'option « acter que le personnel ne se porte pas
-   caution » **n'est plus sur la table** — le backend l'autorise et le teste. Le
-   garant staff atteint l'écran par le chemin porté dans sa notification, pas par
-   le menu. Reste donc une seule question, pour qui possède `Layout.jsx` :
-   ajoute-t-on l'entrée aux autres buckets, ou assume-t-on que la notification est
-   le seul chemin pour eux ? La rareté du cas ne change pas la nature du défaut,
-   elle change le délai avant qu'on le découvre.
+   **Deux branches à arbitrer, pas une** — et elles ne se codent pas au même
+   endroit :
+
+   1. **Ajouter l'entrée aux autres buckets de `Layout.jsx`.** Rattrape le cas.
+      Hors de mon périmètre comme de celui de `lot6-backend`.
+   2. **Exclure les garants staff au niveau des règles**, par une garde dans
+      `_assert_can_guarantee`. **Supprime** le cas au lieu de le rattraper, et le
+      problème de menu disparaît de lui-même. Se code côté backend, pas côté front.
+      Argument de fond en sa faveur : un agent à la fois instructeur et garant dans
+      son propre portefeuille est un problème de contrôle interne, adjacent au
+      maker ≠ checker du principe 2.
+
+   > **Correction d'une erreur de lecture de ma part.** J'avais écrit que la
+   > seconde branche « n'était plus sur la table », au motif que le test de
+   > `lot6-backend` établit qu'un salarié peut être garant. C'était une lecture
+   > trop forte : **un test qui documente un comportement n'est pas un test qui
+   > l'exige.** Ce que ce test change n'est pas l'espace des décisions mais leur
+   > visibilité — exclure les garants staff deviendrait un acte délibéré qui casse
+   > un test nommé, au lieu d'un effet de bord silencieux. Même mécanique que le
+   > test qui verrouille les permissions de la pose : il n'interdit pas de changer
+   > la règle, il garantit qu'on ne la changera pas sans s'en apercevoir.
+   >
+   > La distinction est mince à l'écrit et large en pratique, et je l'ai ratée
+   > dans le sens le plus coûteux : en retirant une option d'un arbitrage qui
+   > n'était pas le mien. Signalé par `lot6-backend`, corrigé ici.
+
+   La rareté du cas ne change pas la nature du défaut, elle change le délai avant
+   qu'on le découvre.
 
 2. ✅ **Notification au garant — émise** (`lot6-backend`, deux canaux). In-app dans
    la transaction de désignation (non best-effort, pour qu'un engagement invisible
