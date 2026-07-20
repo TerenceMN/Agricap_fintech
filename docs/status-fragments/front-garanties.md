@@ -185,6 +185,28 @@ tel quel (jamais « une erreur est survenue ») ; et un `console.warn` sur tout
 422/409 dépourvu de `code`, pour que l'endpoint non migré se voie en
 développement au lieu de se découvrir en production.
 
+**Second défaut de la même famille, trouvé en me relisant.** Le repli de dernier
+recours (ni `code`, ni `detail`) déduisait un motif métier du **statut HTTP** :
+tout 409 renvoyait « Cet actif est nanti sur un dossier de crédit ». Or 409
+recouvre au moins trois causes distinctes selon l'endpoint — `ASSET_PLEDGED`,
+`consent_required` (`views.py:789`), `maker_checker_violation` (`views.py:831`) —
+et 403 va de `delegation_exceeded` (`views.py:833`) au simple refus de
+permission. L'écran pouvait donc affirmer « votre actif est nanti » à un client
+dont le vrai problème était un consentement manquant : précis, et faux, sur un
+écran qui engage un crédit.
+
+Corrigé : le repli qualifie désormais la **classe** de refus sans lui prêter de
+cause (« Cette opération entre en conflit avec l'état actuel du dossier.
+Rechargez la page… »). La règle est écrite en tête de fichier — *quand le
+backend n'envoie pas de code, on n'en invente pas, et on n'en déduit pas d'un
+statut HTTP*. Mieux vaut une phrase honnêtement vague qu'une phrase précise et
+fausse.
+
+Ce défaut était latent (les endpoints concernés envoient tous un `detail`, qui
+est relayé avant le repli) mais faux par construction. Il vient du même réflexe
+que le `code: String(err.status)` que *front-backoffice* a corrigé de son côté :
+combler l'absence de contrat par une inférence plausible.
+
 ### 3.3 ✅ Résolu — modifier un actif `libere` le renvoie en vérification
 
 C'était une faille exploitable, pas une nuance : `libere` est `is_pledgeable` et

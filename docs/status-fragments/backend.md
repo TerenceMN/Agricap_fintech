@@ -2,7 +2,7 @@
 
 > Périmètre : `AGRICAP FINTECH/backend/` uniquement. `src/` n'a pas été touché.
 > Dernière exécution : `./.venv/Scripts/python.exe manage.py test credits assets dataio reference_data`
-> → **133 tests, OK** (baseline mesurée à 81, + 52 nouveaux).
+> → **140 tests, OK** (baseline mesurée à 81, + 59 nouveaux).
 
 ---
 
@@ -311,6 +311,73 @@ sans consentement du garant, exactement ce que la SPEC veut empêcher.
 garant (avec consentement 72 h du garant avant validité), ou la caution reste-t-elle
 saisie par l'agent ? Tant que la réponse n'est pas donnée, le front a raison de
 présenter ces deux types comme « constitués avec votre agent ».
+
+---
+
+## 7ter. `submit` sans `code` — **corrigé** (2e passe `front-garanties`)
+
+`front-garanties` a trouvé, en retirant sa regex de contournement, que
+`POST .../submit/` renvoyait `{detail}` **sans `code`**, avec les quatre causes
+possibles agrégées dans une seule phrase séparée par des « | ». Le message
+d'inéligibilité de garantie — qui **énumère les types admis** — y était noyé ;
+sa regex l'attrapait et le remplaçait par une phrase générique moins informative.
+Le contournement dégradait donc un cas réel.
+
+Corrigé dans `credits/workflow.py` :
+
+- `WorkflowError` porte un `code` et une liste `errors`, avec `as_errors()`
+  qui n'est **jamais vide** (la vue relaie sans tester le cas vide) ;
+- sous-classes typées : `InvalidTransition`, `ApplicationIncomplete`,
+  `DelegationError` → `DELEGATION_EXCEEDED`, `MakerCheckerError` →
+  `MAKER_CHECKER_VIOLATION`, `ConsentError` → `CLIENT_CONSENT_MISSING` ;
+- `submit()` lève `ApplicationIncomplete` avec **une entrée par cause** :
+  `CLIENT_MANQUANT`, `FILIERE_MANQUANTE`, `SUPERFICIE_MANQUANTE`,
+  `MONTANT_MANQUANT`, et `GUARANTEE_TYPE_NOT_ELIGIBLE` dont le message conserve
+  l'énumération des types admis (le front ne peut pas la reconstituer, et ne
+  doit pas connaître `ValueChain.eligible_guarantees` — principe 7).
+
+7 tests dans `credits/tests_workflow_codes.py`.
+
+**Statut HTTP délibérément inchangé (400).** Le passer à 422 serait plus conforme
+au principe 5, mais c'est un changement de contrat sur un endpoint déjà câblé
+côté front : à faire dans une passe coordonnée, pas en silence. **Conséquence à
+signaler à `front-garanties` : son `console.warn` n'écoute que 422/409, il ne
+verra donc pas ce 400 — il doit y ajouter 400.** L'harmonisation 400/422 sur
+toute la surface workflow reste ouverte.
+
+---
+
+## 7quater. Motif à surveiller — un test qui simule le serveur ne teste rien
+
+Suggestion de `front-garanties`, reprise ici : ce motif mérite d'être suivi comme
+une classe de défaut, pas comme deux correctifs ponctuels.
+
+**Mécanisme** : un test qui **recopie la logique de production** au lieu de
+l'appeler valide sa propre copie. Il reste vert quand le code réel diverge, et
+la couverture affichée est trompeuse — c'est pire que pas de test, parce qu'elle
+inspire confiance.
+
+Deux occurrences constatées dans ce dépôt :
+
+1. `assets/tests.py::test_modification_invalide_la_verification` recopiait la
+   condition `if asset.status == VERIFIE` de la vue. Le cas `libere` n'a jamais
+   été testé, et la faille a vécu. Corrigé : le test appelle désormais
+   `assets.services.invalidate_verification()`, la même fonction que la vue.
+2. Historique (déjà documenté comme résolu dans le STATUS, § nomenclature des
+   rôles) : la suite injectait `roles=["agent"]`, une valeur que
+   l'authentification ne produit jamais. Les tests passaient, le workflow était
+   bloqué en production.
+
+**Faiblesse structurelle qui subsiste** : les tests construisent encore
+`ViewContextService(sub=…, roles=[…])` à la main. Ils utilisent aujourd'hui les
+identifiants canoniques (`gest_credit`, `admin`, `client`), donc le bug de 2)
+est bien fermé — mais **rien n'empêche mécaniquement une nouvelle divergence**
+entre ce que `roles_of(request)` produit et ce que les tests injectent. La garde
+serait un test qui vérifie que tout rôle injecté dans la suite appartient au
+registre RBAC.
+
+> **À reporter dans `CREDIT_MODULE_STATUS.md` par qui en a la charge.** Je n'y
+> écris pas (consigne explicite : risque de conflit d'édition).
 
 ---
 

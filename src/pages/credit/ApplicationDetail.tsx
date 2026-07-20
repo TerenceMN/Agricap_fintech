@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Helmet } from 'react-helmet';
 import { Link, useParams } from 'react-router-dom';
-import { api, ApiError } from '@/services/api';
+import { api } from '@/services/api';
 import type { CreditApplication } from '@/types/api';
+import { ErrorPanel, toFieldErrors, type FieldError } from '@/components/backoffice/States';
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
   draft:               { label: 'Brouillon',      color: 'text-gray-400 bg-gray-500/20' },
@@ -33,7 +34,30 @@ const ACTION_LABELS: Record<string, string> = {
 const fmt = (d: string | null) => d ? new Date(d).toLocaleDateString('fr-FR') : '—';
 const fmtDt = (d: string | null) => d ? new Date(d).toLocaleString('fr-FR') : '—';
 
-interface ActionResult { ok: boolean; message?: string }
+/** Un refus de transition n'est pas un message : c'est une ou plusieurs règles
+ *  nommées. `credits/workflow.py` lève des `WorkflowError` typées
+ *  (`INVALID_TRANSITION`, `APPLICATION_INCOMPLETE`, `DELEGATION_EXCEEDED`,
+ *  `MAKER_CHECKER_VIOLATION`, `CLIENT_CONSENT_MISSING`) dont `as_errors()`
+ *  alimente `ApiError.errors`. Sur un écran de décision de crédit, savoir
+ *  QUELLE règle a bloqué change ce que l'analyste fait ensuite — un plafond de
+ *  délégation dépassé s'escalade, une violation maker ≠ checker se délègue. */
+interface ActionResult { ok: boolean; message?: string; errors?: FieldError[] }
+
+/** Ce que l'analyste doit faire, par code de refus. Le texte du serveur explique
+ *  ce qui s'est passé ; ceci indique la suite. Aucun code inventé : la clé vient
+ *  de `WorkflowError.code`, et un code inconnu n'affiche simplement rien. */
+const REFUSAL_GUIDANCE: Record<string, string> = {
+  DELEGATION_EXCEEDED:
+    "Ce montant dépasse votre plafond d'approbation. Transmettez le dossier au comité de crédit.",
+  MAKER_CHECKER_VIOLATION:
+    'Séparation des tâches : vous avez initié cet acte, un autre profil doit le confirmer.',
+  CLIENT_CONSENT_MISSING:
+    "Le consentement du client est absent ou expiré. Il doit être recueilli avant l'instruction.",
+  APPLICATION_INCOMPLETE:
+    'Le dossier ne réunit pas les pièces requises pour cette transition.',
+  INVALID_TRANSITION:
+    "Cette transition n'est pas permise depuis le statut actuel du dossier.",
+};
 
 const ApplicationDetail: React.FC = () => {
   const { code = '' } = useParams();
@@ -117,7 +141,9 @@ const ApplicationDetail: React.FC = () => {
       setExpandedAction(null);
       setActionResult({ ok: true });
     } catch (e) {
-      setActionResult({ ok: false, message: e instanceof ApiError ? e.message : String(e) });
+      // `toFieldErrors` restitue une ligne par règle refusée, avec son code —
+      // au lieu d'aplatir « approbation refusée » sur cinq causes distinctes.
+      setActionResult({ ok: false, errors: toFieldErrors(e) });
     } finally {
       setActionBusy(null);
     }
@@ -167,12 +193,28 @@ const ApplicationDetail: React.FC = () => {
         </Link>
       </div>
 
-      {/* Action result */}
-      {actionResult && (
-        <div className={`rounded-lg p-3 text-sm ${actionResult.ok
-          ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300'
-          : 'bg-red-500/10 border border-red-500/30 text-red-300'}`}>
-          {actionResult.ok ? '✓ ' : '✗ '}{actionResult.message || (actionResult.ok ? 'Opération réussie.' : 'Erreur.')}
+      {/* Résultat de l'acte : succès en une ligne, refus détaillé règle par règle */}
+      {actionResult?.ok && (
+        <div className="rounded-lg p-3 text-sm bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
+          ✓ {actionResult.message || 'Opération réussie.'}
+        </div>
+      )}
+      {actionResult && !actionResult.ok && (
+        <div className="space-y-2">
+          <ErrorPanel
+            errors={actionResult.errors ?? [{ message: actionResult.message || 'Erreur.' }]}
+            title="Le serveur a refusé cet acte"
+          />
+          {/* Suite à donner, quand le code de refus en appelle une. Le message du
+              serveur dit ce qui s'est passé ; ceci dit quoi faire ensuite. */}
+          {(actionResult.errors ?? [])
+            .map((e) => (e.code ? REFUSAL_GUIDANCE[e.code] : undefined))
+            .filter((g): g is string => Boolean(g))
+            .map((guidance, i) => (
+              <p key={i} className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3">
+                {guidance}
+              </p>
+            ))}
         </div>
       )}
 
@@ -433,12 +475,10 @@ const ApplicationDetail: React.FC = () => {
           <h3 className="font-bold text-lg mb-4">Feuille de besoins</h3>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <InfoCard label="Total besoins" value={`${(app.needsSheet.grandTotal ?? 0).toLocaleString('fr-FR')} ${app.needsSheet.currency}`} />
-            {/* La carte « Superficie » lisait `needsSheet.area_ha` : le type le déclare,
-                mais `serialize_application` ne l'émet PAS dans `needsSheet` (clés réelles :
-                id, parsedOk, grandTotal, currency, warnings, anomalies). Elle affichait donc
-                « — » en toutes circonstances. La superficie du dossier est déjà présentée
-                plus haut ; on trace ici la révision parsée, seule information que ce bloc
-                apporte et que rien d'autre ne donne. */}
+            {/* Ex-carte « Superficie », qui lisait `needsSheet.area_ha` — déclaré au type
+                mais jamais émis, donc vide en permanence. Le champ a depuis été retiré du
+                type. On trace la révision parsée : c'est ce qui permet de rattacher une
+                analyse à une version précise de la feuille. */}
             <InfoCard label="Révision parsée" value={app.needsSheet.id != null ? `#${app.needsSheet.id}` : '—'} />
             <InfoCard label="Validée" value={app.needsSheet.parsedOk ? 'Oui' : 'Non'} />
             <InfoCard label="Devise" value={app.needsSheet.currency} />
