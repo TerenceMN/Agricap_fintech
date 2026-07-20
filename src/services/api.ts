@@ -175,6 +175,33 @@ export const api = {
     score: (code: string) =>
       request<import('@/types/api').CreditScoreResult>(`/credits/applications/${code}/score/`, { method: 'POST', body: {} }),
 
+    // ── Moteur d'analyse (SPEC Moteur) ──────────────────────────────────
+    // Routes alignées sur la convention du module (`applications/<code>/`) et
+    // NON sur celles de la SPEC (`admin/demandes/<ref>/`), qui décrivent des
+    // modèles inexistants ici (DemandeCredit, PlanFinancierUpload).
+
+    /** Analyse complète — réservée au staff : elle expose barèmes et plages. */
+    analyse: (code: string) =>
+      request<import('@/types/api').CreditAnalyse>(`/credits/applications/${code}/analyse/`),
+
+    /** Canal de justification d'un indicateur hors plage. Journalisé. */
+    justifyIndicator: (code: string, data: { indicateur: string; justification: string }) =>
+      request<import('@/types/api').CreditAnalyse>(
+        `/credits/applications/${code}/analyse/justifier/`, { method: 'POST', body: data }),
+
+    /** Ré-exécute le moteur : crée une NOUVELLE analyse, ne modifie pas l'ancienne
+     *  (principe 3). Sert le simulateur analyste de RateMaturityModal. */
+    reanalyser: (code: string, data?: {
+      duree_mois?: number; differe_mois?: number; taux_annuel?: number;
+      mode_differe?: 'interets_seuls' | 'franchise_totale';
+    }) => request<import('@/types/api').CreditAnalyse>(
+      `/credits/applications/${code}/reanalyser/`, { method: 'POST', body: data ?? {} }),
+
+    /** Vue CLIENT — sans barèmes ni seuils (principe 7). */
+    analyseResume: (code: string) =>
+      request<import('@/types/api').CreditAnalyseResume>(
+        `/credits/applications/${code}/analyse-resume/`),
+
     // Workflow
     submit: (code: string) =>
       request<import('@/types/api').CreditApplication>(`/credits/applications/${code}/submit/`, { method: 'POST', body: {} }),

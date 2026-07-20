@@ -216,6 +216,15 @@ la retirer serait une régression d'affichage sans contrepartie.
   `credits/static/credits/feuille_besoins_template.xlsx` — la dette du **principe
   11** (template versionné maker-checker en base) reste entière côté backend. Le
   front est prêt : il n'a qu'une URL à appeler.
+- **Dette croisée, hors de mon périmètre** (signalée à `moteur-front-analyse`) :
+  le barème de recommandation à 4 niveaux est défini **deux fois**, dans
+  `src/components/analyse/recommandation.js` et dans
+  `src/components/analyse/simulateur/format.js`, avec des valeurs déjà
+  divergentes — `approbation_cond` en orange d'un côté, en lime de l'autre ;
+  `revue` en yellow vs amber ; et les 4 libellés différents (« Revue manuelle »
+  vs « Revue approfondie requise »). Vocabulaire parallèle au sens du principe 6.
+  Aucun rapport avec `src/components/simulateur/`, qui ne porte aucune constante
+  de barème. À arbitrer entre les lots analyse avant fusion.
 - `src/types/api.ts` ne décrit ni `needsSource`, ni `scheduleDraft`, ni `refData`
   sur `CreditSimulateResult`, ni la forme SPEC de `NeedsParseResult`
   (`needsSourceId`, `revision`, `sha256`). Sans conséquence ici — `Credits.jsx`

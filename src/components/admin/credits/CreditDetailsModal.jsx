@@ -4,9 +4,11 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Table, TableBody, TableHead, TableHeader, TableRow, TableCell } from '@/components/ui/table';
-import { DollarSign, Calendar, Percent, User, Briefcase, FileText, Shield, Star, Hash, Clock, Landmark, Users, Repeat, ShieldCheck, Loader2, CalendarDays } from 'lucide-react';
+import { DollarSign, Calendar, Percent, User, Briefcase, FileText, Shield, Star, Hash, Clock, Landmark, Users, Repeat, ShieldCheck, Loader2, CalendarDays, Gauge } from 'lucide-react';
 import { api } from '@/services/api';
 import TransactionSubTable from './TransactionSubTable';
+import AnalyseTab from '@/components/analyse/AnalyseTab';
+import { useCreditAnalyse } from '@/components/analyse/useCreditAnalyse';
 
 const AnalysisPanel = ({ code }) => {
   const [result, setResult] = useState(null);
@@ -72,11 +74,21 @@ const CreditDetailsModal = ({ isOpen, onOpenChange, credit }) => {
     const [activeTab, setActiveTab] = useState('info');
     const [scheduleData, setScheduleData] = useState(null);
     const [scheduleLoading, setScheduleLoading] = useState(false);
+    // L'analyse n'est sollicitée qu'à l'ouverture de son onglet : on n'appelle
+    // pas le moteur pour un analyste qui ne consulte que les transactions.
+    const [analyseOuverte, setAnalyseOuverte] = useState(false);
+
+    // Référence du dossier d'instruction (app `credits`) — distincte de l'id du
+    // prêt (app `portfolio`). Les deux machines à états ne se mélangent pas :
+    // `applicationCode` est la seule clé qui adresse le moteur d'analyse.
+    const applicationCode = credit?.applicationCode || credit?.id;
+    const analyseState = useCreditAnalyse(applicationCode, analyseOuverte);
 
     // Reset when a different loan is opened.
     useEffect(() => {
         setScheduleData(null);
         setActiveTab('info');
+        setAnalyseOuverte(false);
     }, [credit?.id]);
 
     const loadSchedule = useCallback(async () => {
@@ -99,6 +111,7 @@ const CreditDetailsModal = ({ isOpen, onOpenChange, credit }) => {
     const handleTabChange = (v) => {
         setActiveTab(v);
         if (v === 'schedule') loadSchedule();
+        if (v === 'analyse') setAnalyseOuverte(true);
     };
 
     return (
@@ -115,6 +128,9 @@ const CreditDetailsModal = ({ isOpen, onOpenChange, credit }) => {
                         <TabsTrigger value="transactions" className="data-[state=active]:bg-slate-700">Transactions</TabsTrigger>
                         <TabsTrigger value="schedule" className="data-[state=active]:bg-slate-700">
                             <CalendarDays className="w-4 h-4 mr-1" />Échéancier
+                        </TabsTrigger>
+                        <TabsTrigger value="analyse" className="data-[state=active]:bg-slate-700">
+                            <Gauge className="w-4 h-4 mr-1" />Analyse
                         </TabsTrigger>
                     </TabsList>
 
@@ -217,6 +233,18 @@ const CreditDetailsModal = ({ isOpen, onOpenChange, credit }) => {
                                 <p className="text-sm">Cliquez sur cet onglet pour charger l'échéancier d'amortissement.</p>
                             </div>
                         )}
+                    </TabsContent>
+
+                    {/* Onglet « Analyse » — moteur de scoring (SPEC Moteur §8b).
+                        Surface STAFF : ce modal n'est monté que depuis le tableau de bord
+                        admin (`CreditsDashboard` → `CreditsTable`), jamais depuis le parcours
+                        client. Le serveur reste l'autorité : un 403 s'affiche tel quel. */}
+                    <TabsContent value="analyse" className="mt-3">
+                        <AnalyseTab
+                            code={applicationCode}
+                            currency={credit.currency}
+                            state={analyseState}
+                        />
                     </TabsContent>
                 </Tabs>
 

@@ -1114,3 +1114,93 @@ export interface GuaranteeConsentResult {
   detail: string;
   item: GuaranteeRequest;
 }
+
+/** Recommandation du moteur — barème 4 niveaux (SPEC Moteur §2).
+ *  Le moteur RECOMMANDE, l'humain décide (principe 2) : ce champ ne déclenche
+ *  jamais une transition, il éclaire l'analyste. */
+export type CreditRecommandation =
+  | 'approbation'
+  | 'approbation_cond'
+  | 'revue'
+  | 'refus';
+
+/** Un des 5 critères pondérés. `points = score × poids / 100`. */
+export interface CreditAnalyseCritere {
+  score: number;
+  poids: number;
+  points: number;
+  details: {
+    commentaire?: string;
+    totalPlan?: number;
+    totalReferentiel?: number;
+    ecartMoyenPct?: number;
+    referentiel?: string;
+    ecartsHorsPlage?: Array<{
+      indicateur: string;
+      valeur?: number;
+      reference?: number;
+      ecartPct: number;
+      message: string;
+    }>;
+    dscr?: number;
+    dscrStress?: number;
+    ratioCouverture?: number;
+    constituees?: boolean;
+    [k: string]: unknown;
+  };
+}
+
+/** Une ligne de l'échéancier prévisionnel. Montants déjà arrondis au centime
+ *  côté serveur — le front n'en recalcule aucun (principe 4). */
+export interface CreditEcheancierLigne {
+  mois: number;
+  phase: 'différé' | 'amortissement' | 'franchise';
+  capital: number;
+  interets: number;
+  interetsCapitalises?: number;
+  echeance: number;
+  crd: number;
+}
+
+/** Résultat complet d'une exécution du moteur — vue ANALYSTE.
+ *
+ *  Immuable : une ré-analyse crée une nouvelle ligne, elle n'en modifie aucune
+ *  (principe 3). L'écart entre deux analyses successives est lui-même un signal.
+ *
+ *  Anti-gaming (principe 7) : ce contrat expose barèmes, tolérances et plages —
+ *  il ne doit JAMAIS être servi à un client. La vue client est `analyseResume`. */
+export interface CreditAnalyse {
+  id: number;
+  reference: string;
+  referentiel: string;
+  parametres: { dureeMois: number; differeMois: number; tauxAnnuel: number };
+  scoreGlobal: number;
+  recommandation: CreditRecommandation;
+  dscr: number | null;
+  dscrStress: number | null;
+  criteres: {
+    technique: CreditAnalyseCritere;
+    dscr: CreditAnalyseCritere;
+    stress: CreditAnalyseCritere;
+    comportemental: CreditAnalyseCritere;
+    garanties: CreditAnalyseCritere;
+  };
+  indicateursHorsPlage: Array<{ indicateur: string; message: string; ecartPct?: number }>;
+  justifications: Array<{
+    indicateur: string; justification: string; agent: string; date: string;
+  }>;
+  echeancier: CreditEcheancierLigne[];
+  executeLe: string;
+  versionMoteur: string;
+}
+
+/** Vue CLIENT — volontairement pauvre.
+ *  Le client voit sa lettre et des pistes ; jamais les barèmes, les seuils, les
+ *  tolérances par module ni les plages du référentiel (principe 7). */
+export interface CreditAnalyseResume {
+  reference: string;
+  scoreLettre: 'A' | 'B' | 'C' | 'D';
+  pointsForts: string[];
+  pointsAAmeliorer: string[];
+  analyseLe: string | null;
+}

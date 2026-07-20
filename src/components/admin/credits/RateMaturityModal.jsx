@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,13 +11,31 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/components/ui/use-toast";
 import { api } from '@/services/api';
+import SimulateurMoteur from '@/components/analyse/simulateur/SimulateurMoteur';
+import { formatMontant } from '@/components/guarantees/format';
 import {
-    Calculator, CalendarClock, History, Ban, PauseCircle, PlayCircle, Save, AlertTriangle,
-    TrendingUp, Percent, CalendarDays, ArrowRight, CheckCircle2
+    Calculator, CalendarClock, Ban, PauseCircle, PlayCircle, Save, AlertTriangle,
+    TrendingUp, Percent, FlaskConical
 } from 'lucide-react';
 
 // Statuts considérés « actifs » (affiche Suspendre/Bloquer plutôt que Réactiver).
 const ACTIVE_STATES = ['Active', 'En cours', 'Approuvé', 'En traitement'];
+
+/**
+ * Code de la demande de crédit sur laquelle le moteur d'analyse s'exécute.
+ *
+ * `portfolio/serializers.py::loan_row` sert `applicationCode` : il vaut le code de
+ * la demande pour un prêt issu du pipeline, et la chaîne vide pour un prêt saisi
+ * manuellement (aucune demande, donc aucun dossier à analyser). Quand le champ est
+ * absent — source de données qui ne le porte pas — on retombe sur la référence du
+ * prêt, qui lui est égale pour les prêts issus d'une demande
+ * (`portfolio/services.py`, `reference=app.code`). On ne devine rien de plus.
+ */
+const codeDemande = (credit) => {
+    if (!credit) return null;
+    if (credit.applicationCode !== undefined) return credit.applicationCode || null;
+    return credit.id || null;
+};
 
 const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
     const { toast } = useToast();
@@ -61,67 +79,13 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
         setConfig(prev => ({ ...prev, [field]: value }));
     };
 
-    // Calculation Engine
-    const schedule = useMemo(() => {
-        if (!credit || !config.duration) return [];
-
-        const principal = credit.amountApproved || credit.amountRequested || 0;
-        const rate = parseFloat(config.rate);
-        const duration = parseInt(config.duration);
-        const freqMap = { 'monthly': 1, 'quarterly': 3, 'annual': 12, 'bullet': duration };
-        const freqMonths = freqMap[config.frequency] || 1;
-        
-        const numberOfPayments = Math.ceil(duration / freqMonths);
-        const rows = [];
-        let balance = principal;
-        let currentDate = new Date(config.startDate);
-
-        for (let i = 1; i <= numberOfPayments; i++) {
-            // Advance date
-            currentDate.setMonth(currentDate.getMonth() + freqMonths);
-            const dateStr = currentDate.toISOString().split('T')[0];
-
-            // Interest calculation (Simple interest on remaining balance for the period)
-            // Rate is monthly %
-            const interest = balance * (rate / 100) * freqMonths;
-
-            let principalPayment = 0;
-            if (config.frequency === 'bullet') {
-                principalPayment = i === numberOfPayments ? principal : 0;
-            } else {
-                // Constant Amortization (Simple assumption for this tool)
-                // Real banking apps might use PMT for constant annuity
-                principalPayment = principal / numberOfPayments; 
-            }
-
-            // Adjust last payment to fix rounding issues
-            if (i === numberOfPayments && config.frequency !== 'bullet') {
-                principalPayment = balance;
-            }
-
-            const totalPayment = principalPayment + interest;
-            balance -= principalPayment;
-
-            rows.push({
-                number: i,
-                date: dateStr,
-                principal: principalPayment,
-                interest: interest,
-                total: totalPayment,
-                balance: Math.max(0, balance)
-            });
-        }
-        return rows;
-    }, [credit, config]);
-
-    const totals = useMemo(() => {
-        const totalPrincipal = schedule.reduce((acc, row) => acc + row.principal, 0);
-        const totalInterest = schedule.reduce((acc, row) => acc + row.interest, 0);
-        const totalPayments = totalPrincipal + totalInterest;
-        const apr = ((totalInterest / totalPrincipal) / (config.duration / 12)) * 100; // Rough APR estimation
-
-        return { totalPrincipal, totalInterest, totalPayments, apr: isNaN(apr) ? 0 : apr };
-    }, [schedule, config.duration]);
+    // L'échéancier « de simulation » calculé ici (amortissement constant, intérêt
+    // simple, TAEG estimé) a été SUPPRIMÉ. Il produisait, dans le même modal que
+    // les chiffres serveur, un second tableau d'amortissement et un second coût du
+    // crédit — deux réalités pour un même dossier, dont aucune n'était opposable.
+    // Le simulateur de l'analyste est désormais l'onglet « Simulateur d'analyse » :
+    // il ajuste durée / différé / taux, appelle le moteur, et affiche CE QUE LE
+    // SERVEUR RENVOIE (SPEC §8c, annexe A pour les formules du moteur).
 
     // Actions — persistées côté backend (audit inclus).
     const saveChanges = async (actionType = "Modification") => {
@@ -204,7 +168,7 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
 
     return (
         <Dialog open={isOpen} onOpenChange={onOpenChange}>
-            <DialogContent className="glass-effect text-white max-w-4xl border-slate-700 max-h-[90vh] overflow-y-auto">
+            <DialogContent className="glass-effect text-white max-w-6xl border-slate-700 max-h-[90vh] overflow-y-auto">
                 <DialogHeader>
                     <DialogTitle className="flex items-center gap-3 text-xl">
                         <Calculator className="w-6 h-6 text-emerald-400" />
@@ -218,20 +182,36 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                         </Badge>
                     </DialogTitle>
                     <DialogDescription>
-                        Dossier: <span className="text-white font-medium">{credit.id}</span> - {credit.operator} ({credit.amountApproved?.toLocaleString()} {credit.currency})
+                        Dossier: <span className="text-white font-medium">{credit.id}</span> - {credit.operator} ({formatMontant(credit.amountApproved, credit.currency, { decimals: 0 })})
                     </DialogDescription>
                 </DialogHeader>
 
-                <Tabs defaultValue="settings" className="w-full mt-4">
-                    <TabsList className="grid w-full grid-cols-2 bg-slate-800/50">
-                        <TabsTrigger value="settings">Paramètres & Simulation</TabsTrigger>
+                <Tabs defaultValue="simulateur" className="w-full mt-4">
+                    <TabsList className="grid w-full grid-cols-3 bg-slate-800/50">
+                        <TabsTrigger value="simulateur" className="flex items-center gap-2">
+                            <FlaskConical className="w-3.5 h-3.5" /> Simulateur d'analyse
+                        </TabsTrigger>
+                        <TabsTrigger value="settings">Paramètres du prêt</TabsTrigger>
                         <TabsTrigger value="history">Historique & Audit</TabsTrigger>
                     </TabsList>
 
+                    {/* Simulateur de l'analyste (SPEC §8c) — tous les chiffres viennent du moteur. */}
+                    <TabsContent value="simulateur" className="mt-6">
+                        <SimulateurMoteur code={codeDemande(credit)} credit={credit} actif={isOpen} />
+                    </TabsContent>
+
                     <TabsContent value="settings" className="space-y-6 mt-6">
+                        <p className="text-xs text-slate-400">
+                            Caractéristiques contractuelles du prêt au portefeuille. Elles ne
+                            déclenchent aucune analyse : pour simuler l'effet d'une durée, d'un
+                            différé ou d'un taux sur le DSCR, utilisez l'onglet
+                            « Simulateur d'analyse ».
+                        </p>
                         {/* Settings Form */}
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                            <div className="space-y-4 md:col-span-1">
+                            {/* `contents` : les trois cartes deviennent directement les cellules
+                                de la grille depuis que la colonne de simulation locale a disparu. */}
+                            <div className="contents">
                                 <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700/50 space-y-4">
                                     <h4 className="font-semibold text-emerald-400 flex items-center gap-2"><Percent className="w-4 h-4"/> Taux d'Intérêt</h4>
                                     <div>
@@ -292,72 +272,17 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                                 </div>
                             </div>
 
-                            {/* Simulation Results */}
-                            <div className="md:col-span-2 space-y-4">
-                                <div className="grid grid-cols-3 gap-4 mb-4">
-                                    <div className="bg-slate-900/50 p-3 rounded-lg border border-slate-800">
-                                        <p className="text-xs text-slate-400">Total Intérêts</p>
-                                        <p className="text-lg font-bold text-emerald-400">{totals.totalInterest.toLocaleString(undefined, { maximumFractionDigits: 2 })} {credit.currency}</p>
-                                    </div>
-                                    <div className="bg-slate-900/50 p-3 rounded-lg border border-slate-800">
-                                        <p className="text-xs text-slate-400">Total à Rembourser</p>
-                                        <p className="text-lg font-bold text-white">{totals.totalPayments.toLocaleString(undefined, { maximumFractionDigits: 2 })} {credit.currency}</p>
-                                    </div>
-                                    <div className="bg-slate-900/50 p-3 rounded-lg border border-slate-800">
-                                        <p className="text-xs text-slate-400">TAEG Estimé</p>
-                                        <p className="text-lg font-bold text-blue-400">{totals.apr.toFixed(2)}%</p>
-                                    </div>
-                                </div>
-
-                                {/* Ces trois chiffres et le tableau ci-dessous sont calculés dans le
-                                    navigateur (amortissement constant, intérêt simple) et ne sont PAS
-                                    ceux du moteur d'échéancier serveur. Ils aident à cadrer une
-                                    configuration avant de l'enregistrer ; ils n'engagent personne.
-                                    L'échéancier opposable est servi par
-                                    `GET /api/portfolio/loans/<ref>/schedule` et s'affiche dans
-                                    l'onglet « Échéancier » du détail du crédit. */}
-                                <p className="text-[11px] text-amber-300/80 -mt-2">
-                                    Simulation calculée localement (amortissement constant, intérêt simple)
-                                    pour cadrer la configuration avant enregistrement. L'échéancier opposable
-                                    est celui du serveur, visible dans l'onglet « Échéancier » du dossier.
-                                </p>
-
-                                <div className="rounded-lg border border-slate-700 overflow-hidden h-[300px] flex flex-col">
-                                    <div className="bg-slate-800 p-2 text-xs font-semibold text-slate-300 flex justify-between items-center px-4">
-                                        <span>
-                                            Tableau d'amortissement — simulation locale, non contractuelle
-                                        </span>
-                                        <Badge variant="outline" className="text-[10px] h-5">{schedule.length} échéances</Badge>
-                                    </div>
-                                    <div className="overflow-auto flex-1 bg-slate-900/30">
-                                        <Table>
-                                            <TableHeader>
-                                                <TableRow className="border-slate-800 hover:bg-transparent text-[10px] uppercase">
-                                                    <TableHead className="w-10">#</TableHead>
-                                                    <TableHead>Date</TableHead>
-                                                    <TableHead className="text-right">Principal</TableHead>
-                                                    <TableHead className="text-right">Intérêts</TableHead>
-                                                    <TableHead className="text-right text-white">Total</TableHead>
-                                                    <TableHead className="text-right">Solde</TableHead>
-                                                </TableRow>
-                                            </TableHeader>
-                                            <TableBody>
-                                                {schedule.map((row) => (
-                                                    <TableRow key={row.number} className="border-slate-800/50 hover:bg-slate-800/30 text-xs">
-                                                        <TableCell className="font-mono text-slate-500">{row.number}</TableCell>
-                                                        <TableCell>{row.date}</TableCell>
-                                                        <TableCell className="text-right font-mono text-slate-300">{row.principal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</TableCell>
-                                                        <TableCell className="text-right font-mono text-emerald-500/70">{row.interest.toLocaleString(undefined, { maximumFractionDigits: 0 })}</TableCell>
-                                                        <TableCell className="text-right font-mono font-medium text-white">{row.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}</TableCell>
-                                                        <TableCell className="text-right font-mono text-slate-500">{row.balance.toLocaleString(undefined, { maximumFractionDigits: 0 })}</TableCell>
-                                                    </TableRow>
-                                                ))}
-                                            </TableBody>
-                                        </Table>
-                                    </div>
-                                </div>
-                            </div>
                         </div>
+
+                        <p className="text-[11px] text-slate-500">
+                            Plus aucun échéancier n'est calculé dans le navigateur depuis cet écran.
+                            L'échéancier prévisionnel du moteur s'affiche dans l'onglet
+                            « Simulateur d'analyse » ; l'échéancier de gestion du prêt reste servi par
+                            <code className="mx-1">GET /api/portfolio/loans/&lt;ref&gt;/schedule</code>
+                            et s'affiche dans l'onglet « Échéancier » du dossier.
+                        </p>
+
+
 
                         {/* Action Bar */}
                         <div className="flex flex-wrap gap-3 pt-4 border-t border-slate-700">
