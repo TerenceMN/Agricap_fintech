@@ -418,33 +418,49 @@ détail des sept emplacements.
 
 ### 4.2.1 Une famille de défauts que les tests ne voient pas
 
-> **Correction.** Une version antérieure de cette section citait **trois**
-> exemples, dont « `poidsAppliques` sérialisé en chaînes ». **Faux, et vérifié
-> dans le payload de référence lui-même** : `poidsAppliques` et
-> `criteres[].poids` y sont des flottants (`25.0`, `20.0`, …), pas des chaînes.
-> J'avais repris un défaut auto-signalé par `moteur-backend` sans le confronter
-> au payload — dans la section même qui prescrit de confronter au payload.
-> Signalé par le lot 3. Un argument de méthode illustré par un exemple faux se
-> retourne contre la méthode.
+> **Double correction — à lire en entier, elle est plus instructive que la
+> section.** (1) Cette section a d'abord cité trois exemples, dont
+> « `poidsAppliques` sérialisé en chaînes ». (2) Le lot 3 l'a contestée : le
+> payload de référence montre des flottants. J'ai retiré l'exemple. (3) **Le
+> retrait était lui-même une erreur** : le défaut a bel et bien existé, et git le
+> prouve.
+>
+> ```
+> git show 80f595a:".../moteur-analyse-payload-observe.json"  → "technique": "25.0"   (chaînes)
+> git show 585873b:".../moteur-analyse-payload-observe.json"  → "technique": 25.0     (nombres)
+> ```
+>
+> Vérifié directement, pas relayé. L'artefact avait été committé **avant** le
+> correctif backend, puis régénéré après. Ni ma citation initiale, ni la
+> contestation, ni mon retrait n'étaient fondés sur la bonne source : nous
+> regardions tous les trois l'état *courant* d'un fichier pour statuer sur un
+> défaut *passé*. L'exemple est rétabli.
 
-**Deux** défauts de cette passe ont ce profil : **contrat honoré, donnée
+**Trois** défauts de cette passe ont ce profil : **contrat honoré, donnée
 présente, valeur juste — et l'écran ment quand même.**
 
 - la colonne « intérêts capitalisés » pleine de `0.0`, affichée parce que la clé
   existait (ce lot) ;
 - `pointsForts` contenant le critère comportemental neutre, qui félicitait un
-  client pour un historique inexistant (backend).
+  client pour un historique inexistant (backend) ;
+- `poidsAppliques` sérialisé en chaînes — `.toFixed()` sur une chaîne ne dégrade
+  pas, il jette (backend, corrigé ; cf. `git show 80f595a`).
 
-Ni l'un ni l'autre n'aurait déclenché un test de type ou de schéma : le type est
-respecté, la valeur est exacte, c'est la **lecture** qui est fausse. Les deux ont
-été trouvés en confrontant le code à une réponse réelle.
+Aucun n'aurait déclenché un test de type ou de schéma : le type est respecté, la
+valeur est exacte, c'est la **lecture** qui est fausse. Tous ont été trouvés en
+confrontant le code à une réponse réelle.
+
+**Ce que l'aller-retour ci-dessus enseigne, et qui vaut plus que les trois
+exemples : un payload de référence est un instantané, pas un journal.** Régénéré
+après correctif, il atteste d'un état sain sans documenter ce dont il a été
+guéri — et il invite alors à l'erreur exacte que j'ai commise : conclure qu'un
+défaut n'a jamais existé parce qu'il n'est plus observable. `moteur-backend` a
+depuis ajouté au fichier des blocs `_capture` (état, commit, avertissement) et
+`_corrections` (forme avant / après, `git show` qui exhibe l'avant, test qui
+verrouille), avec consigne de les reconduire à chaque régénération.
 
 C'est l'argument pour que `docs/contracts/*-payload-observe.json` devienne une
-habitude du projet plutôt qu'un artefact de ce lot : un payload de référence
-versionné coûte un fichier et attrape la classe de défauts que le typage laisse
-passer. Accessoirement, c'est aussi lui qui a permis d'infirmer le troisième
-exemple ci-dessus — un payload de référence sert autant à **réfuter** les défauts
-supposés qu'à en trouver de réels.
+habitude du projet — **daté et journalisé**, sinon il ne prouve que le présent.
 
 ---
 
@@ -490,6 +506,41 @@ l'a pas.
   sous-dossier `simulateur/`). Résolveur eslint à configurer, ce n'est pas une
   régression de ce lot.
 
+### 5.1 Deux défauts trouvés par **lecture**, pas par exécution
+
+Ils étaient classés « non observé, faute d'exécution ». Ils ne l'étaient pas :
+ils étaient **non vérifiés**. La distinction est due au lot 3, et elle a coûté
+deux vrais défauts à ce lot avant d'être faite.
+
+**a) `applicationCode` vide → un état vide qui ment.** `portfolio/serializers.py`
+(l. 44) sert `application.code` pour un prêt issu du pipeline et la **chaîne
+vide** pour un prêt saisi à la main. Le repli `applicationCode || id` envoyait
+alors une référence de *prêt* au moteur → 404 → « Analyse non encore exécutée ».
+L'analyste aurait attendu indéfiniment une analyse qui n'arriverait jamais,
+pour un dossier qui n'existe pas. Corrigé : `''` et `null` donnent désormais un
+état distinct — « ce prêt n'est rattaché à aucune demande de crédit ». Le repli
+sur l'id n'est conservé que si le champ est **absent** de la source, seul cas où
+il est fondé (`portfolio/services.py` pose `reference = app.code`).
+
+**b) 401 sans état dédié.** `request()` tente un `refresh()` et rejoue une fois ;
+un 401 qui ressort remonte en `ApiError(401)` et tombait dans la branche
+générique — une session morte s'affichait sous « Analyse indisponible », en
+rouge. Corrigé : état « Session expirée » nommé, qui dit que le moteur n'est pas
+en cause. La question transverse (l'application doit-elle rediriger vers la
+reconnexion ?) reste ouverte et hors périmètre — mais cesser de désigner le
+mauvais coupable était local, et donc à moi.
+
+Le rejeu lui-même est sain ici : mes appels passent des objets JS,
+`JSON.stringify` a lieu à l'émission, le second envoi re-sérialise. Le cas
+`FormData` relevé par le lot 3 ne concerne pas cet onglet — vérifié, pas supposé.
+
+**c) `REFERENTIEL_ABSENT` (422).** Signalé par `moteur-backend` : sans classeur
+simulateur ingéré, aucun référentiel n'existe et `POST /reanalyser/` répond 422
+`REFERENTIEL_ABSENT`. Ce code tombe dans la branche erreur générique, rendue par
+`ErrorPanel` + `toFieldErrors`, qui affiche `code` **et** message serveur ligne
+par ligne — le message est explicite et destiné à l'analyste, il passe donc tel
+quel. Vérifié par lecture ; jamais rendu.
+
 ### Non observé
 
 **Aucune vérification navigateur n'a été faite** — pas de rendu réel, pas de
@@ -499,20 +550,8 @@ DevTools. N'ont donc pas été observés :
   4 niveaux, comportement responsive du tableau des critères) ;
 - l'imbrication du dialogue de justification dans le dialogue du modal (Radix la
   supporte, mais le focus trap et l'`Esc` en cascade n'ont pas été testés) ;
-- **Le 401 après échec de rafraîchissement n'a pas d'état dédié.** Vérifié dans
-  `services/api.ts` : sur 401, `request()` tente `refresh()` puis rejoue une fois
-  avec `retry: false` ; si le rafraîchissement échoue, l'erreur remonte en
-  `ApiError(401)`. `useCreditAnalyse` ne mappe que 404 et 403 — un 401 tombe donc
-  dans la branche générique et s'affiche en `ErrorPanel` rouge. Ce n'est pas
-  silencieux (bien), mais une session expirée s'y lit comme une panne technique
-  du moteur. À traiter comme le 403 l'est déjà : un état nommé, pas une erreur.
-  Non corrigé ici — il faudrait vérifier d'abord comment le reste de
-  l'application traite la déconnexion, et c'est transverse.
-  *(Le rejeu lui-même est sain pour ce lot : mes appels passent des objets JS,
-  `JSON.stringify` a lieu à l'émission, donc le second envoi re-sérialise. Le cas
-  `FormData` relevé par le lot 3 ne concerne pas l'onglet Analyse.)*
-- le comportement réel des états 404 / 403 / erreur. **Aucun appel HTTP n'a été
-  passé depuis ce lot.** Le branchement a en revanche été confronté au payload
+- le comportement réel des états 404 / 403 / 401 / 422 / erreur. **Aucun appel
+  HTTP n'a été passé depuis ce lot.** Le branchement a en revanche été confronté au payload
   observé livré par `moteur-backend` (§3.2), ce qui couvre le nommage et
   l'imbrication des champs — mais pas le transport : codes de statut réels,
   en-têtes d'autorisation, comportement du rafraîchissement de jeton sur 401,

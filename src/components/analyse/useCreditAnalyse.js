@@ -75,6 +75,14 @@ export function useCreditAnalyse(code, enabled = true) {
     notAnalysed: status === 404,
     /** Refus serveur — décision d'autorisation, pas incident technique. */
     forbidden: status === 403,
+    /**
+     * Session expirée : `request()` a tenté un `refresh()` et rejoué une fois ;
+     * un 401 qui ressort est une authentification morte, pas une panne du
+     * moteur. Sans état dédié, il s'affichait sous « Analyse indisponible » —
+     * un message qui désigne le mauvais coupable et fait attendre à l'analyste
+     * une analyse qui n'est pas en cause.
+     */
+    sessionExpiree: status === 401,
     reload: load,
     /** Remplace l'analyse par celle que le serveur vient de renvoyer (justification). */
     setAnalyse,

@@ -37,7 +37,9 @@ import JustifyIndicatorDialog from './JustifyIndicatorDialog';
  * }} props
  */
 const AnalyseTab = ({ code, state }) => {
-  const { analyse, loading, error, notAnalysed, forbidden, reload, setAnalyse } = state;
+  const {
+    analyse, loading, error, notAnalysed, forbidden, sessionExpiree, reload, setAnalyse,
+  } = state;
   const [justifyOpen, setJustifyOpen] = useState(false);
   const [justifyCible, setJustifyCible] = useState(null);
 
@@ -46,7 +48,28 @@ const AnalyseTab = ({ code, state }) => {
     setJustifyOpen(true);
   };
 
+  // Prêt sans demande de crédit liée : il n'y a pas de dossier à analyser, et il
+  // n'y en aura jamais. Distinct de « pas encore analysé » — confondre les deux
+  // ferait attendre l'analyste indéfiniment.
+  if (!code) {
+    return (
+      <Empty
+        title="Ce prêt n'est rattaché à aucune demande de crédit"
+        hint="Le moteur d'analyse s'exécute sur un dossier d'instruction. Un prêt saisi manuellement dans le portefeuille n'en a pas : il n'y a pas d'analyse à attendre."
+      />
+    );
+  }
+
   if (loading && !analyse) return <Loading label="Chargement de l'analyse…" />;
+
+  if (sessionExpiree) {
+    return (
+      <Empty
+        title="Session expirée"
+        hint="Votre authentification n'est plus valide. Reconnectez-vous, puis rouvrez ce dossier. Le moteur d'analyse n'est pas en cause et rien n'a été perdu."
+      />
+    );
+  }
 
   if (forbidden) {
     return (

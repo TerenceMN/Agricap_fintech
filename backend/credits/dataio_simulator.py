@@ -376,6 +376,26 @@ def dataio_simulate(
 
     Retourne un dict compatible avec CreditSimulateResult (TypeScript).
     """
+
+    # ── Frontière de type ────────────────────────────────────────────────────
+    # Ce module calcule en `float` de bout en bout ; les vues, elles, portent
+    # désormais des `Decimal` (principe 4 : aucun `float` n'entre dans un champ
+    # financier). Sans cette coercition, `Decimal / float` lève un TypeError et
+    # la simulation répond 500 — c'est ce qui est arrivé après la correction des
+    # vues, le défaut étant simplement déplacé plutôt que résolu.
+    #
+    # Dette assumée et bornée : ce simulateur est INDICATIF. Le scoring qui fait
+    # foi est `credits/analyse.py`, en `Decimal` du premier au dernier calcul.
+    # Migrer ce module entier en `Decimal` est le correctif propre ; le faire en
+    # urgence sur un chemin non couvert par des tests de vue le serait moins.
+    def _f(x):
+        return float(x) if x is not None else None
+
+    amount_requested = _f(amount_requested)
+    area_ha = _f(area_ha)
+    if ns_totals:
+        ns_totals = {k: _f(v) for k, v in ns_totals.items()}
+
     # ── Filière de référence (ValueChain) ────────────────────────────────────
     value_chain = None
     if value_chain_code:

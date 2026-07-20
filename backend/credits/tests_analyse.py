@@ -359,6 +359,81 @@ class ScoreursTests(TestCase):
         self.assertIs(res["details"]["historiqueDisponible"], False)
         self.assertIn("non disponible", res["details"]["commentaire"])
 
+    # ── C4 avec historique — branche longtemps NON TESTÉE ────────────────────
+    #
+    # Elle était classée « pas calibrable faute de dossier réel ». C'est vrai des
+    # COEFFICIENTS (60 % taux de remboursement / 40 % part soldée / −20 par
+    # incident), qui appellent une décision du comité. Ce n'est pas vrai du
+    # CHEMIN DE CODE : rien n'empêchait de vérifier qu'il s'exécute et produit
+    # des valeurs sensées. « Non calibrable » et « non vérifié » avaient été
+    # confondus, sur le critère qui pèse 30 % du score.
+
+    def _pret(self, user, *, approuve: str, rembourse: str, statut):
+        from portfolio.models import Loan, LoanTransaction
+        _SEQ["n"] += 1
+        pret = Loan.objects.create(
+            reference=f"CRD-TEST-{_SEQ['n']:04d}", operator=user.full_name,
+            borrower_sub=str(user.pk), amount_approved=Decimal(approuve),
+            status=statut,
+        )
+        LoanTransaction.objects.create(
+            loan=pret, kind=LoanTransaction.Kind.DISBURSEMENT,
+            amount=Decimal(approuve))
+        if Decimal(rembourse) > 0:
+            LoanTransaction.objects.create(
+                loan=pret, kind=LoanTransaction.Kind.REPAYMENT,
+                amount=-Decimal(rembourse))
+        return pret
+
+    def test_comportemental_credit_solde_integralement(self):
+        from portfolio.models import Loan
+        user = _user("sub-bon-payeur", "Bon Payeur")
+        self._pret(user, approuve="1000", rembourse="1000", statut=Loan.Status.CLOTURE)
+
+        res = scorer_comportemental(user, None, Decimal("30"))
+        self.assertIs(res["details"]["historiqueDisponible"], True)
+        self.assertEqual(res["details"]["nbCredits"], 1)
+        self.assertEqual(res["details"]["nbClotures"], 1)
+        self.assertEqual(res["details"]["nbDefauts"], 0)
+        self.assertEqual(res["details"]["tauxRemboursement"], 1.0)
+        # 1,0 × 60 + 1,0 × 40 = 100, aucun incident.
+        self.assertEqual(res["score"], Decimal("100.0"))
+        self.assertEqual(res["points"], Decimal("30.0"))
+
+    def test_comportemental_defaut_penalise_et_reste_dans_les_bornes(self):
+        from portfolio.models import Loan
+        user = _user("sub-defaut", "Mauvais Payeur")
+        self._pret(user, approuve="1000", rembourse="100", statut=Loan.Status.DEFAUT)
+
+        res = scorer_comportemental(user, None, Decimal("30"))
+        self.assertIs(res["details"]["historiqueDisponible"], True)
+        self.assertEqual(res["details"]["nbDefauts"], 1)
+        # 0,1 × 60 + 0 × 40 − 20 = −14 → borné à 0, jamais négatif : un score
+        # négatif ferait baisser le total en dessous de la somme des autres
+        # critères et casserait l'invariant Σ points = score global.
+        self.assertEqual(res["score"], Decimal("0.0"))
+        self.assertEqual(res["points"], Decimal("0.0"))
+
+    def test_comportemental_borne_haute_meme_si_surrembourse(self):
+        """Un remboursement supérieur au capital (pénalités, frais) ne dépasse pas 100."""
+        from portfolio.models import Loan
+        user = _user("sub-surpaye", "Sur Payeur")
+        self._pret(user, approuve="1000", rembourse="1400", statut=Loan.Status.CLOTURE)
+        res = scorer_comportemental(user, None, Decimal("30"))
+        self.assertLessEqual(res["score"], Decimal("100.0"))
+        self.assertEqual(res["points"], Decimal("30.0"))
+
+    def test_comportemental_historique_d_un_autre_client_n_est_pas_lu(self):
+        """Le rapprochement se fait sur `borrower_sub` — pas de fuite entre clients."""
+        from portfolio.models import Loan
+        autre = _user("sub-voisin", "Voisin")
+        self._pret(autre, approuve="1000", rembourse="1000", statut=Loan.Status.CLOTURE)
+
+        vierge = _user("sub-sans-rien", "Sans Historique")
+        res = scorer_comportemental(vierge, None, Decimal("30"))
+        self.assertIs(res["details"]["historiqueDisponible"], False)
+        self.assertEqual(res["score"], Decimal("50.0"))
+
     def test_garanties_sans_garantie_plafonnees(self):
         app = _app()
         res = scorer_garanties(app, self.baremes["COUVERTURE_GARANTIES"], Decimal("15"))
