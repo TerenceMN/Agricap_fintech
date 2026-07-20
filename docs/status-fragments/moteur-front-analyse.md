@@ -430,6 +430,20 @@ Règle pour la prochaine dette de cette famille : balayer le dépôt d'abord,
 et n'écrire une prescription qu'après la seconde étape, jamais après la
 première.
 
+**Deux règles d'écriture, tirées des dégâts constatés :**
+
+- **Un fragment de statut cite des clés, pas des valeurs.** Ce document a été
+  préservé de la péremption qui a frappé le §2.2 de `moteur-front-backend`
+  (chiffres calculés sur un référentiel depuis supprimé) uniquement parce qu'il
+  ne documente que des noms de champs. C'était de la chance ; c'est désormais la
+  règle. Les valeurs vont dans un artefact **daté**, avec de quoi savoir de quand
+  il parle.
+- **Une vérification s'horodate ou se rejoue.** Un contrôle passé une fois puis
+  affirmé au présent n'est plus une vérification, c'est un souvenir (formule de
+  `moteur-backend`, qui a repris sa migration réversible pour cette raison). Le
+  décompte eslint du §5 a été rejoué en fin de lot pour cette raison, et la
+  formulation qui l'accompagnait s'est révélée imprécise.
+
 **Ce qui a réellement fonctionné**, et ce n'est pas « chacun vérifie l'autre » :
 les deux agents ont publié leurs corrections **en encadré visible** plutôt qu'en
 réécriture silencieuse. Sans cela, ni le `pipeline.py` inexistant ni le
@@ -522,10 +536,17 @@ l'a pas.
   garde-fou, `CreditDetailsModal.jsx` étant un `.jsx` non type-checké.
 - `npx eslint src/components/analyse src/components/admin/credits/CreditDetailsModal.jsx` :
   6 erreurs, toutes `import/no-unresolved` sur l'alias `@/` pointant vers des
-  modules `.ts` — **préexistantes** (elles frappent aussi
-  `CreditDetailsModal.jsx` sur son import `@/services/api` d'origine et le
-  sous-dossier `simulateur/`). Résolveur eslint à configurer, ce n'est pas une
-  régression de ce lot.
+  modules `.ts`. **Rejoué en fin de lot**, après l'ajout des dix fichiers : même
+  décompte.
+
+  Formulation précisée : c'est la **défaillance du résolveur** qui est
+  préexistante — elle frappe aussi l'import `@/services/api` d'origine de
+  `CreditDetailsModal.jsx` et le sous-dossier `simulateur/`. Trois des six
+  occurrences sont en revanche dans des fichiers **de ce lot** (`AnalyseTab`,
+  `JustifyIndicatorDialog` ×2, `useCreditAnalyse`) : elles sont nouvelles, même
+  si leur cause ne l'est pas. Écrire « toutes préexistantes » laissait entendre
+  que ce lot n'en ajoutait aucune. Le résolveur eslint reste à configurer ; ce
+  n'est pas une régression, mais ce n'est pas non plus un statu quo.
 
 ### 5.1 Deux défauts trouvés par **lecture**, pas par exécution
 
