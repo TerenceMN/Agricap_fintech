@@ -19,6 +19,11 @@ des enregistrements CreditGuarantee dans le module credits.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # imports differes a l'execution (cf. corps des fonctions)
+    from credits.models import CreditGuarantee
+
 import uuid
 from decimal import Decimal
 from typing import Any
@@ -76,7 +81,7 @@ def place_savings_hold(
     amount: Decimal,
     registered_by_sub: str,
     notes: str = "",
-) -> "credits.models.CreditGuarantee":
+) -> "CreditGuarantee":
     """
     Bloque `amount` sur le plan d'épargne `savings_plan_id` pour le dossier.
 
@@ -227,7 +232,7 @@ def place_asset_guarantee(
     application,
     asset_id: int,
     registered_by_sub: str,
-) -> "credits.models.CreditGuarantee":
+) -> "CreditGuarantee":
     """Pose un gage sur un actif vérifié du client.
 
     Cinq règles bloquantes, dans cet ordre — chacune renvoie un code distinct
@@ -351,7 +356,7 @@ def register_moral_guarantee(
     guarantor_sub: str = "",
     montant_couvert: Decimal | None = None,
     notes: str = "",
-) -> "credits.models.CreditGuarantee":
+) -> "CreditGuarantee":
     """Désigne un garant — la caution reste inopposable tant qu'il n'a pas consenti.
 
     Ce qui change par rapport à la version déclarative : le garant doit être un
@@ -452,7 +457,7 @@ def record_guarantor_consent(
     accept: bool,
     channel: str = "app",
     ip: str | None = None,
-) -> "credits.models.CreditGuarantee":
+) -> "CreditGuarantee":
     """Le garant accepte ou refuse sa caution — acte unique et horodaté.
 
     Calqué sur `workflow.record_client_consent` : même contrôle d'identité (seul
@@ -555,7 +560,7 @@ def record_guarantor_consent(
 
 def confirm_moral_guarantee(
     guarantee, confirmer_sub: str
-) -> "credits.models.CreditGuarantee":
+) -> "CreditGuarantee":
     """Constitution de la caution par l'agent — `consented` → `active`.
 
     C'est le `constituted` de la SPEC : l'agent acte que la caution consentie est
@@ -669,10 +674,65 @@ def _audit(*, actor: str, action: str, guarantee, details: dict | None = None,
     )
 
 
-# ── Notification SMS garant ────────────────────────────────────────────────────
+# ── Notification du garant ────────────────────────────────────────────────────
+
+#: Écran garant côté front. Le chemin est porté dans le CORPS de la notification
+#: parce que `notifications.Notification` n'a pas de champ d'URL — voir la note
+#: du fragment de lot : ajouter ce champ est une décision qui engage une app
+#: partagée, pas un effet de bord de ce lot.
+GUARANTEE_REQUESTS_PATH = "/guarantee-requests"
+
+
+def _notify_guarantor(guarantee) -> None:
+    """Prévient le garant sur les deux canaux, avec le chemin de l'écran.
+
+    Signalé par l'agent front : rien ne pointait vers l'écran garant. Une
+    notification sans chemin laisse la fenêtre de 72 h expirer **faute d'accès**,
+    pas faute de décision — le consentement devient alors un obstacle
+    administratif au lieu d'être un acte.
+    """
+    _notify_guarantor_inapp(guarantee)
+    _notify_guarantor_sms(guarantee)
+
+
+def _notify_guarantor_inapp(guarantee) -> None:
+    """Dépose la demande dans la boîte de notifications du garant.
+
+    Volontairement **non** best-effort, contrairement au SMS : c'est une écriture
+    dans la même base et la même transaction que la désignation. Un garant qui
+    n'est pas notifié ne peut pas consentir, donc une caution silencieusement
+    non notifiée est une caution qui expirera — mieux vaut que la désignation
+    échoue franchement que de créer un engagement que personne ne verra.
+    """
+    from notifications.models import Notification
+
+    app = guarantee.application
+    deadline = guarantee.consent_expires_at or guarantee.expires_at
+    echeance = deadline.strftime("%d/%m/%Y à %H:%M") if deadline else "prochainement"
+
+    Notification.objects.create(
+        user=guarantee.guarantor,
+        title="Demande de caution solidaire",
+        body=(
+            f"{app.client.full_name} vous désigne comme garant de son dossier de "
+            f"crédit {app.code}, à hauteur de {guarantee.covered_amount} "
+            f"{guarantee.hold_currency}. En cas de défaut de sa part, vous vous "
+            f"engagez solidairement à hauteur de ce montant.\n\n"
+            f"Vous devez accepter ou refuser avant le {echeance}. "
+            f"Sans réponse de votre part, la demande expire et vous n'êtes engagé "
+            f"à rien.\n\n"
+            f"Répondre : {GUARANTEE_REQUESTS_PATH}"
+        ),
+    )
+
 
 def _notify_guarantor_sms(guarantee) -> None:
-    """Envoie un SMS au garant (best-effort, échec silencieux)."""
+    """Envoie un SMS au garant (best-effort, échec silencieux).
+
+    Best-effort assumé : le SMS dépend d'un tiers (Dream Digital) et d'un réseau.
+    Son échec ne doit pas annuler une désignation, la notification in-app faisant
+    foi comme canal de rattrapage.
+    """
     try:
         from common.sms import send_sms
         phone = guarantee.guarantor_phone
@@ -683,9 +743,9 @@ def _notify_guarantor_sms(guarantee) -> None:
             f"AGRICAP : {app.client.full_name} vous désigne comme garant du "
             f"dossier crédit {app.code}, à hauteur de "
             f"{guarantee.covered_amount} {guarantee.hold_currency}. "
-            f"Vous devez accepter ou refuser avant le {expires} dans "
-            f"l'application ou auprès de votre agence. Sans réponse, la demande "
-            f"expire."
+            f"Acceptez ou refusez avant le {expires} dans l'application "
+            f"(rubrique « Demandes de caution ») ou auprès de votre agence. "
+            f"Sans réponse, la demande expire et ne vous engage à rien."
         )
         send_sms(phone, message)
     except Exception:

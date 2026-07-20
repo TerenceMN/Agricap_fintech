@@ -15,6 +15,11 @@ Flux :
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # imports differes a l'execution (cf. corps des fonctions)
+    from credits.models import DisbursementRequest
+
 import uuid
 from datetime import date
 from decimal import Decimal
@@ -95,7 +100,7 @@ def request_disbursement(
     app,
     requester_sub: str,
     notes: str = "",
-) -> "credits.models.DisbursementRequest":
+) -> "DisbursementRequest":
     """
     APPROVED → PENDING_DISBURSEMENT.
     Crée un DisbursementRequest en attente de double validation.

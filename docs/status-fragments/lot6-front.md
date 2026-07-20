@@ -294,15 +294,37 @@ Restent à valider en conditions réelles :
 
 ## 5. Reste à faire (hors périmètre de ce lot)
 
-1. **Point d'entrée dans la navigation.** La route existe, mais rien ne pointe
-   vers `/guarantee-requests` : ni le menu de `Layout`, ni `ClientNotifications`.
-   Un garant notifié n'a aujourd'hui aucun moyen d'atteindre l'écran autrement
-   qu'en tapant l'URL. C'est le maillon manquant le plus important — sans lui, la
-   fenêtre de consentement expire faute d'accès, pas faute de décision.
-   `Layout.jsx` est hors de mon périmètre ; à attribuer.
-2. **Notification au garant.** La SPEC §2.5 prévoit d'informer le garant via
-   `ClientNotifications`. Je n'ai pas vérifié que le backend l'émet, ni que cet
-   écran-là sait afficher une notification de type caution.
+1. ✅ **Point d'entrée dans la navigation — comblé** (hors de mon fait).
+   `Layout.jsx:60` porte désormais
+   `{ icon: ShieldCheck, label: 'Demandes de caution', path: '/guarantee-requests' }`
+   dans le bucket `client`. Je ne l'ai pas écrit — `Layout.jsx` n'est pas dans
+   mon périmètre — mais je l'ai vérifié : import présent, build vert.
+
+   **Résidu assumé** : l'entrée n'existe que pour le bucket `client`. Ma route est
+   volontairement sans garde `roles` (cf. §1.8) précisément pour qu'un agent ou un
+   salarié caution d'un membre de son groupe puisse y accéder ; pour eux, l'écran
+   reste atteignable **uniquement par URL**. Le cas est plus rare qu'un garant
+   client, mais il produit le même échec silencieux : une fenêtre qui expire faute
+   d'accès. À trancher par qui possède `Layout.jsx` — soit l'entrée est ajoutée aux
+   autres buckets, soit on acte que le personnel ne se porte pas caution.
+
+2. ✅ **Notification au garant — émise** (`lot6-backend`, deux canaux). In-app dans
+   la transaction de désignation (non best-effort, pour qu'un engagement invisible
+   ne puisse pas exister) + SMS best-effort. Les deux portent l'engagement en clair,
+   l'échéance et le chemin `/guarantee-requests`.
+
+   **Limite connue, non résolue** : `notifications.Notification` n'a pas de champ
+   d'URL — le chemin voyage dans le **corps du message, en texte**. Il est donc
+   lisible mais **pas cliquable** depuis `ClientNotifications.jsx`, qui consomme
+   `{id, title, body, read, createdAt}` (vérifié dans le fichier).
+
+   Ajouter un champ `url` est un **changement de contrat entre apps** : il migre
+   `notifications`, modifie le payload et touche `ClientNotifications.jsx`. Ni ce
+   fichier ni l'app `notifications` ne sont dans mon périmètre, et `lot6-backend`
+   a eu raison de ne pas le faire unilatéralement. **Décision à prendre par le
+   fondateur ou par qui possède ces deux surfaces**, pas entre nos deux lots :
+   c'est peu de code mais un contrat partagé, et c'est ainsi que le projet s'est
+   retrouvé avec quatre vocabulaires de rôles.
 3. **Désignation du garant côté demandeur.** `lot6-backend` §1.3 étend
    `guarantees/moral/` avec `guarantor_sub` requis. Le front de `Credits.jsx`
    (étape 3) présente toujours la caution solidaire en carte informative

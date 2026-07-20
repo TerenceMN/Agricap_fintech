@@ -289,6 +289,27 @@ la décote vient bien de la base.
 | 4 seuils institutionnels | `referentiel/models.py` |
 | Migrations | `credits/0009`, `referentiel/0002` |
 
+**Notification du garant** (ajouté après signalement de l'agent front : rien ne
+pointait vers l'écran garant). La désignation dépose une
+`notifications.Notification` dans la boîte du garant, énonçant l'engagement en
+clair (« en cas de défaut de X, vous vous engagez solidairement à hauteur de Y »),
+l'échéance, et **le chemin `/guarantee-requests`**. Le SMS porte la même
+information.
+
+Répartition des exigences, volontairement asymétrique :
+
+| Canal | Best-effort ? | Pourquoi |
+|---|---|---|
+| Notification in-app | **non** — dans la transaction | écriture dans la même base ; un garant non notifié ne consentira pas, donc mieux vaut échouer franchement que créer un engagement invisible |
+| SMS | oui | dépend d'un tiers (Dream Digital) et du réseau ; son échec ne doit pas annuler une désignation, l'in-app servant de rattrapage |
+
+**Limite** : `notifications.Notification` n'a **pas** de champ d'URL — le chemin
+est écrit dans le corps du message, en texte. Ajouter un champ `url` migrerait
+une app partagée et changerait le payload que `ClientNotifications` consomme :
+c'est une décision de contrat entre apps, pas un effet de bord de ce lot. Je ne
+l'ai pas prise unilatéralement. Elle est à arbitrer si l'on veut un lien
+cliquable plutôt qu'un chemin lisible.
+
 **Journalisation** : `credits.guarantee.guarantor_designated`,
 `.consent_accepted`, `.consent_declined`, `.constituted` dans `audit.AuditEntry`,
 via `audit.services.record` (pas de journal réinventé). L'appel est
@@ -318,13 +339,13 @@ test qui vérifie qu'aucune règle ne sort le code générique.
 
 ## 6. Tests
 
-`./.venv/Scripts/python.exe manage.py test` → **507 tests, 8 échecs**, tous dans
+`./.venv/Scripts/python.exe manage.py test` → **512 tests, 8 échecs**, tous dans
 `support/` (7 failures + 1 error) — les préexistants annoncés, non touchés.
-Baseline 427 + **80 nouveaux tests**, tous verts.
+Baseline 427 + **85 nouveaux tests**, tous verts.
 
-- `credits/tests_guarantor.py` (55) — les 7 règles **en refus ET en cas nominal**,
+- `credits/tests_guarantor.py` (60) — les 7 règles **en refus ET en cas nominal**,
   le consentement, l'expiration, la caution croisée, l'immuabilité, la décote,
-  le contrat des codes d'erreur.
+  le contrat des codes d'erreur, la notification du garant.
 - `credits/tests_guarantee_requests_api.py` (25) — forme exacte des 2 endpoints,
   statuts HTTP, isolation par garant, anti-gaming de la réponse.
 

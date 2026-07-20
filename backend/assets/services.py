@@ -14,6 +14,11 @@ Transitions autorisées :
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # imports differes a l'execution (cf. corps des fonctions)
+    from assets.models import Asset
+
 from decimal import Decimal
 
 from django.conf import settings
@@ -117,7 +122,7 @@ def reject_asset(asset, verifier_sub: str, motif: str) -> None:
 # ── Gage / libération ─────────────────────────────────────────────────────────
 
 @transaction.atomic
-def pledge_asset(asset_id: int, application) -> "assets.models.Asset":
+def pledge_asset(asset_id: int, application) -> "Asset":
     """`verifie|libere` → `gage`, sous verrou.
 
     Le `select_for_update` est le cœur de la protection contre le double gage :

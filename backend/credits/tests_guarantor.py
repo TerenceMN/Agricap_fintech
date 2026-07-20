@@ -460,6 +460,73 @@ class ConsentFlowTests(GuarantorRulesTestCase):
         self.assertEqual(guarantee.status, CreditGuarantee.Status.DECLINED)
 
 
+class GuarantorNotificationTests(GuarantorRulesTestCase):
+    """Un garant non joignable est un garant qui n'engagera rien.
+
+    Signalé par l'agent front : rien ne pointait vers l'écran garant. Une
+    notification sans chemin laisse la fenêtre expirer faute d'accès, pas faute
+    de décision.
+    """
+
+    def test_la_designation_notifie_le_garant(self):
+        from notifications.models import Notification
+        _designate(self.app, self.garant, montant="400")
+        notif = Notification.objects.get(user=self.garant)
+        self.assertEqual(notif.title, "Demande de caution solidaire")
+        self.assertFalse(notif.read)
+
+    def test_la_notification_porte_le_chemin_de_l_ecran(self):
+        from credits.guarantees import GUARANTEE_REQUESTS_PATH
+        from notifications.models import Notification
+        _designate(self.app, self.garant)
+        self.assertIn(GUARANTEE_REQUESTS_PATH,
+                      Notification.objects.get(user=self.garant).body)
+
+    def test_la_notification_enonce_l_engagement_en_clair(self):
+        """« C'est un acte juridique, pas un clic social » (SPEC §2.5)."""
+        from notifications.models import Notification
+        _designate(self.app, self.garant, montant="400")
+        body = Notification.objects.get(user=self.garant).body
+        self.assertIn("400", body)
+        self.assertIn(self.demandeur.full_name, body)
+        self.assertIn("solidairement", body)
+
+    def test_le_demandeur_n_est_pas_notifie_a_la_place_du_garant(self):
+        from notifications.models import Notification
+        _designate(self.app, self.garant)
+        self.assertFalse(Notification.objects.filter(user=self.demandeur).exists())
+
+    def test_une_caution_refusee_a_la_pose_ne_notifie_personne(self):
+        from notifications.models import Notification
+        etranger = _user("sub-non-notifie")
+        _savings(etranger, "9000")
+        self._refus(garant=etranger)
+        self.assertFalse(Notification.objects.filter(user=etranger).exists())
+
+    def test_un_garant_staff_est_notifie_comme_un_garant_client(self):
+        """Un salarié peut cautionner un membre de son groupe.
+
+        Signalé par l'agent front : l'entrée de menu vers l'écran garant n'existe
+        que pour le bucket `client`, donc un garant staff n'atteint l'écran que
+        par URL. La notification in-app portant le chemin est alors son SEUL
+        accès — d'où ce test, qui vérifie qu'elle lui parvient réellement au lieu
+        de le supposer.
+        """
+        from credits.guarantees import GUARANTEE_REQUESTS_PATH
+        from notifications.models import Notification
+        from rbac.models import StaffProfile
+
+        salarie = _user("sub-garant-staff", "Agent Garant")
+        StaffProfile.objects.create(user=salarie, status=StaffProfile.Status.ACTIF)
+        _group("AVEC Mixte", self.demandeur, salarie)
+        _savings(salarie, "5000")
+
+        _designate(_app(self.demandeur), salarie, montant="300")
+
+        notif = Notification.objects.get(user=salarie)
+        self.assertIn(GUARANTEE_REQUESTS_PATH, notif.body)
+
+
 class ConsentMetaImmutabilityTests(GuarantorRulesTestCase):
 
     def test_consent_meta_non_reecrivable(self):
