@@ -25,7 +25,8 @@ Fichiers d'appui créés :
 - [src/components/backoffice/States.tsx](../../src/components/backoffice/States.tsx) —
   `Loading` / `Empty` / `ErrorPanel` / `Forbidden` / `KpiCard` / `TruncationNotice`.
   `KpiCard` exige `scope` et `period` : le §7.2 « KPI honnêtes » est rendu structurel plutôt
-  que laissé à la discipline de chaque écran.
+  que laissé à la discipline de chaque écran. `toFieldErrors` restitue les codes métier
+  servis par `ApiError` (§3.4).
 
 Routes déclarées dans [src/App.jsx](../../src/App.jsx) **sans prop `roles`**, délibérément :
 `PrivateRoute roles={…}` compare via `menuKeyFor`, qui écrase les 16 rôles canoniques en
@@ -139,30 +140,27 @@ un nom qui affirme « Usd ».
 | Simulation d'échéancier à paramètres non enregistrés | aucun (`/schedule` porte sur la config **sauvegardée**) | Simulation locale conservée mais étiquetée (§2) |
 | Filtre multi-statuts | `?status=a,b,c` sur `/applications/` | Trois requêtes parallèles depuis le front |
 
-### 3.4 Limite de la couche service (`src/services/api.ts`, hors périmètre)
+### 3.4 Couche service — ✅ RÉSOLU
 
-`request()` ne conserve que le champ `detail` d'une réponse d'erreur :
+> **Mise à jour.** Cette section documentait une perte d'information dans `api.ts` :
+> seul le champ `detail` d'une réponse d'erreur était conservé, ce qui aplatissait les 422
+> multi-erreurs et **jetait le `code` métier**. Un troisième agent a corrigé pendant le lot.
 
-```ts
-detail = ((await res.json()) as { detail?: string }).detail || detail;
-```
+`ApiError` porte désormais `status`, `message`, `code` (code métier du backend) et
+`errors[]` (`{code, message}` par erreur du pipeline de validation). Le principe 5
+— « réponse 422 structurée `{code, message}` par erreur, jamais un message générique » —
+est donc tenu de bout en bout, du serveur à l'écran.
 
-Deux pertes, pas une :
+**Adaptation faite de mon côté** : `toFieldErrors` fabriquait `code: String(err.status)`,
+c'est-à-dire qu'il présentait « 422 » comme s'il s'agissait d'un code métier. C'était un
+pis-aller acceptable tant qu'aucun code réel n'existait ; c'est devenu trompeur dès lors
+qu'il en existe un. Il restitue maintenant, par ordre de précision décroissante :
+`errors[]` (une ligne par erreur, chacune avec son code) → `code` + `message` → `message`
+seul. **Règle posée dans le fichier : quand le backend n'envoie pas de code, on n'en invente
+pas** — un statut HTTP dit que la requête a été refusée, pas pourquoi.
 
-- les 422 structurées du backend (`{errors: [{code, message}, …]}`, principe 5) sont
-  **aplaties en une ligne** ;
-- le champ **`code`** scalaire des corps 422/409 est **jeté** : `ApiError` ne porte que
-  `status` et `message`. Aucun écran ne peut router sur un code d'erreur métier.
-
-Conséquence sur mes écrans : la file de vérification des actifs reçoit bien
-`{detail, code: "ASSET_VERIFY_REFUSED"}` mais n'affiche que `detail`. Acceptable ici — je ne
-route sur aucun code — mais c'est de la chance, pas de la conception. `front-garanties`
-rencontre le même mur et contourne par signature du texte de `detail`, ce qui est fragile
-(tout reformulage d'un message serveur casse silencieusement le routage).
-
-`ErrorPanel` sait afficher une liste et un code dès que la couche service les transmettra.
-Correctif attendu dans `api.ts` : conserver le corps d'erreur complet sur `ApiError`
-(`code`, `errors[]`) plutôt que d'extraire le seul `detail`.
+Retombée concrète : la file de vérification des actifs affiche désormais
+`ASSET_VERIFY_REFUSED` / `ASSET_REJECT_REFUSED` en regard du message, au lieu de « 422 ».
 
 ---
 
@@ -247,7 +245,27 @@ parce que le type mentait, et un écran qui affiche « — » ne lève aucune al
 l'illustration la plus nette de ce que coûte un type faux — il ne cache pas seulement des
 erreurs de compilation, il rend indétectables des bugs d'affichage.
 
-### 4.4 Build — cassé pendant le développement, réparé depuis
+### 4.4 Édition concurrente non coordonnée — risque d'écrasement
+
+Constaté deux fois pendant ce lot, dans les deux sens :
+
+- `ApplicationDetail.tsx` (mon périmètre) a été partiellement corrigé par un tiers pendant
+  que je le réparais : une de mes éditions a été refusée en « File has been modified since
+  read », et plusieurs renommages que je m'apprêtais à faire étaient déjà appliqués ;
+- `front-garanties` rapporte le même phénomène sur l'en-tête de `guaranteeErrors.js`, dans
+  son propre périmètre.
+
+Aucun dégât dans les deux cas — les contenus concordaient — mais c'est de la chance. Deux
+agents qui éditent le même fichier sans le savoir finissent par écraser du travail, et rien
+dans l'outillage ne le signale : `tsc` et `vite build` valident le résultat de l'écrasement
+aussi volontiers que celui du travail perdu.
+
+Les corrections transverses utiles (`types/api.ts`, `api.ts`) ont d'ailleurs été faites par
+un troisième agent, sans que les demandeurs en soient informés — j'ai remonté à `main` une
+demande déjà satisfaite. Un registre des fichiers en cours d'édition, ou simplement l'annonce
+d'une correction transverse aux périmètres concernés, éviterait les deux symptômes.
+
+### 4.5 Build — cassé pendant le développement, réparé depuis
 
 `npx vite build` a échoué pendant tout mon développement sur
 `src/pages/Credits.jsx:572 — "The symbol GUARANTEE_CONFIG has already been declared"`

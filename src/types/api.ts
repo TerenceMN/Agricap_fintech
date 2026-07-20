@@ -759,16 +759,39 @@ export interface CreditScoreResult {
   scheduleDraft?: Array<{ month: number; payment: number; principal: number; interest: number; balance: number }>;
 }
 
+/** Actif sous-jacent d'un gage, tel qu'imbriqué dans une garantie
+ *  `materiel`/`foncier` par `credits.guarantees.get_guarantee_summary`. */
+export interface CreditGuaranteeAsset {
+  id: number;
+  name: string;
+  /** Catégorie du registre : materiel | foncier | vehicule | stock | autre */
+  category: string;
+  /** Valeur déclarée par le client — ne couvre RIEN. */
+  declaredValue: number;
+  /** Valeur retenue après décote — la seule qui entre dans la couverture. */
+  retainedValue: number | null;
+  currency: string;
+  status: string;
+  verifiedAt: string | null;
+}
+
 export interface CreditGuaranteeItem {
   id: number;
-  type: 'epargne' | 'morale';
+  /** Codes canoniques du backend (principe 6). */
+  type: 'epargne' | 'morale' | 'materiel' | 'foncier';
   status: 'pending' | 'active' | 'released' | 'expired';
+  /** Montant réellement couvert, après décote. */
+  coveredAmount?: number | null;
   createdAt: string;
+  // Gage sur actif (materiel / foncier)
+  asset?: CreditGuaranteeAsset;
+  // Nantissement épargne
   holdAmount?: number;
   holdCurrency?: string;
   holdReference?: string;
   holdPlacedAt?: string | null;
   availableBalance?: number | null;
+  // Caution solidaire
   guarantorName?: string;
   guarantorPhone?: string;
   confirmedAt?: string | null;
@@ -777,10 +800,22 @@ export interface CreditGuaranteeItem {
   daysLeft?: number | null;
 }
 
+/** Couverture agrégée d'un dossier.
+ *  Calculée sur les **valeurs retenues** des garanties ACTIVES uniquement —
+ *  une garantie en attente de confirmation ne couvre rien. */
+export interface CreditGuaranteeCoverage {
+  retainedTotal: number;
+  currency: string;
+  requestedAmount: number | null;
+  ratio: number | null;
+  activeCount: number;
+}
+
 export interface CreditGuaranteeSet {
   count: number;
-  guaranteeType: 'epargne' | 'morale' | null;
+  guaranteeType: 'epargne' | 'morale' | 'materiel' | 'foncier' | null;
   items: CreditGuaranteeItem[];
+  coverage?: CreditGuaranteeCoverage;
 }
 
 export interface CreditDisbursement {

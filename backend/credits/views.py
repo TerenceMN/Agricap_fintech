@@ -760,7 +760,13 @@ def submit_application(request: Request, code: str) -> Response:
     try:
         submit(app, submitter_sub=sub)
     except WorkflowError as exc:
-        return Response({"detail": str(exc)}, status=400)
+        # Statut HTTP inchangé (400) : le passer à 422 serait plus conforme au
+        # principe 5, mais c'est un changement de contrat sur un endpoint déjà
+        # câblé côté front — à faire dans une passe coordonnée, pas en silence.
+        return Response(
+            {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+            status=400,
+        )
 
     from credits.workflow import serialize_application
     return Response(serialize_application(app))

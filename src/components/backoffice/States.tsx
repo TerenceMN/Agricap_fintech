@@ -5,12 +5,16 @@
  * erreur, vide (CLAUDE.md §5 « Frontend »). Les centraliser ici évite qu'un
  * écran oublie le cas vide ou affiche un spinner éternel sur une 403.
  *
- * Limite connue de la couche service : `api.ts::request` ne conserve que le
- * champ `detail` d'une réponse d'erreur. Les 422 structurées du backend
- * (`{errors: [{code, message}, …]}`) sont donc réduites à une ligne avant
- * d'arriver ici. `ErrorPanel` sait afficher une liste dès que la couche service
- * la transmettra ; en attendant il affiche le message unique. Dette signalée
- * dans `docs/status-fragments/front-backoffice.md`.
+ * `api.ts::ApiError` porte désormais `code` (code métier du backend) et
+ * `errors[]` (422 multi-erreurs du pipeline de validation), en plus de `status`
+ * et `message`. `toFieldErrors` les restitue tels quels : une ligne par erreur
+ * serveur, avec son propre code — le principe 5 (« réponse 422 structurée
+ * {code, message} par erreur, jamais un message générique ») est donc tenu de
+ * bout en bout.
+ *
+ * Règle : ne JAMAIS présenter le statut HTTP comme un code métier. « 422 » dit à
+ * l'utilisateur que sa requête a été refusée, pas pourquoi. Quand le backend
+ * n'envoie pas de `code`, on n'en invente pas — on affiche le seul message.
  */
 import React from 'react';
 import { ApiError } from '@/services/api';
@@ -31,9 +35,21 @@ export interface FieldError {
   message: string;
 }
 
-/** Extrait une liste d'erreurs affichables. Une seule tant que `api.ts` aplatit. */
+/**
+ * Extrait la liste d'erreurs affichables d'une exception.
+ *
+ * Ordre de préférence, du plus précis au plus pauvre :
+ *   1. `errors[]` — une ligne par erreur de validation, chacune avec son code ;
+ *   2. `code` + `message` — erreur métier unitaire (ex. `ASSET_VERIFY_REFUSED`) ;
+ *   3. `message` seul — le backend n'a pas envoyé de code : on n'en fabrique pas.
+ */
 export function toFieldErrors(err: unknown): FieldError[] {
-  if (err instanceof ApiError) return [{ code: String(err.status), message: err.message }];
+  if (err instanceof ApiError) {
+    if (err.errors.length > 0) {
+      return err.errors.map((e) => ({ code: e.code, message: e.message }));
+    }
+    return [{ code: err.code ?? undefined, message: err.message }];
+  }
   if (err instanceof Error) return [{ message: err.message }];
   return [{ message: String(err) }];
 }

@@ -30,26 +30,61 @@ logger = logging.getLogger(__name__)
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 class WorkflowError(Exception):
-    """Transition invalide ou règle métier violée."""
+    """Transition invalide ou règle métier violée.
+
+    Chaque sous-classe porte son `code` : c'est lui que le front consomme, jamais
+    la formulation du message. `errors` détaille les causes quand il y en a
+    plusieurs — un « dossier incomplet » qui agrège quatre manques en une phrase
+    n'est pas exploitable par une interface (principe 5).
+    """
+
+    code = "WORKFLOW_ERROR"
+
+    def __init__(self, message: str, errors: list[dict] | None = None) -> None:
+        super().__init__(message)
+        #: `[{code, message}]` — vide quand la cause est unique (voir `as_errors`).
+        self.errors = errors or []
+
+    def as_errors(self) -> list[dict]:
+        """Représentation structurée, toujours non vide — prête pour la réponse API."""
+        return self.errors or [{"code": self.code, "message": str(self)}]
+
+
+class InvalidTransition(WorkflowError):
+    """Le statut courant n'autorise pas cette transition."""
+
+    code = "INVALID_TRANSITION"
+
+
+class ApplicationIncomplete(WorkflowError):
+    """Champs obligatoires manquants ou garanties devenues inéligibles."""
+
+    code = "APPLICATION_INCOMPLETE"
 
 
 class DelegationError(WorkflowError):
     """Montant hors délégation pour ce rôle."""
 
+    code = "DELEGATION_EXCEEDED"
+
 
 class MakerCheckerError(WorkflowError):
     """Soumetteur et approbateur sont la même personne."""
 
+    code = "MAKER_CHECKER_VIOLATION"
+
 
 class ConsentError(WorkflowError):
     """Consentement client manquant ou expiré pour demande on_behalf_of."""
+
+    code = "CLIENT_CONSENT_MISSING"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _assert_status(app, *allowed: str) -> None:
     if app.status not in allowed:
-        raise WorkflowError(
+        raise InvalidTransition(
             f"Transition impossible depuis le statut «{app.status}». "
             f"Statuts attendus : {', '.join(allowed)}."
         )
@@ -132,12 +167,18 @@ def _structured_rejection_message(app) -> str:
     return "\n".join(lines)
 
 
-def _ineligible_guarantee_errors(app) -> list[str]:
-    """Types de garantie du dossier devenus inadmis pour sa filière."""
+def _ineligible_guarantee_errors(app) -> list[dict]:
+    """Types de garantie du dossier devenus inadmis pour sa filière.
+
+    Conserve le `code` et le message de `GuaranteeTypeNotEligible` — celui-ci
+    énumère les types admis, information que le front ne peut pas reconstituer
+    (il ne connaît pas `ValueChain.eligible_guarantees`, et ne doit pas le
+    connaître : principe 7).
+    """
     from credits.guarantees import GuaranteeTypeNotEligible, assert_type_eligible
     from credits.models import CreditGuarantee
 
-    errors: list[str] = []
+    errors: list[dict] = []
     vivantes = app.guarantees.filter(
         status__in=[CreditGuarantee.Status.PENDING, CreditGuarantee.Status.ACTIVE],
     )
@@ -145,7 +186,7 @@ def _ineligible_guarantee_errors(app) -> list[str]:
         try:
             assert_type_eligible(app, guarantee.guarantee_type)
         except GuaranteeTypeNotEligible as exc:
-            errors.append(str(exc))
+            errors.append({"code": exc.code, "message": str(exc)})
     return errors
 
 
@@ -159,15 +200,19 @@ def submit(app, submitter_sub: str) -> None:
     """
     _assert_status(app, "draft")
 
-    errors = []
+    errors: list[dict] = []
     if not app.client_id:
-        errors.append("Client non renseigné.")
+        errors.append({"code": "CLIENT_MANQUANT",
+                       "message": "Client non renseigné."})
     if not app.value_chain_id:
-        errors.append("Filière (chaîne de valeur) non renseignée.")
+        errors.append({"code": "FILIERE_MANQUANTE",
+                       "message": "Filière (chaîne de valeur) non renseignée."})
     if not app.area_ha or app.area_ha <= 0:
-        errors.append("Superficie (area_ha) manquante ou nulle.")
+        errors.append({"code": "SUPERFICIE_MANQUANTE",
+                       "message": "Superficie (area_ha) manquante ou nulle."})
     if not app.amount_requested or app.amount_requested <= 0:
-        errors.append("Montant demandé manquant ou nul.")
+        errors.append({"code": "MONTANT_MANQUANT",
+                       "message": "Montant demandé manquant ou nul."})
 
     # Défense en profondeur : un dossier resté longtemps en brouillon peut
     # porter un type de garantie devenu inéligible depuis une mise à jour du
@@ -176,7 +221,12 @@ def submit(app, submitter_sub: str) -> None:
     errors.extend(_ineligible_guarantee_errors(app))
 
     if errors:
-        raise WorkflowError("Dossier incomplet : " + " | ".join(errors))
+        # Le message agrégé reste pour les appelants qui n'affichent que `detail` ;
+        # `errors` porte le détail exploitable, une entrée par cause.
+        raise ApplicationIncomplete(
+            "Dossier incomplet : " + " | ".join(e["message"] for e in errors),
+            errors=errors,
+        )
 
     app.status = "submitted"
     app.submitted_at = timezone.now()
