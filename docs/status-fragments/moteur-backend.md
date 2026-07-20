@@ -15,7 +15,7 @@
 | `backend/credits/management/commands/seed_analyse.py` | Amorçage idempotent des **barèmes** (`update_or_create`) |
 | `backend/credits/views.py` (fin de fichier) | 4 endpoints |
 | `backend/credits/urls.py` | Routes |
-| `backend/credits/tests_analyse.py` | **68 tests** |
+| `backend/credits/tests_analyse.py` | **72 tests** |
 
 `credits/echeancier.py` est **réutilisé tel quel**, non réécrit. La convention
 d'exceptions de `credits/workflow.py` (`code`, `http_status`, `as_errors()`) est
@@ -27,7 +27,7 @@ dossier tant qu'aucun simulateur n'a été ingéré — cf. §6. Ce n'était pas
 la première livraison : `seed_analyse` amorçait alors un référentiel écrit à la
 main, ce qui était un défaut (§6).
 
-**Tests** : 584 au total (baseline 516 + 68). `OK` hors les **8 échecs
+**Tests** : 588 au total (baseline 516 + 72). `OK` hors les **8 échecs
 préexistants de `support/`**, non touchés. Compte à jour en §5bis.
 
 ---
@@ -173,7 +173,17 @@ loggé si la somme ≠ 100.
    par `test_aucun_float_dans_les_montants_de_l_echeancier_stocke`.
 2. **`echeancier.py` produit `phase="differe"` (sans accent) ; le contrat type
    `'différé' | 'amortissement' | 'franchise'`.** Traduction dans `_PHASES_API`.
-   En mode `franchise_totale`, la phase de différé sort en `'franchise'`.
+   En mode `franchise_totale`, la phase de différé sort en `'franchise'` —
+   épinglé par `test_phase_franchise_traduite_pour_le_contrat_front`.
+
+   Ce mode n'avait **aucun test** jusqu'à la clôture, alors qu'il est atteignable
+   par l'API (`POST /reanalyser/` accepte `mode_differe`). Une entrée manquante
+   du mapping serait retombée en silence sur l'identifiant de stockage — valeur
+   hors union, que le front n'aurait indexée dans aucune classe CSS : tableau sans
+   style, sans erreur. Le front n'ayant aucune infrastructure de test, cette garde
+   est la seule du chemin. 4 tests ajoutés, dont l'annexe A.2 reproduite au centime
+   (CRD 1 432,78 en fin de différé · tranche 477,59 · service 1 475,76) —
+   `test_franchise_totale_reproduit_l_annexe_A2`.
 
 ### 3.2 Ajouts au contrat (additifs — aucune clé existante déplacée)
 
@@ -290,7 +300,7 @@ versionnée. **Deux défauts que seule cette confrontation a révélés :**
 Aucun des deux n'aurait été rattrapé par un test de contrat : le premier passe
 `checkJs: false`, le second était un texte grammaticalement correct.
 
-**Tests : 285 sur `credits` (68 sur le moteur), 584 au total.**
+**Tests : 289 sur `credits` (72 sur le moteur), 588 au total.**
 
 ### La vue client n'est branchée nulle part
 

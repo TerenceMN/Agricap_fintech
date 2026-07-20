@@ -252,6 +252,44 @@ class CasDeReferenceTests(TestCase):
         flux = [Decimal("935") / Decimal(8)] * 8
         self.assertEqual(calculer_dscr(flux, lignes), Decimal("0.636"))
 
+    def test_franchise_totale_reproduit_l_annexe_A2(self):
+        """Mode `franchise_totale` — SPEC annexe A.2, au centime.
+
+        Ce mode n'avait AUCUN test alors qu'il est atteignable par l'API
+        (`POST /reanalyser/` accepte `mode_differe`). Écrit une fois, jamais
+        gardé : c'est la catégorie de code qui casse sans que rien ne rougisse.
+
+        Le piège propre à ce mode est que le capital à amortir n'est plus `C`
+        mais le CRD gonflé des intérêts capitalisés — le pseudo-code de la SPEC
+        §4, qui calcule la tranche avant le différé, ne solderait pas le prêt.
+        """
+        lignes = construire_echeancier(
+            Decimal("1330"), Decimal("18"), 8, 5, "franchise_totale")
+
+        # Fin de différé : le capital a grossi des intérêts capitalisés.
+        self.assertEqual(lignes[4]["crd"], Decimal("1432.78"))
+        self.assertEqual(lignes[4]["echeance"], Decimal("0.00"))   # rien n'est payé
+        self.assertEqual(lignes[4]["interets"], Decimal("0.00"))
+        self.assertEqual(lignes[4]["interets_capitalises"], Decimal("21.17"))
+
+        # Tranche calculée sur le CRD gonflé : 1 432,78 / 3 = 477,59.
+        self.assertEqual(lignes[5]["capital"], Decimal("477.59"))
+
+        totaux = totaux_echeancier(lignes)
+        self.assertEqual(totaux["service_dette"], Decimal("1475.76"))
+        self.assertEqual(totaux["interets_capitalises"], Decimal("102.78"))
+        self.assertEqual(totaux["crd_final"], Decimal("0.00"))
+
+    def test_franchise_degrade_le_dscr_davantage_que_les_interets_seuls(self):
+        """SPEC A.2 : « la franchise totale ne doit être proposée que si les
+        cash-flows sont strictement nuls avant récolte ». Le service passe de
+        1 469,65 à 1 475,76 — à cash-flows égaux, le DSCR baisse."""
+        flux = [Decimal("935") / Decimal(8)] * 8
+        interets = construire_echeancier(Decimal("1330"), Decimal("18"), 8, 5)
+        franchise = construire_echeancier(
+            Decimal("1330"), Decimal("18"), 8, 5, "franchise_totale")
+        self.assertLess(calculer_dscr(flux, franchise), calculer_dscr(flux, interets))
+
     def test_ecart_documente_entre_les_scores_et_les_baremes_de_la_spec(self):
         """⚠ Les barèmes de la SPEC §5 NE produisent PAS 19,1 et 14,3.
 
@@ -782,6 +820,47 @@ class ApiAnalyseTests(AuthedAPITestCase):
         for nom, bloc in data["criteres"].items():
             self.assertIsInstance(bloc["poids"], float, nom)
             self.assertEqual(bloc["poids"], data["poidsAppliques"][nom])
+
+    def test_phase_franchise_traduite_pour_le_contrat_front(self):
+        """`franchise_totale` doit sortir la phase `"franchise"`, pas `"différé"`.
+
+        Le contrat type `phase: 'différé' | 'amortissement' | 'franchise'`. La
+        traduction vit dans `_PHASES_API` et n'était exercée que sur la branche
+        `interets_seuls` : une entrée manquante du mapping serait retombée en
+        silence sur l'identifiant de stockage `"differe"` (sans accent), valeur
+        hors union que le front n'aurait indexée dans aucune classe CSS. Le
+        tableau se serait affiché sans style, sans erreur.
+
+        Le front n'a aucun test (cf. `moteur-front-analyse`) : cette garde est
+        donc la seule du chemin.
+        """
+        self.login(role="gest_credit", sub="sub-analyste")
+        res = self.client.post(self.url_reanalyser,
+                               {"duree_mois": 8, "differe_mois": 5,
+                                "mode_differe": "franchise_totale"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["parametres"]["modeDiffere"], "franchise_totale")
+
+        lignes = res.data["echeancier"]
+        phases = [l["phase"] for l in lignes]
+        self.assertEqual(phases[:5], ["franchise"] * 5)
+        self.assertEqual(phases[5:], ["amortissement"] * 3)
+        # Toute phase servie appartient à l'union du contrat.
+        self.assertTrue(set(phases) <= {"différé", "amortissement", "franchise"})
+
+        # Les intérêts capitalisés sont portés, et l'invariant tient.
+        self.assertEqual(lignes[4]["interetsCapitalises"], 21.17)
+        self.assertEqual(lignes[-1]["crd"], 0.0)
+        self.assertEqual(res.data["totaux"]["serviceDette"], 1475.76)
+
+    def test_mode_differe_inconnu_refuse(self):
+        """Un mode inventé ne produit pas un échéancier « best effort »."""
+        self.login(role="gest_credit", sub="sub-analyste")
+        res = self.client.post(self.url_reanalyser,
+                               {"duree_mois": 8, "differe_mois": 5,
+                                "mode_differe": "differe_partiel"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "PARAMETRES_INVALIDES")
 
     def test_totaux_servis_par_le_serveur(self):
         self.login(role="gest_credit", sub="sub-analyste")

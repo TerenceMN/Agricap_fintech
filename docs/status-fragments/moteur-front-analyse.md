@@ -558,8 +558,41 @@ l'a pas.
 > rougisse.
 >
 > Je n'ai pas installé de runner : introduire vitest est une décision d'outillage
-> qui engage tout le front, pas un correctif de ce lot. **À router** — c'est, de
-> tout ce fragment, le manque qui rendrait les autres durables.
+> qui engage tout le front, pas un correctif de ce lot. **À router.**
+>
+> ### Mais vitest ne couvrirait qu'une moitié — et pas celle qui a fait mal
+>
+> Correction de ma conclusion précédente, qui présentait les tests comme « le
+> manque qui rend tous les autres durables ». C'est faux, et mon propre défaut le
+> prouve. Les défauts de ce front se répartissent en **deux classes** :
+>
+> **A — Régressions de logique front.** Les cinq points vérifiés par lecture
+> (résolution `applicationCode`, classification 401/403/404/422, troncature et
+> ses bords, garde `crdFinal ≠ 0`, colonne d'intérêts capitalisés). Vitest les
+> protège. C'est réel et ça vaut.
+>
+> **B — Désaccords entre la forme *déclarée* côté front et la forme *réellement
+> servie*.** Vitest ne les voit pas — **et un test que j'aurais écrit moi-même
+> aurait cimenté l'erreur.** Preuve : mon bandeau d'origine des cash-flows testait
+> `origine !== 'declare'`, sentinelle que j'avais inventée ; le serveur émet
+> `"fourni"` (`analyse.py:835`). Le bandeau annonçait donc « DSCR fondé sur des
+> cash-flows projetés » sur tous les dossiers à trésorerie **réellement
+> déclarée** — un avertissement qui crie à tort, sur le chiffre le plus regardé
+> de l'écran, dans l'onglet dont la raison d'être est de dire ce qui est su et ce
+> qui est supposé. J'aurais écrit `expect(...).toBe(true)` pour `'fourni'` en
+> toute bonne foi : le test aurait été vert, la lecture fausse, et l'erreur
+> désormais protégée par une suite.
+>
+> Trouvé par le fondateur **en cliquant**, pas par un outil. Corrigé : on teste
+> désormais l'appartenance à la valeur positive observée, jamais l'exclusion
+> d'une sentinelle supposée.
+>
+> **Ce que la classe B demande** est d'une autre nature : une confrontation
+> automatisée aux réponses réelles du serveur — contrats exécutables, fixtures
+> régénérées depuis l'API, ou tests d'intégration traversants. Les deux besoins
+> méritent d'être **arbitrés ensemble**, faute de quoi le second passera pour
+> couvert par le premier. C'est la classe B qui a atteint l'utilisateur quatre
+> fois en une journée ; c'est la seule que ce lot a effectivement subie.
 
 - `npx tsc --noEmit` : **0 erreur**.
 - `npx vite build` : **vert** (2832 modules, build en ~8 s). C'est le seul vrai

@@ -995,6 +995,9 @@ def _jsonifier(value):
 #: alors que `echeancier.py` produit `'differe'` / `'amortissement'` (sans accent,
 #: identifiants de stockage). La traduction se fait ICI, à la frontière HTTP :
 #: la valeur stockée reste un identifiant stable, l'affichage reste le contrat.
+#: Exercé pour les DEUX modes par
+#: `test_phase_franchise_traduite_pour_le_contrat_front` : une entrée manquante
+#: retomberait en silence sur l'identifiant de stockage, hors union du contrat.
 _PHASES_API = {
     ("differe", MODE_INTERETS_SEULS): "différé",
     ("differe", "franchise_totale"): "franchise",
