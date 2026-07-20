@@ -756,16 +756,18 @@ def submit_application(request: Request, code: str) -> Response:
     if not (is_owner or is_agent):
         return Response({"detail": "Accès interdit."}, status=403)
 
-    from credits.workflow import submit, WorkflowError
+    from credits.workflow import InvalidTransition, submit, WorkflowError
     try:
         submit(app, submitter_sub=sub)
     except WorkflowError as exc:
-        # Statut HTTP inchangé (400) : le passer à 422 serait plus conforme au
-        # principe 5, mais c'est un changement de contrat sur un endpoint déjà
-        # câblé côté front — à faire dans une passe coordonnée, pas en silence.
+        # Sémantique HTTP, pas un 422 uniforme : un dossier déjà soumis est un
+        # conflit avec l'état de la ressource (409 — même choix que le refus de
+        # remplacer la feuille de besoins hors brouillon), tandis qu'un dossier
+        # incomplet est une entité non traitable (422, principe 5).
+        http_status = 409 if isinstance(exc, InvalidTransition) else 422
         return Response(
             {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
-            status=400,
+            status=http_status,
         )
 
     from credits.workflow import serialize_application

@@ -338,12 +338,56 @@ Corrigé dans `credits/workflow.py` :
 
 7 tests dans `credits/tests_workflow_codes.py`.
 
-**Statut HTTP délibérément inchangé (400).** Le passer à 422 serait plus conforme
-au principe 5, mais c'est un changement de contrat sur un endpoint déjà câblé
-côté front : à faire dans une passe coordonnée, pas en silence. **Conséquence à
-signaler à `front-garanties` : son `console.warn` n'écoute que 422/409, il ne
-verra donc pas ce 400 — il doit y ajouter 400.** L'harmonisation 400/422 sur
-toute la surface workflow reste ouverte.
+**Statut HTTP — corrigé après découplage du front.** `front-garanties` a remplacé
+son filtre par une liste `REFUSAL_STATUSES = [400, 409, 422]`, ce qui a levé mon
+blocage. Vérification faite avant de bouger : **aucun consommateur de `src/` ne
+branche sur le statut HTTP de `submit`** (trois appelants, tous sur
+`ApiError.message` ou la liste structurée).
+
+Choix retenu, sémantique plutôt qu'un 422 uniforme :
+
+| Condition | Statut | Raison |
+|---|---|---|
+| `INVALID_TRANSITION` (dossier déjà soumis) | **409** | conflit avec l'état de la ressource — même choix que `APPLICATION_NOT_DRAFT` sur la feuille de besoins |
+| `APPLICATION_INCOMPLETE` et le reste | **422** | entité non traitable (principe 5) |
+
+L'harmonisation du reste de la surface workflow reste ouverte (cf. §7quinquies).
+
+---
+
+## 7quinquies. Dette que j'ai CRÉÉE : deux nomenclatures de codes d'erreur
+
+À signaler franchement — c'est ma correction qui a introduit le problème, et
+c'est exactement le motif que le projet a déjà payé cher (principe 6 : le module
+a souffert de 4 vocabulaires de rôles et 2 nomenclatures de filières).
+
+En donnant un `code` **MAJUSCULE** aux exceptions de `workflow.py`, j'ai créé un
+doublon avec les codes **minuscules** que les vues émettent déjà à la main pour
+les mêmes conditions :
+
+| Concept | Émis par `submit` (nouveau) | Émis par les autres vues (existant) |
+|---|---|---|
+| Maker = checker | `MAKER_CHECKER_VIOLATION` | `maker_checker_violation` |
+| Hors délégation | `DELEGATION_EXCEEDED` | `delegation_exceeded` |
+| Consentement manquant | `CLIENT_CONSENT_MISSING` | `consent_required` |
+| Consentement expiré | *(pas de sous-classe)* | `consent_expired` |
+
+La convention du reste du module est MAJUSCULE (`ASSET_NOT_OWNED`,
+`FEUILLE_MANQUANTE`, `NEEDS_SOURCE_PROTECTED`) : ce sont les minuscules qui sont
+les outliers. **Mais je n'ai pas fait la migration.** Renommer un `code`
+déjà consommé par un front est précisément le changement silencieux que je
+reproche aux autres ; `front-garanties` a construit sa table de codes dessus.
+
+**Proposition à arbitrer avec les deux fronts** (aucune ligne écrite) :
+1. les vues workflow passent au helper unique qui émet `exc.code` + `errors[]` ;
+2. ajout d'une sous-classe `ConsentExpired` (code `CLIENT_CONSENT_EXPIRED`) pour
+   ne pas perdre la distinction manquant / expiré, aujourd'hui portée par le
+   seul statut HTTP (409 vs 410) ;
+3. période de transition avec `legacyCode` en minuscule si un front en a besoin.
+
+En attendant, **l'état est incohérent et documenté comme tel** : `submit` émet
+en majuscules, `approve` / `reject` / `start-analysis` / `client-consent` en
+minuscules.
 
 ---
 

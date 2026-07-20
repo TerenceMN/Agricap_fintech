@@ -128,6 +128,19 @@ class WorkflowErrorContractTests(TestCase):
         for cls in classes:
             self.assertTrue(issubclass(cls, WorkflowError))
 
+    def test_codes_en_majuscules_convention_du_module(self):
+        """Convention unique (principe 6) : `ASSET_NOT_OWNED`, `FEUILLE_MANQUANTE`…
+
+        Les vues `approve` / `reject` / `start-analysis` / `client-consent`
+        émettent encore des codes en minuscules pour les mêmes concepts — dette
+        documentée en §7quinquies du fragment de statut, migration à arbitrer
+        avec les fronts. Ce test fige au moins la convention côté exceptions.
+        """
+        for cls in (InvalidTransition, ApplicationIncomplete, DelegationError,
+                    MakerCheckerError, ConsentError, WorkflowError):
+            self.assertEqual(cls.code, cls.code.upper())
+            self.assertRegex(cls.code, r"^[A-Z][A-Z_]+$")
+
     def test_as_errors_n_est_jamais_vide(self):
         """La vue peut relayer `as_errors()` sans jamais tester le cas vide."""
         self.assertEqual(
