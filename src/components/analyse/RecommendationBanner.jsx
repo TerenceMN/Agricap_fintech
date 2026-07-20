@@ -1,5 +1,5 @@
 import React from 'react';
-import { Gavel, Info } from 'lucide-react';
+import { Gavel, Info, FlaskConical } from 'lucide-react';
 import { recommandationConfig } from './recommandation';
 import { formatScore, formatDateTimeFr } from './analyseFormat';
 
@@ -11,22 +11,33 @@ import { formatScore, formatDateTimeFr } from './analyseFormat';
  * portée par le composant lui-même, pas laissée à la discrétion de l'écran qui
  * l'intègre. Aucune action de workflow n'est déclenchée d'ici.
  *
+ * La lettre de score vient du serveur (`scoreLettre`), dérivée de la grille
+ * `BaremeScore.DECISION` — elle n'est **pas** recalculée à partir du score
+ * numérique. C'est ce qui permet au comité de recalibrer sans redéploiement
+ * (principe 8), et la grille appliquée est figée sur chaque analyse pour qu'un
+ * recalibrage ne réécrive pas rétroactivement la lettre d'un client.
+ *
  * @param {{
  *   recommandation: string|null,
  *   scoreGlobal: number|null,
+ *   scoreLettre?: string|null,
  *   executeLe?: string|null,
  *   versionMoteur?: string|null,
  *   referentiel?: string|null,
+ *   referentielInfo?: object|null,
  * }} props
  */
 const RecommendationBanner = ({
   recommandation,
   scoreGlobal,
+  scoreLettre,
   executeLe,
   versionMoteur,
   referentiel,
+  referentielInfo,
 }) => {
   const cfg = recommandationConfig(recommandation);
+  const indicatif = referentielInfo?.estIndicatif;
 
   return (
     <div className={`rounded-xl border p-4 ${cfg.banner}`} role="status">
@@ -51,9 +62,30 @@ const RecommendationBanner = ({
           <p className="text-2xl font-bold text-white leading-tight">
             {formatScore(scoreGlobal)}
             <span className="text-sm text-slate-400 font-normal">/100</span>
+            {scoreLettre && (
+              <span className="ml-2 text-lg align-middle px-2 py-0.5 rounded-md bg-white/10 text-slate-100">
+                {scoreLettre}
+              </span>
+            )}
           </p>
+          {scoreLettre && (
+            <p className="text-[11px] text-slate-500 mt-0.5">lettre servie par le moteur</p>
+          )}
         </div>
       </div>
+
+      {indicatif && (
+        <p className="mt-3 flex items-start gap-2 text-xs text-amber-200/90 bg-amber-500/10 border border-amber-500/25 rounded-lg px-3 py-2">
+          <FlaskConical className="w-3.5 h-3.5 mt-0.5 shrink-0" aria-hidden="true" />
+          <span>
+            Référentiel <strong>indicatif</strong>
+            {referentielInfo?.nCasReels !== undefined
+              && ` (${referentielInfo.nCasReels} dossier(s) réel(s))`} — les écarts ci-dessous se
+            lisent « vs plage indicative, fiabilité limitée ». Une plage estimée n'a pas l'autorité
+            d'une plage apprise sur des dossiers clos.
+          </span>
+        </p>
+      )}
 
       <p className="mt-3 flex items-start gap-2 text-xs text-slate-300 bg-black/20 rounded-lg px-3 py-2">
         <Gavel className="w-3.5 h-3.5 mt-0.5 shrink-0 text-slate-400" aria-hidden="true" />

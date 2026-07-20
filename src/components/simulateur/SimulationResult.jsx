@@ -6,16 +6,41 @@
  * n'affiche rien tant que le moteur n'a pas répondu (le fallback historique
  * qui fabriquait une note à partir du montant et de la superficie a été retiré).
  *
- * Réserve connue et signalée : `scoreLetter` applique encore des seuils
- * (85/70/50) codés côté front. C'est la dernière règle métier résiduelle du
- * navigateur — elle doit descendre du serveur avec le score (cf. rapport lot 3).
+ * Réserve connue et signalée : la grille de classement du score est encore
+ * codée ici (cf. `SCORE_BANDS` et le rapport de lot 3 §4.2). Elle doit descendre
+ * du serveur, lue depuis `BaremeScore` — et elle **contredit aujourd'hui le
+ * moteur** sur deux points : 3ᵉ palier à 50 côté front contre 55 côté backend,
+ * et comparaison stricte (`>`) contre `>=` côté backend, ce qui déclasse les
+ * scores valant exactement 85 ou 70. Ne pas corriger ces valeurs ici seul : les
+ * mêmes seuils vivent dans `admin/credits/CreditRow.jsx` et
+ * `admin/credits/CreditDetailsModal.jsx`. Un alignement partiel ferait diverger
+ * la liste, le détail et le simulateur — correctif atomique sur les 4 fichiers,
+ * ou rien.
  */
 import React from 'react';
 import { motion } from 'framer-motion';
 import { formatMontant } from '@/components/guarantees/format';
 
+/**
+ * Grille de classement du score — **une seule échelle** pour ce module.
+ *
+ * Lettre et couleur en dérivaient auparavant par deux ternaires distincts, à
+ * vingt lignes d'écart : deux occasions de diverger pour une même règle. Elles
+ * partagent désormais la même définition. Les seuils sont inchangés (le
+ * réalignement sur le moteur est une tâche transverse, cf. en-tête).
+ */
+const SCORE_BANDS = [
+  { min: 85, letter: 'A', color: '#34d399' },
+  { min: 70, letter: 'B', color: '#60a5fa' },
+  { min: 50, letter: 'C', color: '#fbbf24' },
+  { min: -Infinity, letter: 'D', color: '#f87171' },
+];
+
+/** Bande d'un score serveur. Présentation d'un chiffre reçu, pas un calcul. */
+const scoreBand = (score) => SCORE_BANDS.find(b => Number(score) > b.min) ?? SCORE_BANDS[SCORE_BANDS.length - 1];
+
 /** Lettre associée à un score serveur. Présentation, pas calcul de score. */
-export const scoreLetterOf = (score) => (score > 85 ? 'A' : score > 70 ? 'B' : score > 50 ? 'C' : 'D');
+export const scoreLetterOf = (score) => scoreBand(score).letter;
 
 export const DonutChartScore = ({ score }) => {
   const radius = 60;
@@ -38,7 +63,7 @@ export const DonutChartScore = ({ score }) => {
 
   const value = Number(score);
   const offset = circumference - (value / 100) * circumference;
-  const scoreColor = value > 85 ? '#34d399' : value > 70 ? '#60a5fa' : value > 50 ? '#fbbf24' : '#f87171';
+  const { letter, color: scoreColor } = scoreBand(value);
 
   return (
     <div className="relative flex items-center justify-center w-48 h-48">
@@ -55,7 +80,7 @@ export const DonutChartScore = ({ score }) => {
       </svg>
       <div className="absolute flex flex-col items-center justify-center">
         <span className="text-sm text-gray-400">Score</span>
-        <span className="text-5xl font-black" style={{ color: scoreColor }}>{scoreLetterOf(value)}</span>
+        <span className="text-5xl font-black" style={{ color: scoreColor }}>{letter}</span>
         <span className="font-bold">{value.toFixed(0)}/100</span>
       </div>
     </div>

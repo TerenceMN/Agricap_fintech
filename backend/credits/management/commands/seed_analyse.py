@@ -1,0 +1,172 @@
+"""
+Amorçage des règles du moteur d'analyse — barèmes de score et référentiel filière.
+
+    python manage.py seed_analyse
+
+**Idempotente** (`update_or_create`) : rejouable à chaque déploiement sans créer
+de doublon ni écraser un recalibrage du comité par accident — sauf demande
+explicite `--force`, qui réécrit les courbes aux valeurs de la SPEC §5.
+
+Pourquoi une commande et pas une fixture ni un `RunPython` :
+  - une fixture `loaddata` écrase par PK et casserait un barème recalibré ;
+  - un `RunPython` de migration figerait des seuils métier dans l'historique de
+    schéma, alors que le principe 8 les veut modifiables par le comité sans
+    redéploiement. Une migration crée des TABLES, pas des règles.
+"""
+from __future__ import annotations
+
+import io
+
+from django.core.management.base import BaseCommand
+from django.db import transaction
+
+from credits.models import BaremeScore, ReferentielFiliere
+
+#: Les trois barèmes de la SPEC §5, plus le barème de décision.
+#: Abscisses et ordonnées en CHAÎNES : un JSON `float` ferait rentrer le binaire
+#: flottant dans le calcul de score par la porte de la base (principe 4).
+BAREMES = [
+    {
+        "code": "DSCR",
+        "libelle": "Capacité financière — DSCR → score",
+        "points": [
+            {"x": "0.4", "y": "0"}, {"x": "0.7", "y": "25"},
+            {"x": "1.0", "y": "50"}, {"x": "1.3", "y": "85"},
+            {"x": "1.5", "y": "100"},
+        ],
+        "parametres": {},
+    },
+    {
+        "code": "ECART_TECHNIQUE",
+        "libelle": "Fiabilité technique — écart moyen au référentiel → score",
+        "points": [
+            {"x": "0.00", "y": "100"}, {"x": "0.15", "y": "85"},
+            {"x": "0.30", "y": "60"}, {"x": "0.50", "y": "30"},
+            {"x": "0.80", "y": "0"},
+        ],
+        "parametres": {},
+    },
+    {
+        "code": "COUVERTURE_GARANTIES",
+        "libelle": "Garanties — ratio de couverture après décote → score",
+        "points": [
+            {"x": "0.0", "y": "0"}, {"x": "0.5", "y": "40"},
+            {"x": "1.0", "y": "75"}, {"x": "1.5", "y": "100"},
+        ],
+        # Plafond appliqué tant que les garanties ne sont pas constituées
+        # (SPEC §4 : « score indicatif »). En base, donc recalibrable.
+        "parametres": {"plafond_non_constituees": "60"},
+    },
+    {
+        # AJOUT à la SPEC, assumé : son pseudo-code portait ces seuils en dur
+        # (`>= 75`, `>= 60`, `>= 45`, `CHOC_STRESS = 0.25`), ce que le principe 8
+        # interdit. `points` reste vide : ce barème n'est pas une courbe.
+        "code": "DECISION",
+        "libelle": "Barème de décision à 4 niveaux + choc du stress test",
+        "points": [],
+        "parametres": {
+            "approbation": {"score_min": "75", "dscr_min": "1.2",
+                            "sans_hors_plage": True},
+            "approbation_cond": {"score_min": "60", "dscr_min": "1.0"},
+            "revue": {"score_min": "45"},
+            "choc_revenus": "0.25",
+            # Grille lettre (SPEC §6). Elle vivait recopiée à la main dans trois
+            # fichiers du front : un barème dans le navigateur, que le comité ne
+            # pouvait pas recalibrer et qui apprenait au client où sont les
+            # frontières (principes 7 et 8). Elle vit ici, le serveur seul
+            # l'applique et ne sert que la lettre.
+            "lettres": [{"lettre": "A", "min": "85"}, {"lettre": "B", "min": "70"},
+                        {"lettre": "C", "min": "50"}, {"lettre": "D", "min": "0"}],
+        },
+    },
+]
+
+#: Référentiel Maïs — AGRICAP_FIN_SIM_01. Coûts par hectare et par module,
+#: avec leurs tolérances asymétriques : sous-estimer un poste (tol_inf) est plus
+#: souvent une omission, le sur-estimer (tol_sup) plus souvent une inflation.
+REFERENTIELS = [
+    {
+        "code": "AGRICAP_FIN_SIM_01_Cereales_Mais",
+        "filiere": "Céréales — Maïs",
+        "value_chain_code": "01",
+        "unite_reference": "ha",
+        "devise": "USD",
+        "couts_modules": {
+            "semences":          {"ref": "850",  "tol_inf": "0.30", "tol_sup": "0.40"},
+            "mecanisation":      {"ref": "1200", "tol_inf": "0.30", "tol_sup": "0.40"},
+            "maindoeuvre":       {"ref": "1450", "tol_inf": "0.30", "tol_sup": "0.40"},
+            "equipements":       {"ref": "1100", "tol_inf": "0.40", "tol_sup": "0.40"},
+            "postrecolte":       {"ref": "1350", "tol_inf": "0.30", "tol_sup": "0.40"},
+            "logistique":        {"ref": "1000", "tol_inf": "0.30", "tol_sup": "0.40"},
+            "commercialisation": {"ref": "1150", "tol_inf": "0.30", "tol_sup": "0.40"},
+            "reserve":           {"ref": "1011", "tol_inf": "0.50", "tol_sup": "0.40"},
+        },
+        "rendement_ref": {"qte_unite": "4.5", "prix_unitaire": "380", "unite": "t"},
+        "n_cas_reels": 0,
+        "source": ReferentielFiliere.Source.INDICATIF,
+    },
+]
+
+
+class Command(BaseCommand):
+    help = ("Crée ou met à jour les barèmes de score et le référentiel filière du "
+            "moteur d'analyse (idempotent).")
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--force", action="store_true",
+            help=("Réécrit les courbes et paramètres même s'ils ont été modifiés "
+                  "en base (écrase un recalibrage du comité)."),
+        )
+
+    @transaction.atomic
+    def handle(self, *args, **opts):
+        force: bool = opts["force"]
+        # Silencieuse en verbosity=0 : la commande est appelee dans les tests.
+        if int(opts.get("verbosity", 1)) == 0:
+            self.stdout = io.StringIO()
+
+        for spec in BAREMES:
+            existant = BaremeScore.objects.filter(code=spec["code"]).first()
+            if existant and not force:
+                # On réactive sans toucher aux valeurs : un barème désactivé par
+                # erreur doit pouvoir être relevé sans perdre son calibrage.
+                if not existant.actif:
+                    existant.actif = True
+                    existant.save(update_fields=["actif"])
+                    self.stdout.write(f"  = {spec['code']} : réactivé (valeurs conservées)")
+                else:
+                    self.stdout.write(f"  = {spec['code']} : déjà présent, inchangé")
+                continue
+
+            obj, cree = BaremeScore.objects.update_or_create(
+                code=spec["code"],
+                defaults={
+                    "libelle": spec["libelle"],
+                    "points": spec["points"],
+                    "parametres": spec["parametres"],
+                    "actif": True,
+                    "version": (existant.version + 1) if existant else 1,
+                },
+            )
+            verbe = "créé" if cree else "réécrit (--force)"
+            self.stdout.write(self.style.SUCCESS(f"  + {obj.code} : {verbe} v{obj.version}"))
+
+        for spec in REFERENTIELS:
+            existant = ReferentielFiliere.objects.filter(code=spec["code"]).first()
+            if existant and not force:
+                self.stdout.write(f"  = {spec['code']} : déjà présent, inchangé")
+                continue
+            obj, cree = ReferentielFiliere.objects.update_or_create(
+                code=spec["code"],
+                defaults={**{k: v for k, v in spec.items() if k != "code"},
+                          "actif": True,
+                          "version": (existant.version + 1) if existant else 1},
+            )
+            verbe = "créé" if cree else "réécrit (--force)"
+            self.stdout.write(self.style.SUCCESS(f"  + {obj.code} : {verbe} v{obj.version}"))
+
+        self.stdout.write(self.style.SUCCESS(
+            f"Moteur d'analyse : {BaremeScore.objects.filter(actif=True).count()} barème(s) "
+            f"actif(s), {ReferentielFiliere.objects.filter(actif=True).count()} référentiel(s) "
+            f"actif(s)."))

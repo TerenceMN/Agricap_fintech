@@ -21,13 +21,18 @@ import JustifyIndicatorDialog from './JustifyIndicatorDialog';
  * L'écran ne recalcule rien : score, DSCR, points et montants de l'échéancier
  * viennent du moteur et sont affichés tels quels.
  *
+ * La devise affichée est **celle de l'analyse** (`devise`), pas celle du prêt
+ * portefeuille : ce sont deux agrégats distincts, et étiqueter des montants du
+ * moteur avec la devise d'un autre objet serait une erreur de lignage, pas un
+ * repli acceptable. Si le moteur ne la porte pas, les montants s'affichent sans
+ * devise plutôt qu'avec une devise devinée.
+ *
  * @param {{
  *   code: string,
- *   currency?: string,
  *   state: ReturnType<typeof import('./useCreditAnalyse').useCreditAnalyse>,
  * }} props
  */
-const AnalyseTab = ({ code, currency = '', state }) => {
+const AnalyseTab = ({ code, state }) => {
   const { analyse, loading, error, notAnalysed, forbidden, reload, setAnalyse } = state;
   const [justifyOpen, setJustifyOpen] = useState(false);
   const [justifyCible, setJustifyCible] = useState(null);
@@ -99,6 +104,7 @@ const AnalyseTab = ({ code, currency = '', state }) => {
   }
 
   const ecarts = listerEcartsHorsPlage(analyse);
+  const devise = analyse.devise || analyse.parametres?.devise || '';
 
   return (
     <div className="max-h-[62vh] overflow-y-auto scrollbar-thin scrollbar-thumb-slate-600 scrollbar-track-slate-800 space-y-4 pr-1">
@@ -122,18 +128,24 @@ const AnalyseTab = ({ code, currency = '', state }) => {
       <RecommendationBanner
         recommandation={analyse.recommandation}
         scoreGlobal={analyse.scoreGlobal}
+        scoreLettre={analyse.scoreLettre}
         executeLe={analyse.executeLe}
         versionMoteur={analyse.versionMoteur}
-        referentiel={analyse.referentiel}
+        referentiel={analyse.referentielInfo?.code || analyse.referentiel}
+        referentielInfo={analyse.referentielInfo}
       />
 
       <CriteriaTable criteres={analyse.criteres} scoreGlobal={analyse.scoreGlobal} />
 
       <DscrPanel analyse={analyse} />
 
-      <ModuleGaps analyse={analyse} currency={currency} onJustify={ouvrirJustification} />
+      <ModuleGaps analyse={analyse} currency={devise} onJustify={ouvrirJustification} />
 
-      <EcheancierTable lignes={analyse.echeancier} currency={currency} />
+      <EcheancierTable
+        lignes={analyse.echeancier}
+        currency={devise}
+        totaux={analyse.totaux}
+      />
 
       <JustifyIndicatorDialog
         open={justifyOpen}

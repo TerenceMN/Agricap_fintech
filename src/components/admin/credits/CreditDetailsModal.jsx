@@ -240,11 +240,11 @@ const CreditDetailsModal = ({ isOpen, onOpenChange, credit }) => {
                         admin (`CreditsDashboard` → `CreditsTable`), jamais depuis le parcours
                         client. Le serveur reste l'autorité : un 403 s'affiche tel quel. */}
                     <TabsContent value="analyse" className="mt-3">
-                        <AnalyseTab
-                            code={applicationCode}
-                            currency={credit.currency}
-                            state={analyseState}
-                        />
+                        {/* Pas de `currency` transmis : l'analyse porte SA devise
+                            (`analyse.devise`). Celle du prêt portefeuille est un autre
+                            agrégat — l'emprunter pour étiqueter des montants du moteur
+                            serait une erreur de lignage. */}
+                        <AnalyseTab code={applicationCode} state={analyseState} />
                     </TabsContent>
                 </Tabs>
 

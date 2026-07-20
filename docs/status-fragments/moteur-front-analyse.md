@@ -151,44 +151,55 @@ inventée). Les aligner côté serveur ferait passer l'écran de « correct » �
 6. **404 vs 200 vide.** L'écran traite le 404 comme « analyse non encore
    exécutée ». Si le backend préfère répondre 200 avec un corps vide, le dire —
    les deux sont gérés, mais un seul doit être la convention.
-7. **`scoreLettre` servi avec le score** (demande commune avec le lot 3, cf.
-   §4.1). Les seuils 85/70/50 de `pipeline.py` sont aujourd'hui recopiés à la
-   main dans trois fichiers du front. Servir la lettre — ou la grille — depuis
-   le serveur est la seule façon de tenir le principe 8 : le comité doit pouvoir
-   recalibrer sans qu'un déploiement front soit nécessaire.
+7. **La grille de classe de score dans `BaremeScore`, puis `scoreLettre` servi
+   depuis là** (demande commune avec le lot 3, cf. §4.1). En deux temps, et
+   l'ordre compte :
+   - **Ne pas** se contenter de « servez la lettre ». Les seuils backend sont
+     eux-mêmes codés en dur dans le Python et dupliqués entre `scoring.py` et
+     `dataio_simulator.py`, avec des ajustements de taux qui **divergent déjà**
+     (+2,5 contre +2,0 sur la 3ᵉ bande). Servir une lettre dérivée de l'une de
+     ces deux échelles `if` remplacerait 4 sources de vérité par 2, sans rien
+     régler.
+   - La vraie demande est le **principe 8** : la grille descend dans
+     `BaremeScore`, les deux modules Python la lisent, et l'API sert
+     `scoreLettre` depuis là. C'est aussi ce qui permet au comité de la
+     recalibrer sans redéploiement — l'objet même de la table.
+
+   Enjeu principe 7 par-dessus : côté client, `scoreLetterOf` expose la grille de
+   conversion — le client apprend qu'à 70,1 il passe de C à B.
 
 Le contrat `src/types/api.ts` n'a **pas** été modifié (lecture seule côté
 frontend) : ces ajouts sont à porter par le propriétaire du contrat.
 
 ---
 
-## 4. Duplication à résorber (coordination)
+## 4. Duplication du barème de recommandation — **résolue** (commit 35c3e52)
 
-Le chantier `RateMaturityModal` (fragment `moteur-front-reanalyse.md`) a créé
-`src/components/analyse/simulateur/`. Son `format.js` et
-`analyse/recommandation.js` portent **deux traductions concurrentes du même
-barème à 4 niveaux** — le vocabulaire parallèle que le principe 6 interdit.
+> Statut : tranché et appliqué. Conservé ici pour la trace, le diagnostic ayant
+> servi à l'arbitrage.
 
-Elles ont déjà divergé, sur les 4 niveaux :
+Le chantier `RateMaturityModal` (fragment `moteur-front-reanalyse.md`) et
+celui-ci portaient **deux traductions concurrentes du même barème à 4 niveaux**.
+Elles avaient déjà divergé :
 
-| code | `analyse/recommandation.js` | `analyse/simulateur/format.js` |
+| code | `analyse/recommandation.js` | `analyse/simulateur/format.js` (avant) |
 |---|---|---|
 | `approbation` | « Approbation recommandée » · emerald | « Approbation » · emerald |
 | `approbation_cond` | « Approbation sous conditions » · **orange** | « Approbation conditionnelle » · **lime** |
 | `revue` | « Revue approfondie requise » · **yellow** | « Revue manuelle » · **amber** |
 | `refus` | « Refus recommandé » · red | « Refus » · red |
 
-Le lime sur `approbation_cond` n'est pas une nuance de teinte : il se lit comme
-un feu vert là où l'orange signale une réserve. Et « Revue manuelle » vs « Revue
-approfondie requise » ne décrivent pas le même acte pour l'analyste. Le même
-dossier change donc de sens selon l'écran qui l'affiche — à arbitrer **avant**
-fusion, pas après.
+Le lime sur `approbation_cond` n'était pas une nuance de teinte : il se lit
+comme un feu vert là où l'orange signale une réserve. L'argument qui a tranché
+n'est pas la cohérence visuelle mais l'usage : **le même analyste consulte les
+deux écrans sur le même dossier à deux minutes d'intervalle** (l'onglet Analyse,
+puis le simulateur pour tester un différé).
 
-Direction proposée : `recommandationConfig()` de `analyse/recommandation.js`
-comme source unique (elle porte en plus le repli neutre explicite sur un code
-inconnu) ; `MODE_DIFFERE_LABEL`, `MODE_DIFFERE_AIDE` et `ecartEntre` restent
-locaux au simulateur, ils lui sont propres. Les fichiers du sous-dossier
-`simulateur/` n'ont pas été touchés ici : ils appartiennent à un autre périmètre.
+Résolution : `analyse/recommandation.js` est la source unique ;
+`analyse/simulateur/format.js` dérive désormais `RECOMMANDATION_LABEL` et
+`RECOMMANDATION_CLASS` de `RECOMMANDATION_CONFIG`. Libellés retenus : ceux de la
+SPEC §3. `MODE_DIFFERE_LABEL`, `MODE_DIFFERE_AIDE` et `ecartEntre` restent
+locaux au simulateur, ils lui sont propres.
 
 > **Correction.** Une version antérieure de ce fragment reprochait aussi à
 > `analyse/simulateur/format.js` de redéfinir `formatMontant`. **C'est faux** :
@@ -197,25 +208,102 @@ locaux au simulateur, ils lui sont propres. Les fichiers du sous-dossier
 > second formateur de montants dans le dépôt. Grief retiré — signalé par le
 > chantier lot 3, vérifié dans le code.
 
-### 4.1 Même famille, dette voisine : la lettre de score
+> **Correction.** Une version antérieure de ce fragment reprochait aussi à
+> `analyse/simulateur/format.js` de redéfinir `formatMontant`. **C'est faux** :
+> ce fichier ré-exporte le formateur unique de `components/guarantees/format.js`
+> et son en-tête refuse explicitement d'en créer un second. Il n'existe **aucun**
+> second formateur de montants dans le dépôt. Grief retiré — signalé par le
+> chantier lot 3, vérifié dans le code.
 
-`scoreLetterOf` (`src/components/simulateur/SimulationResult.jsx`, lot 3) dérive
-la lettre A/B/C/D d'un score serveur avec des seuils **85 / 70 / 50 codés en
-dur** — et `CreditDetailsModal.jsx` fait la même chose sur son `scoreColor`,
-avec les mêmes seuils recopiés une troisième fois. Ce sont les mêmes valeurs que
-`pipeline.py` (SPEC §6) applique côté serveur pour `score_lettre`.
+### 4.1 Même famille, dette bien plus large : la grille de classe de score
 
-Un fragment de barème dans le navigateur, donc : contraire au principe 8 (les
-seuils vivent en base), et côté client contraire au principe 7. L'onglet Analyse
-n'affiche **aucune lettre** — il ne restitue que le score numérique du moteur —
-donc il n'aggrave pas la dette, mais il ne la corrige pas non plus : `scoreColor`
-est préexistant dans le fichier et le retirer serait une régression d'affichage
-sans contrepartie.
+> **Correction préalable.** Une version antérieure de ce §4.1 attribuait les
+> seuils serveur à `credits/pipeline.py`. **Ce fichier n'existe pas** : il est
+> *proposé* par la SPEC §6, il n'est pas écrit. J'ai cité comme code en place ce
+> qui n'est qu'une intention de SPEC. Vérifié (`find backend -name pipeline.py`,
+> négatif) et corrigé après signalement du lot 3. Les vrais emplacements sont
+> ci-dessous.
 
-Demande commune avec le lot 3, portée au §3 : **que le moteur serve la lettre
-avec le score**. Sinon l'analyste et le client dérivent la même note de deux (ici
-trois) barèmes front distincts, qui divergeront exactement comme les couleurs de
-recommandation ci-dessus.
+Le front ne porte pas *une* grille divergente du backend : il en porte **deux,
+incompatibles entre elles**, pour le même concept — la classe de risque d'un
+score global.
+
+| Emplacement | Grille | Opérateur | Usage |
+|---|---|---|---|
+| `src/components/simulateur/SimulationResult.jsx` (lot 3) | 85 / 70 / **50** | `>` | lettre A/B/C/D + couleur du donut |
+| `src/pages/Credits.jsx` | ré-importe `scoreLetterOf` | `>` | lettre, vue client |
+| `src/components/admin/credits/CreditDetailsModal.jsx:109` | 85 / 70 / **50** | `>` | `scoreColor` (pastille) |
+| `src/components/admin/credits/CreditRow.jsx:20` | 85 / 70 / **50** | `>` | `ScoreBadge` (liste) |
+| `src/pages/credit/ApplicationDetail.tsx:406` | **70 / 50**, 3 bandes | `>=` | couleur du score du dossier |
+| `src/pages/credit/Applications.tsx:285` | **70 / 50**, 3 bandes | `>=` | couleur du score en liste |
+| `src/pages/credit/CreditAnalysis.tsx:152` | **70 / 50**, 3 bandes | `>=` | couleur du score |
+| `backend/credits/scoring.py:332` | 85 / 70 / **55** | `>=` | taux (−2 / 0 / **+2,5** / +5) |
+| `backend/credits/scoring.py:397` | 85 / 70 / **55** | `>=` | `_valuation_note` |
+| `backend/credits/dataio_simulator.py:343` | 85 / 70 / **55** | `>=` | `_valuation_note` |
+| `backend/credits/dataio_simulator.py:580` | 85 / 70 / **55** | `>=` | taux (−2 / 0 / **+2,0** / +5) |
+
+Ce n'est donc pas une duplication, ce sont **quatre contradictions** :
+
+1. **Deux grilles front incompatibles.** Les écrans d'instruction
+   (`pages/credit/**` — la file analyste, le détail de dossier, l'analyse)
+   classent en **3 bandes 70/50** ; les écrans portefeuille et le simulateur
+   classent en **4 bandes 85/70/50**. Un dossier à 90 est « vert, 1ᵉʳ niveau sur
+   3 » d'un côté et « vert, 1ᵉʳ niveau sur 4 » de l'autre ; à 60, il est rouge
+   dans la file analyste et jaune dans la liste portefeuille. Ce sont les écrans
+   où la décision se prend.
+2. **Front contre backend, sur la bande 50–54.** Un score de 52 s'affiche « C »
+   en jaune, à côté d'une `valuationNote` serveur « Dossier à risque élevé —
+   analyse approfondie requise » et d'un taux majoré de +5. La couleur dit 3ᵉ
+   niveau, le reste de l'écran dit 4ᵉ.
+3. **Opérateur `>` contre `>=`.** Un score valant **exactement 85 ou 70** tombe
+   dans la bande haute pour le moteur et dans la bande suivante pour le front
+   4-bandes. Bug de bord silencieux : corriger 50 → 55 sans corriger `>` → `>=`
+   le laisserait intact, et il est plus discret donc plus durable. (Relevé par
+   le lot 3.)
+4. **Backend contre lui-même, sur la 3ᵉ bande.** `scoring.py` majore de +2,5,
+   `dataio_simulator.py` de +2,0. Deux modules, deux taux pour le même score.
+
+**Hors périmètre de ce constat, vérifié pour éviter un faux positif :**
+`SimulationResult.jsx:112` (`c.points >= 70 / 50`) colore les **critères** d'un
+dossier, pas le score global — `c.points` est un score sur 100 par critère.
+Concept distinct, échelle légitimement différente. Ce n'est **pas** une copie de
+plus.
+
+Diagnostic initial dû au lot 3 (`CreditRow.jsx`, la 4 backend, l'opérateur) ;
+les trois écrans de `pages/credit/**` et la vérification de `c.points` ajoutés
+par un balayage `grep -rnE "(>|>=) ?(85|70|55|50)"` sur tout `src`.
+
+**Pourquoi `scoreColor` n'a pas été corrigé unilatéralement.** Aligner 50 → 55
+dans `CreditDetailsModal.jsx` seul ferait diverger la pastille du modal du badge
+de la liste (`CreditRow.jsx`, hors de mon périmètre) : le même analyste verrait
+jaune dans la liste et rouge dans le détail, sur le même dossier à dix secondes
+d'intervalle. C'est très exactement le mode de défaillance qui vient d'être
+arbitré au §4 — le reproduire pour corriger l'autre moitié serait absurde. Et
+avec les trois écrans de `pages/credit/**`, un alignement partiel ferait pire :
+il créerait une troisième grille.
+
+Le correctif n'a de sens qu'**atomique sur les 7 emplacements front**, et il
+doit porter sur les **trois** écarts à la fois — palier (50 → 55), opérateur
+(`>` → `>=`), et unification des grilles 3-bandes et 4-bandes. Cela traverse
+quatre périmètres d'agents (`admin/credits`, `pages/credit`, `pages/Credits.jsx`,
+`components/simulateur`) : **à router comme une tâche unique**, pas à distribuer.
+
+Demande commune au backend, reformulée en deux temps : voir §3, point 7.
+
+### 4.2 Note de méthode
+
+Ce recensement est passé de 3 à 7 emplacements front en trois itérations, entre
+deux agents. À chaque tour, chacun a vérifié le pointeur de l'autre puis s'est
+arrêté — et le tour suivant a trouvé une pièce de plus, à chaque fois **dans le
+périmètre de celui qui venait de compter**. La cause est identifiable : on a
+compté des *fichiers* au lieu de compter des *échelles*, et on a vérifié ce que
+disait l'autre au lieu de balayer chez soi. Un `grep` unique sur tout `src` en
+fin de chaîne a trouvé plus que les trois recensements successifs réunis.
+
+Pour la prochaine dette de cette famille : balayer d'abord le dépôt entier sur
+le motif, dédupliquer ensuite. L'inventaire complet coûte une commande ; le
+recensement incrémental a coûté trois allers-retours et a produit deux
+affirmations fausses en cours de route (cf. notes de correction ci-dessus).
 
 ---
 

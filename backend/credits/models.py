@@ -583,3 +583,252 @@ class LineFinding(models.Model):
 
     def __str__(self) -> str:
         return f"{self.rule_id_snapshot} [{self.severity}] → NeedsSheet#{self.needs_sheet_id}"
+
+
+# ── Moteur d'analyse technico-économique (SPEC Moteur §3) ────────────────────
+#
+# Écarts assumés avec la SPEC, signalés plutôt que tranchés en silence :
+#   - `DemandeCredit`       → `CreditApplication` (le modèle de la SPEC n'existe pas ici) ;
+#   - `PlanFinancierUpload` → `dataio.DataSource` via `application.needs_source`
+#     (lot 2 : la feuille de besoins est ingérée en tables, plus un fichier).
+#   - la SPEC type les seuils en `float` ; tout est ici en `Decimal` (principe 4).
+
+
+class ReferentielFiliere(models.Model):
+    """Référentiel technico-économique par filière (fichier AGRICAP_FIN_SIM_xx).
+
+    Alimenté par la boucle d'apprentissage (principe 10) : les plages indicatives
+    sont progressivement remplacées par les données réelles à N ≥ 30 dossiers.
+    `source` dit laquelle des deux autorités s'applique — une comparaison faite
+    contre un référentiel `indicatif` ne vaut pas une comparaison faite contre
+    200 dossiers, et le moteur doit le restituer comme tel.
+
+    `value_chain_code` mappe la nomenclature `01`–`14` du référentiel v3 sur les
+    codes `reference_data.ValueChain` : c'est la dette « 2 nomenclatures de
+    filières » (CLAUDE.md §6), résorbée ici par une colonne de jointure plutôt
+    que par une table de correspondance codée en dur.
+    """
+
+    class Source(models.TextChoices):
+        INDICATIF = "indicatif", "Indicatif (plages estimées)"
+        APPRIS = "appris", "Appris (N ≥ 30 dossiers réels)"
+
+    code = models.CharField(max_length=60, unique=True)   # AGRICAP_FIN_SIM_01_Cereales_Mais
+    filiere = models.CharField(max_length=100)            # Céréales — Maïs
+    #: Code `reference_data.ValueChain` correspondant (jointure de nomenclatures).
+    value_chain_code = models.CharField(max_length=50, blank=True, db_index=True)
+    unite_reference = models.CharField(max_length=30, default="ha")
+
+    #: {"semences": {"ref": "850.00", "tol_inf": "0.30", "tol_sup": "0.40"}, ...}
+    #: Montants et tolérances stockés en CHAÎNES : un JSON `float` réintroduirait
+    #: le binaire flottant que le principe 4 bannit du calcul financier.
+    couts_modules = models.JSONField(default=dict)
+    #: {"qte_unite": "4.5", "prix_unitaire": "380.00", "unite": "t"}
+    rendement_ref = models.JSONField(default=dict)
+
+    n_cas_reels = models.PositiveIntegerField(default=0)
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.INDICATIF)
+    version = models.PositiveIntegerField(default=1)
+    actif = models.BooleanField(default=True)
+    devise = models.CharField(max_length=3, default="USD")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["code"]
+
+    def __str__(self) -> str:
+        return f"{self.code} ({self.filiere}) v{self.version}"
+
+    @property
+    def est_indicatif(self) -> bool:
+        return self.source == self.Source.INDICATIF
+
+
+class BaremeScore(models.Model):
+    """Barème de conversion valeur → score, calibrable sans redéploiement (principe 8).
+
+    Deux formes cohabitent, et une seule est renseignée à la fois :
+
+      - **courbe** (`points`) : fonction affine par morceaux
+        `[{"x": "0.5", "y": "0"}, {"x": "1.0", "y": "40"}, ...]` — c'est la forme
+        des trois barèmes de la SPEC §5 (`DSCR`, `ECART_TECHNIQUE`,
+        `COUVERTURE_GARANTIES`) ;
+      - **règles** (`parametres`) : le barème de décision à 4 niveaux et le choc
+        du stress test, qui ne sont pas des courbes. Ajout assumé à la SPEC : ces
+        seuils étaient codés en dur dans son pseudo-code (`>= 75`, `>= 60`,
+        `>= 45`, `CHOC_STRESS = 0.25`), ce que le principe 8 interdit.
+
+    `evaluer()` travaille en `Decimal` de bout en bout. Le pseudo-code de la SPEC
+    prend et rend des `float` : sur un barème dont un point d'inflexion tombe
+    exactement sur un seuil de décision, l'erreur de représentation binaire suffit
+    à faire basculer une recommandation.
+    """
+
+    code = models.CharField(max_length=40, unique=True)   # DSCR, ECART_TECHNIQUE...
+    libelle = models.CharField(max_length=200, blank=True)
+    points = models.JSONField(default=list)
+    parametres = models.JSONField(default=dict, blank=True)
+    actif = models.BooleanField(default=True)
+    version = models.PositiveIntegerField(default=1)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["code"]
+
+    def __str__(self) -> str:
+        return f"{self.code} v{self.version}"
+
+    def evaluer(self, x):
+        """Score 0–100 (quantizé au dixième) pour l'abscisse `x`.
+
+        Hors des bornes, la courbe est prolongée par sa valeur extrême — jamais
+        extrapolée : un DSCR de 40 ne vaut pas 4 000/100.
+        """
+        from decimal import Decimal, ROUND_HALF_UP
+
+        dixieme = Decimal("0.1")
+        pts = sorted(
+            ({"x": Decimal(str(p["x"])), "y": Decimal(str(p["y"]))} for p in self.points),
+            key=lambda p: p["x"],
+        )
+        if not pts:
+            raise ValueError(f"Barème « {self.code} » sans point de courbe.")
+
+        valeur = Decimal(str(x))
+        if valeur <= pts[0]["x"]:
+            return pts[0]["y"].quantize(dixieme, rounding=ROUND_HALF_UP)
+        if valeur >= pts[-1]["x"]:
+            return pts[-1]["y"].quantize(dixieme, rounding=ROUND_HALF_UP)
+
+        for a, b in zip(pts, pts[1:]):
+            if a["x"] <= valeur <= b["x"]:
+                largeur = b["x"] - a["x"]
+                if largeur == 0:
+                    return b["y"].quantize(dixieme, rounding=ROUND_HALF_UP)
+                t = (valeur - a["x"]) / largeur
+                return (a["y"] + t * (b["y"] - a["y"])).quantize(
+                    dixieme, rounding=ROUND_HALF_UP)
+        # Inatteignable : les bornes sont traitées au-dessus.
+        return pts[-1]["y"].quantize(dixieme, rounding=ROUND_HALF_UP)
+
+
+class ImmutableAnalyse(Exception):
+    """Tentative de modification d'une analyse déjà exécutée (principe 3)."""
+
+
+class AnalyseCredit(models.Model):
+    """Résultat complet d'une exécution du moteur — **immuable**.
+
+    On ré-analyse, on ne corrige jamais : chaque exécution crée une ligne. L'écart
+    entre deux analyses successives d'un même dossier est lui-même une donnée
+    (principe 3) — d'où le triplet `needs_source / revision / sha256` figé ici :
+    sans lui, comparer deux analyses ne dirait pas si c'est le moteur, les
+    barèmes ou le fichier du client qui a bougé.
+
+    Seul `justifications` peut évoluer, et seulement par ajout : une justification
+    d'analyste s'ajoute au dossier, elle n'en retire ni n'en réécrit aucune.
+    """
+
+    class Recommandation(models.TextChoices):
+        APPROBATION = "approbation", "Approbation recommandée"
+        APPROBATION_COND = "approbation_cond", "Approbation sous conditions"
+        REVUE = "revue", "Revue approfondie requise"
+        REFUS = "refus", "Refus recommandé"
+
+    #: PROTECT et non CASCADE (la SPEC dit CASCADE) : une analyse est une pièce
+    #: probante, elle ne disparaît pas avec le dossier (garde-fou final §9).
+    application = models.ForeignKey(
+        CreditApplication, on_delete=models.PROTECT, related_name="analyses",
+    )
+
+    # ── Lignage : de quoi rejouer l'analyse à l'identique (principe 1) ────────
+    needs_source = models.ForeignKey(
+        "dataio.DataSource", on_delete=models.PROTECT, related_name="analyses",
+    )
+    needs_source_revision = models.PositiveIntegerField(default=1)
+    needs_source_sha256 = models.CharField(max_length=64, blank=True)
+    referentiel = models.ForeignKey(ReferentielFiliere, on_delete=models.PROTECT)
+
+    # ── Paramètres du crédit analysé ─────────────────────────────────────────
+    duree_mois = models.PositiveIntegerField()
+    differe_mois = models.PositiveIntegerField(default=0)
+    mode_differe = models.CharField(max_length=20, default="interets_seuls")
+    taux_annuel = models.DecimalField(max_digits=6, decimal_places=3)
+    capital = models.DecimalField(max_digits=15, decimal_places=2)
+    devise = models.CharField(max_length=3, default="USD")
+
+    # ── Résultats ────────────────────────────────────────────────────────────
+    criteres = models.JSONField(default=dict)
+    dscr = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
+    dscr_stress = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
+    score_global = models.DecimalField(max_digits=5, decimal_places=1)
+    recommandation = models.CharField(max_length=20, choices=Recommandation.choices)
+
+    indicateurs_hors_plage = models.JSONField(default=list)
+    #: [{indicateur, justification, agent, date}] — APPEND ONLY (cf. `save`).
+    justifications = models.JSONField(default=list)
+    echeancier = models.JSONField(default=list)
+
+    #: Empreinte des règles appliquées : poids retenus et version de chaque
+    #: barème. Un recalibrage du comité ne doit pas rendre une analyse passée
+    #: inexplicable.
+    poids_appliques = models.JSONField(default=dict)
+    baremes_appliques = models.JSONField(default=dict)
+
+    execute_le = models.DateTimeField(auto_now_add=True)
+    execute_par = models.CharField(max_length=255, blank=True)   # sub IdP
+    version_moteur = models.CharField(max_length=10, default="4.0")
+
+    class Meta:
+        ordering = ["-execute_le", "-id"]
+        indexes = [models.Index(fields=["application", "-execute_le"])]
+
+    def __str__(self) -> str:
+        return (f"Analyse #{self.pk} — {self.application.code} : "
+                f"{self.score_global}/100 → {self.recommandation}")
+
+    # ── Immuabilité (principe 3) ─────────────────────────────────────────────
+
+    #: Seul champ dont une analyse déjà écrite accepte la mise à jour.
+    MUTABLE_FIELDS = ("justifications",)
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._db_snapshot = {
+            name: copy.deepcopy(getattr(instance, name))
+            for name in field_names
+            if name not in cls.MUTABLE_FIELDS and name != "id"
+        }
+        instance._db_justifications = copy.deepcopy(getattr(instance, "justifications", []))
+        return instance
+
+    def save(self, *args, **kwargs):
+        snapshot = getattr(self, "_db_snapshot", None)
+        if snapshot is not None:
+            modifies = [
+                name for name, ancien in snapshot.items()
+                if getattr(self, name) != ancien
+            ]
+            if modifies:
+                raise ImmutableAnalyse(
+                    "Une analyse est immuable : on ré-analyse, on ne corrige pas. "
+                    f"Champs modifiés : {', '.join(sorted(modifies))}."
+                )
+            anciennes = getattr(self, "_db_justifications", []) or []
+            nouvelles = self.justifications or []
+            if len(nouvelles) < len(anciennes) or nouvelles[:len(anciennes)] != anciennes:
+                raise ImmutableAnalyse(
+                    "Les justifications sont append-only : une justification "
+                    "déjà enregistrée ne peut être ni retirée ni réécrite."
+                )
+
+        super().save(*args, **kwargs)
+        self._db_snapshot = {
+            f.attname: copy.deepcopy(getattr(self, f.attname))
+            for f in self._meta.concrete_fields
+            if f.attname not in self.MUTABLE_FIELDS and f.attname != "id"
+        }
+        self._db_justifications = copy.deepcopy(self.justifications)

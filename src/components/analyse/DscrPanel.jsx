@@ -47,6 +47,12 @@ const DscrPanel = ({ analyse }) => {
   const levier = detail(dDetails, 'levier', 'levier_chiffre', 'levierChiffre');
   const commentaireStress = detail(sDetails, 'commentaire');
 
+  // Leviers chiffrés servis par `diagnostiquer_levier()` — le moteur reconstruit
+  // l'échéancier à différé réduit sur les mêmes cash-flows. Rien n'est simulé ici.
+  const diag = detail(dDetails, 'diagnostic');
+  const brutes = diag && typeof diag === 'object' ? diag.alternativesDiffere : undefined;
+  const alternatives = Array.isArray(brutes) ? brutes : [];
+
   const lignes = Array.isArray(analyse?.echeancier) ? analyse.echeancier : [];
   const nbAmort = lignes.filter((l) => l?.phase === 'amortissement').length;
 
@@ -96,6 +102,39 @@ const DscrPanel = ({ analyse }) => {
             <p className="text-xs text-emerald-300/90 mt-1.5">
               Levier : {String(levier)}
             </p>
+          )}
+
+          {alternatives.length > 0 && (
+            <div className="mt-3">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500 mb-1">
+                DSCR selon le différé — calculé par le moteur sur les mêmes cash-flows
+              </p>
+              <ul className="flex flex-wrap gap-2">
+                {alternatives.map((a, i) => {
+                  const actuel = Number(a?.differeMois) === Number(params.differeMois);
+                  return (
+                    <li
+                      key={i}
+                      className={`text-xs rounded-md px-2 py-1 border tabular-nums ${
+                        actuel
+                          ? 'bg-white/10 border-white/20 text-white'
+                          : 'bg-slate-800/60 border-slate-700 text-slate-300'
+                      }`}
+                    >
+                      <span className="text-slate-500">différé</span> {a?.differeMois} m
+                      {' → '}
+                      <strong>{formatDscr(a?.dscr)}</strong>
+                      {actuel && <span className="text-slate-400"> (actuel)</span>}
+                    </li>
+                  );
+                })}
+              </ul>
+              <p className="text-[11px] text-slate-500 mt-1.5">
+                Simulations serveur, à titre de diagnostic. Modifier réellement le différé
+                se fait par une ré-analyse, qui crée une nouvelle analyse — elle n'écrase
+                jamais celle-ci.
+              </p>
+            </div>
           )}
         </div>
       ) : (

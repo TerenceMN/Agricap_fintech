@@ -23,13 +23,19 @@ const PHASE_CLASS = {
  * exact (principe 4). Refaire la somme en JavaScript, c'est fabriquer une
  * seconde vérité financière en `float` — précisément ce que le projet interdit.
  *
- * Les totaux (coût du crédit, service de la dette) ne figurent pas dans le
- * contrat `CreditAnalyse` ; tant que le backend ne les sert pas, ils ne sont
- * pas affichés plutôt qu'estimés.
+ * Les totaux viennent du bloc `totaux` servi par le moteur. `totalCommissions`
+ * n'est **volontairement pas** au contrat tant que l'écart 25 vs 19,95 de la
+ * SPEC §A.3 n'est pas tranché : absence de clé = « non implémenté », pas
+ * « zéro ». On n'affiche donc pas de ligne commission à 0, qui laisserait croire
+ * qu'il n'y en a pas.
  *
- * @param {{lignes: import('@/types/api').CreditEcheancierLigne[], currency?: string}} props
+ * @param {{
+ *   lignes: import('@/types/api').CreditEcheancierLigne[],
+ *   currency?: string,
+ *   totaux?: object|null,
+ * }} props
  */
-const EcheancierTable = ({ lignes = [], currency = '' }) => {
+const EcheancierTable = ({ lignes = [], currency = '', totaux = null }) => {
   const [tout, setTout] = useState(false);
 
   if (!Array.isArray(lignes) || lignes.length === 0) {
@@ -51,15 +57,56 @@ const EcheancierTable = ({ lignes = [], currency = '' }) => {
 
   return (
     <section className="bg-slate-800/50 rounded-xl border border-slate-700 overflow-hidden">
-      <header className="px-4 py-3 border-b border-slate-700 flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h4 className="font-semibold text-white text-sm">Échéancier prévisionnel</h4>
-          <p className="text-[11px] text-slate-500 mt-0.5">
-            {lignes.length} échéance(s) — montants arrêtés par le moteur, affichés tels quels
-            {currency ? '' : ' (devise non portée par la réponse d’analyse)'}.
-          </p>
-        </div>
+      <header className="px-4 py-3 border-b border-slate-700">
+        <h4 className="font-semibold text-white text-sm">Échéancier prévisionnel</h4>
+        <p className="text-[11px] text-slate-500 mt-0.5">
+          {totaux?.nbEcheances ?? lignes.length} échéance(s) — montants arrêtés par le moteur,
+          affichés tels quels.
+        </p>
       </header>
+
+      {totaux && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 p-4 border-b border-slate-700">
+          <div className="bg-slate-900/50 rounded-lg p-3">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">Capital</p>
+            <p className="font-bold text-blue-300 text-sm mt-0.5">
+              {formatMontant(totaux.totalCapital, currency)}
+            </p>
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-3">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">Coût du crédit</p>
+            <p className="font-bold text-amber-300 text-sm mt-0.5">
+              {formatMontant(totaux.totalInterets, currency)}
+            </p>
+            {totaux.totalInteretsCapitalises !== undefined
+              && Number(totaux.totalInteretsCapitalises) !== 0 && (
+              <p className="text-[11px] text-orange-300/80 mt-1">
+                dont {formatMontant(totaux.totalInteretsCapitalises, currency)} capitalisés
+              </p>
+            )}
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-3">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">Service de la dette</p>
+            <p className="font-bold text-white text-sm mt-0.5">
+              {formatMontant(totaux.serviceDette, currency)}
+            </p>
+            <p className="text-[11px] text-slate-500 mt-1">dénominateur du DSCR</p>
+          </div>
+          <div className="bg-slate-900/50 rounded-lg p-3">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">CRD final</p>
+            <p className={`font-bold text-sm mt-0.5 ${
+              Number(totaux.crdFinal) === 0 ? 'text-emerald-300' : 'text-red-300'
+            }`}>
+              {formatMontant(totaux.crdFinal, currency)}
+            </p>
+            {Number(totaux.crdFinal) !== 0 && (
+              <p className="text-[11px] text-red-300/90 mt-1">
+                Devrait être nul — à signaler.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="overflow-x-auto">
         <Table>

@@ -41,4 +41,13 @@ urlpatterns = [
     path("applications/<str:code>/guarantees/<int:guarantee_id>/release/", views.release_guarantee),
     # Analyse documentaire (Partie H)
     path("applications/<str:code>/analysis-report/", views.analysis_report),
+    # Moteur d'analyse technico-économique (SPEC Moteur)
+    # Convention du module `applications/<code>/…`, PAS `admin/demandes/<ref>/…`
+    # de la SPEC : elle adresse des modèles qui n'existent pas ici.
+    # `analyse/justifier/` avant `analyse/` n'est pas nécessaire (chemins
+    # distincts, pas de préfixe capturant), mais l'ordre suit la lecture métier.
+    path("applications/<str:code>/analyse/", views.analyse_detail),
+    path("applications/<str:code>/analyse/justifier/", views.analyse_justifier),
+    path("applications/<str:code>/reanalyser/", views.reanalyser),
+    path("applications/<str:code>/analyse-resume/", views.analyse_resume),
 ]

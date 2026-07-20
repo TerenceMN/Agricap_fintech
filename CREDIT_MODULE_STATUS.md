@@ -557,15 +557,55 @@ agent**, sous `select_for_update` — c'est là qu'est empêché le double gage.
 | 6 | Caution solidaire : consentement garant 72 h, 5 règles | ❌ non commencé |
 | 7 | Nomenclature des rôles / délégation | ✅ fait |
 
-### SPEC Moteur d'analyse
+### SPEC Moteur d'analyse — ✅ livrée
 
 | Élément | État |
 |---|---|
-| `construire_echeancier` (`credits/echeancier.py`) | ✅ **fait** — cas A.2 reproduit au centime dans les deux modes |
-| `BaremeScore`, `AnalyseCredit`, fixtures | ❌ non commencé |
-| Les 5 scoreurs + orchestration | ❌ non commencé |
-| Endpoints analyse / justifier / réanalyser | ❌ non commencé |
-| Onglet Analyse (front) | ❌ non commencé |
+| `construire_echeancier` (`credits/echeancier.py`) | ✅ cas A.2 reproduit au centime dans les deux modes |
+| `ReferentielFiliere`, `BaremeScore`, `AnalyseCredit` | ✅ migration 0010, rollback testé |
+| Les 5 scoreurs + orchestration (`credits/analyse.py`) | ✅ `Decimal` partout, journalisation atomique |
+| Seed idempotent (`manage.py seed_analyse`) | ✅ 3 barèmes + référentiel Maïs |
+| Endpoints analyse / justifier / réanalyser / résumé | ✅ permissions déclaratives |
+| Onglet Analyse (front) | ✅ `CreditDetailsModal` |
+| Simulateur analyste (front) | ✅ `RateMaturityModal` |
+
+**Cas de référence conforme** : service de dette 1 469,65 · CRD final 0,00 ·
+DSCR 0,636 · score 29,2 · recommandation `refus`.
+
+`AnalyseCredit` est immuable — `save()` refuse toute modification sauf l'ajout en
+fin de `justifications`. Lignage figé par `needs_source_id + revision + sha256` :
+deux analyses successives sont comparables, et leur écart est lui-même un signal.
+
+#### Trois écarts SPEC / réalité, à arbitrer
+
+**1. Les cash-flows n'ont aucune source.** La SPEC les lit dans une feuille
+`Tresorerie` qui n'existe pas — `dataio` ne commit que les feuilles 4 et 5. Le
+moteur les **projette** depuis `rendement_ref` (revenu brut − coûts, étalé sur
+les mois d'amortissement), hypothèse restituée dans les détails du critère. Les
+935 USD de l'exemple ne se déduisent d'aucune donnée détenue. Soit la feuille
+entre au template, soit la projection devient la règle officielle.
+
+**2. L'exemple de la §2 ne se déduit pas des barèmes de la §5.** La courbe DSCR
+donne 19,7 pour 0,636 (et non 19,1) ; 6,4 pour le stressé 0,477 (et non 14,3).
+La courbe n'a pas été tordue pour retomber sur l'illustration — elle serait
+fausse pour tous les autres dossiers. L'écart est figé dans un test.
+
+**3. Le référentiel Maïs seedé est inventé.** Ses coûts par module ont été
+répartis à la main pour totaliser 9 111 USD/ha ; `AGRICAP_FIN_SIM_01.xlsx` n'a
+pas été ouvert. **Ils pilotent 25 % du score** — à recalibrer avant tout usage réel.
+
+#### Contradiction interne du backend, non arbitrée
+
+Pour un score en bande 55–69, `scoring.py:332` propose `base + 2,5` et
+`dataio_simulator.py:580` `base + 2,0`. **Deux taux différents proposés au même
+client pour le même score.** Choisir change ce qu'on offre à des emprunteurs
+réels : c'est un arbitrage du comité, pas d'implémentation.
+
+S'y ajoute la grille de classement A/B/C/D, dupliquée en **trois échelles front**
+et **quatre backend**, avec deux divergences : 3ᵉ palier à 50 côté front contre
+55 côté backend, et comparaison `>` contre `>=` — un score valant exactement 85
+ou 70 est déclassé d'une lettre à l'écran. Correctif atomique requis, et la
+grille doit descendre dans `BaremeScore` (principe 8).
 
 ### Écrans backoffice (§7 de CLAUDE.md)
 

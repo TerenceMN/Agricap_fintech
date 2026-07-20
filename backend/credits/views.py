@@ -1523,3 +1523,222 @@ def _recompute_confidence_after_override(ns) -> None:
     penalty = sum(_SEV_WEIGHT.get(f.severity, 0) for f in active_findings)
     ns.document_confidence = max(0.0, min(100.0, 100.0 - penalty))
     ns.save(update_fields=["document_confidence"])
+
+
+# ── Moteur d'analyse technico-économique (SPEC Moteur) ────────────────────────
+#
+# Routes alignées sur la convention du module — `applications/<code>/…` — et NON
+# sur celles de la SPEC (`admin/demandes/<ref>/…`), qui adressent des modèles
+# inexistants ici (`DemandeCredit`, `PlanFinancierUpload`). Le contrat publié
+# dans `src/services/api.ts` est celui-ci.
+#
+# Convention d'absence, arrêtée avec l'agent front : **404 + code
+# `ANALYSE_ABSENTE`** quand aucune analyse n'a encore été exécutée. Jamais un 200
+# à corps vide — un écran ne doit pas avoir à distinguer « pas encore analysé »
+# d'« analysé sans résultat » en inspectant la forme de la réponse.
+
+
+def _analyse_error(exc) -> Response:
+    """Réponse unique pour tout refus du moteur — même contrat que `_workflow_error`."""
+    return Response(
+        {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+        status=exc.http_status,
+    )
+
+
+def _derniere_analyse(app):
+    from credits.models import AnalyseCredit
+    return (AnalyseCredit.objects
+            .filter(application=app)
+            .select_related("application", "referentiel", "needs_source")
+            .order_by("-execute_le", "-id")
+            .first())
+
+
+def _parametres_analyse(app, data: dict):
+    """Durée / différé / taux / mode, depuis le corps de la requête ou le dossier.
+
+    Ce sont les leviers du simulateur analyste (`RateMaturityModal`) : l'analyste
+    fait varier la maturité et relance le moteur. Aucune valeur n'est inventée —
+    à défaut de saisie, on prend le cycle et le taux de base de la filière.
+    """
+    import decimal
+
+    chain = app.value_chain
+    duree = data.get("duree_mois", data.get("dureeMois"))
+    if duree in (None, ""):
+        duree = getattr(chain, "cycle_months", None) or 12
+    differe = data.get("differe_mois", data.get("differeMois")) or 0
+    taux = data.get("taux_annuel", data.get("tauxAnnuel"))
+    mode = (data.get("mode_differe") or data.get("modeDiffere") or "interets_seuls")
+
+    try:
+        duree = int(duree)
+        differe = int(differe)
+        taux = decimal.Decimal(str(taux)) if taux not in (None, "") else None
+    except (TypeError, ValueError, decimal.InvalidOperation):
+        return None, Response(
+            {"detail": "Paramètres de crédit invalides : duree_mois et differe_mois "
+                       "doivent être entiers, taux_annuel un nombre.",
+             "code": "PARAMETRES_INVALIDES"},
+            status=400,
+        )
+    return {"duree_mois": duree, "differe_mois": differe,
+            "taux_annuel": taux, "mode_differe": mode}, None
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def analyse_detail(request: Request, code: str) -> Response:
+    """GET /api/credits/applications/<code>/analyse/ — dernière analyse, vue STAFF.
+
+    Réservée au staff : cette réponse expose les barèmes appliqués, les plages du
+    référentiel et les tolérances par module (principe 7). Un client authentifié
+    et propriétaire du dossier n'y a PAS accès — il a `analyse-resume`.
+    """
+    if not _require_group(request, STAFF_ROLES):
+        return Response(
+            {"detail": "L'analyse détaillée est réservée au personnel d'instruction.",
+             "code": "STAFF_REQUIS"},
+            status=403,
+        )
+
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    analyse = _derniere_analyse(app)
+    if analyse is None:
+        return Response(
+            {"detail": "Aucune analyse n'a encore été exécutée sur ce dossier.",
+             "code": "ANALYSE_ABSENTE"},
+            status=404,
+        )
+
+    from credits.analyse import serialiser_analyse_staff
+    return Response(serialiser_analyse_staff(analyse))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def analyse_justifier(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/analyse/justifier/
+
+    Corps : `{"indicateur": "cout_module:semences", "justification": "..."}`.
+    Ajoute une justification à la DERNIÈRE analyse — append only, journalisée.
+    Retourne l'analyse complète mise à jour (contrat `api.ts`).
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response(
+            {"detail": "Seul un agent instructeur peut justifier un indicateur.",
+             "code": "INSTRUCTION_REQUISE"},
+            status=403,
+        )
+
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    analyse = _derniere_analyse(app)
+    if analyse is None:
+        return Response(
+            {"detail": "Aucune analyse à justifier sur ce dossier.",
+             "code": "ANALYSE_ABSENTE"},
+            status=404,
+        )
+
+    from credits.analyse import (
+        AnalyseError, justifier_indicateur, serialiser_analyse_staff,
+    )
+
+    data = request.data or {}
+    try:
+        justifier_indicateur(
+            analyse,
+            indicateur=data.get("indicateur") or data.get("indicator") or "",
+            justification=data.get("justification") or "",
+            agent=getattr(request.user, "sub", "") or "",
+        )
+    except AnalyseError as exc:
+        return _analyse_error(exc)
+
+    analyse.refresh_from_db()
+    return Response(serialiser_analyse_staff(analyse))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def reanalyser(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/reanalyser/
+
+    Corps optionnel : `{duree_mois, differe_mois, taux_annuel, mode_differe}`.
+
+    Crée une NOUVELLE `AnalyseCredit` — l'ancienne reste intacte (principe 3).
+    C'est le simulateur de l'analyste : faire varier la maturité et relancer.
+    Cette route ne déplace JAMAIS le dossier dans la machine à états : le moteur
+    recommande, l'humain décide (principe 2).
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response(
+            {"detail": "Seul un agent instructeur peut lancer une analyse.",
+             "code": "INSTRUCTION_REQUISE"},
+            status=403,
+        )
+
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    params, erreur = _parametres_analyse(app, request.data or {})
+    if erreur is not None:
+        return erreur
+
+    from credits.analyse import (
+        AnalyseError, executer_analyse, serialiser_analyse_staff,
+    )
+
+    try:
+        analyse = executer_analyse(
+            app,
+            execute_par=getattr(request.user, "sub", "") or "",
+            **params,
+        )
+    except AnalyseError as exc:
+        return _analyse_error(exc)
+
+    return Response(serialiser_analyse_staff(analyse), status=201)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def analyse_resume(request: Request, code: str) -> Response:
+    """GET /api/credits/applications/<code>/analyse-resume/ — vue CLIENT.
+
+    Anti-gaming (principe 7) : ni barème, ni seuil, ni tolérance, ni plage du
+    référentiel, ni score chiffré, ni DSCR, ni recommandation. Le client voit sa
+    lettre et des pistes d'amélioration formulées en actions.
+
+    Accessible au titulaire du dossier ; le staff peut la consulter pour voir ce
+    que le client voit — c'est le seul moyen de vérifier l'écran client depuis le
+    backoffice sans se connecter au compte d'un membre.
+    """
+    if not _require_read(request):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    if not _vcs(request).can_read_app(app):
+        return Response({"detail": "Accès interdit."}, status=403)
+
+    analyse = _derniere_analyse(app)
+    if analyse is None:
+        return Response(
+            {"detail": "Votre dossier n'a pas encore été analysé.",
+             "code": "ANALYSE_ABSENTE"},
+            status=404,
+        )
+
+    from credits.analyse import serialiser_analyse_resume
+    return Response(serialiser_analyse_resume(analyse))
