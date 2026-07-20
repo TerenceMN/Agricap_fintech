@@ -300,13 +300,26 @@ Restent à valider en conditions réelles :
    dans le bucket `client`. Je ne l'ai pas écrit — `Layout.jsx` n'est pas dans
    mon périmètre — mais je l'ai vérifié : import présent, build vert.
 
-   **Résidu assumé** : l'entrée n'existe que pour le bucket `client`. Ma route est
-   volontairement sans garde `roles` (cf. §1.8) précisément pour qu'un agent ou un
-   salarié caution d'un membre de son groupe puisse y accéder ; pour eux, l'écran
-   reste atteignable **uniquement par URL**. Le cas est plus rare qu'un garant
-   client, mais il produit le même échec silencieux : une fenêtre qui expire faute
-   d'accès. À trancher par qui possède `Layout.jsx` — soit l'entrée est ajoutée aux
-   autres buckets, soit on acte que le personnel ne se porte pas caution.
+   **Résidu, désormais qualifié par la vérification et non par la supposition** :
+   l'entrée n'existe que pour le bucket `client`. Ma route est volontairement sans
+   garde `roles` (cf. §1.8) précisément pour qu'un agent ou un salarié caution d'un
+   membre de son groupe puisse y accéder ; pour eux, l'écran n'a **aucun point
+   d'entrée dans le menu** et reste atteignable par URL.
+
+   `lot6-backend` a vérifié le versant serveur plutôt que de le supposer :
+   `_assert_account_active` n'écarte qu'un compte **suspendu**, donc un salarié
+   actif membre du groupe du demandeur passe les sept contrôles et **peut être
+   garant** ; la notification in-app est créée pour `guarantee.guarantor` sans
+   distinction de rôle, et un test le verrouille
+   (`test_un_garant_staff_est_notifie_comme_un_garant_client`).
+
+   Conséquence pour le front : l'option « acter que le personnel ne se porte pas
+   caution » **n'est plus sur la table** — le backend l'autorise et le teste. Le
+   garant staff atteint l'écran par le chemin porté dans sa notification, pas par
+   le menu. Reste donc une seule question, pour qui possède `Layout.jsx` :
+   ajoute-t-on l'entrée aux autres buckets, ou assume-t-on que la notification est
+   le seul chemin pour eux ? La rareté du cas ne change pas la nature du défaut,
+   elle change le délai avant qu'on le découvre.
 
 2. ✅ **Notification au garant — émise** (`lot6-backend`, deux canaux). In-app dans
    la transaction de désignation (non best-effort, pour qu'un engagement invisible
