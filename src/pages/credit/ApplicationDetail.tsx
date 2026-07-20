@@ -430,7 +430,7 @@ const ApplicationDetail: React.FC = () => {
               <tbody>
                 {score.breakdown.map((b, i) => (
                   <tr key={i} className="border-t border-white/5">
-                    <td className="py-2 capitalize">{b.criterion.replace(/_/g, ' ')}</td>
+                    <td className="py-2">{b.label || b.code}</td>
                     <td className="py-2 text-right font-bold text-emerald-300">{b.points}</td>
                     <td className="py-2 text-right text-slate-400">{b.maxPoints}</td>
                   </tr>

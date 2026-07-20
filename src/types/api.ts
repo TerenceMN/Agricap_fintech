@@ -747,10 +747,24 @@ export interface CreditNeedsSheet {
   uploadedAt?: string;
 }
 
+/**
+ * Une ligne du détail de score, telle que le backend la sert réellement.
+ *
+ * Ce type déclarait `criterion`, une clé qu'aucune des deux sources n'émet :
+ * `scoring.py` et `dataio_simulator.py` servent toutes deux `code` + `label`.
+ * L'écart était invisible à `tsc` — le type mentait, donc le compilateur
+ * validait `b.criterion.replace(...)` sur un `undefined` garanti à l'exécution.
+ *
+ * `label` est déjà rédigé en français par le backend (« Fiabilité technique ») :
+ * il s'affiche tel quel, sans dérivation cosmétique depuis le code.
+ */
 export interface CreditScoreBreakdown {
-  criterion: string;
+  code: string;
+  label: string;
   points: number;
   maxPoints: number;
+  weight?: number;
+  weightedScore?: number;
   detail?: string;
 }
 
