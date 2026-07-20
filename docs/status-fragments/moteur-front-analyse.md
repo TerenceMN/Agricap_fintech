@@ -179,6 +179,27 @@ présente, la valeur juste. Il fallait regarder la réponse.
 (« intérêts seuls » / « franchise totale — intérêts capitalisés »). Deux dossiers
 instruits sous deux modes ne se comparent pas, et la mention manquait.
 
+**Ajouté ensuite — `diagnostic.hypotheseCashFlows`.** Le dénominateur du DSCR est
+un fait (l'échéancier) ; son **numérateur peut être une projection**. Quand le
+classeur ingéré ne déclare aucune trésorerie prévisionnelle, le moteur projette
+les cash-flows depuis le référentiel filière et le signale
+(`origine: "projection_referentiel"`, avec un commentaire qui dit « hypothèse à
+valider avec le client »). Afficher le ratio sans cette mention donnerait à une
+hypothèse l'autorité d'une donnée — le défaut d'incertitude non assumée que
+CLAUDE.md §4.6 proscrit, sur le chiffre le plus regardé de l'écran.
+
+Un bandeau ambre affiche donc l'origine, le commentaire du moteur, et les
+grandeurs de la projection (revenu brut, charges du plan, marge nette, rendement
+retenu × superficie), avec la question à poser au client.
+
+> **Ce champ existait dans le payload depuis la première confrontation et je ne
+> l'avais pas branché.** Pire : j'avais affirmé à `moteur-backend`, dans un
+> message, que l'écran l'affichait. `grep hypotheseCashFlows src/components/analyse/`
+> ne renvoyait rien. Affirmation fausse sur mon propre code — la variante la plus
+> facile à commettre, puisque je n'avais même pas à mal lire une source
+> extérieure. Corrigé en implémentant plutôt qu'en rétractant : le fond était
+> juste, seule l'affirmation était en avance sur le code.
+
 ---
 
 ### 3.2 Demandes initiales (archive)

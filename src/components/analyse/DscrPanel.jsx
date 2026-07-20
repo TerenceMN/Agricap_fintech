@@ -1,6 +1,6 @@
 import React from 'react';
 import { Activity, TrendingDown, AlertTriangle } from 'lucide-react';
-import { formatDscr, formatTaux, NULL_DISPLAY } from './analyseFormat';
+import { formatDscr, formatTaux, formatMontant, NULL_DISPLAY } from './analyseFormat';
 
 /**
  * Lit une clé de `details` en tolérant les deux conventions de nommage
@@ -47,9 +47,9 @@ const Stat = ({ label, value, tone = 'text-white', hint }) => (
  * Le nombre d'échéances d'amortissement est un **comptage des lignes renvoyées
  * par le serveur**, pas un recalcul de l'échéancier.
  *
- * @param {{analyse: import('@/types/api').CreditAnalyse}} props
+ * @param {{analyse: import('@/types/api').CreditAnalyse, currency?: string}} props
  */
-const DscrPanel = ({ analyse }) => {
+const DscrPanel = ({ analyse, currency = '' }) => {
   const params = analyse?.parametres ?? {};
   const dDetails = analyse?.criteres?.dscr?.details;
   const sDetails = analyse?.criteres?.stress?.details;
@@ -64,6 +64,20 @@ const DscrPanel = ({ analyse }) => {
   const brutes = diag && typeof diag === 'object' ? diag.alternativesDiffere : undefined;
   const alternatives = Array.isArray(brutes) ? brutes : [];
 
+  // Origine des cash-flows : le dénominateur du DSCR est un fait (l'échéancier),
+  // mais le numérateur peut être une PROJECTION du référentiel quand le classeur
+  // ingéré ne déclare aucune trésorerie prévisionnelle. Afficher le ratio sans
+  // le dire donnerait à une hypothèse l'autorité d'une donnée (CLAUDE.md §4.6,
+  // « incertitude assumée »).
+  // Le moteur n'émet que deux origines (`analyse.py` 651 et 835) :
+  // `projection_referentiel` et `fourni`. On teste donc l'appartenance à la
+  // valeur qui appelle l'avertissement, jamais l'exclusion d'une autre : une
+  // liste d'exclusion se trompe en silence dès qu'une origine est ajoutée, et
+  // le sens de l'erreur importe ici — signaler « projeté » sur des cash-flows
+  // réellement fournis discrédite le bandeau, et l'analyste cesse de le lire.
+  const hypothese = diag && typeof diag === 'object' ? diag.hypotheseCashFlows : undefined;
+  const estProjection = String(hypothese?.origine || '') === 'projection_referentiel';
+
   const lignes = Array.isArray(analyse?.echeancier) ? analyse.echeancier : [];
   const nbAmort = lignes.filter((l) => l?.phase === 'amortissement').length;
 
@@ -73,6 +87,43 @@ const DscrPanel = ({ analyse }) => {
         <Activity className="w-4 h-4 text-emerald-400" aria-hidden="true" />
         Capacité de remboursement
       </h4>
+
+      {estProjection && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3">
+          <p className="text-[11px] uppercase tracking-wide text-amber-300/90 flex items-center gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5" aria-hidden="true" />
+            DSCR fondé sur des cash-flows projetés, non déclarés
+          </p>
+          {hypothese?.commentaire && (
+            <p className="text-xs text-amber-100/90 mt-1.5">{String(hypothese.commentaire)}</p>
+          )}
+          <dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-300 tabular-nums">
+            {hypothese?.revenuBrut !== undefined && (
+              <div><dt className="inline text-slate-500">Revenu brut projeté </dt>
+                <dd className="inline font-semibold">{formatMontant(hypothese.revenuBrut, currency)}</dd></div>
+            )}
+            {hypothese?.chargesPlan !== undefined && (
+              <div><dt className="inline text-slate-500">Charges du plan </dt>
+                <dd className="inline font-semibold">{formatMontant(hypothese.chargesPlan, currency)}</dd></div>
+            )}
+            {hypothese?.margeNetteCycle !== undefined && (
+              <div><dt className="inline text-slate-500">Marge nette du cycle </dt>
+                <dd className="inline font-semibold">{formatMontant(hypothese.margeNetteCycle, currency)}</dd></div>
+            )}
+            {hypothese?.rendementUnitaire !== undefined && (
+              <div><dt className="inline text-slate-500">Rendement retenu </dt>
+                <dd className="inline font-semibold">
+                  {hypothese.rendementUnitaire} {hypothese.uniteRendement || ''}
+                  {hypothese.superficieHa !== undefined && ` × ${hypothese.superficieHa} ha`}
+                </dd></div>
+            )}
+          </dl>
+          <p className="text-[11px] text-amber-200/70 mt-2">
+            Hypothèse à valider avec le client — c'est la première question à lui poser avant
+            de conclure sur ce DSCR.
+          </p>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Stat

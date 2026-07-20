@@ -164,7 +164,7 @@ const AnalyseTab = ({ code, state }) => {
 
       <CriteriaTable criteres={analyse.criteres} scoreGlobal={analyse.scoreGlobal} />
 
-      <DscrPanel analyse={analyse} />
+      <DscrPanel analyse={analyse} currency={devise} />
 
       <ModuleGaps analyse={analyse} currency={devise} onJustify={ouvrirJustification} />
 
