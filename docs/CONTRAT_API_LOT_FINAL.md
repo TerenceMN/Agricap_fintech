@@ -57,6 +57,17 @@ référentiel n'existe (filière hors-modèle), l'état reste explicitement
 ## 3. Principe 11 — templates de fichiers versionnés (`dataio`)
 
 - `GET /api/dataio/templates/` — liste, avec `active` (id/version courante).
+  Résumé par ligne seulement (`sheetNames`, `rubriques`) — pas le schéma complet.
+- `GET /api/dataio/templates/<pk>` — **NOUVEAU** : détail d'un template =
+  schéma dérivé COMPLET (`schema.sheets[].columns/types/row_labels`) + `diff`
+  calculé **côté serveur** + `diffBaseline: {id, version, relation}`.
+  `relation="active"` si le template est `pending` (« qu'est-ce que change son
+  activation ? » — la question du checker) ; `relation="supersedes"` s'il est
+  `active`/`archived` (trace de ce qui a changé à SON activation).
+  Sans cet endpoint le **checker** (≠ maker par construction) ne voyait le schéma
+  et le diff que dans la réponse d'`upload` du maker, donc jamais au rechargement
+  de l'écran : il activait à l'aveugle (CLAUDE.md §7.1.5). Le front ne recalcule
+  jamais le diff.
 - `POST /api/dataio/templates/upload` (maker) — `kind="TEMPLATE"`, SHA-256.
 - `POST /api/dataio/templates/<id>/activate` (checker ≠ maker) — le précédent
   passe `archived`; le schéma attendu est **dérivé du template actif**.

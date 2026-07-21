@@ -14,5 +14,6 @@ urlpatterns = [
     # Templates de fichiers versionnés (principe 11) — maker-checker.
     path("templates/", views_templates.templates),
     path("templates/upload", views_templates.upload_template),
+    path("templates/<int:pk>", views_templates.template_detail),
     path("templates/<int:pk>/activate", views_templates.activate_template),
 ]

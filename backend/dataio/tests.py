@@ -271,3 +271,70 @@ class TemplateApiTests(AuthedAPITestCase):
         self.login(role="agent_terrain", sub="no-config")
         res = self.client.get("/api/dataio/templates/")
         self.assertEqual(res.status_code, 403)
+
+
+class TemplateDetailTests(AuthedAPITestCase):
+    """Le CHECKER (≠ maker) doit voir le schéma dérivé complet et le diff AU
+    RECHARGEMENT de l'écran, pas seulement dans la réponse d'upload du maker —
+    sans quoi il activerait à l'aveugle (CLAUDE.md §7.1.5)."""
+
+    def test_detail_exposes_full_schema_and_diff_to_checker(self):
+        v1 = _seed_active(maker="m1", checker="c1")
+        # v2 ajoute une rubrique et retire une feuille par rapport à l'actif.
+        v2 = tpl_svc.upload_template(
+            _upload_file(build_fb(omit_rubriques=("Logistique",))), uploaded_by="m1")
+
+        # Le checker, qui n'a pas fait l'upload, ouvre l'écran.
+        self.login(role="admin_it", sub="c1")
+        res = self.client.get(f"/api/dataio/templates/{v2.pk}")
+        self.assertEqual(res.status_code, 200)
+
+        # Schéma dérivé COMPLET (colonnes/types/row_labels), pas seulement le résumé.
+        self.assertIn("schema", res.data)
+        s4 = next(s for s in res.data["schema"]["sheets"]
+                  if s["name"] == "4_Besoins_Financiers")
+        self.assertIn("columns", s4)
+        self.assertIn("types", s4)
+
+        # Diff calculé SERVEUR vs le template actif (la question du checker).
+        self.assertIn("Logistique", res.data["diff"]["rubriquesRemoved"])
+        self.assertEqual(res.data["diffBaseline"]["id"], v1.pk)
+        self.assertEqual(res.data["diffBaseline"]["relation"], "active")
+
+    def test_detail_of_active_diffs_against_superseded(self):
+        v1 = _seed_active(maker="m1", checker="c1")
+        v2 = tpl_svc.upload_template(_upload_file(build_fb()), uploaded_by="m1")
+        tpl_svc.activate_template(v2, activator_sub="c1")
+
+        self.login(role="admin_it", sub="c1")
+        res = self.client.get(f"/api/dataio/templates/{v2.pk}")
+        self.assertEqual(res.status_code, 200)
+        # Trace historique : ce qui a changé au moment de SON activation.
+        self.assertEqual(res.data["diffBaseline"]["id"], v1.pk)
+        self.assertEqual(res.data["diffBaseline"]["relation"], "supersedes")
+
+    def test_detail_without_baseline_reports_no_previous(self):
+        tpl = tpl_svc.upload_template(_upload_file(build_fb()), uploaded_by="m1")
+        self.login(role="admin_it", sub="c1")
+        res = self.client.get(f"/api/dataio/templates/{tpl.pk}")
+        self.assertEqual(res.status_code, 200)
+        self.assertIsNone(res.data["diffBaseline"]["id"])
+        self.assertFalse(res.data["diff"]["hasPrevious"])
+
+    def test_detail_404_when_unknown(self):
+        self.login(role="admin_it", sub="c1")
+        self.assertEqual(self.client.get("/api/dataio/templates/9999").status_code, 404)
+
+    def test_detail_requires_config_capability(self):
+        tpl = tpl_svc.upload_template(_upload_file(build_fb()), uploaded_by="m1")
+        self.login(role="agent_terrain", sub="no-config")
+        res = self.client.get(f"/api/dataio/templates/{tpl.pk}")
+        self.assertEqual(res.status_code, 403)
+
+    def test_detail_route_does_not_shadow_upload(self):
+        """`templates/<int:pk>` ne doit pas capturer `templates/upload`."""
+        self.login(role="admin_it", sub="maker-a")
+        res = self.client.post(
+            "/api/dataio/templates/upload",
+            {"file": _upload_file(build_fb())}, format="multipart")
+        self.assertEqual(res.status_code, 201)

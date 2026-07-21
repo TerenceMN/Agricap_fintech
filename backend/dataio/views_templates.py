@@ -48,6 +48,53 @@ def _active_ref(t: FileTemplate | None) -> dict | None:
             "activatedAt": t.activated_at.isoformat() if t.activated_at else None}
 
 
+def _diff_baseline(t: FileTemplate) -> tuple[FileTemplate | None, str]:
+    """Template de référence contre lequel diffuser `t`, et le libellé de ce choix.
+
+    - `pending` → le template ACTIF du même `kind` : c'est exactement la question que
+      se pose le checker (« qu'est-ce que change l'activation de celui-ci ? »).
+    - `active` / `archived` → le template qu'il a remplacé (`supersedes`) : la trace
+      historique de ce qui a changé au moment de SON activation.
+
+    Le libellé est renvoyé au front pour qu'il annonce le périmètre du diff au lieu de
+    le deviner (CLAUDE.md §4.6 : pas d'agrégat sans périmètre).
+    """
+    if t.status == FileTemplate.Status.PENDING:
+        active = (FileTemplate.objects
+                  .filter(kind=t.kind, status=FileTemplate.Status.ACTIVE)
+                  .order_by("-activated_at", "-version").first())
+        return active, "active"
+    return t.supersedes, "supersedes"
+
+
+@api_view(["GET"])
+@permission_classes([HasCapability("config")])
+def template_detail(request, pk: int):
+    """Détail d'un template : schéma dérivé COMPLET + diff calculé côté serveur.
+
+    Sans cet endpoint, le checker — qui par construction n'a pas fait l'upload — n'a
+    accès au schéma détaillé et au diff que dans la réponse d'upload du maker, donc
+    jamais au rechargement de l'écran : il activerait à l'aveugle, alors que c'est
+    précisément l'information qui fonde sa décision (CLAUDE.md §7.1.5).
+
+    Le diff n'est JAMAIS recalculé côté client (principe : zéro chiffre métier calculé
+    par le front).
+    """
+    t = FileTemplate.objects.filter(pk=pk).first()
+    if t is None:
+        return Response({"detail": "Template introuvable."}, status=404)
+
+    baseline, baseline_kind = _diff_baseline(t)
+    return Response({
+        **_template_row(t, full=True),
+        "diff": tpl_svc.diff_schema(baseline.schema if baseline else {}, t.schema),
+        "diffBaseline": (
+            {"id": baseline.pk, "version": baseline.version, "relation": baseline_kind}
+            if baseline else {"id": None, "version": None, "relation": baseline_kind}
+        ),
+    })
+
+
 @api_view(["GET"])
 @permission_classes([HasCapability("config")])
 def templates(request):
