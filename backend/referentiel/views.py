@@ -1,16 +1,36 @@
-"""API référentiel : exposer les plages (transparence, PROMPT §6) et les versions."""
+"""API référentiel : plages, configuration institution et versions.
+
+⚠ ANTI-GAMING (principe 7). Ces endpoints étaient tous ouverts à
+`IsAuthenticated`, donc à N'IMPORTE QUEL utilisateur connecté — le rôle
+``client`` porte la capacité ``read``. Un demandeur pouvait donc lire les seuils
+DSCR, la couverture minimale, le score global minimum, les cinq poids du
+scoring et les plages min/max du référentiel : soit exactement les règles du
+moteur, de quoi calibrer un dossier pour franchir la barre plutôt que pour
+réussir. Le principe 7 l'interdit mot pour mot (« Il ne voit JAMAIS : les
+barèmes, les seuils, les tolérances par module, les plages du référentiel »).
+
+La « transparence » que visait ce module est celle du PERSONNEL qui instruit —
+elle est préservée : `IsStaff` laisse passer les rôles internes. Aucun écran
+client ne consommait ces endpoints (vérifié dans `src/`), le resserrage ne
+casse donc aucun parcours.
+
+`chains` reste ouvert : c'est le catalogue des 14 cultures (code, libellé,
+spécialité), pas une règle de décision.
+"""
 from __future__ import annotations
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
+
 from .chains import CHAINS
 from .models import InstitutionConfig, ReferenceRange, ReferentielVersion
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsStaff])
 def ranges(request):
     """Plages de la version active, filtrables par ?chain=09."""
     version = ReferentielVersion.active()
@@ -40,7 +60,7 @@ def chains(request):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsStaff])
 def config(request):
     """Configuration institution active (seuils/pondérations, §8.1)."""
     c = InstitutionConfig.active()
@@ -56,7 +76,7 @@ def config(request):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsStaff])
 def versions(request):
     """Historique des versions du référentiel typé."""
     return Response([{
