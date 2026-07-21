@@ -690,6 +690,24 @@ def _create_application(request: Request) -> Response:
     except FintechUser.DoesNotExist:
         return Response({"detail": "Client introuvable.", "code": "CLIENT_NOT_FOUND"}, status=404)
 
+    # Un membre interne ne peut pas être le BÉNÉFICIAIRE d'un crédit : il
+    # instruirait, approuverait ou décaisserait sa propre demande. C'est le même
+    # principe que maker ≠ checker, appliqué à la racine — un contrôle
+    # d'indépendance ne tient pas si l'intéressé est des deux côtés du dossier.
+    # Le message dit quoi faire, pas seulement ce qui est refusé : le crédit doit
+    # être assigné à un client, via `client_sub`.
+    if client.is_staff_role:
+        return Response(
+            {"detail": (
+                f"« {client.full_name or client.sub} » est un membre interne "
+                f"(rôle « {client.role} ») : un membre du personnel ne peut pas être "
+                "bénéficiaire d'un crédit AGRICAP — il serait juge et partie sur son "
+                "propre dossier. Assignez ce crédit à un client en précisant son "
+                "`client_sub`."
+            ), "code": "BENEFICIAIRE_INTERNE"},
+            status=422,
+        )
+
     try:
         amount_requested = _to_decimal(data.get("amount_requested", 0) or 0)
     except (ValueError, TypeError):
