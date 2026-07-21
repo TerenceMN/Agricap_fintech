@@ -29,7 +29,8 @@ import {
 import { recommandationConfig } from '@/components/analyse/recommandation';
 import { fmtAmount, fmtDateTime } from './wire';
 import {
-  decisionLabel, type CommitteeDecision, type CommitteeVotesSummary, type MoteurEntry,
+  decisionLabel, type CommitteeDecision, type CommitteeVoteResult,
+  type CommitteeVotesSummary, type MoteurEntry,
 } from './committeeWire';
 
 interface Props {
@@ -93,8 +94,7 @@ const CommitteeVotePanel: React.FC<Props> = ({ code, mySub, moteur, onResolved, 
     setForbidden(null);
     setLoadErrors([]);
     try {
-      const res = await api.credits.committeeVotes(code);
-      setPv(res as unknown as CommitteeVotesSummary);
+      setPv(await api.credits.committeeVotes(code));
     } catch (e) {
       setPv(null);
       if (e instanceof ApiError && e.status === 403) setForbidden(e.message);
@@ -125,15 +125,11 @@ const CommitteeVotePanel: React.FC<Props> = ({ code, mySub, moteur, onResolved, 
     setVoteErrors([]);
     setVoteForbidden(null);
     try {
-      const res = await api.credits.committeeVote(code, {
+      const out: CommitteeVoteResult = await api.credits.committeeVote(code, {
         decision,
         comment: comment.trim(),
         ...(conditions.trim() ? { conditions: conditions.trim() } : {}),
       });
-      const out = res as unknown as {
-        tally: { approve: number; reject: number };
-        quorum: number; resolved: boolean; decision: string | null;
-      };
       setVoteDone(
         out.resolved
           ? `Vote enregistré. Quorum atteint : le dossier a été ${
