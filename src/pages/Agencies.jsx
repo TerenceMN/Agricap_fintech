@@ -119,67 +119,6 @@ const AgencyFormModal = ({ isOpen, onClose, agency, onSave }) => {
     );
 };
 
-const ReasonDialog = ({ open, title, description, onClose, onConfirm }) => {
-    const [reason, setReason] = useState('');
-    useEffect(() => { if (open) setReason(''); }, [open]);
-    return (
-        <Dialog open={open} onOpenChange={onClose}>
-            <DialogContent className="bg-slate-900 border-slate-700 text-white">
-                <DialogHeader>
-                    <DialogTitle>{title}</DialogTitle>
-                    <DialogDescription className="text-slate-400">{description}</DialogDescription>
-                </DialogHeader>
-                <div className="py-2">
-                    <Label>Motif</Label>
-                    <Textarea value={reason} onChange={e => setReason(e.target.value)} placeholder="Raison de cette action..." />
-                </div>
-                <DialogFooter>
-                    <Button variant="outline" onClick={onClose}>Annuler</Button>
-                    <Button variant="destructive" onClick={() => onConfirm(reason)}>Confirmer</Button>
-                </DialogFooter>
-            </DialogContent>
-        </Dialog>
-    );
-};
-
-const ReactivationDialog = ({ open, title, description, onClose, onConfirm }) => {
-    const [reason, setReason] = useState('');
-    const [document, setDocument] = useState(null);
-    useEffect(() => { if (open) { setReason(''); setDocument(null); } }, [open]);
-
-    return (
-        <Dialog open={open} onOpenChange={onClose}>
-            <DialogContent className="bg-slate-900 border-slate-700 text-white">
-                <DialogHeader>
-                    <DialogTitle>{title}</DialogTitle>
-                    <DialogDescription className="text-slate-400">{description}</DialogDescription>
-                </DialogHeader>
-                <div className="space-y-3 py-2">
-                    <div>
-                        <Label>Justification écrite</Label>
-                        <Textarea value={reason} onChange={e => setReason(e.target.value)} placeholder="Raison de la réactivation..." />
-                    </div>
-                    <div>
-                        <Label>Document justificatif</Label>
-                        <Input type="file" onChange={e => setDocument(e.target.files?.[0] || null)} />
-                        <p className="text-xs text-slate-500 mt-1">Requis : preuve à l'appui (ex. levée de sanction, approbation, rapport de contrôle).</p>
-                    </div>
-                </div>
-                <DialogFooter>
-                    <Button variant="outline" onClick={onClose}>Annuler</Button>
-                    <Button
-                        className="bg-emerald-600 hover:bg-emerald-700"
-                        disabled={!reason.trim() || !document}
-                        onClick={() => onConfirm(reason, document)}
-                    >
-                        Confirmer la réactivation
-                    </Button>
-                </DialogFooter>
-            </DialogContent>
-        </Dialog>
-    );
-};
-
 // Maker-Checker — étape 1 : le maker soumet une demande d'action sensible.
 // L'action n'est PAS exécutée immédiatement : elle crée un AgencyActionRequest "pending"
 // qu'un checker devra approuver (avec code OTP par SMS) avant que rien ne se passe.
@@ -253,7 +192,7 @@ const MakerRequestDialog = ({ agency, actionType, pendingRequest, onClose, onSub
                                 className="shrink-0 border-amber-500/50 text-amber-400 hover:bg-amber-500/10 text-xs h-7"
                             >
                                 {loading ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <RefreshCcw className="w-3 h-3 mr-1" />}
-                                Annuler et renvoyer
+                                Annuler la demande en attente
                             </Button>
                         </div>
                     )}
@@ -365,8 +304,7 @@ const CheckerDialog = ({ request, onClose, onDone, toast }) => {
     const handleApprove = async () => {
         setLoading(true);
         try {
-            const res = await api.agencies.actionRequests.approve(request.id, otpCode);
-            console.log('[AGRICAP] Approuvé request=%s status=%s', request.id, res?.status);
+            await api.agencies.actionRequests.approve(request.id, otpCode);
             toast({ title: 'Demande approuvée ✓', description: `Action ${actionMeta.label?.toLowerCase()} sur ${request.agencyCode} exécutée.` });
             onDone(); onClose();
         } catch (e) {
@@ -396,7 +334,7 @@ const CheckerDialog = ({ request, onClose, onDone, toast }) => {
                     </DialogTitle>
                     <DialogDescription className="text-slate-400">
                         {panel === 'otp'
-                            ? 'Un code OTP a été envoyé par SMS lors de la soumission. Saisissez-le pour accuser réception et consulter les détails.'
+                            ? 'Saisissez le code OTP reçu par SMS pour accuser réception et consulter les détails. Si vous n\'en avez pas reçu (aucun approbateur désigné n\'était configuré à la soumission), cliquez sur « Renvoyer le code ».'
                             : 'En tant que checker, vous validez ou refusez cette demande d\'action sensible.'}
                     </DialogDescription>
                 </DialogHeader>
@@ -943,9 +881,7 @@ const Agencies = () => {
     const [loading, setLoading] = useState(true);
     const [searchTerm, setSearchTerm] = useState('');
     const [formAgency, setFormAgency] = useState(undefined); // undefined = fermé, null = création, objet = édition
-    const [reasonAction, setReasonAction] = useState(null); // { agency, action, title }
     const [evolutionAgency, setEvolutionAgency] = useState(null);
-    const [reactivation, setReactivation] = useState(null); // { agency, action, title, description }
     const [report, setReport] = useState(null); // { title, rows }
     const [statusHistory, setStatusHistory] = useState(null); // { agencyCode, rows }
     const [reconcilingAgency, setReconcilingAgency] = useState(null);
@@ -982,31 +918,6 @@ const Agencies = () => {
             load();
         } catch (e) {
             toast({ variant: 'destructive', title: 'Erreur', description: e instanceof ApiError ? e.message : String(e) });
-        }
-    };
-
-    const runAction = async (agency, action, reason = '') => {
-        try {
-            await api.agencies.action(agency.code, action, reason);
-            toast({ title: 'Action effectuée', description: `${agency.code} : action « ${action} » appliquée.` });
-            load();
-        } catch (e) {
-            toast({ variant: 'destructive', title: 'Action refusée', description: e instanceof ApiError ? e.message : String(e) });
-        } finally {
-            setReasonAction(null);
-        }
-    };
-
-    const runReactivation = async (reason, document) => {
-        const { agency, action } = reactivation;
-        try {
-            await api.agencies.actionWithDocument(agency.code, action, reason, document);
-            toast({ title: 'Agence réactivée', description: `${agency.code} est de nouveau active.` });
-            load();
-        } catch (e) {
-            toast({ variant: 'destructive', title: 'Réactivation refusée', description: e instanceof ApiError ? e.message : String(e) });
-        } finally {
-            setReactivation(null);
         }
     };
 
@@ -1289,49 +1200,41 @@ const Agencies = () => {
                                                                 variant="outline"
                                                                 className="border-amber-500/40 text-amber-400 hover:bg-amber-500/10 text-xs h-7"
                                                                 onClick={async () => {
+                                                                    // Renvoie l'OTP aux approbateurs désignés SANS toucher la
+                                                                    // demande (préserve l'id et le document justificatif — un
+                                                                    // cancel+recreate perdrait la pièce des actions UNLOCK/REOPEN).
                                                                     try {
-                                                                        // Annuler puis recréer (la création envoie les codes OTP automatiquement)
-                                                                        await api.agencies.actionRequests.cancel(req.id);
-                                                                        const newReq = await api.agencies.actionRequests.create(
-                                                                            req.agencyCode, req.actionType, req.reason
-                                                                        );
-                                                                        toast({ title: 'Demande renvoyée', description: `Nouvelle demande #${newReq.id} créée. Les codes OTP ont été envoyés aux approbateurs.` });
-                                                                        loadRequests();
+                                                                        const res = await api.agencies.actionRequests.notifyApprovers(req.id);
+                                                                        if (res.notified === 0) {
+                                                                            toast({ title: 'Aucun approbateur désigné', description: "Aucun approbateur n'est configuré pour cette action. Le checker peut demander un code depuis « Traiter »." });
+                                                                        } else if (res.smsSent) {
+                                                                            toast({ title: 'Code renvoyé', description: `Code OTP renvoyé à ${res.notified} approbateur(s).` });
+                                                                        } else {
+                                                                            toast({ variant: 'destructive', title: 'SMS non envoyé', description: `${res.notified} approbateur(s) notifié(s), mais l'envoi SMS a échoué — consultez les logs serveur.` });
+                                                                        }
                                                                     } catch (e) {
                                                                         if (e.status === 409) {
-                                                                            // La demande a déjà été annulée ou traitée — rafraîchir la liste
-                                                                            toast({ variant: 'destructive', title: 'Demande déjà traitée', description: 'Cette demande n\'est plus en attente. La liste a été mise à jour.' });
+                                                                            toast({ variant: 'destructive', title: 'Demande déjà traitée', description: "Cette demande n'est plus en attente. La liste a été mise à jour." });
                                                                             loadRequests();
                                                                         } else {
-                                                                            toast({ variant: 'destructive', title: 'Erreur', description: e.message });
+                                                                            toast({ variant: 'destructive', title: 'Erreur', description: e instanceof ApiError ? e.message : String(e) });
                                                                         }
                                                                     }
                                                                 }}
                                                             >
-                                                                <RefreshCcw className="w-3 h-3 mr-1" /> Renvoyer
+                                                                <RefreshCcw className="w-3 h-3 mr-1" /> Renvoyer le code
                                                             </Button>
                                                             <Button
                                                                 size="sm"
                                                                 variant="outline"
                                                                 className="border-red-500/40 text-red-400 hover:bg-red-500/10 text-xs h-7"
                                                                 onClick={async () => {
-                                                                    console.group('%c[AGRICAP AGENCIES] Annuler demande', 'color:#f87171;font-weight:bold');
-                                                                    console.log('requestId  :', req.id);
-                                                                    console.log('agency     :', req.agencyCode);
-                                                                    console.log('actionType :', req.actionType);
-                                                                    console.log('status     :', req.status);
-                                                                    console.log('requestedBy:', req.requestedBy);
-                                                                    console.log('→ POST /api/agencies/action-requests/%s/cancel', req.id);
                                                                     try {
-                                                                        const res = await api.agencies.actionRequests.cancel(req.id);
-                                                                        console.log('✅ Annulé  nouvel état:', res);
-                                                                        console.groupEnd();
+                                                                        await api.agencies.actionRequests.cancel(req.id);
                                                                         toast({ title: 'Demande annulée', description: `Demande #${req.id} annulée.` });
                                                                         loadRequests();
                                                                     } catch (e) {
-                                                                        console.error('❌ Erreur cancel:', e.status, e.message, e);
-                                                                        console.groupEnd();
-                                                                        toast({ variant: 'destructive', title: 'Erreur', description: e.message });
+                                                                        toast({ variant: 'destructive', title: 'Erreur', description: e instanceof ApiError ? e.message : String(e) });
                                                                     }
                                                                 }}
                                                             >
@@ -1343,17 +1246,7 @@ const Agencies = () => {
                                                         size="sm"
                                                         variant={req.status === 'PENDING_APPROVAL' ? 'default' : 'ghost'}
                                                         className={req.status === 'PENDING_APPROVAL' ? 'bg-emerald-600 hover:bg-emerald-700' : 'text-slate-500'}
-                                                        onClick={() => {
-                                                            console.group('%c[AGRICAP AGENCIES] Traiter / Voir demande', 'color:#34d399;font-weight:bold');
-                                                            console.log('requestId  :', req.id);
-                                                            console.log('agency     :', req.agencyCode);
-                                                            console.log('actionType :', req.actionType);
-                                                            console.log('status     :', req.status);
-                                                            console.log('approver   :', req.approvedBy || '(aucun)');
-                                                            console.log('requestedBy:', req.requestedBy);
-                                                            console.groupEnd();
-                                                            setCheckerRequest(req);
-                                                        }}
+                                                        onClick={() => setCheckerRequest(req)}
                                                     >
                                                         {req.status === 'PENDING_APPROVAL' ? <><UserCheck className="w-3 h-3 mr-1" /> Traiter</> : <><Eye className="w-3 h-3 mr-1" /> Voir</>}
                                                     </Button>
@@ -1369,23 +1262,9 @@ const Agencies = () => {
             </div>
 
             <AgencyFormModal isOpen={formAgency !== undefined} onClose={() => setFormAgency(undefined)} agency={formAgency} onSave={handleSave} />
-            <ReasonDialog
-                open={!!reasonAction}
-                title={reasonAction?.title || ''}
-                description="Cette action sera enregistrée dans le journal d'audit."
-                onClose={() => setReasonAction(null)}
-                onConfirm={(reason) => runAction(reasonAction.agency, reasonAction.action, reason)}
-            />
             <ReportDialog open={!!report} title={report?.title || ''} rows={report?.rows ?? null} onClose={() => setReport(null)} />
             <EvolutionPlanDialog agency={evolutionAgency} onClose={() => setEvolutionAgency(null)} toast={toast} onChanged={load} />
             <AgencyComplianceDialog agency={complianceAgency} onClose={() => setComplianceAgency(null)} />
-            <ReactivationDialog
-                open={!!reactivation}
-                title={reactivation?.title || ''}
-                description={reactivation?.description || ''}
-                onClose={() => setReactivation(null)}
-                onConfirm={runReactivation}
-            />
             <StatusHistoryDialog
                 open={!!statusHistory}
                 agencyCode={statusHistory?.agencyCode || ''}
