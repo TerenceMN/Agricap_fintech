@@ -5,13 +5,37 @@ dégrade en log honnête plutôt qu'un envoi simulé — même principe que `par
 from __future__ import annotations
 
 import logging
+import re
 
 import requests
 from django.conf import settings
 
 logger = logging.getLogger("agricap")
 
-_TIMEOUT_SECONDS = 10
+#: `(connexion, lecture)`. Le fournisseur est un canal secondaire : mieux vaut
+#: échouer vite et le dire que faire attendre l'utilisateur devant un bouton.
+#: ⚠ Ces bornes ne couvrent PAS la résolution DNS, qui a lieu avant la connexion :
+#: une panne DNS observée en production a bloqué l'appel 24,8 s malgré un
+#: timeout de 10 s. Si ce chemin doit être garanti court, il faudra sortir
+#: l'envoi du cycle requête/réponse, pas seulement resserrer ces valeurs.
+_TIMEOUT_SECONDS = (5, 10)
+
+#: Paramètres à masquer avant toute journalisation.
+_PARAMS_SECRETS = ("api_password", "api_id")
+
+
+def _sans_secrets(texte: str) -> str:
+    """Masque les identifiants d'API dans un texte destiné au journal.
+
+    `str(exc)` de `requests` embarque l'URL COMPLÈTE de la requête — donc
+    `api_password` en clair. Une simple panne réseau transformait ainsi le
+    journal serveur en dépôt de secrets, lisible par quiconque a accès aux logs
+    ou à qui on les transmet pour diagnostic. Le mot de passe n'apporte rien au
+    diagnostic : ce qu'on veut savoir, c'est l'hôte et la nature de l'erreur.
+    """
+    for param in _PARAMS_SECRETS:
+        texte = re.sub(rf"({param}=)[^&\s)']+", r"\1***", texte)
+    return texte
 
 
 def send_sms(*, phone: str, message: str) -> bool:
@@ -44,7 +68,8 @@ def send_sms(*, phone: str, message: str) -> bool:
             logger.warning("[SMS] ÉCHEC — refusé par l'API to=%s response=%s", normalized_phone, data)
         return ok
     except (requests.RequestException, ValueError) as exc:
-        logger.error("[SMS] ERREUR réseau to=%s err=%s", normalized_phone, exc)
+        logger.error("[SMS] ERREUR réseau to=%s err=%s",
+                     normalized_phone, _sans_secrets(str(exc)))
         return False
 
 
