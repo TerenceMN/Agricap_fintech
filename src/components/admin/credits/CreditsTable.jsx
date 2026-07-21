@@ -1,9 +1,9 @@
 import React, { useState, useMemo } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Table, TableBody, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import CreditRow from './CreditRow';
-import CreditDetailsModal from './CreditDetailsModal';
 import RateMaturityModal from './RateMaturityModal';
 import { Search, FileDown, UserPlus, RefreshCw, Calculator, CalendarDays, AlertCircle } from 'lucide-react';
 import { useToast } from '@/components/ui/use-toast';
@@ -11,16 +11,34 @@ import { exportToExcel } from '@/lib/export.js';
 
 const CreditsTable = ({ credits, onAction }) => {
     const { toast } = useToast();
+    const navigate = useNavigate();
     const [filter, setFilter] = useState('all');
     const [searchTerm, setSearchTerm] = useState('');
-    const [isModalOpen, setIsModalOpen] = useState(false);
     const [isRateModalOpen, setIsRateModalOpen] = useState(false);
     const [selectedCredit, setSelectedCredit] = useState(null);
 
     const handleRowAction = (action, credit) => {
         if (action === 'details') {
-            setSelectedCredit(credit);
-            setIsModalOpen(true);
+            // Le détail n'est plus un modal : on ouvre la PAGE d'instruction
+            // `/credit/dossiers/:code`, surface unique du dossier (analyse en
+            // sous-page, sélecteur de révision). Le modal dupliquait cet écran.
+            //
+            // La cible est le CODE DE DEMANDE, jamais l'id du prêt. Même
+            // résolution que `codeDemande()` de RateMaturityModal : une chaîne
+            // vide (`portfolio/serializers.py::loan_row` la sert pour un prêt
+            // saisi à la main) signifie « aucune demande rattachée » — il n'y a
+            // alors PAS de page d'instruction, et y naviguer donnerait un 404.
+            const code = credit.applicationCode !== undefined
+                ? (credit.applicationCode || null)
+                : (credit.id || null);
+            if (code) {
+                navigate(`/credit/dossiers/${code}`);
+            } else {
+                toast({
+                    title: 'Aucun dossier d\'instruction',
+                    description: "Ce prêt a été saisi manuellement : il n'est rattaché à aucune demande de crédit, il n'y a donc rien à analyser.",
+                });
+            }
         } else if (action === 'configure_rate') {
             setSelectedCredit(credit);
             setIsRateModalOpen(true);
@@ -135,7 +153,6 @@ const CreditsTable = ({ credits, onAction }) => {
                     </TableBody>
                 </Table>
             </div>
-            <CreditDetailsModal isOpen={isModalOpen} onOpenChange={setIsModalOpen} credit={selectedCredit} />
             <RateMaturityModal isOpen={isRateModalOpen} onOpenChange={setIsRateModalOpen} credit={selectedCredit} />
         </div>
     );
