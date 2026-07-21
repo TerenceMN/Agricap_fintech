@@ -184,6 +184,8 @@ SMS = {
     "API_ID": os.environ.get("SMS_API_ID", ""),
     "API_PASSWORD": os.environ.get("SMS_API_PASSWORD", ""),
     "SENDER_ID": os.environ.get("SMS_SENDER_ID", "TEST-SMS"),
+    # « U » = Unicode : indispensable aux accents français (cf. common/sms.py).
+    "ENCODING": os.environ.get("SMS_ENCODING", "U"),
 }
 
 if "test" in sys.argv:

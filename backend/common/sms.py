@@ -12,12 +12,6 @@ from django.conf import settings
 
 logger = logging.getLogger("agricap")
 
-#: `(connexion, lecture)`. Le fournisseur est un canal secondaire : mieux vaut
-#: échouer vite et le dire que faire attendre l'utilisateur devant un bouton.
-#: ⚠ Ces bornes ne couvrent PAS la résolution DNS, qui a lieu avant la connexion :
-#: une panne DNS observée en production a bloqué l'appel 24,8 s malgré un
-#: timeout de 10 s. Si ce chemin doit être garanti court, il faudra sortir
-#: l'envoi du cycle requête/réponse, pas seulement resserrer ces valeurs.
 _TIMEOUT_SECONDS = (5, 10)
 
 #: Paramètres à masquer avant toute journalisation.
@@ -57,7 +51,10 @@ def send_sms(*, phone: str, message: str) -> bool:
     try:
         response = requests.get(config["API_URL"], params={
             "api_id": config["API_ID"], "api_password": config["API_PASSWORD"],
-            "sms_type": "T", "encoding": "T", "sender_id": config["SENDER_ID"],
+      
+            "sms_type": "T",
+            "encoding": config.get("ENCODING") or "U",
+            "sender_id": config["SENDER_ID"],
             "phonenumber": normalized_phone, "textmessage": message,
         }, timeout=_TIMEOUT_SECONDS)
         data = response.json()
