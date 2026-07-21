@@ -1025,7 +1025,37 @@ export interface CreditDashboardAgent {
   monthlyDisbursements: { count: number; volumeUsd: number };
 }
 
-export type CreditDashboard = CreditDashboardClient | CreditDashboardAgent | Record<string, unknown>;
+/** Corbeille du comité — `GET /credits/dashboard/?view=committee`.
+ *  Servie par `dashboard._committee_dashboard`, réservée à `COMMITTEE_ROLES`
+ *  (403 sinon). Les lignes de `pendingApplications` viennent d'un `.values()`
+ *  Django : elles sont en **snake_case** (et `value_chain__label` porte
+ *  littéralement le double underscore), contrairement au reste du payload. */
+export interface CreditDashboardCommittee {
+  role: 'credit_committee';
+  summary: {
+    pendingReview: number;
+    totalVolumeUsd: number;
+    /** Plafond de délégation `gest_zone`, en USD. Au-delà, le comité statue. */
+    delegationThresholdUsd: number;
+  };
+  /** Max 20 lignes, triées par montant décroissant. Le serveur ne renvoie pas
+   *  de total : `summary.pendingReview` est le compte complet, la liste est
+   *  tronquée à 20 — l'écran doit le dire. */
+  pendingApplications: Array<{
+    code: string;
+    status: string;
+    amount_requested: number;
+    currency: string;
+    value_chain__label: string | null;
+    created_at: string;
+  }>;
+}
+
+export type CreditDashboard =
+  | CreditDashboardClient
+  | CreditDashboardAgent
+  | CreditDashboardCommittee
+  | Record<string, unknown>;
 
 /** Actif gageable du registre `assets`.
  *  `value` est declaree par le client ; `valeurRetenue` est fixee par l'agent
@@ -1300,4 +1330,343 @@ export interface CreditAnalyseResume {
   pointsForts: string[];
   pointsAAmeliorer: string[];
   analyseLe: string | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Comité de crédit — procès-verbal append-only (`credits/committee.py`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Un vote nominatif. Append-only : un membre ne vote qu'une fois (409 au second). */
+export interface CommitteeVoteEntry {
+  /** `sub` IdP du votant — le serveur ne résout pas le nom ici. */
+  voter: string;
+  decision: 'approve' | 'reject';
+  /** Motif obligatoire côté serveur (422 `COMMITTEE_DECISION_INVALID` si vide). */
+  comment: string;
+  conditions: string | null;
+  votedAt: string;
+}
+
+/** PV du comité pour un dossier — `GET /credits/applications/<code>/committee-votes/`.
+ *  Lecture ouverte à `COMMITTEE_ROLES | CAN_AUDIT` (403 sinon) ; le VOTE, lui,
+ *  est réservé à `COMMITTEE_ROLES`. */
+export interface CommitteeVotesSummary {
+  applicationCode: string;
+  /** Nombre de votes concordants requis (`InstitutionConfig`, pas une constante front). */
+  quorum: number;
+  requiresCommittee: boolean;
+  /** Plafond de délégation au-delà duquel le comité est saisi, en USD. */
+  thresholdUsd: number;
+  votes: CommitteeVoteEntry[];
+  tally: { approve: number; reject: number };
+  resolved: boolean;
+  decision: 'approve' | 'reject' | null;
+}
+
+/** Résultat d'un vote — `POST /credits/applications/<code>/committee-vote/` (201).
+ *  Refus possibles : 422 `COMMITTEE_DECISION_INVALID`, 409 `COMMITTEE_STATE_INVALID`,
+ *  422 `COMMITTEE_NOT_REQUIRED`, 409 `MAKER_CHECKER_VIOLATION`,
+ *  409 `COMMITTEE_ALREADY_VOTED`. */
+export interface CommitteeVoteResult {
+  vote: CommitteeVoteEntry;
+  tally: { approve: number; reject: number };
+  quorum: number;
+  resolved: boolean;
+  decision: 'approve' | 'reject' | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Barèmes de score (principe 8 : les règles vivent en base) — `credits/baremes.py`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Point d'une courbe par morceaux. Stocké en JSONField brut : le serveur
+ *  accepte des nombres comme des chaînes numériques — ne pas présumer `number`. */
+export interface BaremeCurvePoint {
+  x: number | string;
+  y: number | string;
+}
+
+/** Impact simulé d'un barème sur le golden set, AVANT activation.
+ *  Aucun de ces chiffres n'est recalculable côté front (zéro calcul métier client). */
+export interface BaremeImpactPreview {
+  baremeCode: string;
+  type: 'courbe' | 'regles';
+  goldenSet: {
+    nbDossiers: number;
+    nbEvalues: number;
+    /** Provenance littérale du golden set, à afficher telle quelle. */
+    source: string;
+  };
+  /** Vide si `type === 'regles'` ou si la courbe proposée est vide. */
+  sampleGrid: Array<{
+    x: number;
+    scoreAvant: number | null;
+    scoreApres: number;
+    delta: number | null;
+  }>;
+  /** Un dossier non évaluable ne porte QUE `applicationCode` et `evaluable: false`. */
+  impacts: Array<
+    | { applicationCode: string; evaluable: false }
+    | {
+        applicationCode: string;
+        evaluable: true;
+        scoreGlobalAvant: number;
+        scoreGlobalApres: number;
+        deltaScore: number;
+        recommandationAvant: CreditRecommandation;
+        recommandationApres: CreditRecommandation;
+        recommandationChange: boolean;
+        lettreAvant: 'A' | 'B' | 'C' | 'D';
+        lettreApres: 'A' | 'B' | 'C' | 'D';
+      }
+  >;
+  resume: {
+    nbScoreChange: number;
+    nbRecommandationFlip: number;
+    nbLettreFlip: number;
+    deltaScoreMoyen: number;
+    deltaScoreMax: number;
+  };
+}
+
+/** Révision de barème (maker-checker : le proposeur ne peut pas activer). */
+export interface BaremeRevision {
+  id: number;
+  baremeCode: string;
+  version: number;
+  status: 'draft' | 'active' | 'archived' | 'rejected';
+  comment: string | null;
+  proposedBySub: string;
+  proposedAt: string | null;
+  decidedBySub: string | null;
+  decidedAt: string | null;
+  /** Servis uniquement sur les réponses « détaillées » (proposition, activation,
+   *  et `pendingRevision` d'un barème) — absents de l'historique `revisions`. */
+  points?: BaremeCurvePoint[];
+  parametres?: Record<string, unknown>;
+  impactPreview?: BaremeImpactPreview;
+}
+
+/** Barème de score. Réservé au staff (principe 7 : jamais servi à un client). */
+export interface Bareme {
+  code: string;
+  libelle: string | null;
+  /** `'regles'` uniquement pour le barème `DECISION` (seuils), `'courbe'` sinon. */
+  type: 'courbe' | 'regles';
+  points: BaremeCurvePoint[];
+  parametres: Record<string, unknown>;
+  actif: boolean;
+  version: number;
+  updatedAt: string | null;
+  pendingRevision: BaremeRevision | null;
+  /** Historique, sans `impactPreview` ni `points`. */
+  revisions?: BaremeRevision[];
+}
+
+export interface BaremeListResult {
+  baremes: Bareme[];
+  totalRows: number;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Templates de fichiers (principe 11) — `dataio/views_templates.py`
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface FileTemplateSchemaSheet {
+  name: string;
+  position: number;
+  columns: string[];
+  n_columns: number;
+  /** `{ nom_colonne: 'text'|'number'|'percent'|'range'|'date' }`. */
+  types: Record<string, string>;
+  row_labels: string[];
+}
+
+/** Schéma DÉRIVÉ du classeur à l'activation — c'est lui, et rien d'autre, qui
+ *  sert de règle de validation aux fichiers client (principe 11). Clés en
+ *  snake_case : elles viennent du dérivateur Python, pas d'un serializer. */
+export interface FileTemplateSchema {
+  sheets: FileTemplateSchemaSheet[];
+  sheet_names: string[];
+  synthesis_sheet: string | null;
+  rubriques: string[];
+  derived_at: string;
+}
+
+/** Diff du schéma dérivé vs le template actif — servi à l'upload uniquement. */
+export interface FileTemplateDiff {
+  sheetsAdded: string[];
+  sheetsRemoved: string[];
+  sheetsColumnsChanged: string[];
+  rubriquesAdded: string[];
+  rubriquesRemoved: string[];
+  hasPrevious: boolean;
+}
+
+export interface FileTemplateRow {
+  id: number;
+  /** `FEUILLE_BESOINS` aujourd'hui ; champ libre côté modèle. */
+  kind: string;
+  version: number;
+  status: 'pending' | 'active' | 'archived';
+  originalName: string;
+  sha256: string;
+  uploadedBy: string | null;
+  uploadedAt: string;
+  activatedBy: string | null;
+  activatedAt: string | null;
+  supersedes: number | null;
+  sheetNames: string[];
+  rubriques: string[];
+  /** Présent seulement sur les réponses d'upload et d'activation. */
+  schema?: FileTemplateSchema;
+}
+
+export interface FileTemplateListResult {
+  active: { id: number; version: number; kind: string; activatedAt: string | null } | null;
+  /** Tronquée à 100 par le serveur, sans indication de total (dette backend). */
+  templates: FileTemplateRow[];
+}
+
+/** 201 à l'upload. Refus 422 : `EXTENSION_INVALIDE`, `FICHIER_TROP_VOLUMINEUX`,
+ *  `CLASSEUR_ILLISIBLE` (portés par `ApiError.errors`). */
+export interface FileTemplateUploadResult extends FileTemplateRow {
+  schema: FileTemplateSchema;
+  diff: FileTemplateDiff;
+  message: string;
+}
+
+/** 200 à l'activation (pas de `diff` ici). Refus 409 : `STATUT_INVALIDE`,
+ *  `MAKER_EGAL_CHECKER`. */
+export interface FileTemplateActivateResult extends FileTemplateRow {
+  schema: FileTemplateSchema;
+  message: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Référentiel filières `reference_data` (maker-checker)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Filière servie par `/reference-data/value-chains/`.
+ *  Les montants et ratios sont sérialisés en **chaînes** (`str(Decimal)`) :
+ *  les afficher via le formateur unique, ne jamais les additionner côté front. */
+export interface ReferenceValueChain {
+  code: string;
+  label: string;
+  cycleMonths: number;
+  costPerHectareUsd: string;
+  costPerHectareCdf: string;
+  /** Poids par module, somme = 100 côté serveur. */
+  moduleWeights: Record<string, number>;
+  riskFactor: string;
+  minScoreRequired: number;
+  baseRate: string;
+  harvestMonths: number[];
+  eligibleGuarantees: string[];
+}
+
+/** Résumé de diff d'un upload de référentiel. `{}` tant que l'upload n'a pas
+ *  été validé — d'où les champs optionnels. */
+export interface ReferenceDiffSummary {
+  added?: string[];
+  removed?: string[];
+  modified?: Array<{ code: string; label: string; changes: string[] }>;
+  unchanged?: number;
+  totalNew?: number;
+}
+
+export interface ReferenceUploadRow {
+  id: number;
+  fileType: 'value_chains' | 'suppliers' | 'rates' | string;
+  version: string;
+  uploadedBy: string;
+  uploadedAt: string;
+  activatedBy: string | null;
+  activatedAt: string | null;
+  status: 'pending_validation' | 'active' | 'archived' | 'rejected' | string;
+  rowCount: number;
+  diff: ReferenceDiffSummary;
+}
+
+/** 201 sur upload valide. En cas d'invalidité, le serveur répond 422 avec un
+ *  corps DIFFÉRENT dont `errors` est un tableau de **chaînes** — normalisé en
+ *  `{code, message}` par `api.referenceData.upload`. */
+export interface ReferenceUploadResult {
+  valid: true;
+  uploadId: number;
+  status: string;
+  rowCount: number;
+  diff: ReferenceDiffSummary;
+  message: string;
+}
+
+export interface ReferenceUploadActivateResult {
+  status: string;
+  activatedAt: string;
+  activatedBy: string;
+  chainsCreated: number;
+  message: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Référentiel technico-économique v3 — `referentiel/views.py`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Seul endpoint du lot en snake_case (pas de serializer camelisant). */
+export interface ReferentielVersion {
+  id: number;
+  label: string;
+  imported_at: string;
+  is_active: boolean;
+  n_ranges: number;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Journal d'audit — `audit/views.py`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Filtres communs à `/audit/entries` ET `/audit/export` : un export doit
+ *  porter EXACTEMENT le périmètre affiché, sans quoi le CSV ment. */
+export interface AuditFilters {
+  entity_type?: string;
+  entity_id?: string;
+  /** `sub` IdP de l'acteur. Le serveur accepte aussi `actor` (alias historique). */
+  acteur?: string;
+  actor?: string;
+  /** Seule la valeur `financial` a un effet serveur. */
+  category?: 'financial';
+  /** Code dossier — matché sur `details.applicationCode` ou `details.reference`. */
+  dossier?: string;
+  /** Sous-chaîne cherchée dans `action` (insensible à la casse). */
+  etape?: string;
+  /** Date (`YYYY-MM-DD`) ou datetime ISO. */
+  depuis?: string;
+  /** Date (`YYYY-MM-DD`, jour inclus) ou datetime ISO. */
+  jusqu?: string;
+}
+
+export interface AuditEntryRow {
+  id: number;
+  timestamp: string;
+  /** `sub` IdP brut — peut être vide (action système). */
+  user: string;
+  /** Nom résolu par le serveur ; retombe sur le sub, puis sur « Système ». */
+  userName: string;
+  role: string;
+  action: string;
+  entityType: string;
+  entityId: string;
+  details: Record<string, unknown>;
+  ip: string | null;
+}
+
+/** Réponse de `/audit/entries?meta=1`. L'affichage est plafonné à `cap` lignes
+ *  alors que `totalRows` compte le périmètre entier : `truncated` doit être dit
+ *  à l'utilisateur, et l'export CSV (non plafonné) proposé comme sortie complète. */
+export interface AuditEntriesPage {
+  entries: AuditEntryRow[];
+  totalRows: number;
+  returned: number;
+  truncated: boolean;
+  cap: number;
 }

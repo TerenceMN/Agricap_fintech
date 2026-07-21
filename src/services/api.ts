@@ -87,6 +87,73 @@ async function request<T = unknown>(path: string, opts: RequestOpts = {}): Promi
   return (ct.includes('application/json') ? await res.json() : (res as unknown)) as T;
 }
 
+/** Téléchargement authentifié d'une réponse NON-JSON (export CSV du journal).
+ *
+ *  `request()` ne convient pas ici : il présuppose du JSON. Et une simple
+ *  `<a href>` ne convient pas non plus — l'API s'authentifie par en-tête
+ *  `Authorization`, jamais par cookie : le navigateur enverrait une requête
+ *  anonyme et l'utilisateur téléchargerait un 401 déguisé en fichier. D'où le
+ *  fetch explicite, avec le même retry 401 → `refresh()` que `request`.
+ *
+ *  Renvoie le blob ET le nom de fichier proposé par le serveur
+ *  (`Content-Disposition`), qui porte l'horodatage de l'export. */
+async function requestBlob(
+  path: string,
+  retry = true,
+): Promise<{ blob: Blob; filename: string | null; totalRows: number | null }> {
+  const headers: Record<string, string> = {};
+  if (tokens.access) headers.Authorization = `Bearer ${tokens.access}`;
+
+  const res = await fetch(`/api${path}`, { method: 'GET', headers });
+
+  if (res.status === 401 && retry && (await refresh())) {
+    return requestBlob(path, false);
+  }
+  if (!res.ok) {
+    let detail = `Erreur ${res.status}`;
+    let code: string | null = null;
+    try {
+      const body = (await res.json()) as { detail?: string; code?: string };
+      detail = body.detail || detail;
+      code = body.code ?? null;
+    } catch { /* corps non-JSON */ }
+    console.warn(`[API] GET ${path} -> ${res.status}${code ? ` [${code}]` : ''} ${detail}`);
+    throw new ApiError(res.status, detail, code, []);
+  }
+
+  const disposition = res.headers.get('content-disposition') || '';
+  const match = /filename="?([^";]+)"?/i.exec(disposition);
+  const total = res.headers.get('x-total-rows');
+  return {
+    blob: await res.blob(),
+    filename: match ? match[1] : null,
+    totalRows: total !== null && total !== '' ? Number(total) : null,
+  };
+}
+
+/** Déclenche l'enregistrement d'un blob sous `filename` côté navigateur. */
+function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** Sérialise les filtres du journal d'audit — partagé par la consultation et
+ *  l'export, pour garantir que le CSV porte le périmètre affiché. */
+function auditQuery(filters?: import('@/types/api').AuditFilters, extra?: Record<string, string>): string {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries({ ...(filters || {}), ...(extra || {}) })) {
+    if (value !== undefined && value !== null && value !== '') q.set(key, String(value));
+  }
+  const qs = q.toString();
+  return qs ? `?${qs}` : '';
+}
+
 /** Montant total d'une ligne = quantité × coût unitaire × fréquence (logique client). */
 export function montantLigne(b: BesoinInput): number {
   const n = (v: unknown) => Number(String(v ?? '').replace(',', '.')) || 0;
@@ -281,6 +348,88 @@ export const api = {
         `/credits/guarantee-requests/${requestId}/consent/`,
         { method: 'POST', body: { accept } },
       ),
+
+    // ── Comité de crédit (CLAUDE.md §7.1.4) ───────────────────────────────
+    // Le comité statue sur les dossiers au-dessus du plafond de délégation. Le
+    // PV est append-only : un vote enregistré ne se corrige pas (principe 3).
+
+    /** PV du comité pour un dossier : quorum requis, votes nominatifs déjà
+     *  exprimés, décompte et résolution. Lecture ouverte au comité ET à l'audit
+     *  (403 pour les autres) — un auditeur doit pouvoir reconstituer la décision.
+     *
+     *  `quorum` et `thresholdUsd` viennent d'`InstitutionConfig` : ne jamais les
+     *  coder en dur côté front (principe 8). */
+    committeeVotes: (code: string) =>
+      request<import('@/types/api').CommitteeVotesSummary>(
+        `/credits/applications/${code}/committee-votes/`),
+
+    /** Vote d'un membre du comité — réservé à `COMMITTEE_ROLES` (403 sinon).
+     *
+     *  `comment` est le motif obligatoire (principe : chaque décision exige son
+     *  motif) ; le serveur refuse un commentaire vide en 422
+     *  `COMMITTEE_DECISION_INVALID`. Autres refus : 409 `COMMITTEE_STATE_INVALID`
+     *  (dossier hors `in_analysis`), 422 `COMMITTEE_NOT_REQUIRED` (montant sous
+     *  le plafond — le comité n'a pas à être saisi), 409
+     *  `MAKER_CHECKER_VIOLATION` (l'instructeur du dossier ne vote pas), 409
+     *  `COMMITTEE_ALREADY_VOTED` (un vote par membre, définitif).
+     *
+     *  Quand le quorum est atteint, le serveur résout le dossier dans la foulée
+     *  (approbation ou rejet) : la réponse porte alors `resolved: true`. */
+    committeeVote: (code: string, data: {
+      decision: 'approve' | 'reject';
+      comment: string;
+      conditions?: string;
+    }) => request<import('@/types/api').CommitteeVoteResult>(
+      `/credits/applications/${code}/committee-vote/`, { method: 'POST', body: data }),
+
+    // ── Barèmes de score (principe 8 + CLAUDE.md §7.1.5) ───────────────────
+    // Les courbes de score vivent en base et sont modifiables par le comité
+    // sans redéploiement, sous maker-checker et avec prévisualisation de
+    // l'impact sur le golden set AVANT activation.
+    baremes: {
+      /** Liste des barèmes avec leur historique de révisions.
+       *  Réservé au staff (403 sinon) — un barème exposé à un client rendrait
+       *  le score jouable (principe 7). */
+      list: () => request<import('@/types/api').BaremeListResult>('/credits/baremes/'),
+
+      /** Détail d'un barème (courbe active, révision en attente, historique).
+       *  404 `BAREME_INTROUVABLE`. */
+      get: (code: string) =>
+        request<import('@/types/api').Bareme>(`/credits/baremes/${encodeURIComponent(code)}/`),
+
+      /** Propose une nouvelle révision (statut `draft`) — le barème actif n'est
+       *  PAS modifié : il faudra un second acteur pour activer (maker ≠ checker).
+       *  Réservé au comité (403 sinon).
+       *
+       *  Champs omis = valeurs actives conservées. Refus : 422
+       *  `BAREME_CONTENU_INVALIDE` (moins de 2 points, y hors [0,100], x
+       *  dupliqués…), 409 `BAREME_REVISION_ETAT` (une révision draft existe déjà).
+       *
+       *  La réponse porte `impactPreview` : l'impact chiffré sur le golden set. */
+      propose: (code: string, data: {
+        points?: Array<import('@/types/api').BaremeCurvePoint>;
+        parametres?: Record<string, unknown>;
+        comment?: string;
+      }) => request<import('@/types/api').BaremeRevision>(
+        `/credits/baremes/${encodeURIComponent(code)}/`, { method: 'POST', body: data }),
+
+      /** Prévisualise l'impact d'une courbe SANS rien persister — c'est l'outil
+       *  qui rend la modification d'un barème décidable plutôt que devinée.
+       *  Réservé au comité (403 sinon). */
+      preview: (code: string, data: {
+        points?: Array<import('@/types/api').BaremeCurvePoint>;
+        parametres?: Record<string, unknown>;
+      }) => request<import('@/types/api').BaremeImpactPreview>(
+        `/credits/baremes/${encodeURIComponent(code)}/preview/`, { method: 'POST', body: data }),
+
+      /** Active une révision `draft` (le barème précédent passe en `archived`).
+       *  Refus : 404 `BAREME_REVISION_INTROUVABLE`, 409 `BAREME_REVISION_ETAT`
+       *  (révision déjà décidée), 409 `MAKER_CHECKER_VIOLATION` (le proposeur ne
+       *  peut pas activer sa propre révision). */
+      activateRevision: (revisionId: number) =>
+        request<import('@/types/api').BaremeRevision>(
+          `/credits/baremes/revisions/${revisionId}/activate/`, { method: 'POST', body: {} }),
+    },
   },
 
   // Référentiel (transparence).
@@ -311,6 +460,33 @@ export const api = {
   deleteSource: (id: number) =>
     request<{ detail: string; deleted: boolean }>(`/dataio/sources/${id}`, { method: 'DELETE' }),
   history: (key?: string) => request<DataSource[]>(`/dataio/history${key ? `?key=${encodeURIComponent(key)}` : ''}`),
+
+  /**
+   * Templates de fichiers versionnés — le PRINCIPE 11 vit ici.
+   *
+   * Le schéma de validation des fichiers client est DÉRIVÉ du template actif à
+   * son activation, jamais codé en dur. Le cycle est maker-checker : `upload`
+   * dépose en `pending` (maker), `activate` bascule en `active` et archive le
+   * précédent (checker ≠ maker — le serveur refuse sinon).
+   *
+   * `detail` n'est pas un confort : il sert le schéma dérivé COMPLET et le diff
+   * calculé côté serveur. Sans lui, seul le maker voyait ces informations (elles
+   * ne transitaient que dans la réponse d'`upload`) — le checker, qui par
+   * construction n'a pas fait le dépôt, activait à l'aveugle. Un contrôle
+   * maker-checker sans l'information qui le fonde n'est pas un contrôle.
+   *
+   * Retours typés `unknown` : le panneau appelant caste vers ses propres types.
+   * Mieux vaut ça qu'une forme inventée ici — un type qui ment fait taire `tsc`
+   * au lieu de l'alerter.
+   */
+  templates: {
+    list: () => request<unknown>('/dataio/templates/'),
+    detail: (id: number) => request<unknown>(`/dataio/templates/${id}`),
+    upload: (form: FormData) =>
+      request<unknown>('/dataio/templates/upload', { method: 'POST', body: form, isForm: true }),
+    activate: (id: number) =>
+      request<unknown>(`/dataio/templates/${id}/activate`, { method: 'POST', body: {} }),
+  },
 
   // Portefeuille de crédits (Module Crédits Agricoles — admin).
   portfolio: {
