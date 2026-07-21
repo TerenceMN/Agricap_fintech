@@ -57,7 +57,14 @@ async function request<T = unknown>(path: string, opts: RequestOpts = {}): Promi
     return request<T>(path, { ...opts, retry: false });
   }
   if (!res.ok) {
-    let detail = `Erreur ${res.status}`;
+    // Vide au départ, PAS `Erreur ${status}`. Initialisé au libellé de repli, il
+    // était toujours truthy : la ligne `if (!detail && errors.length)` plus bas
+    // ne s'exécutait JAMAIS. Conséquence — un 422 ne portant que `errors[]`, qui
+    // est la forme la plus courante d'un refus multi-erreurs, s'affichait
+    // « Erreur 422 » dans tout toast rendant `err.message`, alors que le serveur
+    // avait fourni un texte exploitable. Seuls les écrans dépliant `err.errors`
+    // y échappaient. Le repli est composé en DERNIER recours, après le parsing.
+    let detail = '';
     let code: string | null = null;
     let errors: Array<{ code: string; message: string }> = [];
     try {
@@ -87,7 +94,10 @@ async function request<T = unknown>(path: string, opts: RequestOpts = {}): Promi
             : { code: e.code || 'ERREUR', message: e.message || '' });
         if (!detail && errors.length) detail = errors[0].message;
       }
-    } catch { /* corps non-JSON : on garde le message par défaut */ }
+    } catch { /* corps non-JSON : le repli ci-dessous s'applique */ }
+    // Dernier recours seulement : le serveur n'a rien dit d'exploitable (corps
+    // non-JSON, ou JSON sans `detail`, `structureError` ni `errors`).
+    if (!detail) detail = `Erreur ${res.status}`;
     // Une ligne concise (page/route appelante identifiable via `path`) — pas de stack trace,
     // volontairement : les erreurs métier attendues (ex. 404 "pas encore configuré") ne sont
     // pas des bugs à investiguer, juste un signal utile en dev.
@@ -98,16 +108,7 @@ async function request<T = unknown>(path: string, opts: RequestOpts = {}): Promi
   return (ct.includes('application/json') ? await res.json() : (res as unknown)) as T;
 }
 
-/** Téléchargement authentifié d'une réponse NON-JSON (export CSV du journal).
- *
- *  `request()` ne convient pas ici : il présuppose du JSON. Et une simple
- *  `<a href>` ne convient pas non plus — l'API s'authentifie par en-tête
- *  `Authorization`, jamais par cookie : le navigateur enverrait une requête
- *  anonyme et l'utilisateur téléchargerait un 401 déguisé en fichier. D'où le
- *  fetch explicite, avec le même retry 401 → `refresh()` que `request`.
- *
- *  Renvoie le blob ET le nom de fichier proposé par le serveur
- *  (`Content-Disposition`), qui porte l'horodatage de l'export. */
+
 async function requestBlob(
   path: string,
   retry = true,
@@ -328,17 +329,7 @@ export const api = {
     releaseGuarantee: (code: string, guaranteeId: number) =>
       request<import('@/types/api').CreditGuaranteeSet>(`/credits/applications/${code}/guarantees/${guaranteeId}/release/`, { method: 'POST', body: {} }),
 
-    // ── Caution solidaire, côté garant (lot 6) ────────────────────────────
-    // Contrat : `docs/status-fragments/lot6-backend.md` §1.
-    //
-    // Ces deux appels ne sont PAS sous `/applications/<code>/` : le garant est un
-    // tiers, il n'a pas accès au dossier du demandeur. Il ne voit que les lignes
-    // dont il est le garant désigné — le serveur filtre sur `guarantor ==
-    // request.user`, y compris pour un admin.
-
-    /** Demandes de caution adressées au garant connecté.
-     *  Sans `status`, **toutes** sont servies, expirées comprises : l'écran doit
-     *  pouvoir afficher « expirée » sans l'inférer d'une date passée. */
+    
     guaranteeRequests: (params?: { status?: string }) => {
       const qs = params?.status ? `?status=${encodeURIComponent(params.status)}` : '';
       return request<import('@/types/api').GuaranteeRequestList>(`/credits/guarantee-requests/${qs}`);
@@ -374,18 +365,7 @@ export const api = {
       request<import('@/types/api').CommitteeVotesSummary>(
         `/credits/applications/${code}/committee-votes/`),
 
-    /** Vote d'un membre du comité — réservé à `COMMITTEE_ROLES` (403 sinon).
-     *
-     *  `comment` est le motif obligatoire (principe : chaque décision exige son
-     *  motif) ; le serveur refuse un commentaire vide en 422
-     *  `COMMITTEE_DECISION_INVALID`. Autres refus : 409 `COMMITTEE_STATE_INVALID`
-     *  (dossier hors `in_analysis`), 422 `COMMITTEE_NOT_REQUIRED` (montant sous
-     *  le plafond — le comité n'a pas à être saisi), 409
-     *  `MAKER_CHECKER_VIOLATION` (l'instructeur du dossier ne vote pas), 409
-     *  `COMMITTEE_ALREADY_VOTED` (un vote par membre, définitif).
-     *
-     *  Quand le quorum est atteint, le serveur résout le dossier dans la foulée
-     *  (approbation ou rejet) : la réponse porte alors `resolved: true`. */
+   
     committeeVote: (code: string, data: {
       decision: 'approve' | 'reject';
       comment: string;
@@ -475,24 +455,7 @@ export const api = {
     request<{ detail: string; deleted: boolean }>(`/dataio/sources/${id}`, { method: 'DELETE' }),
   history: (key?: string) => request<DataSource[]>(`/dataio/history${key ? `?key=${encodeURIComponent(key)}` : ''}`),
 
-  /**
-   * Templates de fichiers versionnés — le PRINCIPE 11 vit ici.
-   *
-   * Le schéma de validation des fichiers client est DÉRIVÉ du template actif à
-   * son activation, jamais codé en dur. Le cycle est maker-checker : `upload`
-   * dépose en `pending` (maker), `activate` bascule en `active` et archive le
-   * précédent (checker ≠ maker — le serveur refuse sinon).
-   *
-   * `detail` n'est pas un confort : il sert le schéma dérivé COMPLET et le diff
-   * calculé côté serveur. Sans lui, seul le maker voyait ces informations (elles
-   * ne transitaient que dans la réponse d'`upload`) — le checker, qui par
-   * construction n'a pas fait le dépôt, activait à l'aveugle. Un contrôle
-   * maker-checker sans l'information qui le fonde n'est pas un contrôle.
-   *
-   * Retours typés `unknown` : le panneau appelant caste vers ses propres types.
-   * Mieux vaut ça qu'une forme inventée ici — un type qui ment fait taire `tsc`
-   * au lieu de l'alerter.
-   */
+  
   templates: {
     list: () => request<unknown>('/dataio/templates/'),
     detail: (id: number) => request<unknown>(`/dataio/templates/${id}`),

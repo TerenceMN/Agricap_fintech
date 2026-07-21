@@ -1,20 +1,4 @@
-/**
- * Parseur d'erreurs HTTP de `src/services/api.ts`.
- *
- * Pourquoi ce fichier en premier : c'est le seul endroit du front où une
- * régression a effectivement VIDÉ des messages d'erreur en production. Le
- * backend n'a pas un dialecte d'erreur mais deux — le pipeline de la feuille de
- * besoins émet `errors: [{code, message}]`, `reference_data/validators.py` émet
- * `errors: ["…"]`, des CHAÎNES nues, sans `detail` et avec `structureError` à la
- * place. L'ancien mapping faisait `e.message` sur une chaîne (`undefined`), et
- * le maker voyait douze puces sans un mot d'explication alors que le serveur
- * avait tout dit.
- *
- * `request()` n'est pas exporté : on le teste par la porte publique (`api.me`),
- * `fetch` étant remplacé. Aucun test ici ne parle au vrai backend — cf. la mise
- * en garde en tête de `vitest.config.ts` : ces payloads sont écrits d'après la
- * même lecture du contrat que le code testé, ils ne la VALIDENT pas.
- */
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, api } from '@/services/api';
 
@@ -221,24 +205,27 @@ describe('DÉFAUT CONSTATÉ — le repli `detail = errors[0].message` est inatte
    * initialiser `detail` à `''` et ne composer « Erreur <statut> » qu'en tout
    * dernier recours, APRÈS la lecture de `errors[]`.
    */
-  it('constate le comportement ACTUEL : le message reste « Erreur 422 »', async () => {
+  it('reprend le premier message quand le serveur ne donne pas de `detail`', async () => {
     respondWith(jsonResponse(422, {
       errors: [{ code: 'SOMME_F4_F5', message: 'Feuille 5 ≠ somme feuille 4.' }],
     }));
     const err = await capture(api.me());
 
-    expect(err.message).toBe('Erreur 422');
-    // Le texte existe pourtant, une couche plus bas.
+    // CORRIGÉ : `detail` part désormais de `''`, donc le repli sur `errors[0]`
+    // s'exécute réellement. Un bandeau qui ne rend que `err.message` affiche
+    // l'explication du serveur, plus un numéro de statut.
+    expect(err.message).toBe('Feuille 5 ≠ somme feuille 4.');
     expect(err.errors[0].message).toBe('Feuille 5 ≠ somme feuille 4.');
   });
 
-  it.skip('ATTENDU (échoue aujourd’hui) : reprend le premier message quand `detail` manque', async () => {
-    respondWith(jsonResponse(422, {
-      errors: [{ code: 'SOMME_F4_F5', message: 'Feuille 5 ≠ somme feuille 4.' }],
-    }));
+  it('compose « Erreur <statut> » SEULEMENT quand le serveur n’a rien dit', async () => {
+    // Le repli doit rester : sans corps exploitable, l'utilisateur a quand même
+    // besoin d'un message. Ce test empêche de supprimer le repli en croyant
+    // supprimer le bug.
+    respondWith(jsonResponse(500, {}));
     const err = await capture(api.me());
 
-    expect(err.message).toBe('Feuille 5 ≠ somme feuille 4.');
+    expect(err.message).toBe('Erreur 500');
   });
 
   /**
