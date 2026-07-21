@@ -1,20 +1,7 @@
-/**
- * File d'instruction analyste — `/credit/dossiers`.
- *
- * Sert deux publics avec le même endpoint : `GET /api/credits/applications/`
- * filtre déjà par rôle côté serveur (`ViewContextService.filter_qs`) — un client
- * n'y voit que ses dossiers, un instructeur voit la file. Le front ne décide
- * donc jamais « qui voit quoi » : il présente ce que le serveur a bien voulu
- * servir.
- *
- * La file d'instruction agrège les trois statuts en attente d'un acte humain :
- * `submitted` (à prendre en charge), `in_analysis` (en cours), `adjourned`
- * (rouvert). L'API n'accepte qu'un statut par appel : trois requêtes parallèles,
- * pas de filtrage client sur une liste tronquée.
- */
+
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Helmet } from 'react-helmet';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '@/services/api';
 import type { CreditApplication } from '@/types/api';
 import { Empty, ErrorPanel, Loading, toFieldErrors, type FieldError } from '@/components/backoffice/States';
@@ -51,6 +38,20 @@ const CONSENT_BADGE: Record<ConsentState, { label: string; className: string } |
   },
 };
 
+/**
+ * Actions de file — sous-ensemble d'`availableActions` exécutable sans saisie.
+ *
+ * Toute action portant une décision (approuver, rejeter, ajourner) exige un
+ * motif obligatoire (§7.2) : elle n'a pas sa place sur une ligne de liste et
+ * reste sur le détail. Ne restent ici que les deux actes de prise en charge,
+ * qui n'ont pas de champ à remplir. Une clé absente de cette table n'affiche
+ * simplement pas de bouton — jamais un bouton sans libellé.
+ */
+const QUEUE_ACTIONS: Record<string, string> = {
+  start_analysis: 'Prendre en charge',
+  reopen_analysis: "Rouvrir l'analyse",
+};
+
 /** Date de référence pour l'ancienneté : la soumission fait foi, la création à défaut. */
 const referenceDate = (a: CreditApplication): string => a.submittedAt || a.createdAt;
 
@@ -58,11 +59,20 @@ const Applications: React.FC = () => {
   const [apps, setApps] = useState<CreditApplication[]>([]);
   const [loading, setLoading] = useState(true);
   const [errors, setErrors] = useState<FieldError[]>([]);
-  /** '' = file d'instruction (3 statuts) ; sinon un statut unique. */
-  const [statusFilter, setStatusFilter] = useState<string>('');
+  /** Le statut vit dans l'URL : le tableau de bord y renvoie avec un statut
+   *  précis (`/credit/dossiers?status=submitted`), et un lien de file partagé
+   *  entre collègues doit rouvrir la même file. '' = les trois statuts. */
+  const [searchParams, setSearchParams] = useSearchParams();
+  const statusFilter = searchParams.get('status') ?? '';
+  const setStatusFilter = useCallback((value: string) => {
+    setSearchParams(value ? { status: value } : {}, { replace: true });
+  }, [setSearchParams]);
   const [sortKey, setSortKey] = useState<SortKey>('age_desc');
   const [consentOnly, setConsentOnly] = useState(false);
   const [maybeTruncated, setMaybeTruncated] = useState(false);
+  /** Code du dossier dont une action est en cours, et erreurs par dossier. */
+  const [rowBusy, setRowBusy] = useState<string | null>(null);
+  const [rowErrors, setRowErrors] = useState<Record<string, FieldError[]>>({});
 
   const load = useCallback(async (status: string) => {
     setLoading(true);
@@ -85,6 +95,30 @@ const Applications: React.FC = () => {
   }, []);
 
   useEffect(() => { void load(statusFilter); }, [load, statusFilter]);
+
+  /**
+   * Exécute une action de prise en charge sur une ligne.
+   *
+   * Le refus serveur est restitué règle par règle (`toFieldErrors`) sous la
+   * ligne concernée, et non dans un bandeau global : sur une file de vingt
+   * dossiers, « action refusée » sans savoir lequel ne sert à rien. Après
+   * succès la file est rechargée — le dossier change de statut, donc de seau,
+   * et le front ne déplace jamais une ligne de sa propre initiative.
+   */
+  const runRowAction = useCallback(async (code: string, action: string) => {
+    setRowBusy(code);
+    setRowErrors((prev) => ({ ...prev, [code]: [] }));
+    try {
+      if (action === 'start_analysis') await api.credits.startAnalysis(code);
+      else if (action === 'reopen_analysis') await api.credits.reopenAnalysis(code);
+      else return;
+      await load(statusFilter);
+    } catch (e) {
+      setRowErrors((prev) => ({ ...prev, [code]: toFieldErrors(e) }));
+    } finally {
+      setRowBusy(null);
+    }
+  }, [load, statusFilter]);
 
   const rows = useMemo(() => {
     const filtered = consentOnly
@@ -142,6 +176,12 @@ const Applications: React.FC = () => {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Link
+            to="/credit/tableau-de-bord"
+            className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm"
+          >
+            Tableau de bord
+          </Link>
           <Link
             to="/credit/comite"
             className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm"
@@ -292,9 +332,33 @@ const Applications: React.FC = () => {
                     {days != null ? `${days} j` : '—'}
                   </td>
                   <td className="p-4 text-right">
-                    <Link to={`/credit/dossiers/${a.code}`} className="text-primary text-xs underline">
-                      Instruire
-                    </Link>
+                    <div className="flex flex-col items-end gap-1.5">
+                      {/* Boutons servis par le serveur, pas déduits du statut. */}
+                      {(a.availableActions ?? [])
+                        .filter((act) => act in QUEUE_ACTIONS)
+                        .map((act) => (
+                          <button
+                            key={act}
+                            type="button"
+                            disabled={rowBusy === a.code}
+                            onClick={() => void runRowAction(a.code, act)}
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium disabled:opacity-50 whitespace-nowrap"
+                          >
+                            {rowBusy === a.code ? '…' : QUEUE_ACTIONS[act]}
+                          </button>
+                        ))}
+                      <Link to={`/credit/dossiers/${a.code}`} className="text-primary text-xs underline">
+                        Ouvrir le dossier
+                      </Link>
+                    </div>
+                    {(rowErrors[a.code]?.length ?? 0) > 0 && (
+                      <div className="mt-2 text-left">
+                        <ErrorPanel
+                          errors={rowErrors[a.code]}
+                          title="Le serveur a refusé cet acte"
+                        />
+                      </div>
+                    )}
                   </td>
                 </tr>
               );
@@ -316,9 +380,11 @@ const Applications: React.FC = () => {
       </div>
 
       <p className="text-xs text-slate-500">
-        Les actions possibles sur un dossier (prise en charge, approbation, rejet, ajournement,
-        décaissement) sont décidées par le serveur et n'apparaissent que dans le détail du
-        dossier — cet écran ne propose aucune action qu'il ne pourrait garantir.
+        Les actions possibles sur un dossier sont décidées par le serveur
+        (<code className="font-mono">availableActions</code>) : cet écran n'en déduit aucune.
+        Seule la prise en charge s'exécute d'ici, parce qu'elle ne demande aucune saisie.
+        Toute décision — approbation, rejet, ajournement, décaissement — exige un motif
+        obligatoire et se prend dans le détail du dossier, jamais d'un clic en liste.
       </p>
     </div>
   );
