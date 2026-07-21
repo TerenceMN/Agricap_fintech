@@ -8,28 +8,21 @@ import DscrPanel from './DscrPanel';
 import ModuleGaps, { listerEcartsHorsPlage } from './ModuleGaps';
 import EcheancierTable from './EcheancierTable';
 import JustifyIndicatorDialog from './JustifyIndicatorDialog';
+import RevisionSelector from './RevisionSelector';
 
 /**
  * Onglet « Analyse » du dossier de crédit (SPEC Moteur §8b, CLAUDE.md §7.1.3).
  *
  * ⚠ **Staff uniquement.** Cet écran expose les barèmes, les tolérances par
- * module et les plages du référentiel : servi à un client, il lui apprendrait
- * à fabriquer un dossier qui passe (principe 7, anti-gaming). Aucun composant
- * de ce dossier ne doit être monté dans un écran client.
+ * module, les plages du référentiel et désormais la lignée complète des dépôts
+ * de la feuille de besoins : servi à un client, il lui apprendrait à fabriquer
+ * un dossier qui passe (principe 7, anti-gaming). Aucun composant de ce dossier
+ * ne doit être monté dans un écran client — la vue prévue pour lui est
+ * `analyse-resume`, volontairement pauvre, et sans surface à ce jour.
  *
- * La vue prévue pour le client est `analyse-resume`, volontairement pauvre.
- * Attention : à ce jour **elle n'a aucune surface** — `api.credits.analyseResume`
- * n'est appelé par aucun composant du dépôt. Ne pas lire ce commentaire comme
- * « le client a déjà sa version » : il ne voit pas encore son analyse.
- *
- * L'écran ne recalcule rien : score, DSCR, points et montants de l'échéancier
- * viennent du moteur et sont affichés tels quels.
- *
- * La devise affichée est **celle de l'analyse** (`devise`), pas celle du prêt
- * portefeuille : ce sont deux agrégats distincts, et étiqueter des montants du
- * moteur avec la devise d'un autre objet serait une erreur de lignage, pas un
- * repli acceptable. Si le moteur ne la porte pas, les montants s'affichent sans
- * devise plutôt qu'avec une devise devinée.
+ * L'écran ne recalcule rien : score, DSCR, points, montants de l'échéancier et
+ * empreintes SHA-256 viennent du serveur et sont affichés tels quels. La devise
+ * affichée est celle de l'analyse (`devise`), jamais celle d'un autre agrégat.
  *
  * @param {{
  *   code: string,
@@ -161,6 +154,12 @@ const AnalyseTab = ({ code, state }) => {
         referentiel={analyse.referentielInfo?.code || analyse.referentiel}
         referentielInfo={analyse.referentielInfo}
       />
+
+      {/* Lignage AVANT les chiffres : savoir sur QUELLE version du fichier
+          l'analyse a tourné conditionne la lecture de tout ce qui suit
+          (principe 1 — « ce qui est scoré = ce qui est en base », identifié par
+          `needs_source_id + revision + sha256`). */}
+      <RevisionSelector code={code} lignage={analyse.lignage} />
 
       <CriteriaTable criteres={analyse.criteres} scoreGlobal={analyse.scoreGlobal} />
 
