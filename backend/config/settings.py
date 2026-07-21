@@ -120,11 +120,23 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
-        # `timeout` = busy_timeout SQLite (secondes) : sans lui, un écrivain concurrent
-        # (ex. provisioning JIT sur plusieurs requêtes simultanées, cf. accounts/
-        # authentication.py::_provision) échoue immédiatement en "database is locked" au
-        # lieu d'attendre que le verrou se libère.
-        "OPTIONS": {"timeout": 20},
+        # `timeout` (busy_timeout) ne suffit PAS seul contre le provisioning JIT
+        # concurrent : deux `update_or_create` simultanés font chacun SELECT puis
+        # UPDATE, et l'upgrade verrou partagé → exclusif est un deadlock que SQLite
+        # REFUSE tout de suite (« database is locked » en 60 ms, sans attendre les
+        # 20 s). Le 500 observé sur /api/me venait de là.
+        #   - `journal_mode=WAL`      : lecteurs et écrivain ne se bloquent plus ;
+        #   - `transaction_mode=IMMEDIATE` : la transaction prend le verrou d'écriture
+        #     dès le BEGIN, donc le second writer ATTEND (busy_timeout) au lieu de
+        #     deadlocker sur l'upgrade — c'est ce qui transforme le 500 en attente ;
+        #   - `synchronous=NORMAL`    : sûr sous WAL, évite un fsync par écriture.
+        # `transaction_mode` et `init_command` sont supportés nativement par le
+        # backend sqlite3 de Django ≥ 5.1 (ici 5.2).
+        "OPTIONS": {
+            "timeout": 20,
+            "transaction_mode": "IMMEDIATE",
+            "init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        },
     }
 }
 

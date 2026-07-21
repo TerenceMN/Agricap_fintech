@@ -63,7 +63,10 @@ const DetailItem = ({ icon: Icon, label, value, className = '' }) => (
         <div className="text-emerald-400 mt-1"><Icon className="w-5 h-5" /></div>
         <div>
             <p className="text-xs text-slate-400">{label}</p>
-            <p className="font-semibold text-white">{value}</p>
+            {/* `div` et non `p` : `value` reçoit parfois un `<Badge>` (statut,
+                score), qui rend un `<div>` — un bloc dans un `<p>` est du DOM
+                invalide, React le signalait à chaque ouverture du détail. */}
+            <div className="font-semibold text-white">{value}</div>
         </div>
     </div>
 );

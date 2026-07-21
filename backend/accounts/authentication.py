@@ -51,7 +51,21 @@ def _provision(claims: dict) -> FintechUser:
         "national_id": claims.get("national_id") or "",
         "company_name": claims.get("company_name") or "",
     }
-    user, _ = FintechUser.objects.update_or_create(sub=sub, defaults=data)
+    # Écrire uniquement sur création ou changement réel. `update_or_create`
+    # écrivait la ligne à CHAQUE requête authentifiée — c'est ce write inutile,
+    # multiplié par les appels concurrents d'un même chargement de page, qui
+    # produisait la contention d'écriture sur SQLite. Les claims d'un jeton ne
+    # changent qu'à la connexion suivante ; relire et comparer suffit.
+    user = FintechUser.objects.filter(sub=sub).first()
+    if user is None:
+        user = FintechUser.objects.create(sub=sub, **data)
+    else:
+        modifie = [champ for champ, valeur in data.items()
+                   if getattr(user, champ) != valeur]
+        if modifie:
+            for champ in modifie:
+                setattr(user, champ, data[champ])
+            user.save(update_fields=modifie)
     from rbac.services import sync_staff_profile
     sync_staff_profile(user)
     return user
