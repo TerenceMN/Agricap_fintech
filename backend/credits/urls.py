@@ -50,4 +50,15 @@ urlpatterns = [
     path("applications/<str:code>/analyse/justifier/", views.analyse_justifier),
     path("applications/<str:code>/reanalyser/", views.reanalyser),
     path("applications/<str:code>/analyse-resume/", views.analyse_resume),
+    # Comité de crédit — décision collégiale à quorum (CONTRAT §2)
+    path("applications/<str:code>/committee-votes/", views.committee_votes),
+    path("applications/<str:code>/committee-vote/", views.committee_vote),
+    # Barèmes de score éditables par le comité (CONTRAT §5)
+    # `<code>` (DSCR, ECART_TECHNIQUE…) plutôt que `<id>` : le code est l'identité
+    # stable et unique du barème, et celle que sert la liste. Écart au contrat
+    # signalé dans le rapport de lot.
+    path("baremes/", views.list_baremes),
+    path("baremes/revisions/<int:revision_id>/activate/", views.bareme_activate),
+    path("baremes/<str:code>/", views.bareme_detail),
+    path("baremes/<str:code>/preview/", views.bareme_preview),
 ]

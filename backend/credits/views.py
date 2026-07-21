@@ -33,10 +33,12 @@ from credits.needs_template import generate_needs_sheet_template
 from credits.prefill import get_prefill_data
 from credits.dataio_simulator import dataio_simulate
 from credits.roles import (
+    CAN_AUDIT,
     CAN_CONFIRM_DISBURSEMENT,
     CAN_DECIDE,
     CAN_INSTRUCT,
     CAN_REQUEST_DISBURSEMENT,
+    COMMITTEE_ROLES,
     STAFF_ROLES,
     in_group,
     roles_of,
@@ -1772,3 +1774,194 @@ def analyse_resume(request: Request, code: str) -> Response:
 
     from credits.analyse import serialiser_analyse_resume
     return Response(serialiser_analyse_resume(analyse))
+
+
+# ── Comité de crédit — décision collégiale à quorum (CONTRAT §2) ──────────────
+
+def _committee_error(exc) -> Response:
+    """Réponse unique pour tout refus du comité — même contrat que `_workflow_error`."""
+    return Response(
+        {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+        status=exc.http_status,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def committee_votes(request: Request, code: str) -> Response:
+    """GET /api/credits/applications/<code>/committee-votes/
+
+    Procès-verbal du comité : quorum, votes nominatifs, décompte, résolution.
+    Réservé au comité et aux auditeurs (lecture) — jamais au client (§7).
+    """
+    if not _require_group(request, COMMITTEE_ROLES | CAN_AUDIT):
+        return Response({"detail": "Vue comité réservée à la direction et à l'audit."},
+                        status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.committee import votes_summary
+    return Response(votes_summary(app))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def committee_vote(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/committee-vote/
+
+    Corps : `{ decision: "approve"|"reject", comment, conditions? }`.
+    Un vote par membre (append-only). Quorum atteint → transition via `workflow`.
+    """
+    if not _require_group(request, COMMITTEE_ROLES):
+        return Response({"detail": "Seul un membre du comité de crédit peut voter."},
+                        status=403)
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    data = request.data or {}
+    from credits.committee import cast_vote, CommitteeError
+    try:
+        result = cast_vote(
+            app,
+            voter_sub=getattr(request.user, "sub", "") or "",
+            decision=data.get("decision", ""),
+            comment=data.get("comment", ""),
+            conditions=data.get("conditions", ""),
+            voter_roles=_roles(request),
+        )
+    except CommitteeError as exc:
+        return _committee_error(exc)
+
+    return Response(result, status=201)
+
+
+# ── Barèmes de score éditables par le comité (CONTRAT §5) ─────────────────────
+
+def _bareme_error(exc) -> Response:
+    return Response(
+        {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+        status=exc.http_status,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_baremes(request: Request) -> Response:
+    """GET /api/credits/baremes/ — courbes par critère + historique (staff seul).
+
+    Anti-gaming (principe 7) : les barèmes, seuils et tolérances ne transitent
+    JAMAIS vers un client. Réservé au staff.
+    """
+    if not _require_group(request, STAFF_ROLES):
+        return Response({"detail": "Barèmes réservés au personnel."}, status=403)
+
+    from credits.baremes import serialize_bareme
+    from credits.models import BaremeScore
+
+    baremes = BaremeScore.objects.all().prefetch_related("revisions")
+    data = [serialize_bareme(b, include_history=True) for b in baremes]
+    return Response({"baremes": data, "totalRows": len(data)})
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def bareme_detail(request: Request, code: str) -> Response:
+    """GET  /api/credits/baremes/<code>/  — un barème + son historique (staff).
+    POST /api/credits/baremes/<code>/  — proposition d'édition (comité, maker).
+
+    La proposition calcule et FIGE l'impact sur le golden set AVANT toute
+    activation (principe 8) ; elle n'active rien (maker ≠ checker, l'activation
+    est un second acte).
+    """
+    from credits.baremes import (
+        BaremeError, serialize_bareme, proposer_revision, serialize_revision,
+    )
+    from credits.models import BaremeScore
+
+    if request.method == "GET":
+        if not _require_group(request, STAFF_ROLES):
+            return Response({"detail": "Barèmes réservés au personnel."}, status=403)
+        try:
+            bareme = BaremeScore.objects.prefetch_related("revisions").get(code=code)
+        except BaremeScore.DoesNotExist:
+            return Response({"detail": "Barème introuvable.",
+                             "code": "BAREME_INTROUVABLE"}, status=404)
+        return Response(serialize_bareme(bareme, include_history=True))
+
+    # POST — proposition (comité)
+    if not _require_group(request, COMMITTEE_ROLES):
+        return Response({"detail": "Seul le comité de crédit édite les barèmes."},
+                        status=403)
+
+    data = request.data or {}
+    try:
+        revision = proposer_revision(
+            code=code,
+            points=data.get("points"),
+            parametres=data.get("parametres"),
+            comment=data.get("comment", ""),
+            proposed_by_sub=getattr(request.user, "sub", "") or "",
+        )
+    except BaremeError as exc:
+        return _bareme_error(exc)
+
+    return Response(serialize_revision(revision, with_preview=True), status=201)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def bareme_preview(request: Request, code: str) -> Response:
+    """POST /api/credits/baremes/<code>/preview/ — impact sur le golden set,
+    SANS créer de révision (aide à la décision avant proposition). Comité seul.
+    """
+    if not _require_group(request, COMMITTEE_ROLES):
+        return Response({"detail": "Seul le comité de crédit prévisualise les barèmes."},
+                        status=403)
+
+    from credits.baremes import BaremeError, previsualiser_impact, valider_contenu
+    from credits.models import BaremeScore
+
+    try:
+        bareme = BaremeScore.objects.get(code=code)
+    except BaremeScore.DoesNotExist:
+        return Response({"detail": "Barème introuvable.",
+                         "code": "BAREME_INTROUVABLE"}, status=404)
+
+    data = request.data or {}
+    points = data.get("points") if data.get("points") is not None else bareme.points
+    parametres = (data.get("parametres")
+                  if data.get("parametres") is not None else bareme.parametres)
+    try:
+        valider_contenu(code, points, parametres)
+    except BaremeError as exc:
+        return _bareme_error(exc)
+
+    return Response(previsualiser_impact(bareme, points=points, parametres=parametres))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def bareme_activate(request: Request, revision_id: int) -> Response:
+    """POST /api/credits/baremes/revisions/<revision_id>/activate/
+
+    Active une révision brouillon (checker ≠ maker) : bascule le barème actif et
+    archive le précédent. Journalisé.
+    """
+    if not _require_group(request, COMMITTEE_ROLES):
+        return Response({"detail": "Seul le comité de crédit active un barème."},
+                        status=403)
+
+    from credits.baremes import BaremeError, activer_revision, serialize_revision
+    try:
+        revision = activer_revision(
+            revision_id=revision_id,
+            activated_by_sub=getattr(request.user, "sub", "") or "",
+        )
+    except BaremeError as exc:
+        return _bareme_error(exc)
+
+    return Response(serialize_revision(revision, with_preview=True))

@@ -832,3 +832,164 @@ class AnalyseCredit(models.Model):
             if f.attname not in self.MUTABLE_FIELDS and f.attname != "id"
         }
         self._db_justifications = copy.deepcopy(self.justifications)
+
+
+# ── Comité de crédit : décision collégiale à quorum (§7.1.4) ──────────────────
+
+class ImmutableCommitteeVote(Exception):
+    """Tentative de réécriture d'un vote de comité déjà enregistré (principe 3)."""
+
+
+class CommitteeVote(models.Model):
+    """Vote nominatif d'un membre du comité de crédit sur un dossier — append-only.
+
+    Le procès-verbal du comité EST la séquence de ces votes : chacun porte son
+    auteur, sa décision, son motif et le quorum en vigueur au moment du vote. Un
+    membre ne vote qu'une fois (contrainte d'unicité) ; un vote enregistré ne se
+    modifie ni ne s'efface (principe 3 : append-only sur tout ce qui est probant).
+
+    La décision collégiale se déclenche quand le quorum d'un sens (approbation ou
+    rejet) est atteint — la transition passe alors par `credits.workflow`, jamais
+    par une écriture directe de `status` (§5). maker ≠ checker : celui qui a
+    soumis ou initié le dossier ne siège pas dessus (contrôlé par le service).
+    """
+
+    class Decision(models.TextChoices):
+        APPROVE = "approve", "Pour l'approbation"
+        REJECT = "reject", "Pour le rejet"
+
+    application = models.ForeignKey(
+        CreditApplication, on_delete=models.CASCADE, related_name="committee_votes",
+    )
+    voter_sub = models.CharField(max_length=255)
+    decision = models.CharField(max_length=10, choices=Decision.choices)
+    #: Motif obligatoire — chaque décision porte sa justification (§7.2).
+    comment = models.TextField()
+    #: Conditions éventuelles attachées à un vote d'approbation.
+    conditions = models.TextField(blank=True)
+    #: Quorum en vigueur AU MOMENT du vote — fige la règle appliquée (principe 8).
+    quorum_at_vote = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["application", "voter_sub"],
+                name="unique_committee_vote_per_member",
+            ),
+        ]
+        indexes = [models.Index(fields=["application", "created_at"])]
+
+    def __str__(self) -> str:
+        return f"Vote {self.decision} de {self.voter_sub} — {self.application.code}"
+
+    # ── Immuabilité (principe 3) ─────────────────────────────────────────────
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._persisted = True
+        return instance
+
+    def save(self, *args, **kwargs):
+        if getattr(self, "_persisted", False):
+            raise ImmutableCommitteeVote(
+                "Un vote de comité est append-only : il ne peut être ni modifié "
+                "ni réécrit après son enregistrement. On révote sur une nouvelle "
+                "instruction, on ne corrige pas un vote passé."
+            )
+        super().save(*args, **kwargs)
+        self._persisted = True
+
+
+# ── Barèmes éditables par le comité — historique maker-checker (§7.1.5) ───────
+
+class ImmutableBaremeRevision(Exception):
+    """Tentative de modification du contenu figé d'une révision de barème (principe 3)."""
+
+
+class BaremeRevision(models.Model):
+    """Proposition / historique append-only d'un barème (`BaremeScore`), maker-checker.
+
+    Croisement des principes 8 (les règles vivent en base) et 3 (append-only sur
+    les historiques de configuration), plus §7.2 (maker ≠ checker sur toute
+    modification de référentiel). Une édition de barème n'écrase jamais l'ancien
+    en silence : elle crée une révision `draft`, dont l'IMPACT sur le golden set
+    est calculé et figé AVANT toute activation. L'activation est le fait d'un
+    SECOND acteur (`decided_by_sub` ≠ `proposed_by_sub`) ; elle bascule
+    `BaremeScore` sur la nouvelle courbe et archive la révision précédemment
+    active.
+
+    Le contenu proposé (`points`, `parametres`, `version`, `impact_preview`) est
+    immuable une fois écrit — seuls `status` et les champs de décision évoluent,
+    et jamais en arrière (une révision activée ne redevient pas brouillon).
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Proposée (en attente d'activation)"
+        ACTIVE = "active", "Active"
+        ARCHIVED = "archived", "Archivée (remplacée)"
+        REJECTED = "rejected", "Rejetée par le comité"
+
+    bareme = models.ForeignKey(
+        BaremeScore, on_delete=models.PROTECT, related_name="revisions",
+    )
+    #: Snapshot du code — une révision reste rattachable même si le barème est renommé.
+    bareme_code = models.CharField(max_length=40, db_index=True)
+    points = models.JSONField(default=list)
+    parametres = models.JSONField(default=dict, blank=True)
+    version = models.PositiveIntegerField()
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.DRAFT)
+    #: Impact sur le golden set, calculé et figé à la proposition (principe 8).
+    impact_preview = models.JSONField(default=dict, blank=True)
+    comment = models.TextField(blank=True)
+
+    proposed_by_sub = models.CharField(max_length=255)   # maker
+    proposed_at = models.DateTimeField(auto_now_add=True)
+    decided_by_sub = models.CharField(max_length=255, blank=True)   # checker
+    decided_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["bareme_code", "-version", "-id"]
+        indexes = [models.Index(fields=["bareme_code", "status"])]
+
+    def __str__(self) -> str:
+        return f"BaremeRevision {self.bareme_code} v{self.version} [{self.status}]"
+
+    # ── Immuabilité du contenu proposé (principe 3) ──────────────────────────
+
+    #: Seuls champs qu'une révision déjà écrite accepte de voir évoluer.
+    MUTABLE_FIELDS = ("status", "decided_by_sub", "decided_at", "updated_at")
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._db_snapshot = {
+            name: copy.deepcopy(getattr(instance, name))
+            for name in field_names
+            if name not in cls.MUTABLE_FIELDS and name != "id"
+        }
+        return instance
+
+    def save(self, *args, **kwargs):
+        snapshot = getattr(self, "_db_snapshot", None)
+        if snapshot is not None:
+            modifies = [
+                name for name, ancien in snapshot.items()
+                if getattr(self, name) != ancien
+            ]
+            if modifies:
+                raise ImmutableBaremeRevision(
+                    "Le contenu d'une révision de barème est figé à sa "
+                    "proposition : on propose une NOUVELLE révision, on ne "
+                    f"réécrit pas l'historique. Champs immuables modifiés : "
+                    f"{', '.join(sorted(modifies))}."
+                )
+        super().save(*args, **kwargs)
+        self._db_snapshot = {
+            f.attname: copy.deepcopy(getattr(self, f.attname))
+            for f in self._meta.concrete_fields
+            if f.attname not in self.MUTABLE_FIELDS and f.attname != "id"
+        }
