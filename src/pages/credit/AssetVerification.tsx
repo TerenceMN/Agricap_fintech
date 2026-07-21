@@ -10,14 +10,19 @@
  *
  * Point cardinal rendu visible à l'écran : **la valeur retenue est calculée par
  * le serveur**, valeur constatée moins la décote institutionnelle
- * (`InstitutionConfig.decote_garantie`, 30 % par défaut — cf.
- * `assets/services.py::valeur_apres_decote`). L'agent constate, il ne négocie
- * pas la décote, et le front n'en simule jamais le résultat : la valeur retenue
- * n'est affichée qu'APRÈS retour du serveur. Le taux de décote n'est d'ailleurs
- * pas exposé par l'API — le front ne pourrait pas la calculer même s'il le
- * voulait, et c'est très bien ainsi.
+ * (`InstitutionConfig.decote_garantie` — cf. `assets/services.py::valeur_apres_decote`).
+ * L'agent constate, il ne négocie pas la décote, et le front n'en simule jamais
+ * le résultat : la valeur retenue n'est affichée qu'APRÈS retour du serveur.
+ * Le taux de décote n'est exposé par aucun endpoint (`GET /api/referentiel/config`
+ * sert les seuils et pondérations, pas `decote_garantie`) — la décote montrée
+ * après enregistrement est donc l'écart CONSTATÉ entre les deux montants du
+ * serveur, jamais un taux recopié côté écran. Cf. `RetainedValueBreakdown`.
+ *
+ * L'écran instruit sur pièces : `image` et `documents` (JSONField libre) sont
+ * consultables ligne à ligne via `AssetEvidence`, et l'absence de pièce est
+ * elle-même signalée.
  */
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Helmet } from 'react-helmet';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '@/services/api';
@@ -25,15 +30,12 @@ import type { AssetRow } from '@/types/api';
 import {
   Empty, ErrorPanel, Forbidden, Loading, toFieldErrors, type FieldError,
 } from '@/components/backoffice/States';
-import { fmtAmount, fmtDate } from './wire';
-
-const TYPE_LABELS: Record<string, string> = {
-  materiel: 'Matériel / équipement',
-  foncier: 'Foncier',
-  vehicule: 'Véhicule',
-  stock: 'Stock',
-  autre: 'Autre',
-};
+// Nomenclature unique des catégories/statuts d'actif (principe 6) : miroir de
+// `assets.Asset.Type` / `Asset.Status`, partagé avec l'inventaire client.
+import { assetCategory, assetStatus } from '@/components/assets/assetMeta';
+import AssetEvidence from '@/components/assets/AssetEvidence';
+import RetainedValueBreakdown from '@/components/assets/RetainedValueBreakdown';
+import { fmtAmount, fmtDate, fmtDateTime } from './wire';
 
 /** Résultat d'un acte de vérification, conservé pour montrer la valeur retenue. */
 interface Outcome {
@@ -41,9 +43,18 @@ interface Outcome {
   name: string;
   kind: 'verified' | 'rejected';
   declaredValue: number;
+  /** Valeur constatée envoyée au serveur — indispensable pour lire la décote. */
+  observedValue: number | null;
   retainedValue: number | null;
+  isPledgeable: boolean;
   currency: string;
+  verifieLe: string | null;
   motif?: string;
+}
+
+/** Nombre de pièces jointes servies pour un actif (photo comprise). */
+function pieceCount(asset: AssetRow): number {
+  return (asset.documents?.length ?? 0) + (asset.image && asset.image.trim() ? 1 : 0);
 }
 
 const AssetVerification: React.FC = () => {
@@ -60,6 +71,7 @@ const AssetVerification: React.FC = () => {
   const [busy, setBusy] = useState(false);
   const [actionErrors, setActionErrors] = useState<FieldError[]>([]);
   const [outcomes, setOutcomes] = useState<Outcome[]>([]);
+  const [evidenceOpen, setEvidenceOpen] = useState<number[]>([]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -90,7 +102,21 @@ const AssetVerification: React.FC = () => {
     setValeurVerifiee('');
     setMotif('');
     setActionErrors([]);
+    // On ne tranche pas sans avoir les pièces sous les yeux.
+    setEvidenceOpen((prev) => (prev.includes(asset.id) ? prev : [...prev, asset.id]));
   };
+
+  const toggleEvidence = (id: number) => {
+    setEvidenceOpen((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  /** Écho de la saisie de l'agent, uniquement pour l'afficher — aucun calcul métier. */
+  const observedInput = useMemo(() => {
+    const raw = valeurVerifiee.trim().replace(',', '.');
+    if (!raw) return null;
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : null;
+  }, [valeurVerifiee]);
 
   const submit = async (asset: AssetRow) => {
     setActionErrors([]);
@@ -116,8 +142,11 @@ const AssetVerification: React.FC = () => {
           name: asset.name,
           kind: 'verified',
           declaredValue: asset.value,
+          observedValue: num,
           retainedValue: updated.valeurRetenue,
+          isPledgeable: updated.isPledgeable,
           currency: updated.currency || asset.currency,
+          verifieLe: updated.verifieLe,
         }, ...prev]);
         setOpenId(null);
         await load();
@@ -142,8 +171,11 @@ const AssetVerification: React.FC = () => {
         name: asset.name,
         kind: 'rejected',
         declaredValue: asset.value,
+        observedValue: null,
         retainedValue: updated.valeurRetenue,
+        isPledgeable: updated.isPledgeable,
         currency: updated.currency || asset.currency,
+        verifieLe: updated.verifieLe,
         motif: updated.motifRejet || motif.trim(),
       }, ...prev]);
       setOpenId(null);
@@ -188,7 +220,8 @@ const AssetVerification: React.FC = () => {
           déduit seul la <strong>valeur retenue</strong> en appliquant la décote
           institutionnelle en vigueur. Vous ne négociez pas la décote et cet écran ne la
           prévisualise pas : la valeur retenue s'affiche après enregistrement, telle que le
-          serveur l'a calculée. C'est elle, et elle seule, qui couvrira un crédit.
+          serveur l'a calculée, avec l'abattement qu'elle a subi. C'est elle, et elle seule,
+          qui couvrira un crédit.
         </p>
       </div>
 
@@ -203,7 +236,7 @@ const AssetVerification: React.FC = () => {
 
           {/* Journal des actes de la session — la valeur retenue y est visible */}
           {outcomes.length > 0 && (
-            <div className="bg-white/5 border border-white/10 rounded-xl p-4 space-y-2">
+            <div className="bg-white/5 border border-white/10 rounded-xl p-4 space-y-3">
               <h2 className="text-sm font-semibold text-slate-300">Actes enregistrés dans cette session</h2>
               {outcomes.map((o, i) => (
                 <div
@@ -214,18 +247,24 @@ const AssetVerification: React.FC = () => {
                 >
                   <p className="font-medium">
                     {o.kind === 'verified' ? 'Actif vérifié' : 'Actif rejeté'} — {o.name}
+                    <span className="ml-2 text-xs font-normal opacity-70">
+                      {fmtDateTime(o.verifieLe)}
+                    </span>
                   </p>
                   {o.kind === 'verified' ? (
-                    <p className="mt-1">
-                      Valeur retenue calculée par le serveur :{' '}
-                      <span className="font-bold">{fmtAmount(o.retainedValue, o.currency)}</span>
-                      <span className="text-emerald-200/70">
-                        {' '}(valeur déclarée par le client : {fmtAmount(o.declaredValue, o.currency)})
-                      </span>
-                    </p>
+                    <div className="mt-2">
+                      <RetainedValueBreakdown
+                        currency={o.currency}
+                        declaredValue={o.declaredValue}
+                        observedValue={o.observedValue}
+                        retainedValue={o.retainedValue}
+                        isPledgeable={o.isPledgeable}
+                      />
+                    </div>
                   ) : (
                     <p className="mt-1">
-                      Valeur retenue effacée par le serveur. Motif transmis : « {o.motif} »
+                      Valeur retenue effacée par le serveur ({fmtAmount(o.retainedValue, o.currency)}) :
+                      cet actif ne peut plus garantir aucun crédit. Motif transmis : « {o.motif} »
                     </p>
                   )}
                 </div>
@@ -243,121 +282,169 @@ const AssetVerification: React.FC = () => {
           </div>
 
           <div className="space-y-3">
-            {items.map((asset) => (
-              <div key={asset.id} className="bg-white/5 border border-white/10 rounded-xl p-4">
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div className="min-w-0">
-                    <p className="font-semibold text-white">{asset.name || `Actif #${asset.id}`}</p>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      {TYPE_LABELS[asset.type] ?? asset.type}
-                      {asset.guaranteeType && (
-                        <> · type de garantie : <span className="text-emerald-300">{asset.guaranteeType}</span></>
+            {items.map((asset) => {
+              const cat = assetCategory(asset.type);
+              const st = assetStatus(asset.status);
+              const pieces = pieceCount(asset);
+              const showEvidence = evidenceOpen.includes(asset.id);
+              // `guaranteeType` est servi par le serveur : `null` = catégorie
+              // « autre », que `verify_asset` refuse (422). On le dit avant l'acte.
+              const notPledgeableCategory = !asset.guaranteeType;
+
+              return (
+                <div key={asset.id} className="bg-white/5 border border-white/10 rounded-xl p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-white flex items-center gap-2 flex-wrap">
+                        {asset.name || `Actif #${asset.id}`}
+                        <span className={`px-2 py-0.5 rounded-full border text-[11px] font-normal ${st.badge}`}>
+                          {st.label}
+                        </span>
+                      </p>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        <span className={cat.color}>{cat.label}</span>
+                        {asset.guaranteeType && (
+                          <> · type de garantie : <span className="text-emerald-300">{asset.guaranteeType}</span></>
+                        )}
+                        {' '}· déclaré le {fmtDate(asset.createdAt)}
+                      </p>
+                      <p className="text-sm text-slate-300 mt-2">
+                        Propriétaire :{' '}
+                        <span className="text-white font-medium">
+                          {asset.owner?.displayName || asset.owner?.sub || '—'}
+                        </span>
+                        {asset.owner?.phone && <span className="text-slate-500"> · {asset.owner.phone}</span>}
+                      </p>
+                      {asset.localisation && (
+                        <p className="text-sm text-slate-400">Localisation : {asset.localisation}</p>
                       )}
-                      {' '}· déclaré le {fmtDate(asset.createdAt)}
-                    </p>
-                    <p className="text-sm text-slate-300 mt-2">
-                      Propriétaire :{' '}
-                      <span className="text-white font-medium">
-                        {asset.owner?.displayName || asset.owner?.sub || '—'}
-                      </span>
-                      {asset.owner?.phone && <span className="text-slate-500"> · {asset.owner.phone}</span>}
-                    </p>
-                    {asset.localisation && (
-                      <p className="text-sm text-slate-400">Localisation : {asset.localisation}</p>
-                    )}
-                    {asset.description && (
-                      <p className="text-sm text-slate-400 mt-1">{asset.description}</p>
-                    )}
-                    <p className="text-xs text-slate-400 mt-2">
-                      Documents joints : {(asset.documents?.length ?? 0)}
-                      {asset.image ? ' · une photo fournie' : ' · aucune photo'}
-                    </p>
-                  </div>
+                      {asset.description && (
+                        <p className="text-sm text-slate-400 mt-1">{asset.description}</p>
+                      )}
 
-                  <div className="text-right shrink-0">
-                    <p className="text-xs text-slate-400">Valeur déclarée par le client</p>
-                    <p className="text-xl font-bold text-white">{fmtAmount(asset.value, asset.currency)}</p>
-                    <p className="text-[11px] text-slate-500 mt-1">Déclarative — non opposable</p>
-                    <div className="flex gap-2 mt-3 justify-end">
                       <button
                         type="button"
-                        onClick={() => openPanel(asset, 'verify')}
-                        className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium"
+                        onClick={() => toggleEvidence(asset.id)}
+                        aria-expanded={showEvidence}
+                        className="mt-2 text-xs px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-slate-300"
                       >
-                        Vérifier
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => openPanel(asset, 'reject')}
-                        className="px-3 py-1.5 rounded-lg bg-red-700/60 hover:bg-red-600 text-sm font-medium"
-                      >
-                        Rejeter
+                        {showEvidence ? 'Masquer' : 'Consulter'} les pièces jointes ({pieces})
                       </button>
                     </div>
+
+                    <div className="text-right shrink-0">
+                      <p className="text-xs text-slate-400">Valeur déclarée par le client</p>
+                      <p className="text-xl font-bold text-white">{fmtAmount(asset.value, asset.currency)}</p>
+                      <p className="text-[11px] text-slate-500 mt-1">Déclarative — non opposable</p>
+                      <p className="text-[11px] text-slate-500">
+                        Valeur retenue : aucune tant que l'actif n'est pas vérifié
+                      </p>
+                      <div className="flex gap-2 mt-3 justify-end">
+                        <button
+                          type="button"
+                          onClick={() => openPanel(asset, 'verify')}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium"
+                        >
+                          Vérifier
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openPanel(asset, 'reject')}
+                          className="px-3 py-1.5 rounded-lg bg-red-700/60 hover:bg-red-600 text-sm font-medium"
+                        >
+                          Rejeter
+                        </button>
+                      </div>
+                    </div>
                   </div>
+
+                  {notPledgeableCategory && (
+                    <p className="mt-3 text-xs text-amber-200 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2.5">
+                      Catégorie « {cat.label} » : le serveur ne lui associe aucun type de
+                      garantie (<code className="font-mono">guaranteeType = null</code>). Une
+                      vérification sera refusée tant que le client n'aura pas précisé la
+                      catégorie du bien — le rejet motivé est ici la voie normale.
+                    </p>
+                  )}
+
+                  {showEvidence && (
+                    <div className="mt-3">
+                      <AssetEvidence image={asset.image} documents={asset.documents} />
+                    </div>
+                  )}
+
+                  {openId === asset.id && (
+                    <div className="mt-4 pt-4 border-t border-white/10 space-y-3">
+                      {mode === 'verify' ? (
+                        <div className="space-y-3">
+                          <div>
+                            <label className="text-xs text-slate-400" htmlFor={`val-${asset.id}`}>
+                              Valeur constatée sur place ({asset.currency}) — obligatoire
+                            </label>
+                            <input
+                              id={`val-${asset.id}`}
+                              type="text"
+                              inputMode="decimal"
+                              value={valeurVerifiee}
+                              onChange={(e) => setValeurVerifiee(e.target.value)}
+                              placeholder={String(asset.value)}
+                              className="w-full max-w-xs mt-1 bg-white/10 border border-white/20 rounded px-3 py-2 text-sm"
+                            />
+                            <p className="text-[11px] text-slate-500 mt-1">
+                              Ne recopiez pas la valeur déclarée par réflexe : c'est votre
+                              constat qui fonde la garantie.
+                            </p>
+                          </div>
+
+                          <RetainedValueBreakdown
+                            currency={asset.currency}
+                            declaredValue={asset.value}
+                            observedValue={observedInput}
+                            retainedValue={null}
+                            pendingLabel="calculée par le serveur"
+                          />
+                        </div>
+                      ) : (
+                        <div>
+                          <label className="text-xs text-slate-400" htmlFor={`motif-${asset.id}`}>
+                            Motif du rejet — obligatoire, transmis au client et journalisé
+                          </label>
+                          <textarea
+                            id={`motif-${asset.id}`}
+                            rows={3}
+                            value={motif}
+                            onChange={(e) => setMotif(e.target.value)}
+                            className="w-full mt-1 bg-white/10 border border-white/20 rounded px-3 py-2 text-sm"
+                            placeholder="Ex. : le bien décrit n'a pas été retrouvé à l'adresse indiquée."
+                          />
+                        </div>
+                      )}
+
+                      <ErrorPanel errors={actionErrors} title="Enregistrement refusé" />
+
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void submit(asset)}
+                          className="px-4 py-2 rounded-lg bg-primary text-white text-sm font-medium disabled:opacity-50"
+                        >
+                          {busy ? 'Enregistrement…' : mode === 'verify' ? 'Enregistrer la vérification' : 'Enregistrer le rejet'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => setOpenId(null)}
+                          className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm disabled:opacity-50"
+                        >
+                          Annuler
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
-
-                {openId === asset.id && (
-                  <div className="mt-4 pt-4 border-t border-white/10 space-y-3">
-                    {mode === 'verify' ? (
-                      <div>
-                        <label className="text-xs text-slate-400" htmlFor={`val-${asset.id}`}>
-                          Valeur constatée sur place ({asset.currency}) — obligatoire
-                        </label>
-                        <input
-                          id={`val-${asset.id}`}
-                          type="text"
-                          inputMode="decimal"
-                          value={valeurVerifiee}
-                          onChange={(e) => setValeurVerifiee(e.target.value)}
-                          placeholder={String(asset.value)}
-                          className="w-full max-w-xs mt-1 bg-white/10 border border-white/20 rounded px-3 py-2 text-sm"
-                        />
-                        <p className="text-[11px] text-slate-500 mt-1">
-                          La valeur retenue sera calculée par le serveur après décote et
-                          affichée ci-dessus une fois enregistrée.
-                        </p>
-                      </div>
-                    ) : (
-                      <div>
-                        <label className="text-xs text-slate-400" htmlFor={`motif-${asset.id}`}>
-                          Motif du rejet — obligatoire, transmis au client et journalisé
-                        </label>
-                        <textarea
-                          id={`motif-${asset.id}`}
-                          rows={3}
-                          value={motif}
-                          onChange={(e) => setMotif(e.target.value)}
-                          className="w-full mt-1 bg-white/10 border border-white/20 rounded px-3 py-2 text-sm"
-                          placeholder="Ex. : le bien décrit n'a pas été retrouvé à l'adresse indiquée."
-                        />
-                      </div>
-                    )}
-
-                    <ErrorPanel errors={actionErrors} title="Enregistrement refusé" />
-
-                    <div className="flex gap-2">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void submit(asset)}
-                        className="px-4 py-2 rounded-lg bg-primary text-white text-sm font-medium disabled:opacity-50"
-                      >
-                        {busy ? 'Enregistrement…' : mode === 'verify' ? 'Enregistrer la vérification' : 'Enregistrer le rejet'}
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => setOpenId(null)}
-                        className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm disabled:opacity-50"
-                      >
-                        Annuler
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           {loading && <Loading label="Chargement de la file de vérification…" />}
