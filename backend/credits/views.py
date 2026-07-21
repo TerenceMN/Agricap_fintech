@@ -463,6 +463,10 @@ def simulate_scoring(request: Request) -> Response:
     # ns_totals envoyé directement par le frontend (nsResult.totalByModule)
     ns_totals_raw = data.get("ns_totals") or {}
     ns_totals = {k: float(v) for k, v in ns_totals_raw.items() if v} if isinstance(ns_totals_raw, dict) else {}
+    # Financement par module (contrat §1) — % demandé par module (coûts non touchés).
+    from credits.dataio_simulator import normalize_module_financing
+    module_financing = normalize_module_financing(
+        data.get("module_financing") or data.get("moduleFinancing"))
 
     try:
         area_ha = _to_decimal(data["area_ha"]) if data.get("area_ha") else None
@@ -504,6 +508,7 @@ def simulate_scoring(request: Request) -> Response:
         amount_requested=amount_requested,
         currency=currency,
         guarantees_data=None,
+        module_financing=module_financing,
     )
 
     if "error" in result:
@@ -555,6 +560,11 @@ def _simulate_from_source(request: Request, application_code: str, data) -> Resp
         )
 
     currency: str = (data.get("currency") or app.currency or "USD").upper()
+    # Financement par module (contrat §1) — % demandé par module. Les COÛTS
+    # restent lus des DataRecord (`ns_totals`), jamais du payload (principe 1).
+    from credits.dataio_simulator import normalize_module_financing
+    module_financing = normalize_module_financing(
+        data.get("module_financing") or data.get("moduleFinancing"))
     result = dataio_simulate(
         client=app.client,
         value_chain_code=app.value_chain.code if app.value_chain else None,
@@ -564,6 +574,7 @@ def _simulate_from_source(request: Request, application_code: str, data) -> Resp
         amount_requested=float(app.amount_requested) if app.amount_requested else None,
         currency=currency,
         guarantees_data=None,
+        module_financing=module_financing,
     )
     if "error" in result:
         return Response({"detail": result["error"]}, status=400)

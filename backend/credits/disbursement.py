@@ -137,6 +137,13 @@ def request_disbursement(
     app.status = "pending_disbursement"
     app.save(update_fields=["status", "updated_at"])
 
+    from credits.workflow import _audit_transition
+    _audit_transition(
+        app, actor=requester_sub, action="credits.disbursement.request",
+        etape="decaissement_demande", montant=str(dr.amount), devise=dr.currency,
+        motif=notes,
+    )
+
     return dr
 
 
@@ -207,10 +214,22 @@ def confirm_disbursement(
     dr.journal_entry_id = journal_entry.pk if journal_entry else None
     dr.save()
 
-    # ── 6. SMS client ─────────────────────────────────────────────────────
+    # ── 6. Journalisation append-only (tâche D) ───────────────────────────
+    # maker ≠ checker : l'entrée trace les DEUX acteurs, c'est la preuve du
+    # double contrôle sur l'opération la plus sensible du module.
+    from credits.workflow import _audit_transition
+    _audit_transition(
+        app, actor=confirmer_sub, action="credits.disbursement.confirm",
+        etape="decaissement_confirme", montant=str(amount), devise=currency,
+        demandePar=dr.requested_by_sub, confirmePar=confirmer_sub,
+        loanReference=loan.reference,
+        journalEntryId=(journal_entry.pk if journal_entry else None),
+    )
+
+    # ── 7. SMS client ─────────────────────────────────────────────────────
     _notify_client_disbursement(app, amount, currency)
 
-    # ── 7. Instructions fournisseurs ──────────────────────────────────────
+    # ── 8. Instructions fournisseurs ──────────────────────────────────────
     supplier_instructions = _build_supplier_instructions(app)
 
     return {
@@ -246,6 +265,12 @@ def cancel_disbursement_request(app, cancelled_by_sub: str) -> None:
 
     app.status = "approved"
     app.save(update_fields=["status", "updated_at"])
+
+    from credits.workflow import _audit_transition
+    _audit_transition(
+        app, actor=cancelled_by_sub, action="credits.disbursement.cancel",
+        etape="decaissement_annule", montant=str(dr.amount), devise=dr.currency,
+    )
 
 
 # ── Helpers internes ──────────────────────────────────────────────────────────

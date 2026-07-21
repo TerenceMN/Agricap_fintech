@@ -27,6 +27,11 @@ KIND_CHOICES = [
     )
 ]
 
+#: `kind` de FileTemplate = type de fichier CLIENT que le template régit. On réutilise la
+#: nomenclature dataio existante (principe 6) plutôt que d'inventer un code : un template
+#: de feuille de besoins régit les fichiers `KIND_FEUILLE_BESOINS`.
+TEMPLATE_KINDS = (KIND_FEUILLE_BESOINS,)
+
 STATUS_STAGED = "STAGED"        # uploadé, analysé, PAS encore enregistré
 STATUS_COMMITTED = "COMMITTED"  # enregistré manuellement en base
 STATUS_CHOICES = [(s, s) for s in (STATUS_STAGED, STATUS_COMMITTED)]
@@ -118,3 +123,64 @@ class DataRecord(models.Model):
     class Meta:
         ordering = ["row_index"]
         indexes = [models.Index(fields=["table", "row_index"])]
+
+
+class FileTemplate(models.Model):
+    """
+    Template de fichier versionné — cœur du **principe 11**.
+
+    Le template officiel (feuille de besoins, et tout futur formulaire Excel) est un
+    fichier de RÉFÉRENCE téléversé par l'admin (maker), puis activé par un SECOND admin
+    (checker ≠ maker), exactement comme les `ValueChain` de `reference_data`. Le schéma
+    attendu — feuilles, colonnes, ordre, types, rubriques — est **dérivé automatiquement**
+    du fichier à son activation (`schema`), jamais maintenu à la main dans le code.
+
+    Un seul template `active` par `kind` : le précédent passe `archived` à l'activation
+    du suivant. La validation structurelle d'un fichier client se fait contre le `schema`
+    du template actif ; sans template actif → `TEMPLATE_NOT_CONFIGURED`.
+
+    NB : c'est ce modèle qui incarne le « kind=TEMPLATE » du contrat. Son champ `kind`
+    désigne le type de fichier CLIENT régi (nomenclature dataio réutilisée, principe 6),
+    pas le fait d'être un template (implicite au modèle).
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "En attente d'activation"
+        ACTIVE = "active", "Actif"
+        ARCHIVED = "archived", "Archivé"
+
+    kind = models.CharField(max_length=40, default=KIND_FEUILLE_BESOINS, db_index=True)
+    file = models.FileField(upload_to="dataio/templates/")
+    original_name = models.CharField(max_length=255)
+
+    # Version numérique croissante par `kind` (1, 2, 3…). Le versionnage maker-checker
+    # se lit ici, pas dans le nom de fichier.
+    version = models.IntegerField(default=1)
+
+    # Empreinte du fichier (principe 3) : rejouabilité + comparaison de révisions.
+    sha256 = models.CharField(max_length=64, blank=True, db_index=True)
+
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True,
+    )
+
+    # Schéma dérivé du fichier (feuilles / colonnes / ordre / types / rubriques).
+    # Aperçu à l'upload, autoritatif après activation.
+    schema = models.JSONField(default=dict, blank=True)
+
+    uploaded_by = models.CharField(max_length=255, blank=True)   # sub IdP (maker)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    activated_by = models.CharField(max_length=255, blank=True)  # sub IdP (checker)
+    activated_at = models.DateTimeField(null=True, blank=True)
+
+    # Le template que celui-ci a remplacé à son activation (traçabilité de la lignée).
+    supersedes = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="superseded_by",
+    )
+
+    class Meta:
+        ordering = ["-uploaded_at"]
+        indexes = [models.Index(fields=["kind", "status"])]
+
+    def __str__(self) -> str:
+        return f"Template {self.kind} v{self.version} [{self.status}]"

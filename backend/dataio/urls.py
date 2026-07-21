@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import views, views_templates
 
 urlpatterns = [
     path("sources", views.sources),
@@ -10,4 +10,9 @@ urlpatterns = [
     path("tables/<int:pk>", views.table_detail),
     path("tables/<int:pk>/records", views.update_table_records),
     path("history", views.history),
+
+    # Templates de fichiers versionnés (principe 11) — maker-checker.
+    path("templates/", views_templates.templates),
+    path("templates/upload", views_templates.upload_template),
+    path("templates/<int:pk>/activate", views_templates.activate_template),
 ]

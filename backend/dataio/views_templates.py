@@ -1,0 +1,117 @@
+"""
+API des templates de fichiers versionnés (principe 11), onglet Référence de l'admin.
+
+    GET  /api/dataio/templates/            → liste + template actif (id/version)
+    POST /api/dataio/templates/upload      → upload (maker, SHA-256)
+    POST /api/dataio/templates/<id>/activate → activation (checker ≠ maker)
+
+Réservé à la capacité RBAC `config` (référentiel maker-checker), comme `reference_data`.
+"""
+from __future__ import annotations
+
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.response import Response
+
+from rbac.permissions import HasCapability
+
+from . import services_templates as tpl_svc
+from .models import FileTemplate, KIND_FEUILLE_BESOINS
+
+
+def _template_row(t: FileTemplate, *, full: bool = False) -> dict:
+    row = {
+        "id": t.pk,
+        "kind": t.kind,
+        "version": t.version,
+        "status": t.status,
+        "originalName": t.original_name,
+        "sha256": t.sha256,
+        "uploadedBy": t.uploaded_by or None,
+        "uploadedAt": t.uploaded_at.isoformat(),
+        "activatedBy": t.activated_by or None,
+        "activatedAt": t.activated_at.isoformat() if t.activated_at else None,
+        "supersedes": t.supersedes_id,
+        # Résumé du schéma dérivé — suffisant pour la liste.
+        "sheetNames": (t.schema or {}).get("sheet_names", []),
+        "rubriques": (t.schema or {}).get("rubriques", []),
+    }
+    if full:
+        row["schema"] = t.schema
+    return row
+
+
+def _active_ref(t: FileTemplate | None) -> dict | None:
+    if t is None:
+        return None
+    return {"id": t.pk, "version": t.version, "kind": t.kind,
+            "activatedAt": t.activated_at.isoformat() if t.activated_at else None}
+
+
+@api_view(["GET"])
+@permission_classes([HasCapability("config")])
+def templates(request):
+    """Liste des templates (historique) + le template actif (id/version courante)."""
+    kind = request.GET.get("kind", "")
+    qs = FileTemplate.objects.all()
+    if kind:
+        qs = qs.filter(kind=kind)
+    active = (qs.filter(status=FileTemplate.Status.ACTIVE)
+              .order_by("-activated_at", "-version").first())
+    return Response({
+        "active": _active_ref(active),
+        "templates": [_template_row(t) for t in qs[:100]],
+    })
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("config")])
+@parser_classes([MultiPartParser, FormParser])
+def upload_template(request):
+    """Upload d'un template (maker). Renvoie la ligne créée + schéma dérivé + diff/actif."""
+    f = request.FILES.get("file")
+    if not f:
+        return Response({"detail": "Fichier « file » requis."}, status=400)
+
+    kind = request.data.get("kind") or KIND_FEUILLE_BESOINS
+    try:
+        tpl = tpl_svc.upload_template(
+            f, kind=kind, uploaded_by=getattr(request.user, "sub", "") or "",
+        )
+    except tpl_svc.TemplateUploadError as exc:
+        return Response(
+            {"detail": exc.message, "errors": [{"code": exc.code, "message": exc.message}]},
+            status=422,
+        )
+
+    active = tpl_svc.active_template(kind)
+    diff = tpl_svc.diff_schema(active.schema if active else {}, tpl.schema)
+    return Response(
+        {**_template_row(tpl, full=True), "diff": diff,
+         "message": (f"Template « {kind} » v{tpl.version} téléversé. "
+                     f"En attente d'activation par un second administrateur (checker ≠ maker).")},
+        status=201,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("config")])
+def activate_template(request, pk: int):
+    """Activation d'un template (checker ≠ maker). Le précédent actif passe `archived`."""
+    tpl = FileTemplate.objects.filter(pk=pk).first()
+    if tpl is None:
+        return Response({"detail": "Template introuvable."}, status=404)
+
+    try:
+        tpl_svc.activate_template(tpl, activator_sub=getattr(request.user, "sub", "") or "")
+    except tpl_svc.TemplateActivationError as exc:
+        return Response(
+            {"detail": exc.message, "errors": [{"code": exc.code, "message": exc.message}]},
+            status=409,
+        )
+
+    return Response({
+        **_template_row(tpl, full=True),
+        "message": (f"Template « {tpl.kind} » v{tpl.version} activé. "
+                    f"Le schéma dérivé devient la règle de validation des fichiers client."),
+    })

@@ -22,9 +22,39 @@ from decimal import Decimal
 from typing import Any
 
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+
+# ── Journalisation du workflow (tâche D, priorité métier n°1) ──────────────────
+
+def _audit_transition(app, *, actor: str, action: str, etape: str, **details) -> None:
+    """Trace append-only d'une transition de la machine à états (principe 3).
+
+    Réutilise le journal d'audit unique (`audit.services.record`, le mécanisme de
+    `guarantees._audit`). Volontairement NON best-effort : une décision de crédit
+    non journalisée ne se reconstitue pas — un auditeur doit pouvoir rejouer
+    chaque transition (acteur, dossier, étape, motif, horodatage). L'appel vit
+    dans la transaction atomique de la transition : si l'audit échoue, la
+    transition est annulée avec lui.
+
+    `entity_id = app.code` : la référence humaine du dossier, filtrable directement
+    par l'écran auditeur (`GET /api/audit/entries?entity_type=CreditApplication&
+    entity_id=CRED-…`).
+    """
+    from audit.services import record
+
+    payload = {"applicationCode": app.code, "etape": etape, "statut": app.status}
+    payload.update({k: v for k, v in details.items() if v not in (None, "")})
+    record(
+        actor=actor or "",
+        action=action,
+        entity_type="CreditApplication",
+        entity_id=app.code,
+        details=payload,
+    )
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -264,6 +294,7 @@ def _missing_guarantor_consent_errors(app) -> list[dict]:
 
 # ── Transitions ───────────────────────────────────────────────────────────────
 
+@transaction.atomic
 def submit(app, submitter_sub: str) -> None:
     """
     DRAFT → SUBMITTED.
@@ -318,11 +349,19 @@ def submit(app, submitter_sub: str) -> None:
         "client_consent_expires", "updated_at",
     ])
 
+    _audit_transition(
+        app, actor=submitter_sub, action="credits.workflow.submit",
+        etape="soumission", onBehalfOf=app.is_on_behalf_of,
+        clientConsentExpires=(app.client_consent_expires.isoformat()
+                              if app.client_consent_expires else None),
+    )
+
     # Notifier le client si on_behalf_of
     if app.is_on_behalf_of:
         _notify_client_consent_needed(app)
 
 
+@transaction.atomic
 def start_analysis(app, analyst_sub: str) -> None:
     """SUBMITTED → IN_ANALYSIS."""
     _assert_status(app, "submitted")
@@ -344,7 +383,13 @@ def start_analysis(app, analyst_sub: str) -> None:
     app.reviewed_at = timezone.now()
     app.save(update_fields=["status", "reviewed_by_sub", "reviewed_at", "updated_at"])
 
+    _audit_transition(
+        app, actor=analyst_sub, action="credits.workflow.start_analysis",
+        etape="prise_en_charge",
+    )
 
+
+@transaction.atomic
 def approve(
     app,
     approver_sub: str,
@@ -398,9 +443,16 @@ def approve(
         "approval_comment", "rejection_reason_code", "rejection_comment", "updated_at",
     ])
 
+    _audit_transition(
+        app, actor=approver_sub, action="credits.workflow.approve",
+        etape="approbation", montantApprouve=str(amount_approved),
+        devise=app.currency, motif=comment,
+    )
+
     _notify_client_decision(app, approved=True)
 
 
+@transaction.atomic
 def reject(
     app,
     rejector_sub: str,
@@ -437,6 +489,11 @@ def reject(
         "reviewed_by_sub", "reviewed_at", "updated_at",
     ])
 
+    _audit_transition(
+        app, actor=rejector_sub, action="credits.workflow.reject",
+        etape="rejet", reasonCode=reason_code, motif=comment,
+    )
+
     message = _structured_rejection_message(app)
     _notify_client_decision(app, approved=False, rejection_message=message)
 
@@ -452,6 +509,7 @@ def reject(
     }
 
 
+@transaction.atomic
 def adjourn(app, approver_sub: str, comment: str = "") -> None:
     """IN_ANALYSIS → ADJOURNED (dossier ajourné, nouveau dépôt requis)."""
     _assert_status(app, "in_analysis")
@@ -467,7 +525,13 @@ def adjourn(app, approver_sub: str, comment: str = "") -> None:
         "status", "reviewed_by_sub", "reviewed_at", "approval_comment", "updated_at",
     ])
 
+    _audit_transition(
+        app, actor=approver_sub, action="credits.workflow.adjourn",
+        etape="ajournement", motif=comment,
+    )
 
+
+@transaction.atomic
 def reopen_analysis(app, analyst_sub: str) -> None:
     """ADJOURNED → IN_ANALYSIS (après corrections du client)."""
     _assert_status(app, "adjourned")
@@ -477,7 +541,13 @@ def reopen_analysis(app, analyst_sub: str) -> None:
     app.reviewed_at = timezone.now()
     app.save(update_fields=["status", "reviewed_by_sub", "reviewed_at", "updated_at"])
 
+    _audit_transition(
+        app, actor=analyst_sub, action="credits.workflow.reopen_analysis",
+        etape="reouverture",
+    )
 
+
+@transaction.atomic
 def record_client_consent(
     app, client_sub: str, method: str = "app"
 ) -> None:
@@ -503,6 +573,11 @@ def record_client_consent(
     app.client_consent_at = timezone.now()
     app.client_consent_method = method
     app.save(update_fields=["client_consent_at", "client_consent_method", "updated_at"])
+
+    _audit_transition(
+        app, actor=client_sub, action="credits.workflow.client_consent",
+        etape="consentement_client", methode=method,
+    )
 
 
 # ── Sérialiseur de dossier ─────────────────────────────────────────────────────
