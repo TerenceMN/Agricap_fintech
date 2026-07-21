@@ -27,6 +27,9 @@ from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Comptes SYSCOHADA pour le décaissement crédit
 _ACCOUNT_CREDIT_ENCOURS = "4121"   # Crédits à court terme (DR)
@@ -455,13 +458,18 @@ def _notify_client_disbursement(app, amount: Decimal, currency: str) -> None:
     try:
         from common.sms import send_sms
         send_sms(
-            app.client.phone,
-            f"AGRICAP : Votre crédit {app.code} de {amount} {currency} "
+            phone=app.client.phone,
+            message=f"AGRICAP : Votre crédit {app.code} de {amount} {currency} "
             f"a été décaissé. Bonne campagne agricole ! "
             f"Pour toute question, contactez votre conseiller.",
         )
     except Exception:
-        pass
+        # Journalisé, PAS avalé. Un `pass` muet a caché pendant tout ce temps un
+        # `send_sms()` appelé en positionnel alors qu'il exige des mots-clés :
+        # chaque notification client levait un TypeError, personne ne recevait
+        # rien, et rien ne le signalait. Un canal secondaire ne doit pas faire
+        # échouer l'opération métier — mais son échec doit LAISSER UNE TRACE.
+        logger.warning("[NOTIF] envoi impossible pour %s", getattr(app, "code", "?"), exc_info=True)
 
 
 # ── Sérialiseur DisbursementRequest ───────────────────────────────────────────

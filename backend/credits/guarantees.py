@@ -30,6 +30,9 @@ from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -747,9 +750,14 @@ def _notify_guarantor_sms(guarantee) -> None:
             f"(rubrique « Demandes de caution ») ou auprès de votre agence. "
             f"Sans réponse, la demande expire et ne vous engage à rien."
         )
-        send_sms(phone, message)
+        send_sms(phone=phone, message=message)
     except Exception:
-        pass  # SMS non bloquant
+        # Journalisé, PAS avalé. Un `pass` muet a caché pendant tout ce temps un
+        # `send_sms()` appelé en positionnel alors qu'il exige des mots-clés :
+        # chaque notification client levait un TypeError, personne ne recevait
+        # rien, et rien ne le signalait. Un canal secondaire ne doit pas faire
+        # échouer l'opération métier — mais son échec doit LAISSER UNE TRACE.
+        logger.warning("[NOTIF] envoi impossible pour %s", getattr(app, "code", "?"), exc_info=True)
 
 
 # ── Vue « demandes de caution » du garant ─────────────────────────────────────

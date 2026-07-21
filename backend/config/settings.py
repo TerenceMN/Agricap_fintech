@@ -6,6 +6,7 @@ sans dépendance supplémentaire : le projet reste isolé et léger.
 """
 from pathlib import Path
 import os
+import sys
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -120,18 +121,7 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
-        # `timeout` (busy_timeout) ne suffit PAS seul contre le provisioning JIT
-        # concurrent : deux `update_or_create` simultanés font chacun SELECT puis
-        # UPDATE, et l'upgrade verrou partagé → exclusif est un deadlock que SQLite
-        # REFUSE tout de suite (« database is locked » en 60 ms, sans attendre les
-        # 20 s). Le 500 observé sur /api/me venait de là.
-        #   - `journal_mode=WAL`      : lecteurs et écrivain ne se bloquent plus ;
-        #   - `transaction_mode=IMMEDIATE` : la transaction prend le verrou d'écriture
-        #     dès le BEGIN, donc le second writer ATTEND (busy_timeout) au lieu de
-        #     deadlocker sur l'upgrade — c'est ce qui transforme le 500 en attente ;
-        #   - `synchronous=NORMAL`    : sûr sous WAL, évite un fsync par écriture.
-        # `transaction_mode` et `init_command` sont supportés nativement par le
-        # backend sqlite3 de Django ≥ 5.1 (ici 5.2).
+        
         "OPTIONS": {
             "timeout": 20,
             "transaction_mode": "IMMEDIATE",
@@ -172,8 +162,6 @@ IDP = {
     "USERINFO_CACHE_TTL": int(os.environ.get("IDP_USERINFO_CACHE_TTL", "300")),
 }
 
-# --- Analyse assistée par IA (hybride : calculs déterministes + IA sur les
-#     verdicts/message/décision, en s'appuyant sur les documents de la plateforme) ---
 AI = {
     "PROVIDER": os.environ.get("AI_PROVIDER", "anthropic"),
     "API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
@@ -191,9 +179,6 @@ CORS_ALLOWED_ORIGINS = _env_list(
 # --- Emplacement des classeurs de référence (amorçage CLI) ------------------
 DOCUMENT_EXCEL_DIR = os.environ.get("DOCUMENT_EXCEL_DIR", str(BASE_DIR.parent / "Document Excel"))
 
-# --- SMS (Dream Digital / aSMSC) — OTP par SMS (maker-checker) + notifications
-#     ticket/alerte. Sans SMS_API_ID configuré, `common.sms.send_sms` dégrade en
-#     log honnête (pas d'envoi simulé), même principe que `partners.services`. ---
 SMS = {
     "API_URL": os.environ.get("SMS_API_URL", ""),
     "API_ID": os.environ.get("SMS_API_ID", ""),
@@ -201,26 +186,9 @@ SMS = {
     "SENDER_ID": os.environ.get("SMS_SENDER_ID", "TEST-SMS"),
 }
 
-# --- Délégation d'approbation crédit (montant max en USD par rôle) ----------
-# Clés = identifiants canoniques de `rbac.role_registry`. None = illimité.
-#
-# Cette table porte l'AUTORITÉ d'approbation crédit, distincte de la capacité
-# RBAC `validate` : `admin_it` et `compliance` valident de la configuration et
-# de la conformité, pas des engagements financiers — ils sont donc absents ici
-# et ne peuvent approuver aucun dossier. Un rôle absent = aucune autorité.
-#
-# Le comité de crédit n'a pas de rôle propre (décision de juillet 2026 : aucun
-# nouveau rôle) — il est exercé par `dg` et `admin`, en délégation illimitée.
-#
-# Correspondance avec l'ancien vocabulaire, supprimé car il ne correspondait à
-# aucun identifiant réel de `accounts.FintechUser.role` :
-#   agent → agent_terrain · gestionnaire/credit_officer → gest_credit
-#   branch_manager → gest_zone · regional_director → dir_ops
-#   credit_committee → dg + admin
-# Les agents de terrain (`agent_terrain`, `agent_cash`) sont volontairement
-# ABSENTS : ils ne portent pas la capacité `validate` dans le registre, ils
-# montent et instruisent les dossiers mais n'engagent jamais les fonds.
-# L'ancienne entrée « agent : 5 000 USD » visait un rôle qui n'a jamais existé.
+if "test" in sys.argv:
+    SMS = {**SMS, "API_URL": "", "API_ID": "", "API_PASSWORD": ""}
+
 CREDIT_DELEGATION_USD: dict[str, float | None] = {
     "gest_credit":        25_000,   # Gestionnaire Crédits
     "gest_port":          25_000,   # Gestionnaire Portefeuille

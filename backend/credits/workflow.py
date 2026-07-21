@@ -657,12 +657,17 @@ def _notify_client_consent_needed(app) -> None:
         from common.sms import send_sms
         expires = app.client_consent_expires.strftime("%d/%m/%Y à %H:%M")
         send_sms(
-            app.client.phone,
-            f"AGRICAP : Un agent a déposé une demande de crédit {app.code} en votre nom. "
+            phone=app.client.phone,
+            message=f"AGRICAP : Un agent a déposé une demande de crédit {app.code} en votre nom. "
             f"Confirmez votre accord avant le {expires} via l'application ou votre agence.",
         )
     except Exception:
-        pass
+        # Journalisé, PAS avalé. Un `pass` muet a caché pendant tout ce temps un
+        # `send_sms()` appelé en positionnel alors qu'il exige des mots-clés :
+        # chaque notification client levait un TypeError, personne ne recevait
+        # rien, et rien ne le signalait. Un canal secondaire ne doit pas faire
+        # échouer l'opération métier — mais son échec doit LAISSER UNE TRACE.
+        logger.warning("[NOTIF] envoi impossible pour %s", getattr(app, "code", "?"), exc_info=True)
 
 
 def _notify_client_decision(app, approved: bool, rejection_message: str = "") -> None:
@@ -688,9 +693,14 @@ def _notify_client_decision(app, approved: bool, rejection_message: str = "") ->
                 f"AGRICAP : Votre dossier {app.code} n'a pas pu être approuvé "
                 f"({reason}). Contactez votre conseiller pour plus d'informations."
             )
-        send_sms(app.client.phone, msg)
+        send_sms(phone=app.client.phone, message=msg)
     except Exception:
-        pass
+        # Journalisé, PAS avalé. Un `pass` muet a caché pendant tout ce temps un
+        # `send_sms()` appelé en positionnel alors qu'il exige des mots-clés :
+        # chaque notification client levait un TypeError, personne ne recevait
+        # rien, et rien ne le signalait. Un canal secondaire ne doit pas faire
+        # échouer l'opération métier — mais son échec doit LAISSER UNE TRACE.
+        logger.warning("[NOTIF] envoi impossible pour %s", getattr(app, "code", "?"), exc_info=True)
 
 
 def _release_savings_holds_on_rejection(app) -> None:
@@ -705,4 +715,9 @@ def _release_savings_holds_on_rejection(app) -> None:
         for hold in holds:
             release_savings_hold(hold)
     except Exception:
-        pass
+        # Journalisé, PAS avalé. Un `pass` muet a caché pendant tout ce temps un
+        # `send_sms()` appelé en positionnel alors qu'il exige des mots-clés :
+        # chaque notification client levait un TypeError, personne ne recevait
+        # rien, et rien ne le signalait. Un canal secondaire ne doit pas faire
+        # échouer l'opération métier — mais son échec doit LAISSER UNE TRACE.
+        logger.warning("[NOTIF] envoi impossible pour %s", getattr(app, "code", "?"), exc_info=True)
