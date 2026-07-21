@@ -1333,7 +1333,15 @@ const Credits = () => {
         <GestionCreditsClient approvedCredit={approvedCredit} refreshCredit={refreshCredit} />
       </TabsContent>
       <TabsContent value="demandes" className="pt-6">
-        <MesDossiers dossiers={mesDossiers} chargement={dossiersEnChargement} />
+        {/* `onRefresh` : après un consentement client, le dossier change d'état
+            côté serveur (`pendingClientConsent` retombe, l'analyse devient
+            possible). On RELIT la liste plutôt que de patcher l'objet local —
+            l'état du dossier appartient au serveur, pas au navigateur. */}
+        <MesDossiers
+          dossiers={mesDossiers}
+          chargement={dossiersEnChargement}
+          onRefresh={() => api.credits.list().then(setMesDossiers).catch(() => {})}
+        />
       </TabsContent>
       <TabsContent value="demande" className="pt-6">
           {!(isSubmitted && approvedCredit) && (

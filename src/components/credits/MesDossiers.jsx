@@ -18,13 +18,14 @@ import { useNavigate } from 'react-router-dom';
 import { FileText, AlertCircle, ChevronRight } from 'lucide-react';
 import { formatMontant } from '@/components/guarantees/format';
 import { statutClient, EN_COURS } from './dossierStatus';
+import ConsentementClient from './ConsentementClient';
 
 const formatDate = (iso) =>
   iso ? new Date(iso).toLocaleDateString('fr-FR', {
     day: '2-digit', month: 'short', year: 'numeric',
   }) : '—';
 
-function LigneDossier({ dossier, onOpen }) {
+function LigneDossier({ dossier, onOpen, onRefresh }) {
   const statut = statutClient(dossier.status);
   // Le montant accordé prime sur le montant demandé dès qu'il existe : c'est
   // celui qui engage le client, et il peut différer de ce qu'il avait demandé.
@@ -86,6 +87,16 @@ function LigneDossier({ dossier, onOpen }) {
           </span>
         </td>
       </tr>
+      {/* Le consentement prime sur tout le reste : sans lui le dossier ne bouge
+          pas. `pendingClientConsent` est calculé par le SERVEUR — le front ne
+          déduit jamais lui-même qu'une signature est due. */}
+      {dossier.pendingClientConsent && (
+        <tr className="bg-amber-500/[0.04]">
+          <td colSpan={6} className="px-3 pb-3">
+            <ConsentementClient dossier={dossier} onConfirme={onRefresh} />
+          </td>
+        </tr>
+      )}
       {motifRefus && (
         <tr className="bg-red-500/[0.04]">
           <td colSpan={6} className="px-3 pb-3">
@@ -102,7 +113,7 @@ function LigneDossier({ dossier, onOpen }) {
   );
 }
 
-function Tableau({ titre, dossiers, onOpen }) {
+function Tableau({ titre, dossiers, onOpen, onRefresh }) {
   if (!dossiers.length) return null;
   return (
     <section className="space-y-3">
@@ -122,7 +133,7 @@ function Tableau({ titre, dossiers, onOpen }) {
             </tr>
           </thead>
           <tbody>
-            {dossiers.map((d) => <LigneDossier key={d.code} dossier={d} onOpen={onOpen} />)}
+            {dossiers.map((d) => <LigneDossier key={d.code} dossier={d} onOpen={onOpen} onRefresh={onRefresh} />)}
           </tbody>
         </table>
       </div>
@@ -130,7 +141,7 @@ function Tableau({ titre, dossiers, onOpen }) {
   );
 }
 
-export default function MesDossiers({ dossiers, chargement }) {
+export default function MesDossiers({ dossiers, chargement, onRefresh }) {
   const navigate = useNavigate();
   // Chaque dossier ouvre SA sous-page d'analyse client (score-lettre + pistes,
   // jamais les barèmes du moteur — principe 7). La route vit sous `/credits/…`
@@ -165,8 +176,8 @@ export default function MesDossiers({ dossiers, chargement }) {
       <p className="text-xs text-slate-500">
         Cliquez sur une demande pour voir son analyse (votre note et des pistes d'amélioration).
       </p>
-      <Tableau titre="Demandes en cours" dossiers={enCours} onOpen={ouvrirAnalyse} />
-      <Tableau titre="Historique" dossiers={historique} onOpen={ouvrirAnalyse} />
+      <Tableau titre="Demandes en cours" dossiers={enCours} onOpen={ouvrirAnalyse} onRefresh={onRefresh} />
+      <Tableau titre="Historique" dossiers={historique} onOpen={ouvrirAnalyse} onRefresh={onRefresh} />
     </motion.div>
   );
 }
