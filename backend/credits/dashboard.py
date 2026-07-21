@@ -191,34 +191,49 @@ def _committee_dashboard() -> dict[str, Any]:
     from credits.models import CreditApplication
     from config import settings
 
+    from credits.committee import _amount_usd, committee_threshold_usd, requires_committee
+
     qs = CreditApplication.objects.select_related("client", "value_chain")
 
-    # Dossiers dépassant la délégation du niveau agence (>= 25 000 USD)
-    branch_limit = settings.CREDIT_DELEGATION_USD.get("gest_zone") or 0
-    committee_apps = qs.filter(
-        status="in_analysis",
-        amount_requested__gte=branch_limit,
-    )
+    # La corbeille applique EXACTEMENT la règle qui autorise le vote
+    # (`requires_committee`, qui convertit en USD). Le filtre précédent comparait
+    # `amount_requested` BRUT à un seuil en USD, donc des devises entre elles :
+    # un dossier en CDF porte un nombre énorme en brut et entrait toujours dans
+    # la corbeille — pour se voir ensuite refuser le vote en
+    # `COMMITTEE_NOT_REQUIRED`. Le comité voyait des dossiers sur lesquels il ne
+    # pouvait rien faire.
+    # `in_analysis` est la file d'instruction : ensemble borné, donc filtrable en
+    # Python. C'est le prix assumé pour n'avoir QU'UNE règle — une seconde règle
+    # au niveau SQL, c'est une divergence qui revient au premier changement.
+    candidats = [a for a in qs.filter(status="in_analysis") if requires_committee(a)]
+    candidats.sort(key=_amount_usd, reverse=True)
 
-    counts = committee_apps.aggregate(
-        count=Count("id"),
-        total_volume=Sum("amount_requested"),
-    )
+    # Agrégat converti : sommer des montants de devises différentes et appeler le
+    # total « USD » produisait un chiffre qui ne veut rien dire (§7.2, KPI honnêtes).
+    total_usd = sum(_amount_usd(a) for a in candidats)
 
-    pending_list = list(
-        committee_apps.order_by("-amount_requested").values(
-            "code", "status", "amount_requested", "currency",
-            "value_chain__label", "created_at",
-        )[:20]
-    )
+    pending_list = [
+        {
+            "code": a.code,
+            "status": a.status,
+            "amount_requested": a.amount_requested,
+            "currency": a.currency,
+            "value_chain__label": a.value_chain.label if a.value_chain_id else None,
+            "created_at": a.created_at,
+            # Montant comparable entre dossiers : c'est lui qui a décidé de la
+            # présence dans la corbeille, il doit donc être lisible à l'écran.
+            "amountUsd": _amount_usd(a),
+        }
+        for a in candidats[:20]
+    ]
     _serialize_qs_values(pending_list)
 
     return {
         "role": "credit_committee",
         "summary": {
-            "pendingReview": counts["count"] or 0,
-            "totalVolumeUsd": float(counts["total_volume"] or 0),
-            "delegationThresholdUsd": float(branch_limit),
+            "pendingReview": len(candidats),
+            "totalVolumeUsd": float(total_usd),
+            "delegationThresholdUsd": float(committee_threshold_usd()),
         },
         "pendingApplications": pending_list,
     }
