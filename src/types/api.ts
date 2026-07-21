@@ -961,6 +961,21 @@ export interface NeedsParseResult {
   totalByModule: Record<string, number>;
 }
 
+/** Une ligne du plan de financement par module, telle que le serveur la
+ *  RECALCULE (contrat §1). Le front n'en dérive aucun montant : `partDemandee`
+ *  vient du serveur (`coutFichier × pct/100`, arrondi côté serveur), pas d'un
+ *  produit refait dans le navigateur (principe 4 / anti-gaming). */
+export interface CreditModuleFinancingLine {
+  /** Code canonique du module (`semences`, `maindoeuvre`…). */
+  module: string;
+  /** Coût lu des DataRecord de la feuille — jamais du payload (principe 1). */
+  coutFichier: number;
+  /** Part demandée à AGRICAP, en % entier 0..100 (choix du client). */
+  pct: number;
+  /** Montant demandé sur ce module = `coutFichier × pct/100`, arrondi serveur. */
+  partDemandee: number;
+}
+
 // Résultat simulate
 export interface CreditSimulateResult {
   score: number;
@@ -969,6 +984,14 @@ export interface CreditSimulateResult {
   proposedRate: number;
   minScoreRequired: number;
   breakdown: CreditScoreBreakdown[];
+  /** Détail du financement par module (contrat §1). Présent uniquement quand
+   *  `module_financing` a été envoyé ET que le backend le prend en charge : un
+   *  serveur pas encore à jour ne sert pas ces champs, d'où l'optionnalité. Le
+   *  front ne recompose jamais ces montants — il les affiche tels quels. */
+  moduleFinancing?: CreditModuleFinancingLine[];
+  /** Montant demandé effectivement scoré = Σ `partDemandee` (et NON le total
+   *  feuille). Le DSCR et l'échéancier sont calculés dessus, côté serveur. */
+  montantDemandeAjuste?: number;
 }
 
 // Dashboard par rôle

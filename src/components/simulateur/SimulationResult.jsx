@@ -27,7 +27,9 @@
  */
 import React from 'react';
 import { motion } from 'framer-motion';
+import { Lock } from 'lucide-react';
 import { formatMontant } from '@/components/guarantees/format';
+import { moduleConfig } from './modules';
 
 /**
  * Grille de classement du score — **une seule échelle** pour ce module.
@@ -159,6 +161,75 @@ export const ScoreBreakdown = ({ simResult }) => {
  * à 0, intérêts seuls) sont signalés d'un point pour que l'écart de mensualité
  * s'explique de lui-même.
  */
+/**
+ * Plan de financement par module RETENU PAR LE MOTEUR (contrat §1).
+ *
+ * Restitution pure de `simResult.moduleFinancing` : chaque ligne porte le coût
+ * lu du fichier (`coutFichier`, en lecture seule — c'est un cadenas, pas un
+ * champ), la part demandée en % (`pct`, choix du client) et le montant demandé
+ * correspondant (`partDemandee`), tous CALCULÉS PAR LE SERVEUR. Le total est
+ * `montantDemandeAjuste`, servi lui aussi — le front n'additionne rien
+ * (principe 4 : les totaux viennent du serveur).
+ *
+ * Se rend invisible tant que le backend ne sert pas encore ces champs
+ * (déploiement en parallèle) : l'écran ne casse pas, il attend le câblage.
+ */
+export const ModuleFinancingSummary = ({ simResult, currency }) => {
+  const lines = simResult?.moduleFinancing;
+  if (!lines?.length) return null;
+  const total = simResult?.montantDemandeAjuste;
+  return (
+    <div className="glass-effect p-5 rounded-2xl">
+      <div className="flex items-baseline justify-between gap-3 mb-3 flex-wrap">
+        <h4 className="font-bold text-white">Plan de financement retenu par le moteur</h4>
+        <span className="text-xs text-gray-500 flex items-center gap-1">
+          <Lock className="w-3 h-3" aria-hidden="true" /> coûts issus de votre fichier
+        </span>
+      </div>
+      <div className="overflow-x-auto rounded-lg border border-white/5">
+        <table className="w-full text-sm min-w-[420px]">
+          <thead className="bg-slate-900/60">
+            <tr className="text-gray-400 border-b border-white/10">
+              <th className="text-left py-2 px-3">Module</th>
+              <th className="text-right py-2 px-3">Coût fichier</th>
+              <th className="text-right py-2 px-3">Demandé</th>
+              <th className="text-right py-2 px-3">Part demandée</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.map((l) => (
+              <tr key={l.module} className="border-b border-white/5 text-gray-300 tabular-nums">
+                <td className="py-1.5 px-3 text-gray-200">{moduleConfig(l.module).label}</td>
+                <td className="py-1.5 px-3 text-right text-gray-400">
+                  {formatMontant(l.coutFichier, '', { decimals: 0 })}
+                </td>
+                <td className="py-1.5 px-3 text-right text-emerald-300">{l.pct} %</td>
+                <td className="py-1.5 px-3 text-right font-semibold text-white">
+                  {formatMontant(l.partDemandee, currency, { decimals: 0 })}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+          {total != null && (
+            <tfoot>
+              <tr className="border-t border-white/15 text-white font-semibold tabular-nums">
+                <td className="py-2 px-3" colSpan={3}>Montant demandé scoré</td>
+                <td className="py-2 px-3 text-right text-emerald-400">
+                  {formatMontant(total, currency, { decimals: 0 })}
+                </td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+      <p className="text-[11px] text-gray-500 mt-2">
+        Le score, le DSCR et l'échéancier ci-dessous sont calculés sur ce montant demandé,
+        pas sur le total de votre feuille.
+      </p>
+    </div>
+  );
+};
+
 export const SchedulePreview = ({ simResult, currency }) => {
   const schedule = simResult?.scheduleDraft;
   if (!schedule?.length) return null;

@@ -14,7 +14,8 @@
  */
 import React from 'react';
 import { motion } from 'framer-motion';
-import { FileText, AlertCircle } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { FileText, AlertCircle, ChevronRight } from 'lucide-react';
 import { formatMontant } from '@/components/guarantees/format';
 import { statutClient, EN_COURS } from './dossierStatus';
 
@@ -23,7 +24,7 @@ const formatDate = (iso) =>
     day: '2-digit', month: 'short', year: 'numeric',
   }) : '—';
 
-function LigneDossier({ dossier }) {
+function LigneDossier({ dossier, onOpen }) {
   const statut = statutClient(dossier.status);
   // Le montant accordé prime sur le montant demandé dès qu'il existe : c'est
   // celui qui engage le client, et il peut différer de ce qu'il avait demandé.
@@ -36,9 +37,20 @@ function LigneDossier({ dossier }) {
   const motifRefus = dossier.status === 'rejected'
     && (dossier.rejectionComment || dossier.rejectionReasonCode);
 
+  const open = () => onOpen(dossier.code);
+
   return (
     <>
-      <tr className="border-t border-white/5 hover:bg-white/[0.03]">
+      <tr
+        role="button"
+        tabIndex={0}
+        aria-label={`Voir l'analyse du dossier ${dossier.code}`}
+        onClick={open}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+        }}
+        className="border-t border-white/5 hover:bg-white/[0.05] cursor-pointer transition-colors focus:outline-none focus:bg-white/[0.06]"
+      >
         <td className="py-3 px-3">
           <p className="font-semibold text-white">
             {dossier.valueChain?.label || 'Filière non précisée'}
@@ -68,10 +80,15 @@ function LigneDossier({ dossier }) {
             </p>
           )}
         </td>
+        <td className="py-3 px-2 text-right">
+          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-300/90 whitespace-nowrap">
+            Analyse <ChevronRight className="w-4 h-4" aria-hidden="true" />
+          </span>
+        </td>
       </tr>
       {motifRefus && (
         <tr className="bg-red-500/[0.04]">
-          <td colSpan={5} className="px-3 pb-3">
+          <td colSpan={6} className="px-3 pb-3">
             <div className="flex gap-2 rounded-lg border border-red-500/25 bg-red-500/10 p-3">
               <AlertCircle className="w-4 h-4 text-red-300 shrink-0 mt-0.5" />
               <div className="text-sm text-red-100 whitespace-pre-line">
@@ -85,7 +102,7 @@ function LigneDossier({ dossier }) {
   );
 }
 
-function Tableau({ titre, dossiers }) {
+function Tableau({ titre, dossiers, onOpen }) {
   if (!dossiers.length) return null;
   return (
     <section className="space-y-3">
@@ -93,7 +110,7 @@ function Tableau({ titre, dossiers }) {
         {titre} <span className="text-slate-500 font-normal">({dossiers.length})</span>
       </h3>
       <div className="rounded-xl border border-white/10 bg-white/5 overflow-x-auto">
-        <table className="w-full min-w-[560px] text-sm">
+        <table className="w-full min-w-[600px] text-sm">
           <thead>
             <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500">
               <th className="py-2.5 px-3 font-medium">Filière</th>
@@ -101,10 +118,11 @@ function Tableau({ titre, dossiers }) {
               <th className="py-2.5 px-3 font-medium">Déposé le</th>
               <th className="py-2.5 px-3 font-medium">Statut</th>
               <th className="py-2.5 px-3 font-medium text-right">Montant</th>
+              <th className="py-2.5 px-2 font-medium" aria-label="Ouvrir l'analyse" />
             </tr>
           </thead>
           <tbody>
-            {dossiers.map((d) => <LigneDossier key={d.code} dossier={d} />)}
+            {dossiers.map((d) => <LigneDossier key={d.code} dossier={d} onOpen={onOpen} />)}
           </tbody>
         </table>
       </div>
@@ -113,6 +131,12 @@ function Tableau({ titre, dossiers }) {
 }
 
 export default function MesDossiers({ dossiers, chargement }) {
+  const navigate = useNavigate();
+  // Chaque dossier ouvre SA sous-page d'analyse client (score-lettre + pistes,
+  // jamais les barèmes du moteur — principe 7). La route vit sous `/credits/…`
+  // (le client) ; `/credit/*` au singulier est réservé au staff.
+  const ouvrirAnalyse = (code) => navigate(`/credits/analyse/${code}`);
+
   if (chargement) {
     return (
       <div className="rounded-xl border border-white/10 bg-white/5 p-6 text-sm text-slate-400">
@@ -138,8 +162,11 @@ export default function MesDossiers({ dossiers, chargement }) {
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
-      <Tableau titre="Demandes en cours" dossiers={enCours} />
-      <Tableau titre="Historique" dossiers={historique} />
+      <p className="text-xs text-slate-500">
+        Cliquez sur une demande pour voir son analyse (votre note et des pistes d'amélioration).
+      </p>
+      <Tableau titre="Demandes en cours" dossiers={enCours} onOpen={ouvrirAnalyse} />
+      <Tableau titre="Historique" dossiers={historique} onOpen={ouvrirAnalyse} />
     </motion.div>
   );
 }

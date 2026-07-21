@@ -25,6 +25,7 @@ import ClientWallet from '@/pages/ClientWallet';
 import ClientDocuments from '@/pages/ClientDocuments';
 import ClientNotifications from '@/pages/ClientNotifications';
 import Credits from '@/pages/Credits';
+import ClientCreditAnalyse from '@/pages/ClientCreditAnalyse';
 import Savings from '@/pages/Savings';
 import Transactions from '@/pages/Transactions';
 import Contracts from '@/pages/Contracts';
@@ -132,6 +133,11 @@ const AppRoutes = () => {
       
       {/* Shared / User Routes */}
       <Route path="/credits" element={<PrivateRoute roles={['admin', 'client']}><Credits /></PrivateRoute>} />
+      {/* Sous-page d'analyse CLIENT (score-lettre + pistes, principe 7). Route
+          `/credits/…` au pluriel = espace client ; `/credit/*` au singulier =
+          staff. Accès mêmes rôles que /credits ; le serveur re-vérifie l'accès
+          au dossier (403) et distingue « pas encore analysé » (404). */}
+      <Route path="/credits/analyse/:code" element={<PrivateRoute roles={['admin', 'client']}><ClientCreditAnalyse /></PrivateRoute>} />
       <Route path="/savings" element={<PrivateRoute roles={['admin', 'client']}><Savings /></PrivateRoute>} />
       <Route path="/transactions" element={<PrivateRoute roles={['admin', 'client', 'caissier']}><Transactions /></PrivateRoute>} />
       <Route path="/contracts" element={<PrivateRoute roles={['admin', 'client']}><Contracts /></PrivateRoute>} />

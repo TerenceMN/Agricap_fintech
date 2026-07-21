@@ -51,12 +51,79 @@ const AdminCreditsDashboard = () => {
 
   useEffect(() => { load(); }, [load]);
 
-  // Actions nécessitant une saisie rapide (MVP : window.prompt).
-  const PROMPTS = {
-    reassign: () => ({ manager: window.prompt('Nouveau gestionnaire ?') }),
-    extend: () => ({ months: window.prompt('Prolonger de combien de mois ?', '3') }),
-    note: () => ({ text: window.prompt('Note à ajouter :') }),
-    disburse: () => ({ amount: window.prompt('Montant à décaisser ?') }),
+  // Actions irréversibles / sensibles : confirmation explicite avant l'appel
+  // serveur (garde-fou §4 du brief). Le libellé dit ce qui va se passer.
+  const DESTRUCTIVE = {
+    block: 'Bloquer ce crédit ? Le taux sera ramené à 0 %. Action sensible.',
+    default: 'Passer ce crédit en DÉFAUT ? Cette qualification est lourde de conséquences.',
+    close: 'Clôturer définitivement ce dossier de crédit ?',
+    cancel: 'Annuler / rejeter ce crédit ? Le dossier passera au statut « Rejeté ».',
+  };
+
+  /**
+   * Collecte des paramètres d'une action (MVP : window.prompt).
+   * Retourne `null` pour signaler une annulation ou une saisie invalide — dans
+   * ce cas aucun appel serveur n'est fait (pas d'action « à vide »).
+   */
+  const collectParams = (action) => {
+    const num = (s) => Number(String(s ?? '').replace(',', '.'));
+    switch (action) {
+      case 'reassign': {
+        const manager = window.prompt('Nouveau gestionnaire (nom ou sub) ?');
+        if (manager === null) return null;
+        if (!manager.trim()) {
+          toast({ variant: 'destructive', title: 'Saisie requise', description: 'Le gestionnaire ne peut pas être vide.' });
+          return null;
+        }
+        return { manager: manager.trim() };
+      }
+      case 'extend': {
+        const months = window.prompt('Prolonger de combien de mois ?', '3');
+        if (months === null) return null;
+        const n = parseInt(months, 10);
+        if (!Number.isFinite(n) || n <= 0) {
+          toast({ variant: 'destructive', title: 'Durée invalide', description: 'Indiquez un nombre de mois entier positif.' });
+          return null;
+        }
+        return { months: n };
+      }
+      case 'note': {
+        const text = window.prompt('Note à ajouter :');
+        if (text === null) return null;
+        if (!text.trim()) {
+          toast({ variant: 'destructive', title: 'Note vide', description: 'Rien n\'a été ajouté.' });
+          return null;
+        }
+        return { text: text.trim() };
+      }
+      case 'approve': {
+        const amt = window.prompt('Montant approuvé (vide = conserver le montant demandé) :');
+        if (amt === null) return null;
+        if (!amt.trim()) return {};               // approbation sans changer le montant
+        const n = num(amt);
+        if (!Number.isFinite(n) || n < 0) {
+          toast({ variant: 'destructive', title: 'Montant invalide', description: 'Saisissez un montant positif ou laissez vide.' });
+          return null;
+        }
+        return { amountApproved: n };
+      }
+      case 'disburse': {
+        const amt = window.prompt('Montant à décaisser ?');
+        if (amt === null) return null;
+        const n = num(amt);
+        if (!Number.isFinite(n) || n <= 0) {
+          toast({ variant: 'destructive', title: 'Montant invalide', description: 'Le montant du décaissement doit être positif.' });
+          return null;
+        }
+        const ref = window.prompt('Référence de la transaction (optionnel) :', '');
+        if (ref === null) return null;            // annulation au 2e prompt
+        const params = { amount: n };
+        if (ref.trim()) params.ref = ref.trim();
+        return params;
+      }
+      default:
+        return {};                                // pause, resume, block, close, cancel, default, reminder
+    }
   };
 
   const handleAction = async (action, credit) => {

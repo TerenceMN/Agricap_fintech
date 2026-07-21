@@ -32,7 +32,7 @@ import NeedsSheetPanel, { NeedsSheetErrorList, NeedsSheetFailure } from '@/compo
 import { isFileValidationError, transportErrorMessage } from '@/components/simulateur/needsSheetErrors';
 import ModuleGrid from '@/components/simulateur/ModuleGrid';
 import {
-  DonutChartScore, ScoreBreakdown, SchedulePreview, scoreLetterOf,
+  DonutChartScore, ModuleFinancingSummary, ScoreBreakdown, SchedulePreview, scoreLetterOf,
 } from '@/components/simulateur/SimulationResult';
 
 // =================================================================
@@ -172,6 +172,9 @@ const SimulateurIntelligent = ({
   const [simErrors, setSimErrors] = useState([]);
   const [simFailure, setSimFailure] = useState(null);
   const [simResult, setSimResult] = useState(formData.simResult || null);
+  // Instantané du financement % au moment de la dernière simulation : sert à
+  // détecter qu'un curseur a bougé depuis, ce qui périme le score affiché.
+  const [simFinancing, setSimFinancing] = useState(formData.simFinancing || null);
 
   // Part demandée à AGRICAP, par module. Seul état réellement saisi par le
   // client sur cet écran ; conservé d'un téléversement à l'autre.
@@ -215,9 +218,21 @@ const SimulateurIntelligent = ({
   // re-téléverse après avoir simulé, le score affiché ne décrit plus le
   // fichier courant : on le dit au lieu de laisser un chiffre périmé à l'écran.
   const simulatedRevision = simResult?.needsSource?.revision ?? null;
-  const staleSimulation = Boolean(
+  const staleRevision = Boolean(
     simResult && nsResult && simulatedRevision != null && simulatedRevision !== nsResult.revision,
   );
+  // De même, bouger un curseur de « Financement demandé % » après avoir simulé
+  // périme le score : la demande n'est plus celle qui a été scorée.
+  const staleFinancing = useMemo(() => {
+    if (!simResult || !simFinancing) return false;
+    return MODULE_CODES.some(
+      (code) => (simFinancing[code] ?? 100) !== (financing[code] ?? 100),
+    );
+  }, [simResult, simFinancing, financing]);
+  const staleSimulation = staleRevision || staleFinancing;
+  // Les chiffres serveur (montant ajusté, part par module) ne valent que pour la
+  // demande réellement scorée : on ne les montre pas s'ils sont périmés.
+  const montantAjuste = !staleSimulation ? (simResult?.montantDemandeAjuste ?? null) : null;
 
   const handleUpload = async (file) => {
     setUploading(true);
@@ -267,12 +282,16 @@ const SimulateurIntelligent = ({
     setSimLoading(true);
     setSimErrors([]);
     setSimFailure(null);
+    // Instantané figé de la demande envoyée — sert de référence de fraîcheur.
+    const financingSent = { ...financing };
     try {
-      const result = await runSimulation();
+      const result = await runSimulation(financingSent);
       setSimResult(result);
-      setFormData(prev => ({ ...prev, simResult: result }));
+      setSimFinancing(financingSent);
+      setFormData(prev => ({ ...prev, simResult: result, simFinancing: financingSent }));
     } catch (e) {
       setSimResult(null);
+      setSimFinancing(null);
       if (isFileValidationError(e)) setSimErrors(guaranteeErrorList(e));
       else setSimFailure(transportErrorMessage(e));
     } finally {
@@ -334,13 +353,23 @@ const SimulateurIntelligent = ({
           )}
 
           <div className="mt-4 glass-effect p-4 rounded-lg inline-block text-left">
-            <p className="text-sm text-gray-400">Montant total financé</p>
+            {/* Tant que le moteur n'a pas répondu, on montre l'APERÇU de la
+                demande (Σ coût × part), expression du choix client autorisée par
+                la SPEC §1.4 point 3 — clairement étiqueté « à confirmer ». Dès
+                qu'une simulation fraîche renvoie `montantDemandeAjuste`, c'est
+                CE chiffre serveur qui fait foi (principe 3). */}
+            <p className="text-sm text-gray-400">
+              {montantAjuste != null ? 'Montant demandé scoré' : 'Montant demandé (aperçu)'}
+            </p>
             <p className="text-3xl font-bold text-emerald-400 tabular-nums">
-              {costs ? formatMontant(totalFinanced, formData.currency, { decimals: 0 }) : '—'}
+              {montantAjuste != null
+                ? formatMontant(montantAjuste, formData.currency, { decimals: 0 })
+                : costs ? formatMontant(totalFinanced, formData.currency, { decimals: 0 }) : '—'}
             </p>
             {costs && (
               <p className="text-xs text-gray-500 mt-1">
                 sur un besoin total de {formatMontant(totalNeeds, formData.currency, { decimals: 0 })}
+                {montantAjuste == null && ' · à confirmer par la simulation'}
               </p>
             )}
           </div>
@@ -396,9 +425,18 @@ const SimulateurIntelligent = ({
         <div className="rounded-2xl border border-amber-500/30 bg-amber-500/[0.08] p-4 flex items-start gap-3">
           <AlertTriangle className="w-4 h-4 text-amber-300 mt-0.5 shrink-0" aria-hidden="true" />
           <p className="text-sm text-amber-100/90">
-            Votre feuille a été mise à jour (révision {nsResult.revision}) depuis cette simulation,
-            calculée sur la révision {simulatedRevision}. Relancez la simulation pour obtenir le
-            score correspondant à votre fichier actuel.
+            {staleRevision ? (
+              <>
+                Votre feuille a été mise à jour (révision {nsResult.revision}) depuis cette
+                simulation, calculée sur la révision {simulatedRevision}. Relancez la simulation
+                pour obtenir le score correspondant à votre fichier actuel.
+              </>
+            ) : (
+              <>
+                Vous avez modifié la part demandée d'au moins un module depuis cette simulation.
+                Relancez-la pour recalculer le score et le montant sur votre demande actuelle.
+              </>
+            )}
           </p>
         </div>
       )}
@@ -412,6 +450,8 @@ const SimulateurIntelligent = ({
         onFinancingChange={handleFinancingChange}
         currency={formData.currency}
       />
+
+      {!staleSimulation && <ModuleFinancingSummary simResult={simResult} currency={formData.currency} />}
 
       <ScoreBreakdown simResult={simResult} />
       <SchedulePreview simResult={simResult} currency={formData.currency} />
@@ -1243,21 +1283,29 @@ const Credits = () => {
   };
 
   /**
-   * Simulation adossée aux tables du dossier (SPEC §1.4 point 4).
+   * Simulation adossée aux tables du dossier (SPEC §1.4 point 4, contrat §1).
    *
-   * Le corps ne porte plus que `application_code` : depuis le lot 2, le backend
-   * charge `application.needs_source`, relit les `DataRecord` de la révision
-   * courante et **ignore** tout montant du payload. Continuer à envoyer
-   * `ns_totals`, `amount_requested` ou `area_ha` entretiendrait l'illusion que
-   * le front pèse sur le score — principe 1, ce qui est scoré est ce qui est en
-   * base.
+   * Le corps porte `application_code` et, désormais, `module_financing` : le
+   * client choisit la PART demandée par module (% entier), pas les coûts. Depuis
+   * le lot 2, le backend charge `application.needs_source`, relit les
+   * `DataRecord` de la révision courante pour les COÛTS et **ignore** tout
+   * montant du payload — principe 1, ce qui est scoré est ce qui est en base.
+   * Le `module_financing` n'ouvre aucune brèche : il ne fixe pas un coût, il
+   * pondère la demande (`part = cout_fichier × pct/100`), et le montant scoré
+   * devient `Σ parts demandées`, calculé côté serveur.
    *
    * Les erreurs ne sont plus avalées : un 422 `NEEDS_SOURCE_MISSING` doit se
    * voir à l'écran, pas produire un score vide sans explication.
+   *
+   * @param {Record<string, number>} [moduleFinancing] part demandée par module, en %
    */
-  const runSimulation = useCallback(async () => {
+  const runSimulation = useCallback(async (moduleFinancing) => {
     const code = await ensureDraft();
-    return api.credits.simulate({ application_code: code });
+    const payload = { application_code: code };
+    if (moduleFinancing && Object.keys(moduleFinancing).length > 0) {
+      payload.module_financing = moduleFinancing;
+    }
+    return api.credits.simulate(payload);
   }, [ensureDraft]);
 
   const renderClientApplicationFlow = () => {

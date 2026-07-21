@@ -2,23 +2,41 @@ import React, { useState } from 'react';
 import { TableRow, TableCell } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { 
-    MoreHorizontal, Eye, Banknote, MessageSquare, UserCog, AlertTriangle, Clock, CircleOff, Check, ChevronDown, ChevronUp, Settings2
+import {
+    MoreHorizontal, Eye, Banknote, MessageSquare, UserCog, AlertTriangle, Clock, CircleOff,
+    Check, ChevronDown, ChevronUp, Settings2, Play, Ban, ThumbsUp, XOctagon
 } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { motion, AnimatePresence } from 'framer-motion';
 import TransactionSubTable from './TransactionSubTable';
 
-const ProgressBar = ({ value }) => (
-    <div className="w-full bg-slate-700 rounded-full h-2 relative overflow-hidden">
-        <div className="absolute inset-0 bg-emerald-500/20"></div>
-        <div className="bg-gradient-to-r from-emerald-500 to-green-400 h-2 rounded-full" style={{ width: `${value}%` }}></div>
-    </div>
-);
+const ProgressBar = ({ value }) => {
+    const pct = Number.isFinite(Number(value)) ? Math.max(0, Math.min(100, Number(value))) : 0;
+    return (
+        <div className="w-full bg-slate-700 rounded-full h-2 relative overflow-hidden">
+            <div className="absolute inset-0 bg-emerald-500/20"></div>
+            <div className="bg-gradient-to-r from-emerald-500 to-green-400 h-2 rounded-full" style={{ width: `${pct}%` }}></div>
+        </div>
+    );
+};
 
 const ScoreBadge = ({ score }) => {
-    const scoreColor = score > 85 ? 'bg-emerald-500/20 text-emerald-400' : score > 70 ? 'bg-blue-500/20 text-blue-400' : score > 50 ? 'bg-yellow-500/20 text-yellow-400' : 'bg-red-500/20 text-red-400';
-    return <span className={`px-2 py-1 text-xs font-semibold rounded-full ${scoreColor}`}>{score}/100</span>;
+    if (score == null || !Number.isFinite(Number(score))) {
+        return <span className="px-2 py-1 text-xs font-semibold rounded-full bg-slate-600/30 text-slate-400">—</span>;
+    }
+    const s = Number(score);
+    const scoreColor = s > 85 ? 'bg-emerald-500/20 text-emerald-400' : s > 70 ? 'bg-blue-500/20 text-blue-400' : s > 50 ? 'bg-yellow-500/20 text-yellow-400' : 'bg-red-500/20 text-red-400';
+    return <span className={`px-2 py-1 text-xs font-semibold rounded-full ${scoreColor}`}>{s}/100</span>;
+};
+
+/** Chaîne non vide, sinon tiret — jamais de cellule vide ou « undefined ». */
+const orDash = (v) => (v === null || v === undefined || v === '' ? '—' : v);
+
+/** Date ISO → jj/mm/aaaa ; chaîne vide/absente → tiret. */
+const fmtDate = (iso) => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleDateString('fr-FR');
 };
 
 const CreditRow = ({ credit, onAction }) => {
@@ -32,14 +50,19 @@ const CreditRow = ({ credit, onAction }) => {
         'Défaut': { variant: 'destructive' },
         'Rejeté': { variant: 'destructive' },
         'Blocked': { variant: 'destructive' },
-        'Suspended': { variant: 'warning' }
+        'Bloqué': { variant: 'destructive' },
+        'Suspended': { variant: 'warning' },
+        'Suspendu': { variant: 'warning' }
     };
-    
+
+    /** Montant → format devise ; null/NaN → tiret (jamais de crash `.toLocaleString`). */
     const formatCurrency = (amount, currency) => {
+        if (amount === null || amount === undefined || !Number.isFinite(Number(amount))) return '—';
+        const n = Number(amount);
         if (currency === 'CDF') {
-            return `${(amount / 1000000).toFixed(1)}M FC`;
+            return `${(n / 1000000).toFixed(1)}M FC`;
         }
-        return `$${amount.toLocaleString()}`;
+        return `$${n.toLocaleString('fr-FR')}`;
     };
 
     return (
@@ -50,31 +73,33 @@ const CreditRow = ({ credit, onAction }) => {
                         {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                     </Button>
                 </TableCell>
-                <TableCell className="font-mono text-xs text-slate-400">{credit.id}</TableCell>
-                <TableCell className="text-sm">{credit.date}</TableCell>
-                <TableCell className="font-semibold">{credit.operator}</TableCell>
-                <TableCell>{credit.type}</TableCell>
+                <TableCell className="font-mono text-xs text-slate-400">{orDash(credit.id)}</TableCell>
+                <TableCell className="text-sm">{fmtDate(credit.date)}</TableCell>
+                <TableCell className="font-semibold">{orDash(credit.operator)}</TableCell>
+                <TableCell>{orDash(credit.type)}</TableCell>
                 <TableCell className="text-right font-mono text-slate-400">{formatCurrency(credit.amountRequested, credit.currency)}</TableCell>
                 <TableCell className="text-right font-mono font-bold text-emerald-300">{formatCurrency(credit.amountApproved, credit.currency)}</TableCell>
                 <TableCell className="text-right font-mono text-slate-300">{formatCurrency(credit.amountDisbursed, credit.currency)}</TableCell>
-                <TableCell><Badge variant="outline">{credit.currency}</Badge></TableCell>
-                <TableCell className="text-center">{credit.duration}</TableCell>
-                <TableCell className="text-center">{credit.rate}%</TableCell>
-                <TableCell>{credit.dueDate}</TableCell>
-                <TableCell>{credit.manager}</TableCell>
-                <TableCell>{credit.investor}</TableCell>
-                <TableCell>{credit.source}</TableCell>
+                <TableCell>{credit.currency ? <Badge variant="outline">{credit.currency}</Badge> : '—'}</TableCell>
+                <TableCell className="text-center">{credit.duration != null && credit.duration !== '' ? credit.duration : '—'}</TableCell>
+                <TableCell className="text-center">{credit.rate != null && Number.isFinite(Number(credit.rate)) ? `${credit.rate}%` : '—'}</TableCell>
+                <TableCell>{fmtDate(credit.dueDate)}</TableCell>
+                <TableCell>{orDash(credit.manager)}</TableCell>
+                <TableCell>{orDash(credit.investor)}</TableCell>
+                <TableCell>{orDash(credit.source)}</TableCell>
                 <TableCell>
                     <Badge variant={statusConfig[credit.status]?.variant || 'default'}>
-                        {credit.status}
+                        {orDash(credit.status)}
                     </Badge>
                 </TableCell>
                 <TableCell><ScoreBadge score={credit.score} /></TableCell>
-                <TableCell>{credit.guarantee}</TableCell>
+                <TableCell>{orDash(credit.guarantee)}</TableCell>
                 <TableCell>
                     <div className="flex items-center gap-2">
                         <ProgressBar value={credit.progress} />
-                        <span className="text-xs font-semibold text-slate-400">{credit.progress}%</span>
+                        <span className="text-xs font-semibold text-slate-400">
+                            {Number.isFinite(Number(credit.progress)) ? `${Number(credit.progress)}%` : '—'}
+                        </span>
                     </div>
                 </TableCell>
                 <TableCell className="text-right">
@@ -95,6 +120,7 @@ const CreditRow = ({ credit, onAction }) => {
                                 où `credits` expose une génération de contrat et un export de dossier
                                 — la route de rapport `GET /api/credits/applications/<code>/rapport`
                                 porte sur le dossier d'instruction, pas sur un prêt du portefeuille. */}
+                            <DropdownMenuItem onSelect={() => onAction('approve', credit)} className="text-emerald-400 focus:text-emerald-300"><ThumbsUp className="mr-2 h-4 w-4" />Approuver le Dossier</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => onAction('disburse', credit)}><Banknote className="mr-2 h-4 w-4" />Décaissement / Paiement</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => onAction('note', credit)}><MessageSquare className="mr-2 h-4 w-4" />Ajouter une note</DropdownMenuItem>
                             <DropdownMenuSeparator className="bg-slate-700"/>
@@ -103,8 +129,14 @@ const CreditRow = ({ credit, onAction }) => {
                             <DropdownMenuItem onSelect={() => onAction('reassign', credit)}><UserCog className="mr-2 h-4 w-4" />Réaffecter Gestionnaire</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => onAction('reminder', credit)} className="text-yellow-400 focus:text-yellow-300"><AlertTriangle className="mr-2 h-4 w-4" />Relancer / Notifier</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => onAction('extend', credit)}><Clock className="mr-2 h-4 w-4" />Prolonger Échéance</DropdownMenuItem>
-                            <DropdownMenuItem onSelect={() => onAction('pause', credit)}><CircleOff className="mr-2 h-4 w-4" />Mettre en Pause / Bloquer</DropdownMenuItem>
-                             <DropdownMenuItem onSelect={() => onAction('close', credit)} className="text-emerald-400 focus:text-emerald-300"><Check className="mr-2 h-4 w-4" />Clôturer le Crédit</DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => onAction('pause', credit)}><CircleOff className="mr-2 h-4 w-4" />Mettre en Pause</DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => onAction('resume', credit)} className="text-emerald-400 focus:text-emerald-300"><Play className="mr-2 h-4 w-4" />Réactiver</DropdownMenuItem>
+                            <DropdownMenuSeparator className="bg-slate-700"/>
+                            <DropdownMenuLabel className="text-red-400/80">Actions sensibles</DropdownMenuLabel>
+                            <DropdownMenuSeparator className="bg-slate-700"/>
+                            <DropdownMenuItem onSelect={() => onAction('block', credit)} className="text-red-400 focus:text-red-300"><Ban className="mr-2 h-4 w-4" />Bloquer (taux 0%)</DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => onAction('default', credit)} className="text-red-400 focus:text-red-300"><XOctagon className="mr-2 h-4 w-4" />Passer en Défaut</DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => onAction('close', credit)} className="text-emerald-400 focus:text-emerald-300"><Check className="mr-2 h-4 w-4" />Clôturer le Crédit</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => onAction('cancel', credit)} className="text-red-400 focus:text-red-300"><CircleOff className="mr-2 h-4 w-4" />Annuler / Rejeter</DropdownMenuItem>
                         </DropdownMenuContent>
                     </DropdownMenu>

@@ -148,6 +148,11 @@ export const api = {
       area_ha?: number;
       amount_requested?: number;
       currency?: string;
+      /** Financement par module (contrat §1) : `{ moduleCode: pct }`, pct entier
+       *  0..100. La part demandée = `cout_fichier × pct/100` ; le montant scoré
+       *  devient `Σ parts demandées` (et non le total feuille). Les COÛTS restent
+       *  lus des DataRecord — seul le % de demande vient d'ici (principe 1). */
+      module_financing?: Record<string, number>;
     }) => request<import('@/types/api').CreditSimulateResult>('/credits/simulate/', { method: 'POST', body: data }),
 
     // CRUD dossiers

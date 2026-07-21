@@ -5,7 +5,7 @@ import { motion } from 'framer-motion';
 import {
     Store, Plus, Search, MapPin, Building2, AlertTriangle,
     MoreHorizontal, RefreshCcw, Download, History, Lock, ShieldCheck, ArrowLeftRight, Eye, ClipboardCheck,
-    Clock, CheckCircle2, XCircle, Send, UserCheck
+    Clock, CheckCircle2, XCircle, Send, UserCheck, Loader2
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -1164,11 +1164,17 @@ const Agencies = () => {
                                             </TableCell>
                                             <TableCell className="text-sm">{agency.manager || '—'}</TableCell>
                                             <TableCell className="text-center">
-                                                <button type="button" onClick={() => setComplianceAgency(agency)}>
-                                                    <Badge variant="outline" className={`cursor-pointer hover:opacity-80 ${agency.complianceScore > 90 ? 'text-emerald-400 border-emerald-500/30' : 'text-amber-400 border-amber-500/30'}`}>
-                                                        {agency.complianceScore}%
-                                                    </Badge>
-                                                </button>
+                                                <Badge
+                                                    variant="outline"
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    title="Voir le détail du score de conformité"
+                                                    onClick={() => setComplianceAgency(agency)}
+                                                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setComplianceAgency(agency); } }}
+                                                    className={`cursor-pointer hover:opacity-80 ${agency.complianceScore > 90 ? 'text-emerald-400 border-emerald-500/30' : 'text-amber-400 border-amber-500/30'}`}
+                                                >
+                                                    {agency.complianceScore}%
+                                                </Badge>
                                             </TableCell>
                                             <TableCell className="text-right">
                                                 <div className="font-mono text-emerald-400">{agency.balanceUSD.toLocaleString()} $</div>
