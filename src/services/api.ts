@@ -64,16 +64,27 @@ async function request<T = unknown>(path: string, opts: RequestOpts = {}): Promi
       const body = (await res.json()) as {
         detail?: string;
         code?: string;
-        errors?: Array<{ code?: string; message?: string }>;
+        /** `reference_data` renvoie des CHAÎNES, le pipeline crédit des objets. */
+        errors?: Array<string | { code?: string; message?: string }>;
+        /** `reference_data` nomme ainsi son message principal, sans `detail`. */
+        structureError?: string;
       };
-      detail = body.detail || detail;
+      // `structureError` en repli : sans lui, un rapport de validation référentiel
+      // s'affichait « Erreur 422 » alors que le serveur disait précisément quoi.
+      detail = body.detail || body.structureError || detail;
       code = body.code ?? null;
-      // 422 multi-erreurs du pipeline de validation : chaque entrée porte son code.
+      // 422 multi-erreurs. Deux formes coexistent côté serveur : le pipeline de
+      // la feuille de besoins émet des `{code, message}`, mais
+      // `reference_data/validators.py` émet des CHAÎNES nues. L'ancien mapping
+      // faisait `e.message` sur une chaîne → `undefined` → message VIDE : le
+      // maker voyait douze puces « ERREUR » sans un mot d'explication, alors que
+      // le serveur avait tout dit. Normaliser ici, et non chez un appelant,
+      // parce que le défaut touche n'importe quel endpoint servant des chaînes.
       if (Array.isArray(body.errors)) {
-        errors = body.errors.map((e) => ({
-          code: e.code || 'ERREUR',
-          message: e.message || '',
-        }));
+        errors = body.errors.map((e) =>
+          typeof e === 'string'
+            ? { code: 'ERREUR', message: e }
+            : { code: e.code || 'ERREUR', message: e.message || '' });
         if (!detail && errors.length) detail = errors[0].message;
       }
     } catch { /* corps non-JSON : on garde le message par défaut */ }

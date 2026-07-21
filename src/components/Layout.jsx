@@ -88,11 +88,21 @@ const allMenuItems = {
       { icon: MessageSquare, label: 'Support Client', path: '/support' },
       { icon: CreditCard, label: 'Crédits Agricoles', path: '/credits' },
       { icon: CreditCard, label: 'Analyse de crédit', path: '/credit' },
-      { icon: Package, label: 'Données de référence', path: '/admin/data' },
       { icon: PiggyBank, label: 'Épargne', path: '/savings' },
       { icon: TrendingUp, label: 'Investissements', path: '/investments' },
       { icon: Repeat, label: 'Transactions', path: '/transactions' },
       { icon: Wallet, label: 'Portefeuilles', path: '/wallets' },
+    // Les écrans du backoffice crédit n'avaient AUCUNE entrée de navigation :
+    // ils n'étaient atteignables qu'en tapant l'URL. « Mes données » désigne
+    // l'admin des données ingérées (`/admin/data`) ; il portait auparavant le
+    // libellé « Données de référence », qui appartient en propre au nouvel
+    // écran `/credit/reference` — deux libellés identiques pour deux écrans
+    // distincts est une confusion qu'on ne laisse pas s'installer.
+    { section: 'Documents' },
+    { icon: Folder, label: 'Mes données', path: '/admin/data' },
+    { icon: ClipboardCheck, label: 'Vérification des actifs', path: '/credit/actifs' },
+    { icon: Landmark, label: 'Corbeille du comité', path: '/credit/comite' },
+    { icon: Package, label: 'Données de référence', path: '/credit/reference' },
     { section: 'Institution' },
     { icon: Landmark, label: 'Trésorerie', path: '/treasury' },
     { icon: BookOpen, label: 'Comptabilité', path: '/accounting' },
@@ -102,6 +112,11 @@ const allMenuItems = {
     { icon: ShieldAlert, label: 'Cas Spéciaux', path: '/special-cases' },
     { icon: ShieldCheck, label: 'Conformité', path: '/compliance' },
     { icon: History, label: 'Journal d\'Audit', path: '/audit-log' },
+    // Deux écrans du lot crédit, sans entrée de navigation jusqu'ici.
+    // « Journal d'Audit » ci-dessus est un AUTRE écran (`/audit-log`) : celui-ci
+    // est le journal append-only du module crédit, avec export complet.
+    { icon: ShieldCheck, label: 'Suivi des garanties', path: '/credit/garanties' },
+    { icon: History, label: 'Journal crédit & audit', path: '/credit/journal' },
     { icon: Bell, label: 'Mes notifications', path: '/notifications' },
     { section: 'Administration' },
     { icon: UserCog, label: 'Utilisateurs', path: '/users' },
@@ -133,6 +148,10 @@ const allMenuItems = {
     { icon: Store, label: 'Réseau Agences', path: '/agencies' },
     { icon: ShieldCheck, label: 'Conformité', path: '/compliance' },
     { icon: History, label: 'Journal d\'Audit', path: '/audit-log' },
+    // Le journal append-only du module crédit — c'est LITTÉRALEMENT l'écran de
+    // l'auditeur (§7.1 point 8) : filtres par dossier/acteur/étape/période et
+    // export CSV complet. L'omettre du rôle auditeur aurait été l'ironie du lot.
+    { icon: History, label: 'Journal crédit & audit', path: '/credit/journal' },
     { icon: BookOpen, label: 'Comptabilité', path: '/accounting' },
   ],
 };
