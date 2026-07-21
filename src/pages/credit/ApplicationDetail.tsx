@@ -1,6 +1,8 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Helmet } from 'react-helmet';
 import { Link, useParams } from 'react-router-dom';
+import AnalyseTab from '@/components/analyse/AnalyseTab';
+import { useCreditAnalyse } from '@/components/analyse/useCreditAnalyse';
 import { api } from '@/services/api';
 import type { CreditApplication } from '@/types/api';
 import { ErrorPanel, toFieldErrors, type FieldError } from '@/components/backoffice/States';
@@ -107,6 +109,13 @@ const ApplicationDetail: React.FC = () => {
   const [adjournComment, setAdjournComment] = useState('');
   const [disbursementNotes, setDisbursementNotes] = useState('');
   const [expandedAction, setExpandedAction] = useState<string | null>(null);
+
+  // Sous-onglet de la page : le dossier (défaut) ou l'analyse moteur complète.
+  // Ces deux hooks doivent rester AVANT les retours anticipés plus bas (règle
+  // des hooks). `useCreditAnalyse` ne charge le moteur qu'à l'ouverture de son
+  // onglet — un instructeur qui ne consulte que le dossier n'appelle pas le moteur.
+  const [ongletActif, setOngletActif] = useState<'dossier' | 'analyse'>('dossier');
+  const analyseState = useCreditAnalyse(code, ongletActif === 'analyse');
 
   const reload = useCallback(() => {
     api.credits.get(code)
@@ -225,6 +234,30 @@ const ApplicationDetail: React.FC = () => {
           ← Retour aux dossiers
         </Link>
       </div>
+
+      {/* Navigation « Dossier » / « Analyse de crédit ». L'analyse moteur
+          (score, DSCR, stress, leviers, lettre) vit dans son propre onglet :
+          c'est la sous-page d'analyse, surface unique désormais — l'ancien
+          modal admin qui la portait est retiré. */}
+      <div className="flex gap-1 border-b border-white/10">
+        {([['dossier', 'Dossier'], ['analyse', 'Analyse de crédit']] as const).map(([cle, libelle]) => (
+          <button
+            key={cle}
+            type="button"
+            onClick={() => setOngletActif(cle)}
+            className={`px-4 py-2 text-sm font-medium -mb-px border-b-2 transition-colors ${
+              ongletActif === cle
+                ? 'border-emerald-400 text-white'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            {libelle}
+          </button>
+        ))}
+      </div>
+
+      {ongletActif === 'dossier' && (
+      <>
 
       {/* Résultat de l'acte : succès en une ligne, refus détaillé règle par règle */}
       {actionResult?.ok && (
@@ -544,6 +577,15 @@ const ApplicationDetail: React.FC = () => {
             </div>
           )}
         </section>
+      )}
+      </>
+      )}
+
+      {/* Onglet « Analyse de crédit » — moteur de scoring complet. Chargé à
+          l'ouverture de l'onglet seulement ; le serveur reste l'autorité
+          (403 / 404 ANALYSE_ABSENTE / erreur structurée s'affichent tels quels). */}
+      {ongletActif === 'analyse' && (
+        <AnalyseTab code={code} state={analyseState} />
       )}
     </div>
   );

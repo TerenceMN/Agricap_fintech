@@ -193,12 +193,15 @@ const NeedsSheetPanel = ({
             <div className="flex items-start gap-3">
               <CheckCircle2 className="w-5 h-5 text-emerald-400 mt-0.5 shrink-0" aria-hidden="true" />
               <div>
-                <p className="font-semibold text-white flex flex-wrap items-center gap-2">
+                {/* `div` et non `p` : ce conteneur flex porte un `<Badge>`
+                    (rendu `<div>`) — un bloc dans un `<p>` est du DOM invalide,
+                    React le signalait à chaque feuille enregistrée. */}
+                <div className="font-semibold text-white flex flex-wrap items-center gap-2">
                   Feuille de besoins enregistrée
                   <Badge variant="outline" className="border-emerald-500/40 text-emerald-300 bg-emerald-500/10">
                     révision {result.revision}
                   </Badge>
-                </p>
+                </div>
                 <p className="text-sm text-gray-400 mt-1">
                   Besoin total du cycle :{' '}
                   <span className="font-semibold text-emerald-300">
