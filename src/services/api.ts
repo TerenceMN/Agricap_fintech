@@ -1003,6 +1003,33 @@ export const api = {
         entityType: string; entityId: string; details: Record<string, unknown>; ip: string | null;
       }>>(`/audit/entries${auditQuery(filters)}`),
 
+    /**
+     * Même lecture que `entries`, mais avec l'effectif RÉEL du périmètre.
+     *
+     * `entries` sert une liste nue plafonnée : l'écran ne pouvait donc pas dire
+     * à l'auditeur combien de lignes existent réellement avant qu'il exporte.
+     * Il annonçait « vous ne voyez pas tout » sans pouvoir chiffrer — honnête,
+     * mais insuffisant pour quelqu'un qui doit conclure sur un périmètre.
+     *
+     * Le total passe par le CORPS (`?meta=1`) et non par l'en-tête
+     * `X-Total-Rows` : un en-tête personnalisé n'est lisible en JavaScript que
+     * si le serveur l'expose via `Access-Control-Expose-Headers`. Ça fonctionne
+     * en dev derrière le proxy Vite (même origine) et casse en production dès
+     * que l'API est sur un autre domaine — une panne qui ne se voit qu'au
+     * déploiement. Le corps, lui, traverse tout.
+     */
+    entriesWithMeta: (filters?: import('@/types/api').AuditFilters) =>
+      request<{
+        entries: Array<{
+          id: number; timestamp: string; user: string; role: string; action: string;
+          entityType: string; entityId: string; details: Record<string, unknown>; ip: string | null;
+        }>;
+        totalRows: number;
+        returned: number;
+        truncated: boolean;
+        cap: number;
+      }>(`/audit/entries${auditQuery(filters, { meta: '1' })}`),
+
     /** Télécharge le CSV complet du périmètre filtré. Renvoie l'effectif réel
      *  exporté (`totalRows`) pour que l'écran puisse le confirmer. */
     export: async (filters?: import('@/types/api').AuditFilters) => {
