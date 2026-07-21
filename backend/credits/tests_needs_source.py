@@ -134,13 +134,50 @@ def _codes(errors: list[dict]) -> set[str]:
     return {e["code"] for e in errors}
 
 
+def _seed_fb_template(maker: str = "tpl-maker", checker: str = "tpl-checker",
+                      **workbook_kwargs):
+    """Sème + active un template feuille-de-besoins dans la base de TEST (principe 11).
+
+    Depuis le lot « principe 11 », `validate_needs_sheet` valide CONTRE le template
+    actif : sans template actif, tout classeur est refusé `TEMPLATE_NOT_CONFIGURED`.
+    Chaque test qui valide/ingère une feuille sème donc le sien (jamais la base dev).
+    """
+    from dataio.services_templates import activate_template, upload_template
+    tpl = upload_template(
+        _upload(build_workbook(**workbook_kwargs), name="template_fb.xlsx"),
+        uploaded_by=maker,
+    )
+    return activate_template(tpl, activator_sub=checker)
+
+
 class ValidationTests(TestCase):
-    """Les 6 contrôles du tableau de la SPEC, un par un."""
+    """Les 6 contrôles du tableau de la SPEC, un par un.
+
+    La FORME est désormais validée contre le template ACTIF (principe 11) : chaque
+    test sème un template feuille-de-besoins conforme dans la base de test.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media = tempfile.mkdtemp(prefix="agricap-test-media-")
+        cls._override = override_settings(MEDIA_ROOT=cls._media)
+        cls._override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._override.disable()
+        shutil.rmtree(cls._media, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        _seed_fb_template()
 
     def _validate(self, **kwargs) -> list[dict]:
         path = _write_tmp(build_workbook(**kwargs))
         try:
-            return validate_needs_sheet(path)
+            errors, _ref = validate_needs_sheet(path)
+            return errors
         finally:
             os.unlink(path)
 
@@ -205,13 +242,37 @@ class ValidationTests(TestCase):
         self.assertEqual(self._validate(lignes=lignes), [])
 
     def test_le_modele_officiel_livre_aux_clients_passe_la_validation(self):
-        """Principe 11 : le fichier téléchargé doit être celui contre lequel on valide."""
+        """Principe 11 : le fichier téléchargé EST celui contre lequel on valide.
+
+        Le template actif est le modèle officiel lui-même : validé contre
+        lui-même, il ne lève aucune erreur — sinon un client ne pourrait pas
+        déposer le fichier qu'on lui donne.
+        """
         path = os.path.join(
             os.path.dirname(__file__), "static", "credits", "feuille_besoins_template.xlsx",
         )
         if not os.path.exists(path):       # pragma: no cover - dépend du dépôt
             self.skipTest("Modèle statique absent du dépôt.")
-        self.assertEqual(validate_needs_sheet(path), [])
+        from dataio.services_templates import activate_template, upload_template
+        with open(path, "rb") as fh:
+            upload = SimpleUploadedFile(
+                "feuille_besoins_template.xlsx", fh.read(),
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        tpl = upload_template(upload, uploaded_by="tpl-maker")
+        activate_template(tpl, activator_sub="tpl-checker")
+
+        errors, ref = validate_needs_sheet(path)
+        self.assertEqual(errors, [])
+        self.assertEqual(ref, {"templateId": tpl.pk, "version": tpl.version})
+
+    def test_sans_template_actif_refuse_avec_code_explicite(self):
+        """Principe 11 : sans template actif, jamais de validation « best effort »."""
+        from dataio.models import FileTemplate
+        FileTemplate.objects.update(status=FileTemplate.Status.ARCHIVED)
+        errors, ref = validate_needs_sheet(_write_tmp(build_workbook()))
+        self.assertEqual(_codes(errors), {"TEMPLATE_NOT_CONFIGURED"})
+        self.assertEqual(ref, {})
 
     def test_arret_au_premier_etage_en_echec(self):
         """Une feuille absente ne fait pas remonter d'erreurs de cohérence."""
@@ -237,6 +298,8 @@ class IngestionTests(TestCase):
 
     def setUp(self):
         from accounts.models import FintechUser
+        # Principe 11 : l'ingestion valide contre le template actif — on le sème.
+        _seed_fb_template()
         self.client_user, _ = FintechUser.objects.get_or_create(
             sub="sub-client-fb", defaults={"full_name": "Client FB", "phone": "+243000000001"},
         )
@@ -396,3 +459,33 @@ class IngestionTests(TestCase):
 
         staff = ViewContextService(sub="sub-agent", roles=["gest_credit"]).serialize_for_role(self.app)
         self.assertEqual((staff.get("scoreResult") or {}).get("score"), 71.0)
+
+
+class DownloadTemplateTests(TestCase):
+    """GET needs-sheet-template/ sert EXACTEMENT le template actif (principe 11)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media = tempfile.mkdtemp(prefix="agricap-test-media-")
+        cls._override = override_settings(MEDIA_ROOT=cls._media)
+        cls._override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._override.disable()
+        shutil.rmtree(cls._media, ignore_errors=True)
+        super().tearDownClass()
+
+    def test_sert_le_template_actif(self):
+        tpl = _seed_fb_template()
+        res = self.client.get("/api/credits/needs-sheet-template/")
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res["Content-Disposition"].startswith("attachment"))
+        self.assertEqual(res["X-Template-Version"], str(tpl.version))
+        self.assertTrue(res.content)   # octets du template, pas un corps vide
+
+    def test_sans_template_actif_renvoie_503(self):
+        res = self.client.get("/api/credits/needs-sheet-template/")
+        self.assertEqual(res.status_code, 503)
+        self.assertEqual(res.json()["code"], "TEMPLATE_NOT_CONFIGURED")

@@ -28,6 +28,7 @@ import openpyxl
 
 from dataio import services as dataio_services
 from dataio.models import DataSource, KIND_FEUILLE_BESOINS
+from dataio.services_templates import validate_structure
 
 CENT = Decimal("0.01")
 
@@ -195,33 +196,65 @@ def _cell(row: tuple, idx: int | None):
 
 # ── Validation (les 6 contrôles de la SPEC) ───────────────────────────────────
 
-def validate_needs_sheet(path: str) -> list[dict]:
-    """Valide un classeur de feuille de besoins. Retourne `[]` si tout passe.
+def validate_needs_sheet(path: str) -> tuple[list[dict], dict]:
+    """Valide un classeur de feuille de besoins CONTRE le template actif (principe 11).
 
-    Étages successifs : structure → types → cohérence. On s'arrête au premier
-    étage en échec mais on remonte TOUTES ses erreurs (principe 5).
+    Renvoie `(errors, template_ref)` :
+      - `errors` : liste de `{code, message}` (→ 422), `[]` si tout passe ;
+      - `template_ref` : `{templateId, version}` du template ACTIF ayant servi à la
+        validation structurelle — à consigner dans le rapport de validation, pour
+        que le dossier garde la référence de SA version de template. `{}` si aucun
+        template actif (l'unique erreur est alors `TEMPLATE_NOT_CONFIGURED`).
+
+    Pipeline (principe 5, arrêt au premier étage en échec) :
+      structure (feuilles / colonnes / rubriques) → types → cohérence interne.
+
+    La FORME n'est plus comparée à un schéma codé en dur (`REQUIRED_SHEETS`,
+    `COLUMN_ROLES_*`) mais au schéma **dérivé du template actif**, via
+    `dataio.validate_structure` : le fichier servi au client
+    (`GET needs-sheet-template/`) est exactement celui contre lequel on valide —
+    une seule source (principe 11). Les contrôles de type et de cohérence (N2)
+    restent métier et vivent ici.
     """
+    # ── Étages 1-2 : structure, contre le template ACTIF (principe 11) ────────
+    struct_errors, template_ref = validate_structure(path, KIND_FEUILLE_BESOINS)
+    if not template_ref:
+        # Aucun template actif → refus explicite (TEMPLATE_NOT_CONFIGURED),
+        # jamais une validation « best effort » contre un schéma de repli.
+        return struct_errors, {}
+    if struct_errors:
+        return struct_errors, template_ref
+
+    # ── Étages 3-4 : types + cohérence interne (métier, N2) ───────────────────
     try:
         wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     except Exception as exc:  # classeur illisible / corrompu
-        return [{"code": "CLASSEUR_ILLISIBLE",
-                 "message": f"Le classeur n'a pas pu être ouvert : {exc}"}]
+        return ([{"code": "CLASSEUR_ILLISIBLE",
+                  "message": f"Le classeur n'a pas pu être ouvert : {exc}"}],
+                template_ref)
     try:
-        return _validate_workbook(wb)
+        return _validate_values(wb), template_ref
     finally:
         wb.close()
 
 
-def _validate_workbook(wb) -> list[dict]:
-    # ── Étage 1 : feuilles présentes ─────────────────────────────────────────
+def _validate_values(wb) -> list[dict]:
+    """Types et cohérence interne, la structure ayant déjà été validée en amont.
+
+    Défense en profondeur : si une feuille ou une colonne nécessaire à la LECTURE
+    des montants manque malgré tout (template actif incohérent), on le signale au
+    lieu de lever un `KeyError` — le chemin nominal ne l'atteint jamais, la
+    structure ayant été validée contre le template actif.
+    """
     sheets = {normalize(n): n for n in wb.sheetnames}
-    missing = [s for s in REQUIRED_SHEETS if normalize(s) not in sheets]
-    if missing:
+    if (normalize(SHEET_BESOINS) not in sheets
+            or normalize(SHEET_SYNTHESE) not in sheets):
         return [{
             "code": "FEUILLE_MANQUANTE",
-            "message": (f"La feuille « {s} » est absente du classeur. "
-                        f"Utilisez le modèle officiel AGRICAP sans renommer les feuilles."),
-        } for s in missing]
+            "message": ("Feuilles de besoins introuvables après validation "
+                        "structurelle — le template actif ne décrit pas une feuille "
+                        "de besoins AGRICAP standard."),
+        }]
 
     ws4 = wb[sheets[normalize(SHEET_BESOINS)]]
     ws5 = wb[sheets[normalize(SHEET_SYNTHESE)]]
@@ -231,53 +264,15 @@ def _validate_workbook(wb) -> list[dict]:
     cols4 = _map_columns(header4, COLUMN_ROLES_F4)
     cols5 = _map_columns(header5, COLUMN_ROLES_F5)
 
-    # ── Étage 2 : colonnes et rubriques ──────────────────────────────────────
-    errors: list[dict] = []
-    for role, label, _frag in COLUMN_ROLES_F4:
-        if role not in cols4:
-            errors.append({
-                "code": "COLONNE_MANQUANTE",
-                "message": (f"Feuille « {SHEET_BESOINS} » : colonne « {label} » introuvable. "
-                            f"En-têtes lus : {', '.join(h for h in header4 if h) or '(aucun)'}."),
-            })
-    if "rubrique" not in cols5 or "total" not in cols5:
-        errors.append({
+    if ("rubrique" not in cols4 or "total" not in cols4
+            or "rubrique" not in cols5 or "total" not in cols5):
+        return [{
             "code": "COLONNE_MANQUANTE",
-            "message": (f"Feuille « {SHEET_SYNTHESE} » : les colonnes « Rubrique » et "
-                        f"« Total rubrique » sont requises. "
-                        f"En-têtes lus : {', '.join(h for h in header5 if h) or '(aucun)'}."),
-        })
-    if errors:
-        return errors
+            "message": ("Colonnes nécessaires à la lecture des montants introuvables "
+                        "malgré une structure validée — vérifiez le template actif."),
+        }]
 
-    # Rubriques de la feuille 5 : les 8 modules + TOTAL GÉNÉRAL.
-    seen_modules: set[str] = set()
-    has_grand_total = False
-    for row in rows5:
-        raw = _cell(row, cols5["rubrique"])
-        if is_total_row(raw):
-            has_grand_total = True
-            continue
-        code = rubrique_to_module(raw)
-        if code:
-            seen_modules.add(code)
-
-    for code in MODULE_CODES:
-        if code not in seen_modules:
-            errors.append({
-                "code": "RUBRIQUE_MANQUANTE",
-                "message": (f"Feuille « {SHEET_SYNTHESE} » : la rubrique "
-                            f"« {MODULE_LABELS[code]} » est absente. Les 8 rubriques "
-                            f"doivent figurer, même à 0."),
-            })
-    if not has_grand_total:
-        errors.append({
-            "code": "RUBRIQUE_MANQUANTE",
-            "message": (f"Feuille « {SHEET_SYNTHESE} » : la ligne « TOTAL GÉNÉRAL » "
-                        f"est absente."),
-        })
-    if errors:
-        return errors
+    errors: list[dict] = []
 
     # ── Étage 3 : types ──────────────────────────────────────────────────────
     freq_idx = _find_frequence(header4, set(cols4.values()))
@@ -430,7 +425,9 @@ def parse_and_ingest(file, application, uploaded_by: str = "") -> dict:
             ),
         }])
 
-    errors = validate_needs_sheet(source.file.path)
+    # Validation structurelle CONTRE le template actif (principe 11) + N2.
+    # `template_ref` = {templateId, version} de la règle de validation appliquée.
+    errors, template_ref = validate_needs_sheet(source.file.path)
     if errors:
         raise NeedsSheetValidationError(errors)
 
@@ -440,14 +437,47 @@ def parse_and_ingest(file, application, uploaded_by: str = "") -> dict:
     application.needs_source = source
     application.save(update_fields=["needs_source", "updated_at"])
 
+    # Rapport de validation : le dossier garde la référence de SA version de
+    # template (principe 11). Journalisé (append-only) plutôt que stocké dans un
+    # nouveau champ — aucune migration, et l'auditeur reconstitue quelle règle de
+    # validation a été appliquée à quelle révision de la feuille de besoins.
+    _record_validation(source, application, template_ref, by=uploaded_by or "")
+
     totals = extract_module_totals(source)
     return {
         "needs_source_id": source.pk,
         "revision": source.revision,
         "sha256": source.sha256,
+        "templateId": template_ref.get("templateId"),
+        "templateVersion": template_ref.get("version"),
         "totals": {k: str(v) for k, v in totals.items()},
         "grand_total": str(_q(sum(totals.values(), Decimal("0")))),
     }
+
+
+def _record_validation(source, application, template_ref: dict, by: str) -> None:
+    """Trace append-only de la validation d'une feuille de besoins (principe 11).
+
+    Best-effort volontaire : l'ingestion a réussi et la source est déjà commitée ;
+    un journal indisponible ne doit pas défaire une ingestion valide. La référence
+    de template reste par ailleurs dans le payload retourné (rapport de validation).
+    """
+    try:
+        from audit.services import record
+        record(
+            actor=by or "", action="credits.needs_sheet.validated",
+            entity_type="DataSource", entity_id=str(source.pk),
+            details={
+                "applicationCode": application.code,
+                "needsSourceId": source.pk,
+                "revision": source.revision,
+                "sha256": source.sha256 or "",
+                "templateId": template_ref.get("templateId"),
+                "templateVersion": template_ref.get("version"),
+            },
+        )
+    except Exception:  # noqa: BLE001 — l'audit ne défait pas une ingestion valide
+        pass
 
 
 def extract_module_totals(source: DataSource) -> dict[str, Decimal]:

@@ -380,43 +380,37 @@ def _ingest_needs_sheet(request: Request, file, application_code: str) -> Respon
 @api_view(["GET"])
 @permission_classes([])
 def download_needs_sheet_template(request: Request) -> HttpResponse:
-    """ 
-    GET /api/credits/needs-sheet-template/?value_chain_code=<code>
-
-    Endpoint public — retourne le gabarit Excel AGRICAP (pas de données sensibles).
-    Sert le fichier statique embarqué ; le code filière est ajouté au nom du fichier.
     """
-    import os
+    GET /api/credits/needs-sheet-template/
 
-    static_path = os.path.join(
-        os.path.dirname(__file__), "static", "credits", "feuille_besoins_template.xlsx",
-    )
+    Principe 11 — sert EXACTEMENT le template actif (`dataio`, maker-checker) :
+    le fichier téléchargé par le client est celui contre lequel sa feuille sera
+    validée (une seule source, jamais un `.xlsx` statique ni une génération
+    dynamique de repli). Sans template actif → 503 + `TEMPLATE_NOT_CONFIGURED`,
+    message explicite, jamais un fichier « best effort ».
+    """
+    from dataio.models import KIND_FEUILLE_BESOINS
+    from dataio.services_templates import TemplateNotConfigured, serve_active
 
-    value_chain_code: str = request.query_params.get("value_chain_code", "")
+    try:
+        data, original_name, ref = serve_active(KIND_FEUILLE_BESOINS)
+    except TemplateNotConfigured as exc:
+        return Response(
+            {"detail": exc.message, "code": exc.code},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
-    if os.path.exists(static_path):
-        with open(static_path, "rb") as f:
-            xlsx_bytes = f.read()
-    else:
-        # Fallback : génération dynamique si le fichier statique est absent
-        value_chain = None
-        if value_chain_code:
-            try:
-                from reference_data.models import ValueChain
-                value_chain = ValueChain.objects.get(code=value_chain_code, active=True)
-            except Exception:
-                pass
-        xlsx_bytes = generate_needs_sheet_template(value_chain=value_chain)
-
-    vc_slug = value_chain_code.lower() if value_chain_code else "generic"
-    filename = f"AGRICAP_Feuille_Besoins_{vc_slug}.xlsx"
-
+    filename = original_name or "AGRICAP_Feuille_Besoins.xlsx"
     response = HttpResponse(
-        xlsx_bytes,
+        data,
         content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     response["Access-Control-Allow-Origin"] = "*"
+    # Le client (et l'auditeur) sait quelle version il a téléchargée = celle
+    # contre laquelle il sera validé.
+    response["X-Template-Id"] = str(ref.get("templateId", ""))
+    response["X-Template-Version"] = str(ref.get("version", ""))
     return response
 
 
