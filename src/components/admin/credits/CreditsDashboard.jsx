@@ -154,14 +154,20 @@ const AdminCreditsDashboard = () => {
       });
       return;
     }
-    let params = {};
-    if (PROMPTS[action]) {
-      params = PROMPTS[action]();
-      const key = Object.keys(params)[0];
-      if (params[key] === null) return;               // annulé
-    }
+    // Confirmation explicite avant une action irréversible (block/default/close/
+    // cancel). L'opérateur qui décline ne déclenche AUCUN appel serveur.
+    if (DESTRUCTIVE[action] && !window.confirm(DESTRUCTIVE[action])) return;
+
+    // Recueil des paramètres de l'action. `collectParams` renvoie `null` pour une
+    // annulation ou une saisie invalide : dans ce cas on ne mute rien côté serveur.
+    // Sinon un objet (éventuellement vide pour les actions sans paramètre).
+    const params = collectParams(action);
+    if (params === null) return;
+
     try {
       const res = await api.portfolio.action(credit.id, action, params);
+      // Le serveur répond `{ ok, detail, credit }`. Une action inconnue revient en
+      // HTTP 400 (ok:false) → l'ApiError est levée et affichée dans le `catch`.
       toast({ title: 'Action effectuée', description: res.detail });
       await load();
     } catch (e) {
