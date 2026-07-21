@@ -99,6 +99,7 @@ const allMenuItems = {
     // écran `/credit/reference` — deux libellés identiques pour deux écrans
     // distincts est une confusion qu'on ne laisse pas s'installer.
     { section: 'Documents' },
+    { icon: LayoutDashboard, label: 'Tableau de bord crédit', path: '/credit/tableau-de-bord' },
     { icon: Folder, label: 'Mes données', path: '/admin/data' },
     { icon: ClipboardCheck, label: 'Vérification des actifs', path: '/credit/actifs' },
     { icon: Landmark, label: 'Corbeille du comité', path: '/credit/comite' },

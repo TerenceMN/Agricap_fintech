@@ -171,6 +171,52 @@ def pending_verification(request):
     return Response({"total_rows": len(rows), "items": rows})
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def verification_history(request):
+    """Historique des actifs déjà instruits — ce que l'agent a vérifié ou rejeté.
+
+    `pending_verification` ne sert QUE les `declare` : une fois l'acte posé,
+    l'actif disparaissait de l'écran sans laisser de trace consultable. L'agent
+    ne pouvait donc ni revoir une valeur qu'il avait retenue, ni relire le motif
+    d'un rejet qu'on lui opposait, ni constater qu'un actif qu'il avait vérifié
+    était depuis gagé. Une file sans historique oblige à se souvenir.
+
+    Lecture seule : instruire se fait par `verify`/`reject`, jamais ici.
+    `?status=` restreint à un statut ; sans paramètre, tout le post-déclaratif.
+    """
+    if not in_group(request, CAN_VERIFY_ASSET):
+        return Response({"detail": "Réservé aux agents de terrain."}, status=403)
+
+    #: Tout sauf `declare`, qui est la file d'attente et vit dans l'autre vue.
+    instruits = [s for s in Asset.Status.values if s != Asset.Status.DECLARE]
+    demande = (request.GET.get("status") or "").strip()
+    if demande and demande not in instruits:
+        return Response(
+            {"detail": f"Statut inconnu. Valeurs acceptées : {instruits}.",
+             "code": "STATUT_INCONNU"},
+            status=400,
+        )
+
+    qs = Asset.objects.filter(status=demande or None) if demande else \
+        Asset.objects.filter(status__in=instruits)
+    # `verifie_le` décroissant : l'agent cherche ce qu'il vient de faire. Les
+    # actifs sans horodatage (rejets anciens) restent visibles en fin de liste
+    # plutôt que d'être exclus par un tri qui les ignorerait.
+    qs = qs.select_related("user", "gage_application").order_by("-verifie_le", "-id")
+
+    rows = []
+    for a in qs:
+        row = _row(a, staff=True)
+        row["owner"] = {
+            "sub": a.user.sub,
+            "displayName": a.user.full_name or a.user.sub,
+            "phone": a.user.phone,
+        }
+        rows.append(row)
+    return Response({"total_rows": len(rows), "items": rows})
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def verify(request, asset_id):

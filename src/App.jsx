@@ -20,6 +20,7 @@ import Committee from '@/pages/credit/Committee';
 import AuditJournal from '@/pages/credit/AuditJournal';
 import Guarantees from '@/pages/credit/Guarantees';
 import ReferenceData from '@/pages/credit/ReferenceData';
+import CreditDashboard from '@/pages/credit/Dashboard';
 import DataAdmin from '@/pages/admin/DataAdmin';
 
 // Client Specific Pages
@@ -104,6 +105,7 @@ const AppRoutes = () => {
       <Route path="/credit/journal" element={<PrivateRoute><Layout><AuditJournal /></Layout></PrivateRoute>} />
       <Route path="/credit/garanties" element={<PrivateRoute><Layout><Guarantees /></Layout></PrivateRoute>} />
       <Route path="/credit/reference" element={<PrivateRoute><Layout><ReferenceData /></Layout></PrivateRoute>} />
+      <Route path="/credit/tableau-de-bord" element={<PrivateRoute><Layout><CreditDashboard /></Layout></PrivateRoute>} />
       <Route path="/admin/data" element={<PrivateRoute roles={['admin']}><Layout><DataAdmin /></Layout></PrivateRoute>} />
       
       {/* Client Routes */}
