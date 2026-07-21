@@ -438,6 +438,9 @@ export const api = {
       `/referentiel/ranges${chain ? `?chain=${chain}` : ''}`),
   chains: () => request<Array<{ code: string; libelle: string; specialite: string }>>('/referentiel/chains'),
   config: () => request<Record<string, unknown>>('/referentiel/config'),
+  /** Historique des versions du référentiel — sans écran jusqu'ici, alors que
+   *  c'est ce qui permet de savoir SOUS QUELLE version un dossier a été scoré. */
+  referentielVersions: () => request<unknown>('/referentiel/versions'),
 
   // Données (admin) — ingestion hybride : upload → aperçu → commit (manuel) → historique.
   dataSources: () => request<DataSource[]>('/dataio/sources'),
@@ -981,19 +984,48 @@ export const api = {
   },
 
   // Journal d'audit partagé (AuditLog.jsx + onglet Audit de Users.jsx).
+  /**
+   * Journal d'audit — consultation et export, en LECTURE SEULE absolue.
+   *
+   * Les deux passent par `auditQuery` : c'est la garantie que le CSV exporté
+   * porte EXACTEMENT le périmètre que l'auditeur a sous les yeux. Deux
+   * sérialisations de filtres, c'est deux périmètres qui divergent en silence.
+   *
+   * Différence à restituer à l'utilisateur : `entries` est plafonné à 500 lignes
+   * pour l'affichage, `export` est COMPLET sur le périmètre filtré. Un auditeur
+   * qui croit voir tout alors qu'il voit 500 lignes tire de fausses conclusions —
+   * d'où `totalRows`, à afficher dès qu'il dépasse le nombre de lignes rendues.
+   */
   audit: {
-    entries: (filters?: { entity_type?: string; entity_id?: string; actor?: string; category?: 'financial' }) => {
-      const q = new URLSearchParams();
-      if (filters?.entity_type) q.set('entity_type', filters.entity_type);
-      if (filters?.entity_id) q.set('entity_id', filters.entity_id);
-      if (filters?.actor) q.set('actor', filters.actor);
-      if (filters?.category) q.set('category', filters.category);
-      const qs = q.toString();
-      return request<Array<{
+    entries: (filters?: import('@/types/api').AuditFilters) =>
+      request<Array<{
         id: number; timestamp: string; user: string; role: string; action: string;
         entityType: string; entityId: string; details: Record<string, unknown>; ip: string | null;
-      }>>(`/audit/entries${qs ? `?${qs}` : ''}`);
+      }>>(`/audit/entries${auditQuery(filters)}`),
+
+    /** Télécharge le CSV complet du périmètre filtré. Renvoie l'effectif réel
+     *  exporté (`totalRows`) pour que l'écran puisse le confirmer. */
+    export: async (filters?: import('@/types/api').AuditFilters) => {
+      const { blob, filename, totalRows } = await requestBlob(`/audit/export${auditQuery(filters)}`);
+      saveBlob(blob, filename || 'journal_audit.csv');
+      return { totalRows };
     },
+  },
+
+  /**
+   * Référentiel filières `ValueChain` — maker-checker, UI historiquement absente
+   * (dette explicite du CLAUDE.md §6 : « maker-checker inaccessible hors API »).
+   *
+   * `activate` exige un checker ≠ maker ; le serveur refuse sinon. Le front ne
+   * pré-juge jamais ce droit : il tente et relaie le refus serveur.
+   */
+  referenceData: {
+    valueChains: () => request<unknown>('/reference-data/value-chains/'),
+    uploads: () => request<unknown>('/reference-data/uploads/'),
+    upload: (form: FormData) =>
+      request<unknown>('/reference-data/upload/', { method: 'POST', body: form, isForm: true }),
+    activate: (id: number) =>
+      request<unknown>(`/reference-data/uploads/${id}/activate/`, { method: 'POST', body: {} }),
   },
 
   // RBAC (rôles/capacités/annuaire du personnel) — remplace les constantes codées en dur
