@@ -618,6 +618,17 @@ def dataio_simulate(
         duration_months=duration_months,
         deferred=deferred_months,
     )
+    # Totaux de l'échéancier servis PAR LE SERVEUR : le front affiche un
+    # échéancier complet (toutes les lignes) et sa synthèse, mais ne somme
+    # jamais lui-même (règle §5 « zéro chiffre métier calculé côté client »).
+    # Ce module est indicatif et calcule en float de bout en bout ; on arrondit
+    # pour ne pas exposer le bruit binaire.
+    schedule_totals = {
+        "totalPrincipal": round(sum(r["principal"] for r in schedule), 2),
+        "totalInterest":  round(sum(r["interest"] for r in schedule), 2),
+        "totalPayments":  round(sum(r["payment"] for r in schedule), 2),
+        "count":          len(schedule),
+    }
 
     source_label = (
         source.original_name if source_matches_chain
@@ -632,6 +643,7 @@ def dataio_simulate(
         "minScoreRequired": min_score,
         "proposedRate":     proposed_rate,
         "scheduleDraft":    schedule,
+        "scheduleTotals":   schedule_totals,
         "valuationNote":    _valuation_note(final_score, eligible),
         "refData": {
             "source":          source_label,

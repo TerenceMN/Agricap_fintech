@@ -149,44 +149,69 @@ export const ScoreBreakdown = ({ simResult }) => {
   );
 };
 
-/** Échéancier prévisionnel : les 6 premières lignes servies par le moteur. */
+/**
+ * Échéancier prévisionnel COMPLET — toutes les échéances servies par le moteur.
+ *
+ * Plus de troncature à 6 lignes : le demandeur voit l'intégralité de son plan de
+ * remboursement, en-tête figé et corps défilant au-delà de ~12 lignes pour ne
+ * pas déborder la page. Les totaux (`scheduleTotals`) viennent du SERVEUR — le
+ * front ne somme jamais l'échéancier (règle §5). Les mois en différé (principal
+ * à 0, intérêts seuls) sont signalés d'un point pour que l'écart de mensualité
+ * s'explique de lui-même.
+ */
 export const SchedulePreview = ({ simResult, currency }) => {
   const schedule = simResult?.scheduleDraft;
   if (!schedule?.length) return null;
+  const totals = simResult?.scheduleTotals;
+  const enDiffere = (row) => Number(row.principal) === 0;
   return (
-    <div className="glass-effect p-5 rounded-2xl overflow-x-auto">
-      <h4 className="font-bold text-white mb-3">Échéancier prévisionnel</h4>
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="text-gray-400 border-b border-white/10">
-            <th className="text-left pb-2">Mois</th>
-            <th className="text-right pb-2">Principal</th>
-            <th className="text-right pb-2">Intérêts</th>
-            <th className="text-right pb-2">Mensualité</th>
-            <th className="text-right pb-2">Solde</th>
-          </tr>
-        </thead>
-        <tbody>
-          {schedule.slice(0, 6).map((row) => (
-            <tr key={row.month} className="border-b border-white/5 text-gray-300 tabular-nums">
-              <td className="py-1">{row.month}</td>
-              <td className="py-1 text-right">{formatMontant(row.principal, '', { decimals: 0 })}</td>
-              <td className="py-1 text-right text-amber-400">{formatMontant(row.interest, '', { decimals: 0 })}</td>
-              <td className="py-1 text-right font-semibold text-emerald-400">
-                {formatMontant(row.payment, currency, { decimals: 0 })}
-              </td>
-              <td className="py-1 text-right text-gray-400">{formatMontant(row.balance, '', { decimals: 0 })}</td>
+    <div className="glass-effect p-5 rounded-2xl">
+      <div className="flex items-baseline justify-between mb-3 gap-3">
+        <h4 className="font-bold text-white">Échéancier prévisionnel</h4>
+        <span className="text-xs text-gray-500">{schedule.length} échéances</span>
+      </div>
+      <div className="overflow-x-auto max-h-80 overflow-y-auto rounded-lg border border-white/5">
+        <table className="w-full text-sm">
+          <thead className="sticky top-0 bg-slate-900/95 backdrop-blur">
+            <tr className="text-gray-400 border-b border-white/10">
+              <th className="text-left py-2 px-2">Mois</th>
+              <th className="text-right py-2 px-2">Principal</th>
+              <th className="text-right py-2 px-2">Intérêts</th>
+              <th className="text-right py-2 px-2">Mensualité</th>
+              <th className="text-right py-2 px-2">Solde</th>
             </tr>
-          ))}
-          {schedule.length > 6 && (
-            <tr className="text-gray-500 text-xs">
-              <td colSpan={5} className="pt-2">
-                … {schedule.length - 6} échéances supplémentaires · {schedule.length} au total
-              </td>
-            </tr>
+          </thead>
+          <tbody>
+            {schedule.map((row) => (
+              <tr key={row.month} className="border-b border-white/5 text-gray-300 tabular-nums">
+                <td className="py-1 px-2">
+                  {row.month}
+                  {enDiffere(row) && (
+                    <span className="ml-1 text-[10px] text-amber-400/80" title="Différé : intérêts seuls, capital non encore amorti">•</span>
+                  )}
+                </td>
+                <td className="py-1 px-2 text-right">{formatMontant(row.principal, '', { decimals: 0 })}</td>
+                <td className="py-1 px-2 text-right text-amber-400">{formatMontant(row.interest, '', { decimals: 0 })}</td>
+                <td className="py-1 px-2 text-right font-semibold text-emerald-400">
+                  {formatMontant(row.payment, currency, { decimals: 0 })}
+                </td>
+                <td className="py-1 px-2 text-right text-gray-400">{formatMontant(row.balance, '', { decimals: 0 })}</td>
+              </tr>
+            ))}
+          </tbody>
+          {totals && (
+            <tfoot className="sticky bottom-0 bg-slate-900/95 backdrop-blur">
+              <tr className="border-t border-white/15 text-white font-semibold tabular-nums">
+                <td className="py-2 px-2">Total</td>
+                <td className="py-2 px-2 text-right">{formatMontant(totals.totalPrincipal, '', { decimals: 0 })}</td>
+                <td className="py-2 px-2 text-right text-amber-300">{formatMontant(totals.totalInterest, '', { decimals: 0 })}</td>
+                <td className="py-2 px-2 text-right text-emerald-300">{formatMontant(totals.totalPayments, currency, { decimals: 0 })}</td>
+                <td className="py-2 px-2 text-right text-gray-500">—</td>
+              </tr>
+            </tfoot>
           )}
-        </tbody>
-      </table>
+        </table>
+      </div>
     </div>
   );
 };

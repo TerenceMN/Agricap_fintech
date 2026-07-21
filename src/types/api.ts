@@ -776,6 +776,9 @@ export interface CreditScoreResult {
   minScoreRequired?: number;
   breakdown?: CreditScoreBreakdown[];
   scheduleDraft?: Array<{ month: number; payment: number; principal: number; interest: number; balance: number }>;
+  // Totaux servis par le serveur (`dataio_simulator.dataio_simulate`) : le front
+  // ne somme jamais l'échéancier lui-même.
+  scheduleTotals?: { totalPrincipal: number; totalInterest: number; totalPayments: number; count: number };
 }
 
 /** Actif sous-jacent d'un gage, tel qu'imbriqué dans une garantie
