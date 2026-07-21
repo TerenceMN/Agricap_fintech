@@ -96,7 +96,10 @@ export async function handleCallback(): Promise<TokenResponse> {
   return data;
 }
 
-export async function refresh(): Promise<boolean> {
+/** Rafraîchissement en cours, partagé par tous les appelants (voir `refresh`). */
+let rafraichissementEnCours: Promise<boolean> | null = null;
+
+async function _refresh(): Promise<boolean> {
   const rt = tokens.refresh;
   if (!rt) return false;
   const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rt, client_id: CLIENT_ID });
@@ -106,6 +109,35 @@ export async function refresh(): Promise<boolean> {
   if (!res.ok) { tokens.clear(); return false; }
   tokens.set(await res.json());
   return true;
+}
+
+/**
+ * Rafraîchit le jeton — UN SEUL appel réseau à la fois, quoi qu'il arrive.
+ *
+ * L'IdP applique la ROTATION avec DÉTECTION DE RÉUTILISATION : un jeton de
+ * rafraîchissement ne sert qu'une fois, et le présenter une seconde fois est
+ * interprété comme un vol de jeton — l'IdP révoque alors la session entière.
+ *
+ * Sans cette sérialisation, le scénario nominal déclenchait exactement ça :
+ * une page du SPA lance une dizaine de requêtes en parallèle (notifications,
+ * portefeuille, tickets, supervision…) ; à l'expiration de l'access token,
+ * TOUTES prennent 401 en même temps et appelaient chacune `refresh()`. Elles
+ * lisaient le même `tokens.refresh`, le premier POST le consommait, et les
+ * suivants le rejouaient → « Réutilisation détectée : la session a été
+ * révoquée », déconnexion en pleine navigation, sans rien avoir fait de mal.
+ *
+ * Les appelants concurrents attendent donc la MÊME promesse ; le jeton n'est
+ * présenté qu'une fois, et tous repartent avec le jeton neuf.
+ */
+export function refresh(): Promise<boolean> {
+  if (rafraichissementEnCours) return rafraichissementEnCours;
+  rafraichissementEnCours = _refresh().finally(() => {
+    // Libéré seulement une fois `tokens` à jour : un appelant qui arriverait
+    // entre la réponse et cette ligne doit rejoindre la promesse en cours, pas
+    // en démarrer une seconde avec l'ancien jeton.
+    rafraichissementEnCours = null;
+  });
+  return rafraichissementEnCours;
 }
 
 export function logout(): void {

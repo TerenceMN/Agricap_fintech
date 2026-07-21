@@ -185,56 +185,28 @@ describe('corps de réponse non exploitable', () => {
   });
 });
 
-describe('DÉFAUT CONSTATÉ — le repli `detail = errors[0].message` est inatteignable', () => {
-  /**
-   * `request()` initialise `detail = \`Erreur ${res.status}\`` AVANT de lire le
-   * corps, puis exécute plus bas :
-   *
-   *     if (!detail && errors.length) detail = errors[0].message;
-   *
-   * `detail` étant déjà « Erreur 422 », donc TRUTHY, la condition n'est jamais
-   * vraie : ce repli est du code mort. Un 422 qui ne porte que `errors[]` — la
-   * forme la plus courante d'un refus multi-erreurs — s'affiche donc
-   * « Erreur 422 » là où le serveur avait fourni un texte utilisable.
-   *
-   * Conséquence visible : tout écran qui rend `err.message` seul (bandeau, toast)
-   * affiche un nombre au lieu d'une explication ; seuls les écrans qui déplient
-   * `err.errors` s'en sortent.
-   *
-   * Correctif hors périmètre (`api.ts` est en lecture seule pour cet agent) :
-   * initialiser `detail` à `''` et ne composer « Erreur <statut> » qu'en tout
-   * dernier recours, APRÈS la lecture de `errors[]`.
-   */
+describe('repli sur le premier message de `errors[]` (défaut corrigé)', () => {
+ 
   it('reprend le premier message quand le serveur ne donne pas de `detail`', async () => {
     respondWith(jsonResponse(422, {
       errors: [{ code: 'SOMME_F4_F5', message: 'Feuille 5 ≠ somme feuille 4.' }],
     }));
     const err = await capture(api.me());
 
-    // CORRIGÉ : `detail` part désormais de `''`, donc le repli sur `errors[0]`
-    // s'exécute réellement. Un bandeau qui ne rend que `err.message` affiche
-    // l'explication du serveur, plus un numéro de statut.
+   
     expect(err.message).toBe('Feuille 5 ≠ somme feuille 4.');
     expect(err.errors[0].message).toBe('Feuille 5 ≠ somme feuille 4.');
   });
 
   it('compose « Erreur <statut> » SEULEMENT quand le serveur n’a rien dit', async () => {
-    // Le repli doit rester : sans corps exploitable, l'utilisateur a quand même
-    // besoin d'un message. Ce test empêche de supprimer le repli en croyant
-    // supprimer le bug.
+   
     respondWith(jsonResponse(500, {}));
     const err = await capture(api.me());
 
     expect(err.message).toBe('Erreur 500');
   });
 
-  /**
-   * Même cause, forme la plus dommageable : un objet `{code}` SANS `message` est
-   * normalisé en `message: ''`. La puce affichée par `ErrorPanel` porte alors son
-   * code et rien d'autre. `refDataErrors` (écran Référence) a été écrit pour
-   * rattraper exactement ce cas côté écran — preuve que le trou est connu, mais
-   * il est rattrapé à un seul endroit sur les quatre écrans concernés.
-   */
+  
   it('constate qu’un objet sans `message` produit une puce muette', async () => {
     respondWith(jsonResponse(422, { errors: [{ code: 'SANS_TEXTE' }] }));
     const err = await capture(api.me());
