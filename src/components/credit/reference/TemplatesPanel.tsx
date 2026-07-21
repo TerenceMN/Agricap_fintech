@@ -20,12 +20,15 @@
  * Backend : `dataio/views_templates.py`, `dataio/services_templates.py`.
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { api, ApiError } from '@/services/api';
-import { Empty, ErrorPanel, Loading, toFieldErrors, type FieldError } from '@/components/backoffice/States';
+import { api } from '@/services/api';
+import {
+  Empty, ErrorPanel, Forbidden, Loading, toFieldErrors, type FieldError,
+} from '@/components/backoffice/States';
 import { Btn, Card, CardHead, MakerChecker, Note, Pill, Tokens } from './Bits';
 import {
-  DIFF_BASELINE_LABELS, TEMPLATE_KINDS, TEMPLATE_STATUS_LABELS, fmtDateTime, labelOf,
-  shortHash, shortSub, type TemplateDetail, type TemplateListResponse, type TemplateRow,
+  DIFF_BASELINE_LABELS, TEMPLATES_CAP, TEMPLATE_KINDS, TEMPLATE_STATUS_LABELS, fmtDateTime,
+  isForbidden, labelOf, shortHash, shortSub, type TemplateActivateResponse, type TemplateDetail,
+  type TemplateListResponse, type TemplateRow, type TemplateUploadResponse,
 } from './wire';
 
 interface Props {
@@ -39,6 +42,7 @@ const TemplatesPanel: React.FC<Props> = ({ mySub, canConfig }) => {
   const [data, setData] = useState<TemplateListResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [errors, setErrors] = useState<FieldError[]>([]);
+  const [forbidden, setForbidden] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>('');
 
   const [kind, setKind] = useState<string>(TEMPLATE_KINDS[0].code);
@@ -54,12 +58,15 @@ const TemplatesPanel: React.FC<Props> = ({ mySub, canConfig }) => {
   const load = useCallback(async () => {
     setLoading(true);
     setErrors([]);
+    setForbidden(null);
     try {
       const res = await api.templates.list();
       setData(res as unknown as TemplateListResponse);
     } catch (e) {
       setData(null);
-      setErrors(toFieldErrors(e));
+      // 403 : décision d'autorisation, pas panne — la capacité `config` manque.
+      if (isForbidden(e)) setForbidden(e.message);
+      else setErrors(toFieldErrors(e));
     } finally {
       setLoading(false);
     }
@@ -67,8 +74,16 @@ const TemplatesPanel: React.FC<Props> = ({ mySub, canConfig }) => {
 
   useEffect(() => { void load(); }, [load]);
 
-  const openDetail = useCallback(async (id: number) => {
-    if (openId === id) { setOpenId(null); setDetail(null); return; }
+  /**
+   * Charge le détail canonique d'un template.
+   *
+   * `force` sert après un upload ou une activation : la réponse de ces deux
+   * endpoints porte le schéma mais PAS `diffBaseline` (`views_templates.py`).
+   * On ne l'affiche donc jamais depuis la réponse d'écriture — on relit le
+   * détail, seule source qui annonce le périmètre de son diff.
+   */
+  const openDetail = useCallback(async (id: number, force = false) => {
+    if (openId === id && !force) { setOpenId(null); setDetail(null); return; }
     setOpenId(id);
     setDetail(null);
     setDetailErrors([]);
@@ -92,31 +107,31 @@ const TemplatesPanel: React.FC<Props> = ({ mySub, canConfig }) => {
       const form = new FormData();
       form.append('file', file);
       form.append('kind', kind);
-      const res = (await api.templates.upload(form)) as unknown as TemplateDetail;
+      const res = (await api.templates.upload(form)) as unknown as TemplateUploadResponse;
       setNotice(res.message
         || `Template v${res.version} téléversé — en attente d'activation par un second administrateur.`);
       setFile(null);
       await load();
-      // Le maker voit immédiatement le schéma dérivé de SON dépôt et son diff.
-      setOpenId(res.id);
-      setDetail(res);
+      // Le maker voit immédiatement le schéma dérivé de SON dépôt et son diff,
+      // relus depuis `detail` (la réponse d'upload n'a pas de `diffBaseline`).
+      await openDetail(res.id, true);
     } catch (e) {
       setErrors(toFieldErrors(e));
     } finally {
       setUploading(false);
     }
-  }, [file, kind, load]);
+  }, [file, kind, load, openDetail]);
 
   const doActivate = useCallback(async (row: TemplateRow) => {
     setActivatingId(row.id);
     setErrors([]);
     setNotice('');
     try {
-      const res = (await api.templates.activate(row.id)) as unknown as TemplateDetail;
+      const res = (await api.templates.activate(row.id)) as unknown as TemplateActivateResponse;
       setNotice(res.message
         || `Template v${res.version} activé : son schéma dérivé devient la règle de validation.`);
       await load();
-      if (openId === row.id) await openDetail(row.id);
+      if (openId === row.id) await openDetail(row.id, true);
     } catch (e) {
       // 409 `MAKER_EGAL_CHECKER` / `STATUT_INVALIDE` : message serveur relayé tel quel.
       setErrors(toFieldErrors(e));
@@ -128,6 +143,15 @@ const TemplatesPanel: React.FC<Props> = ({ mySub, canConfig }) => {
   const rows = data?.templates ?? [];
   const active = data?.active ?? null;
   const readOnly = canConfig === false;
+
+  if (forbidden) {
+    return (
+      <Forbidden
+        message="Templates de fichiers réservés à la capacité « config »."
+        detail={forbidden}
+      />
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -309,6 +333,13 @@ const TemplatesPanel: React.FC<Props> = ({ mySub, canConfig }) => {
               </tbody>
             </table>
           </div>
+        )}
+
+        {!loading && rows.length >= TEMPLATES_CAP && (
+          <p className="text-xs text-amber-300/90 px-4 py-3 border-t border-white/10">
+            Liste plafonnée à {TEMPLATES_CAP} versions par le serveur, qui ne renvoie pas
+            l'effectif total : des versions plus anciennes peuvent manquer de cet historique.
+          </p>
         )}
       </Card>
     </div>
