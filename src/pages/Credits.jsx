@@ -1273,13 +1273,19 @@ const Credits = () => {
 
   const renderClientView = () => (
     <Tabs defaultValue="gestion" className="w-full">
-      <TabsList className="grid w-full grid-cols-2 bg-white/5"><TabsTrigger value="gestion">Gérer mes crédits</TabsTrigger><TabsTrigger value="demande">Demander un crédit</TabsTrigger></TabsList>
+      <TabsList className="grid w-full grid-cols-3 bg-white/5">
+        <TabsTrigger value="gestion">Gérer mes crédits</TabsTrigger>
+        <TabsTrigger value="demandes">Mes demandes de crédit</TabsTrigger>
+        <TabsTrigger value="demande">Demander un crédit</TabsTrigger>
+      </TabsList>
+      {/* Le crédit accepté (GestionCreditsClient) et la liste des demandes
+          étaient empilés dans un seul onglet. Séparés : « Mes demandes de
+          crédit » est désormais son propre onglet, à côté du crédit accepté. */}
       <TabsContent value="gestion" className="pt-6 space-y-8">
         <GestionCreditsClient approvedCredit={approvedCredit} refreshCredit={refreshCredit} />
-        <div>
-          <h2 className="text-lg font-bold text-white mb-3">Mes demandes de crédit</h2>
-          <MesDossiers dossiers={mesDossiers} chargement={dossiersEnChargement} />
-        </div>
+      </TabsContent>
+      <TabsContent value="demandes" className="pt-6">
+        <MesDossiers dossiers={mesDossiers} chargement={dossiersEnChargement} />
       </TabsContent>
       <TabsContent value="demande" className="pt-6">
           {!(isSubmitted && approvedCredit) && (
