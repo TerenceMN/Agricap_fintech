@@ -3,7 +3,12 @@ personnel disposant de la capacité `audit`. LECTURE SEULE ABSOLUE : aucune écr
 possible depuis cet écran (c'est l'écran de l'auditeur)."""
 from __future__ import annotations
 
+import csv
+import json
+
 from django.db.models import Q
+from django.http import StreamingHttpResponse
+from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -26,6 +31,22 @@ FINANCIAL_ACTION_PREFIXES = (
     "transaction.", "investments.", "portfolio.", "caisses.", "savings.",
     "contract.", "fx.", "ledger.", "kyc.", "assets.",
 )
+
+
+def _names_by_sub(subs) -> dict[str, str]:
+    """Résout un ensemble de `sub` IdP en noms lisibles, en un seul aller-retour.
+
+    Pas de FK `AuditEntry -> FintechUser` : l'acteur d'une action système peut être
+    vide ou inexistant, une FK stricte casserait l'écriture de l'entrée elle-même.
+    """
+    subs = {s for s in subs if s}
+    if not subs:
+        return {}
+    from accounts.models import FintechUser
+    return {
+        u.sub: (u.full_name or u.email)
+        for u in FintechUser.objects.filter(sub__in=subs)
+    }
 
 
 def _row(e: AuditEntry, names_by_sub: dict[str, str]) -> dict:
@@ -108,15 +129,8 @@ def entries(request):
     rows = list(qs[:ROWS_CAP])
     truncated = total > ROWS_CAP
 
-    # Résolution `sub` -> nom lisible en un seul aller-retour (pas de FK AuditEntry ->
-    # FintechUser : l'acteur d'une action système peut être vide/inexistant, une FK stricte
-    # casserait l'écriture de l'entrée d'audit elle-même).
-    from accounts.models import FintechUser
-    actors = {e.actor for e in rows if e.actor}
-    names_by_sub = {
-        u.sub: (u.full_name or u.email)
-        for u in FintechUser.objects.filter(sub__in=actors)
-    }
+    # Résolution `sub` -> nom lisible en un seul aller-retour.
+    names_by_sub = _names_by_sub(e.actor for e in rows)
     data = [_row(e, names_by_sub) for e in rows]
 
     # `totalRows` / troncature (contrat §4). Rétro-compatibilité : la réponse reste une
@@ -135,4 +149,74 @@ def entries(request):
         response = Response(data)
     response["X-Total-Rows"] = str(total)
     response["X-Truncated"] = "1" if truncated else "0"
+    return response
+
+
+# ── Export CSV (écran auditeur) ──────────────────────────────────────────────
+#
+# Colonnes de l'export, dans l'ordre. Français (l'auditeur ouvre le fichier dans
+# Excel/LibreOffice). `Détails` contient le JSON brut de l'entrée — c'est là que vit
+# le code du dossier (`applicationCode`), donc rien n'est perdu à l'export.
+EXPORT_HEADER = [
+    "Horodatage", "Acteur (sub)", "Acteur (nom)", "Rôle", "Action",
+    "Type entité", "Id entité", "Détails", "IP",
+]
+
+
+class _Echo:
+    """Buffer pseudo-fichier pour `csv.writer` : `write` renvoie la ligne au lieu de la
+    stocker, ce qui permet de streamer l'export sans le matérialiser en mémoire."""
+
+    def write(self, value: str) -> str:
+        return value
+
+
+def _export_rows(qs, names_by_sub: dict[str, str]):
+    """Générateur des lignes CSV. BOM UTF-8 en tête pour qu'Excel affiche correctement
+    les accents. `qs.iterator()` : on ne charge jamais tout le journal en mémoire."""
+    writer = csv.writer(_Echo())
+    yield "\ufeff" + writer.writerow(EXPORT_HEADER)
+    for e in qs.iterator(chunk_size=500):
+        details = ""
+        if e.details:
+            details = json.dumps(e.details, ensure_ascii=False, sort_keys=True)
+        yield writer.writerow([
+            e.created_at.isoformat(),
+            e.actor or "",
+            names_by_sub.get(e.actor, "") if e.actor else "",
+            e.actor_role or "",
+            e.action,
+            e.entity_type or "",
+            e.entity_id or "",
+            details,
+            e.ip_address or "",
+        ])
+
+
+@api_view(["GET"])
+@permission_classes([HasCapability("audit")])
+def export(request):
+    """Export CSV du journal filtré — mêmes filtres que `entries`, capacité `audit`,
+    LECTURE SEULE. Contrairement à `entries` (plafonné à ROWS_CAP pour l'affichage),
+    l'export est COMPLET sur le périmètre filtré : un auditeur doit obtenir l'intégralité
+    des lignes correspondant à ses critères, jamais un sous-ensemble tronqué en silence.
+    """
+    qs = _apply_filters(AuditEntry.objects.all(), request.GET).order_by("-created_at")
+
+    total = qs.count()
+    # Noms résolus une fois, sur les acteurs DISTINCTS du périmètre (borné par l'effectif
+    # du personnel, pas par le nombre de lignes) — puis stream sans re-requête par ligne.
+    distinct_actors = (qs.exclude(actor="").order_by()
+                       .values_list("actor", flat=True).distinct())
+    names_by_sub = _names_by_sub(distinct_actors)
+
+    stamp = timezone.now().strftime("%Y%m%d_%H%M%S")
+    response = StreamingHttpResponse(
+        _export_rows(qs, names_by_sub), content_type="text/csv; charset=utf-8",
+    )
+    response["Content-Disposition"] = f'attachment; filename="journal_audit_{stamp}.csv"'
+    # L'export étant complet, la troncature est toujours fausse ; le total reste exposé
+    # pour recoupement avec l'écran.
+    response["X-Total-Rows"] = str(total)
+    response["X-Truncated"] = "0"
     return response

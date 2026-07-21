@@ -79,3 +79,65 @@ class AuditFilterTests(AuthedAPITestCase):
         self.login(role="aud_fin", sub="auditor")
         res = self.client.post("/api/audit/entries", {}, format="json")
         self.assertEqual(res.status_code, 405)  # méthode non autorisée
+
+
+class AuditExportTests(AuthedAPITestCase):
+    def setUp(self):
+        record(actor="analyst-1", actor_role="gest_credit",
+               action="credits.analyse.execute", entity_type="AnalyseCredit",
+               entity_id="7", details={"applicationCode": "CRED-0001"})
+        record(actor="agent-9", actor_role="agent_terrain",
+               action="assets.verify", entity_type="Asset",
+               entity_id="42", details={"reference": "CRED-0001"})
+        record(actor="analyst-2", actor_role="gest_credit",
+               action="credits.analyse.justifier", entity_type="AnalyseCredit",
+               entity_id="8", details={"applicationCode": "CRED-0002"})
+
+    def _body(self, res) -> str:
+        return b"".join(res.streaming_content).decode("utf-8")
+
+    def test_export_is_csv_attachment_with_all_rows(self):
+        self.login(role="aud_fin", sub="auditor")
+        res = self.client.get("/api/audit/export")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("text/csv", res["Content-Type"])
+        self.assertIn("attachment", res["Content-Disposition"])
+        self.assertIn(".csv", res["Content-Disposition"])
+        body = self._body(res)
+        # BOM UTF-8 en tête (ouverture correcte dans Excel).
+        self.assertEqual(ord(body[0]), 0xFEFF)
+        body = body[1:]
+        # En-tête + 3 lignes de données.
+        lines = [l for l in body.splitlines() if l.strip()]
+        self.assertEqual(len(lines), 4)
+        self.assertIn("Horodatage", lines[0])
+        self.assertIn("credits.analyse.execute", body)
+        self.assertEqual(res["X-Total-Rows"], "3")
+        self.assertEqual(res["X-Truncated"], "0")
+
+    def test_export_respects_filters(self):
+        self.login(role="aud_fin", sub="auditor")
+        res = self.client.get("/api/audit/export?dossier=CRED-0001")
+        body = self._body(res)
+        self.assertIn("credits.analyse.execute", body)
+        self.assertIn("assets.verify", body)
+        self.assertNotIn("credits.analyse.justifier", body)
+        self.assertEqual(res["X-Total-Rows"], "2")
+
+    def test_export_details_preserved_as_json(self):
+        self.login(role="aud_fin", sub="auditor")
+        res = self.client.get("/api/audit/export?acteur=analyst-1")
+        body = self._body(res)
+        # Le code du dossier vit dans les détails — rien n'est perdu à l'export.
+        self.assertIn("applicationCode", body)
+        self.assertIn("CRED-0001", body)
+
+    def test_export_requires_audit_capability(self):
+        self.login(role="agent_terrain", sub="no-audit")
+        res = self.client.get("/api/audit/export")
+        self.assertEqual(res.status_code, 403)
+
+    def test_export_read_only_no_write_verb(self):
+        self.login(role="aud_fin", sub="auditor")
+        res = self.client.post("/api/audit/export", {}, format="json")
+        self.assertEqual(res.status_code, 405)

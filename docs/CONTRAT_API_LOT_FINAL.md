@@ -68,8 +68,15 @@ référentiel n'existe (filière hors-modèle), l'état reste explicitement
 ## 4. Journal & audit (écran auditeur, lecture seule)
 
 - `GET /api/audit/entries` — **existe**. Filtres attendus : `?dossier=&acteur=&
-  etape=&depuis=&jusqu=`. Réponse liste + `totalRows` (troncature signalée).
+  etape=&depuis=&jusqu=`. Réponse liste + `totalRows` (troncature signalée,
+  `?meta=1` pour l'obtenir dans le corps ; toujours en en-tête `X-Total-Rows`).
   Aucune écriture depuis cet écran.
+- `GET /api/audit/export` — **NOUVEAU** : export CSV (BOM UTF-8) du journal filtré,
+  **mêmes filtres** que `entries`, capacité `audit`, lecture seule. Contrairement à
+  `entries` (plafonné à 500 pour l'affichage), l'export est **complet** sur le
+  périmètre filtré — un auditeur obtient l'intégralité de ses lignes, jamais un
+  sous-ensemble tronqué en silence. Colonne `Détails` = JSON brut de l'entrée
+  (le code du dossier y vit, rien n'est perdu).
 
 ## 5. Barèmes (`BaremeScore`, comité)
 
