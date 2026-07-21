@@ -65,7 +65,10 @@ export interface WireAuditEntry {
   ip: string | null;
 }
 
-/** `audit.views.entries` coupe à `qs[:500]` sans indicateur de troncature. */
+/** `audit.views.entries` coupe à `qs[:ROWS_CAP]` (500). Le total du périmètre
+ *  filtré existe côté serveur — en-tête `X-Total-Rows`, et dans le corps avec
+ *  `?meta=1` — mais `api.audit.entries` sert la liste nue et n'en restitue rien :
+ *  l'écran ne connaît le total qu'après un export (`api.audit.export`). */
 export const AUDIT_ROWS_CAP = 500;
 
 // ── État du consentement client ───────────────────────────────────────────────

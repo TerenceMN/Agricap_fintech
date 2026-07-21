@@ -26,7 +26,13 @@ import { Clock } from 'lucide-react';
  * affiche donc le temps **restant réel**, jamais la durée nominale de la
  * fenêtre.
  *
- * @param {{expiresAt: string|null|undefined, tone?: 'normal'|'muted'}} props
+ * ── `audience` : à qui l'on parle ─────────────────────────────────────────
+ * Le décompte est le même ; la phrase qui l'introduit ne peut pas l'être. Dire
+ * « il vous reste » à l'agent qui SUIT la caution d'un tiers (écran
+ * `/credit/garanties`) lui attribue un délai qui n'est pas le sien. Le défaut
+ * reste `guarantor` : le parcours du garant est inchangé, au mot près.
+ *
+ * @param {{expiresAt: string|null|undefined, audience?: 'guarantor'|'staff'}} props
  *   `expiresAt` — ISO 8601 servi par l'API.
  */
 
@@ -68,7 +74,7 @@ const TONE = {
   elapsed: 'bg-red-500/15 text-red-200 border-red-500/40',
 };
 
-const ConsentCountdown = ({ expiresAt }) => {
+const ConsentCountdown = ({ expiresAt, audience = 'guarantor' }) => {
   const target = expiresAt ? new Date(expiresAt).getTime() : NaN;
   const valid = Number.isFinite(target);
 
@@ -110,7 +116,9 @@ const ConsentCountdown = ({ expiresAt }) => {
         <span>Délai écoulé</span>
       ) : (
         <span>
-          <span className="font-normal opacity-80">Il vous reste</span>{' '}
+          <span className="font-normal opacity-80">
+            {audience === 'staff' ? 'Réponse du garant attendue sous' : 'Il vous reste'}
+          </span>{' '}
           <span className="tabular-nums">{formatRemaining(remaining)}</span>
         </span>
       )}

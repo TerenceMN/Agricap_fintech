@@ -307,3 +307,97 @@ const CAN_INSTRUCT_ROLES: ReadonlySet<string> = new Set([
 export function canInstruct(roleId: string | null | undefined): boolean {
   return Boolean(roleId && CAN_INSTRUCT_ROLES.has(roleId));
 }
+
+/**
+ * Statuts que le serveur accepte de confirmer, relus dans `guarantees.py`.
+ *
+ *   - `morale`   → `confirm_moral_guarantee` : `consented` (chemin opposable) et
+ *                  `pending` (cautions déclaratives d'avant le consentement, que
+ *                  le principe 3 interdit de réécrire). `pending_consent`,
+ *                  `declined` et `expired` lèvent explicitement ;
+ *   - `materiel` / `foncier` → `confirm_asset_guarantee` : `pending` uniquement ;
+ *   - `epargne`  → aucun : `place_savings_hold` pose déjà la garantie en `active`,
+ *                  le cash est bloqué au moment du geste, il n'y a rien à acter.
+ */
+export function isConfirmable(row: GuaranteeRow): boolean {
+  const { status, type } = row.guarantee;
+  if (type === 'morale') return status === 'consented' || status === 'pending';
+  if (type === 'materiel' || type === 'foncier') return status === 'pending';
+  return false;
+}
+
+/**
+ * Libération : `release_guarantee` ne refuse aucun statut hormis `released`
+ * (`release_savings_hold` sort en silence, `_do_release` écrit toujours). Le
+ * bouton n'est donc proposé que sur une garantie qui immobilise réellement
+ * quelque chose — `active` ou `pending` (un gage `pending` retient déjà l'actif
+ * côté `assets`). Proposer « libérer » sur une caution refusée n'aurait aucun
+ * sens même si le serveur l'acceptait.
+ */
+export function isReleasable(row: GuaranteeRow): boolean {
+  const { status } = row.guarantee;
+  return status === 'active' || status === 'pending';
+}
+
+// ── Construction des lignes ───────────────────────────────────────────────────
+
+/** Le minimum qu'un dossier doit porter pour qu'on en tire des lignes. Signature
+ *  structurelle : `CreditApplication` la satisfait, une réponse de `confirm` /
+ *  `release` (qui ne renvoie que le `guarantees`) non — d'où le rechargement. */
+export interface GuaranteeSourceApplication {
+  code: string;
+  status: string;
+  currency: string;
+  client?: { displayName?: string | null; sub?: string } | null;
+  valueChain?: { code: string; label: string } | null;
+  guarantees?: unknown;
+}
+
+/**
+ * Aplatit les dossiers servis par `GET /credits/applications/` en lignes de
+ * garantie. Le sérialiseur de la LISTE embarque déjà `get_guarantee_summary`
+ * (`workflow.serialize_application`) : aucune requête par dossier n'est
+ * nécessaire, et surtout aucun total n'est recomposé — `coverage` est repris
+ * tel quel du dossier auquel il appartient.
+ */
+export function toGuaranteeRows(apps: GuaranteeSourceApplication[]): GuaranteeRow[] {
+  const rows: GuaranteeRow[] = [];
+  for (const app of apps) {
+    const set = app.guarantees as WireGuaranteeSet | undefined;
+    for (const guarantee of set?.items ?? []) {
+      rows.push({
+        guarantee,
+        applicationCode: app.code,
+        applicationStatus: app.status,
+        applicationCurrency: app.currency,
+        clientName: app.client?.displayName || app.client?.sub || '—',
+        valueChainLabel: app.valueChain?.label ?? null,
+        coverage: set?.coverage,
+      });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Ordre d'affichage : l'échéance de consentement la plus proche en tête, puis
+ * les lignes sans échéance par ancienneté décroissante. C'est un tri, pas une
+ * priorisation métier — aucun score, aucune pondération.
+ */
+export function byUrgency(a: GuaranteeRow, b: GuaranteeRow): number {
+  const ea = a.guarantee.consentExpiresAt;
+  const eb = b.guarantee.consentExpiresAt;
+  if (ea && eb) return new Date(ea).getTime() - new Date(eb).getTime();
+  if (ea) return -1;
+  if (eb) return 1;
+  return new Date(b.guarantee.createdAt).getTime() - new Date(a.guarantee.createdAt).getTime();
+}
+
+/** Horodatage de la décision du garant, refus compris — jamais recalculé. */
+export function decisionAt(row: GuaranteeRow): { at: string | null; label: string } {
+  const g = row.guarantee;
+  if (g.consentedAt) return { at: g.consentedAt, label: 'Consentement' };
+  if (g.declinedAt) return { at: g.declinedAt, label: 'Refus' };
+  if (g.confirmedAt) return { at: g.confirmedAt, label: 'Constitution' };
+  return { at: null, label: 'Décision' };
+}

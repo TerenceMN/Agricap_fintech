@@ -1,28 +1,50 @@
 /**
  * Journal & audit crédit — `/credit/journal`. LECTURE SEULE ABSOLUE.
  *
- * `GET /api/audit/entries` (`audit/views.py`), protégé par la capacité RBAC
- * `audit`. Aucun bouton d'écriture, aucune action mutante, aucun export
- * fabriqué côté client : cet écran consulte, point.
+ * `GET /api/audit/entries` et `GET /api/audit/export` (`audit/views.py`), tous
+ * deux protégés par la capacité RBAC `audit`. Aucun bouton d'écriture, aucune
+ * action mutante, aucune suppression : cet écran consulte, point. L'export
+ * lui-même est un GET — il produit un fichier, il ne touche à rien.
  *
- * Deux vérités désagréables que l'écran affiche plutôt que de les masquer :
+ * ── Ce qui a changé, et pourquoi ce fichier n'affirme plus l'inverse ──────────
+ * Ce commentaire portait deux avertissements devenus faux, et les afficher plus
+ * longtemps aurait été pire que de ne rien dire :
  *
- * 1. **Le module `credits` n'écrit rien dans ce journal.** Aucun appel à
- *    `audit.services.record` n'existe dans `backend/credits/` : prise en charge,
- *    approbation, rejet, ajournement, demande et confirmation de décaissement
- *    ne laissent aucune trace ici. Seuls `assets.*` et `portfolio.*` alimentent
- *    le journal. Le `JournalValidation` append-only du principe 3 n'existe pas
- *    en base. Un auditeur ne peut donc PAS reconstituer une décision de crédit.
+ *   1. « le module `credits` n'écrit rien dans ce journal ». Il écrit désormais :
+ *      `workflow._audit_transition` (soumission, prise en charge, approbation,
+ *      rejet, ajournement, réouverture, consentement client),
+ *      `guarantees._audit` (désignation du garant, consentement, constitution),
+ *      `analyse`, `committee`, `disbursement`, `baremes`, `needs_sheet`. La liste
+ *      d'étapes ci-dessous est relue une par une dans `backend/credits/`.
+ *   2. « le filtre de période est client-side ». `_apply_filters` accepte
+ *      `depuis` / `jusqu` (date ou datetime ISO, borne haute inclusive au jour),
+ *      ainsi que `dossier` et `etape`. Les cinq filtres du contrat §4 sont
+ *      SERVEUR : filtrer une période filtre bien la période, plus les 500
+ *      dernières lignes.
  *
- * 2. **Le filtre de période est client-side.** L'endpoint n'accepte ni `date_from`
- *    ni `date_to` et coupe à 500 lignes (`qs[:500]`) sans compteur total ni
- *    pagination. Filtrer une période dans le navigateur filtre donc les 500
- *    dernières entrées, pas la période : l'écran le dit explicitement.
+ * ── L'honnêteté d'affichage, qui est le vrai sujet de cet écran ──────────────
+ * `entries` est plafonné à 500 lignes ; `export` est COMPLET sur le même
+ * périmètre. Les deux passent par la même sérialisation de filtres
+ * (`api.ts::auditQuery`), donc le CSV porte exactement ce qui est à l'écran —
+ * ni plus, ni moins.
+ *
+ * Reste une asymétrie que l'écran expose au lieu de la taire : `api.audit.entries`
+ * renvoie la liste nue, sans le total. Le serveur le connaît (en-tête
+ * `X-Total-Rows`, corps avec `?meta=1`) mais le contrat ne le remonte pas. Tant
+ * qu'il ne le fera pas, l'écran raisonne ainsi :
+ *   - 500 lignes rendues ⇒ le périmètre en compte AU MOINS 500, et la liste est
+ *     très probablement coupée : c'est dit, en rouge, sans attendre l'export ;
+ *   - après un export, `totalRows` est connu et affiché tel quel — c'est le seul
+ *     chiffre exact dont l'écran dispose, et il permet de recouper.
+ * Un auditeur qui croit tout voir alors qu'il voit 500 lignes tire de fausses
+ * conclusions ; c'est le seul risque que cet écran doit absolument écarter.
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Helmet } from 'react-helmet';
 import { Link } from 'react-router-dom';
+import { AlertTriangle, Download, Lock } from 'lucide-react';
 import { api, ApiError } from '@/services/api';
+import type { AuditFilters } from '@/types/api';
 import {
   Empty, ErrorPanel, Forbidden, Loading, toFieldErrors, type FieldError,
 } from '@/components/backoffice/States';
@@ -31,6 +53,8 @@ import { AUDIT_ROWS_CAP, fmtDateTime, type WireAuditEntry } from './wire';
 /** Types d'entités réellement journalisées et pertinentes pour le crédit. */
 const ENTITY_TYPES = [
   { value: '', label: 'Toutes les entités' },
+  { value: 'CreditApplication', label: 'Dossier de crédit' },
+  { value: 'CreditGuarantee', label: 'Garantie / caution' },
   { value: 'Asset', label: 'Actif gageable (Asset)' },
   { value: 'Loan', label: 'Prêt décaissé (Loan)' },
   { value: 'LoanTransaction', label: 'Transaction de prêt' },
@@ -39,114 +63,188 @@ const ENTITY_TYPES = [
   { value: 'JournalEntry', label: 'Écriture comptable' },
 ];
 
+/**
+ * Étapes proposées en suggestion — le filtre serveur est une SOUS-CHAÎNE
+ * (`action__icontains`), donc `credits.workflow` attrape les sept transitions et
+ * `credits.` attrape tout le module. Ces valeurs sont relues dans
+ * `backend/credits/` ; la saisie reste libre, la liste n'est qu'un raccourci.
+ *
+ * Noter l'irrégularité de nommage, conservée telle quelle parce qu'elle est dans
+ * les données : les garanties écrivent `credit.` au singulier, tout le reste
+ * `credits.` au pluriel. Un filtre `credits.` manque donc les garanties.
+ */
+const ETAPE_SUGGESTIONS = [
+  'credits.workflow.submit',
+  'credits.workflow.start_analysis',
+  'credits.workflow.approve',
+  'credits.workflow.reject',
+  'credits.workflow.adjourn',
+  'credits.workflow.reopen_analysis',
+  'credits.workflow.client_consent',
+  'credits.analyse.execute',
+  'credits.analyse.justifier',
+  'credits.committee.vote',
+  'credits.committee.resolved',
+  'credits.disbursement.request',
+  'credits.disbursement.confirm',
+  'credits.disbursement.cancel',
+  'credits.needs_sheet.validated',
+  'credits.bareme.propose',
+  'credits.bareme.activate',
+  'credit.guarantee.guarantor_designated',
+  'credit.guarantee.consent_accepted',
+  'credit.guarantee.consent_declined',
+  'credit.guarantee.constituted',
+];
+
 const AuditJournal: React.FC = () => {
   const [entries, setEntries] = useState<WireAuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [forbidden, setForbidden] = useState<string | null>(null);
   const [errors, setErrors] = useState<FieldError[]>([]);
 
-  // Filtres serveur
+  // Filtres du contrat §4 — tous serveur, aucun repli navigateur.
+  const [dossier, setDossier] = useState('');
+  const [acteur, setActeur] = useState('');
+  const [etape, setEtape] = useState('');
+  const [depuis, setDepuis] = useState('');
+  const [jusqu, setJusqu] = useState('');
   const [entityType, setEntityType] = useState('');
   const [entityId, setEntityId] = useState('');
-  const [actor, setActor] = useState('');
   const [financialOnly, setFinancialOnly] = useState(false);
-  // Filtre client (l'API n'accepte pas de bornes de date)
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
 
-  const load = useCallback(async () => {
+  // `applied` : les filtres RÉELLEMENT servis. Séparés de la saisie en cours pour
+  // que le bouton d'export ne parte jamais avec un périmètre que l'écran n'affiche
+  // pas encore — c'est toute la garantie « le CSV porte ce que vous voyez ».
+  const [applied, setApplied] = useState<AuditFilters>({});
+  const [exporting, setExporting] = useState(false);
+  const [exportErrors, setExportErrors] = useState<FieldError[]>([]);
+  const [exportTotal, setExportTotal] = useState<number | null>(null);
+
+  const draft = useMemo<AuditFilters>(() => ({
+    dossier: dossier.trim() || undefined,
+    acteur: acteur.trim() || undefined,
+    etape: etape.trim() || undefined,
+    depuis: depuis || undefined,
+    jusqu: jusqu || undefined,
+    entity_type: entityType || undefined,
+    entity_id: entityId.trim() || undefined,
+    category: financialOnly ? 'financial' : undefined,
+  }), [dossier, acteur, etape, depuis, jusqu, entityType, entityId, financialOnly]);
+
+  const load = useCallback(async (filters: AuditFilters) => {
     setLoading(true);
     setErrors([]);
     setForbidden(null);
+    // Un total obtenu pour un autre périmètre serait un mensonge : il meurt avec lui.
+    setExportTotal(null);
+    setExportErrors([]);
     try {
-      const res = await api.audit.entries({
-        entity_type: entityType || undefined,
-        entity_id: entityId.trim() || undefined,
-        actor: actor.trim() || undefined,
-        category: financialOnly ? 'financial' : undefined,
-      });
+      const res = await api.audit.entries(filters);
       setEntries(res as unknown as WireAuditEntry[]);
     } catch (e) {
       setEntries([]);
-      if (e instanceof ApiError && e.status === 403) {
-        setForbidden(e.message);
-      } else {
-        setErrors(toFieldErrors(e));
-      }
+      if (e instanceof ApiError && e.status === 403) setForbidden(e.message);
+      else setErrors(toFieldErrors(e));
     } finally {
       setLoading(false);
     }
-  }, [entityType, entityId, actor, financialOnly]);
+  }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void load({}); }, [load]);
 
-  const rows = useMemo(() => {
-    if (!dateFrom && !dateTo) return entries;
-    const from = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : -Infinity;
-    const to = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : Infinity;
-    return entries.filter((e) => {
-      const t = new Date(e.timestamp).getTime();
-      return t >= from && t <= to;
-    });
-  }, [entries, dateFrom, dateTo]);
+  const apply = useCallback(() => {
+    setApplied(draft);
+    void load(draft);
+  }, [draft, load]);
 
+  const reset = useCallback(() => {
+    setDossier(''); setActeur(''); setEtape(''); setDepuis(''); setJusqu('');
+    setEntityType(''); setEntityId(''); setFinancialOnly(false);
+    setApplied({});
+    void load({});
+  }, [load]);
+
+  /** Export CSV — MÊMES filtres que la vue courante, via la même sérialisation. */
+  const doExport = useCallback(async () => {
+    setExporting(true);
+    setExportErrors([]);
+    try {
+      const { totalRows } = await api.audit.export(applied);
+      setExportTotal(totalRows);
+    } catch (e) {
+      setExportErrors(toFieldErrors(e));
+    } finally {
+      setExporting(false);
+    }
+  }, [applied]);
+
+  const activeFilters = useMemo(
+    () => Object.entries(applied).filter(([, v]) => v !== undefined && v !== ''),
+    [applied],
+  );
+  const dirty = useMemo(
+    () => JSON.stringify(draft) !== JSON.stringify(applied),
+    [draft, applied],
+  );
+  /** 500 lignes rendues : le serveur a coupé, ou s'est arrêté pile au plafond. */
   const atCap = entries.length >= AUDIT_ROWS_CAP;
-  const periodFiltered = Boolean(dateFrom || dateTo);
+  /** Troncature CERTAINE : l'export a compté plus de lignes que l'écran n'en rend. */
+  const provenTruncated = exportTotal !== null && exportTotal > entries.length;
+
+  const inputCls =
+    'block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white';
 
   return (
-    <div className="p-6 max-w-7xl mx-auto space-y-5 text-white [&>option]:bg-slate-800 [&>option]:text-white">
-      <Helmet><title>Journal & audit — AGRICAP FINTECH</title></Helmet>
+    <div className="p-6 max-w-7xl mx-auto space-y-5 text-white">
+      <Helmet><title>Journal &amp; audit — AGRICAP FINTECH</title></Helmet>
 
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold">Journal &amp; audit</h1>
-          <p className="text-sm text-slate-400 mt-1">
-            Consultation du journal des opérations. Écran en lecture seule : aucune action
-            mutante n'y est proposée.
+          <p className="text-sm text-slate-400 mt-1 flex items-center gap-1.5">
+            <Lock className="w-3.5 h-3.5" aria-hidden="true" />
+            Écran de l'auditeur, en lecture seule absolue : aucune écriture, aucune
+            correction, aucune suppression n'y est possible.
           </p>
         </div>
-        <Link to="/credit/dossiers" className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm">
-          File d'instruction
-        </Link>
+        <div className="flex items-center gap-2">
+          <Link to="/credit/garanties" className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm">
+            Suivi des garanties
+          </Link>
+          <Link to="/credit/dossiers" className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm">
+            File d'instruction
+          </Link>
+        </div>
       </div>
 
-      {/* Avertissement de couverture — sans lui, l'écran laisserait croire que
-          l'absence de trace vaut absence d'événement. */}
-      <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 text-sm text-amber-100">
-        <p className="font-semibold mb-1">Couverture réelle de ce journal</p>
-        <p className="text-amber-100/80 leading-relaxed">
-          Le module d'instruction du crédit <strong>n'écrit rien dans ce journal</strong> :
-          prise en charge, approbation, rejet, ajournement et décaissement d'un dossier
-          n'y laissent aucune trace. Seuls les actifs (<code className="font-mono">assets.*</code>)
-          et le portefeuille (<code className="font-mono">portfolio.*</code>) y sont journalisés.
-          Une absence de ligne sur un dossier ne signifie donc pas qu'il ne s'est rien passé.
+      {/* Couverture réelle — remplace l'ancien avertissement, devenu faux. */}
+      <div className="bg-white/5 border border-white/10 rounded-xl p-4 text-sm text-slate-300">
+        <p className="font-semibold text-white mb-1">Ce que ce journal couvre</p>
+        <p className="text-slate-400 leading-relaxed">
+          Les transitions du crédit y sont tracées (<code className="font-mono">credits.workflow.*</code>,{' '}
+          <code className="font-mono">credits.analyse.*</code>,{' '}
+          <code className="font-mono">credits.committee.*</code>,{' '}
+          <code className="font-mono">credits.disbursement.*</code>,{' '}
+          <code className="font-mono">credit.guarantee.*</code>), aux côtés des actifs
+          (<code className="font-mono">assets.*</code>) et du portefeuille
+          (<code className="font-mono">portfolio.*</code>). Le code du dossier vit dans
+          <code className="font-mono"> details.applicationCode</code> — c'est sur lui que porte
+          le filtre « dossier », et il est conservé dans l'export.
         </p>
       </div>
 
-      {/* Filtres */}
+      {/* Filtres — les cinq du contrat §4, tous serveur. */}
       <div className="bg-white/5 border border-white/10 rounded-xl p-4 space-y-4">
         <div className="flex flex-wrap items-end gap-4">
           <label className="text-xs text-slate-400">
-            Type d'entité
-            <select
-              value={entityType}
-              onChange={(e) => setEntityType(e.target.value)}
-              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
-            >
-              {ENTITY_TYPES.map((t) => (
-                <option key={t.value} value={t.value}>{t.label}</option>
-              ))}
-            </select>
-          </label>
-
-          <label className="text-xs text-slate-400">
-            Identifiant d'entité (dossier, référence de prêt, id d'actif)
+            Dossier (code)
             <input
               type="text"
-              value={entityId}
-              onChange={(e) => setEntityId(e.target.value)}
-              placeholder="ex. : 42 ou LN-2026-0007"
-              className="block mt-1 w-56 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
+              value={dossier}
+              onChange={(e) => setDossier(e.target.value)}
+              placeholder="ex. : CRED-2026-0042"
+              className={`${inputCls} w-52`}
             />
           </label>
 
@@ -154,10 +252,54 @@ const AuditJournal: React.FC = () => {
             Acteur (sub IdP)
             <input
               type="text"
-              value={actor}
-              onChange={(e) => setActor(e.target.value)}
+              value={acteur}
+              onChange={(e) => setActeur(e.target.value)}
               placeholder="sub de l'utilisateur"
-              className="block mt-1 w-56 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
+              className={`${inputCls} w-56`}
+            />
+          </label>
+
+          <label className="text-xs text-slate-400">
+            Étape (sous-chaîne de l'action)
+            <input
+              type="text"
+              list="audit-etapes"
+              value={etape}
+              onChange={(e) => setEtape(e.target.value)}
+              placeholder="ex. : approve, guarantee, disbursement"
+              className={`${inputCls} w-64`}
+            />
+            <datalist id="audit-etapes">
+              {ETAPE_SUGGESTIONS.map((a) => <option key={a} value={a} />)}
+            </datalist>
+          </label>
+
+          <label className="text-xs text-slate-400">
+            Du
+            <input type="date" value={depuis} onChange={(e) => setDepuis(e.target.value)} className={inputCls} />
+          </label>
+          <label className="text-xs text-slate-400">
+            Au (jour inclus)
+            <input type="date" value={jusqu} onChange={(e) => setJusqu(e.target.value)} className={inputCls} />
+          </label>
+        </div>
+
+        <div className="flex flex-wrap items-end gap-4 pt-3 border-t border-white/10">
+          <label className="text-xs text-slate-400">
+            Type d'entité
+            <select value={entityType} onChange={(e) => setEntityType(e.target.value)} className={inputCls}>
+              {ENTITY_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+            </select>
+          </label>
+
+          <label className="text-xs text-slate-400">
+            Identifiant d'entité
+            <input
+              type="text"
+              value={entityId}
+              onChange={(e) => setEntityId(e.target.value)}
+              placeholder="ex. : CRED-2026-0042, 42"
+              className={`${inputCls} w-52`}
             />
           </label>
 
@@ -171,49 +313,34 @@ const AuditJournal: React.FC = () => {
             Opérations financières uniquement
           </label>
 
-          <button
-            type="button"
-            onClick={() => void load()}
-            className="ml-auto px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm"
-          >
-            Appliquer
-          </button>
-        </div>
-
-        <div className="flex flex-wrap items-end gap-4 pt-3 border-t border-white/10">
-          <label className="text-xs text-slate-400">
-            Du
-            <input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => setDateFrom(e.target.value)}
-              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
-            />
-          </label>
-          <label className="text-xs text-slate-400">
-            Au
-            <input
-              type="date"
-              value={dateTo}
-              onChange={(e) => setDateTo(e.target.value)}
-              className="block mt-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
-            />
-          </label>
-          {periodFiltered && (
+          <div className="ml-auto flex items-end gap-2">
             <button
               type="button"
-              onClick={() => { setDateFrom(''); setDateTo(''); }}
+              onClick={reset}
               className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm"
             >
-              Effacer la période
+              Réinitialiser
             </button>
-          )}
-          <p className="text-[11px] text-amber-300/90 max-w-xl">
-            Le filtre de période s'applique dans le navigateur : l'API n'accepte pas de bornes
-            de date et ne renvoie que les {AUDIT_ROWS_CAP} entrées les plus récentes du filtre
-            serveur. Une période ancienne peut donc paraître vide alors qu'elle ne l'est pas.
-          </p>
+            <button
+              type="button"
+              onClick={apply}
+              className={`px-3 py-2 rounded-lg text-sm ${
+                dirty
+                  ? 'bg-emerald-500/25 border border-emerald-500/40 text-emerald-100 hover:bg-emerald-500/35'
+                  : 'bg-white/10 hover:bg-white/20'
+              }`}
+            >
+              Appliquer
+            </button>
+          </div>
         </div>
+
+        {dirty && (
+          <p className="text-[11px] text-amber-300/90">
+            Filtres modifiés mais non appliqués : le tableau et l'export portent encore le
+            périmètre précédent. Cliquez « Appliquer ».
+          </p>
+        )}
       </div>
 
       {loading && <Loading label="Chargement du journal…" />}
@@ -229,18 +356,65 @@ const AuditJournal: React.FC = () => {
         <>
           <ErrorPanel errors={errors} title="Chargement du journal impossible" />
 
-          <div className="flex flex-wrap gap-3 text-xs text-slate-400">
+          {/* Effectif, troncature, export : les trois se lisent ensemble. */}
+          <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
             <span className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10">
-              {rows.length} entrée(s) affichée(s)
-              {periodFiltered && ` sur ${entries.length} servie(s) par le serveur`}
+              {entries.length} entrée(s) affichée(s)
+              {exportTotal !== null && (
+                <> sur <strong className="text-white">{exportTotal}</strong> dans le périmètre
+                (compté par le dernier export)</>
+              )}
             </span>
-            {atCap && (
-              <span className="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200">
-                Plafond serveur atteint : {AUDIT_ROWS_CAP} entrées renvoyées, sans
-                <code className="font-mono"> total_rows </code>ni pagination. Affinez les filtres.
-              </span>
-            )}
+            <span className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10">
+              Périmètre : {activeFilters.length === 0
+                ? 'aucun filtre — tout le journal'
+                : activeFilters.map(([k, v]) => `${k} = ${String(v)}`).join(' · ')}
+            </span>
+
+            <button
+              type="button"
+              onClick={() => void doExport()}
+              disabled={exporting}
+              className="ml-auto px-3 py-2 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-100 text-sm hover:bg-emerald-500/30 disabled:opacity-50 inline-flex items-center gap-2"
+            >
+              <Download className="w-4 h-4" aria-hidden="true" />
+              {exporting ? 'Export en cours…' : 'Exporter le CSV du périmètre'}
+            </button>
           </div>
+
+          <ErrorPanel errors={exportErrors} title="Export refusé par le serveur" />
+
+          {/* Le message central de l'écran : ce que vous voyez ≠ ce qui existe. */}
+          {(atCap || provenTruncated) && (
+            <div className="bg-red-500/10 border border-red-500/40 rounded-xl p-4 text-sm text-red-100">
+              <p className="font-semibold mb-1 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4" aria-hidden="true" />
+                Vous ne voyez pas tout le périmètre
+              </p>
+              <p className="text-red-100/85 leading-relaxed">
+                {provenTruncated ? (
+                  <>
+                    Le périmètre filtré compte <strong>{exportTotal}</strong> entrées ; le tableau
+                    n'en affiche que <strong>{entries.length}</strong> (plafond serveur de{' '}
+                    {AUDIT_ROWS_CAP} lignes). Ne concluez rien de l'absence d'une ligne à l'écran.
+                  </>
+                ) : (
+                  <>
+                    Le tableau atteint le plafond serveur de {AUDIT_ROWS_CAP} lignes : le périmètre
+                    filtré en compte au moins autant, et très probablement davantage. Affinez les
+                    filtres (période, dossier, étape) ou exportez le CSV, qui est complet.
+                  </>
+                )}
+              </p>
+            </div>
+          )}
+
+          {exportTotal !== null && !provenTruncated && (
+            <p className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 rounded-lg px-4 py-3 text-sm">
+              Export terminé : {exportTotal} ligne(s) — soit exactement le périmètre affiché.
+              Le fichier reprend les mêmes filtres, et le détail JSON complet de chaque entrée.
+            </p>
+          )}
 
           <div className="bg-white/5 border border-white/10 rounded-xl overflow-x-auto">
             <table className="w-full text-sm min-w-[900px]">
@@ -256,11 +430,11 @@ const AuditJournal: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((e) => (
+                {entries.map((e) => (
                   <tr key={e.id} className="border-t border-white/5 hover:bg-white/5 align-top">
                     <td className="p-4 text-slate-300 whitespace-nowrap">{fmtDateTime(e.timestamp)}</td>
                     <td className="p-4">
-                      <span className="text-white [&>option]:bg-slate-800 [&>option]:text-white">{e.userName || e.user || 'Système'}</span>
+                      <span className="text-white">{e.userName || e.user || 'Système'}</span>
                       {e.user && e.userName && e.userName !== e.user && (
                         <span className="block font-mono text-[10px] text-slate-500">{e.user}</span>
                       )}
@@ -284,12 +458,10 @@ const AuditJournal: React.FC = () => {
               </tbody>
             </table>
 
-            {rows.length === 0 && errors.length === 0 && (
+            {entries.length === 0 && errors.length === 0 && (
               <Empty
                 title="Aucune entrée pour ces filtres."
-                hint={periodFiltered
-                  ? 'La période demandée peut être hors des dernières entrées servies : élargissez ou retirez les bornes.'
-                  : 'Rappel : les décisions de crédit ne sont pas journalisées ici.'}
+                hint="Les filtres sont appliqués par le serveur : un résultat vide signifie qu'aucune entrée du journal ne correspond, pas qu'elle serait hors des dernières lignes servies."
               />
             )}
           </div>
