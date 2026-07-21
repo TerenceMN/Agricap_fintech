@@ -7,7 +7,9 @@
     "dev": "vite --host :: --port 5173",
     "build": "node tools/generate-llms.js || true && vite build",
     "preview": "vite preview --host :: --port 5173",
-    "lint": "eslint . --quiet"
+    "lint": "eslint . --quiet",
+    "test": "vitest",
+    "test:run": "vitest run"
   },
   "dependencies": {
     "@babel/generator": "^7.26.3",
@@ -69,6 +71,10 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/node": "^20.19.43",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
@@ -80,9 +86,11 @@
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^5.1.0",
     "globals": "^15.14.0",
+    "jsdom": "^29.1.1",
     "postcss": "^8.4.31",
     "tailwindcss": "^3.3.3",
     "typescript": "^7.0.2",
-    "vite": "^7.3.1"
+    "vite": "^7.3.1",
+    "vitest": "^3.2.7"
   }
 }
