@@ -997,6 +997,36 @@ def client_consent(request: Request, code: str) -> Response:
     return Response(serialize_application(app))
 
 
+@api_view(["POST"])
+def renew_client_consent(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/renew-consent/
+
+    Relance la demande de confirmation auprès du client quand le délai a expiré.
+    Réservé à l'équipe d'instruction : c'est elle qui constate l'absence de
+    réponse et recontacte le client. Le client, lui, confirme via
+    `client-consent/`.
+    """
+    if not _require_group(request, CAN_INSTRUCT):
+        return Response(
+            {"detail": "Seule l'équipe d'instruction peut relancer une demande "
+                       "de confirmation client.", "code": "PERMISSION_REFUSEE"},
+            status=403,
+        )
+
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.workflow import renew_client_consent as _renew, WorkflowError
+    try:
+        _renew(app, agent_sub=getattr(request.user, "sub", "") or "")
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+    from credits.workflow import serialize_application
+    return Response(serialize_application(app))
+
+
 # ── Garanties ─────────────────────────────────────────────────────────────────
 
 def _get_application(code: str):

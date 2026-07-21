@@ -34,6 +34,8 @@ _ACTION_ROLES: dict[str, dict[str, set[str]]] = {
     },
     "submitted": {
         "start_analysis": set(CAN_INSTRUCT),
+        # Seule issue d'un dossier dont la confirmation client a expire.
+        "renew_consent": set(CAN_INSTRUCT),
     },
     "in_analysis": {
         "approve": set(CAN_DECIDE),

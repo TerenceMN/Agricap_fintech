@@ -134,11 +134,32 @@ class ConsentExpired(ConsentError):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _libelle_statut(code: str) -> str:
+    """Nom lisible d'un statut. « En analyse », pas « in_analysis ».
+
+    Les codes sont le contrat technique ; ils n'ont rien à faire dans une phrase
+    lue par un gestionnaire de crédit. Les libellés existent déjà sur
+    `CreditApplication.Status` — on les réutilise plutôt que d'en écrire une
+    seconde liste (principe 6 : une seule nomenclature par concept).
+    """
+    from credits.models import CreditApplication
+    try:
+        return CreditApplication.Status(code).label
+    except ValueError:
+        return code
+
+
 def _assert_status(app, *allowed: str) -> None:
     if app.status not in allowed:
+        attendus = [_libelle_statut(s) for s in allowed]
+        # Le message dit CE QUI bloque, DEPUIS OÙ, et VERS QUOI il faudrait être.
+        # « Transition impossible depuis le statut «submitted» » ne veut rien dire
+        # pour la personne qui lit l'écran : ni « transition » ni « submitted »
+        # n'appartiennent à son vocabulaire.
         raise InvalidTransition(
-            f"Transition impossible depuis le statut «{app.status}». "
-            f"Statuts attendus : {', '.join(allowed)}."
+            f"Cette action n'est pas possible sur un dossier « {_libelle_statut(app.status)} ». "
+            f"Elle ne s'applique qu'aux dossiers : {', '.join(attendus)}. "
+            f"Vérifiez l'état du dossier avant de recommencer."
         )
 
 
@@ -374,8 +395,9 @@ def start_analysis(app, analyst_sub: str) -> None:
                 "Le client doit être recontacté pour reformuler la demande."
             )
         raise ConsentError(
-            f"En attente du consentement client (délai : {_consent_window_hours()}h). "
-            "L'analyse ne peut débuter qu'après confirmation."
+            f"Le client n'a pas encore confirmé cette demande déposée en son nom. "
+            "Il dispose de {_consent_window_hours()} h pour le faire depuis son espace "
+            "« Mes demandes de crédit », ou en agence. L'analyse commencera ensuite."
         )
 
     app.status = "in_analysis"
@@ -409,8 +431,9 @@ def approve(
     # Maker ≠ checker
     if app.submitted_by_sub and app.submitted_by_sub == approver_sub:
         raise MakerCheckerError(
-            "La même personne ne peut pas soumettre et approuver un dossier "
-            "(principe maker ≠ checker)."
+            "Vous avez soumis ce dossier : vous ne pouvez pas l'approuver vous-même. "
+            "Un autre membre de l'équipe doit prendre la décision — c'est ce qui "
+            "garantit qu'un dossier est vu par deux personnes."
         )
 
     # Délégation — un rôle sans autorité et un plafond dépassé sont deux cas
@@ -476,7 +499,8 @@ def reject(
     # Maker ≠ checker sur le rejet aussi
     if app.submitted_by_sub and app.submitted_by_sub == rejector_sub:
         raise MakerCheckerError(
-            "La même personne ne peut pas soumettre et rejeter un dossier."
+            "Vous avez soumis ce dossier : vous ne pouvez pas le rejeter vous-même. "
+            "Un autre membre de l'équipe doit prendre la décision."
         )
 
     app.status = "rejected"
@@ -558,7 +582,9 @@ def record_client_consent(
     _assert_status(app, "submitted")
 
     if not app.is_on_behalf_of:
-        raise WorkflowError("Ce dossier n'est pas une demande au nom d'un tiers.")
+        raise WorkflowError("Ce dossier a été créé par le client lui-même : aucune confirmation de sa part "
+            "n'est nécessaire. La confirmation ne concerne que les demandes déposées "
+            "par un agent au nom d'un client.")
 
     if str(app.client.sub) != client_sub:
         raise WorkflowError("Seul le client bénéficiaire peut confirmer son consentement.")
@@ -578,6 +604,57 @@ def record_client_consent(
         app, actor=client_sub, action="credits.workflow.client_consent",
         etape="consentement_client", methode=method,
     )
+
+
+@transaction.atomic
+def renew_client_consent(app, agent_sub: str) -> None:
+    """Rouvre la fenêtre de consentement d'un dossier dont le délai a expiré.
+
+    Sans cela, un dossier au consentement expiré était DÉFINITIVEMENT coincé :
+    `start_analysis` le refusait, `reject` n'existe que depuis « En analyse », et
+    plus aucun consentement ne pouvait être enregistré. Il restait dans la file
+    d'instruction sans qu'aucun acte ne soit possible dessus.
+
+    C'est un ACTE HUMAIN, jamais automatique : un agent constate que le client
+    n'a pas répondu à temps, le recontacte, et relance la demande. La machine ne
+    décide rien — elle exécute ce qu'un agent a décidé, et le consigne.
+
+    La fenêtre repart à neuf plutôt que d'être prolongée : un consentement doit
+    être FRAIS. Chaque relance est journalisée avec son auteur et son horodatage,
+    donc une relance abusive se voit dans le journal — c'est la trace qui tient
+    lieu de garde-fou, pas un plafond arbitraire.
+    """
+    _assert_status(app, "submitted")
+
+    if not app.is_on_behalf_of:
+        raise WorkflowError(
+            "Ce dossier a été créé par le client lui-même : il n'y a aucune "
+            "confirmation à relancer."
+        )
+
+    if app.client_consent_at:
+        raise WorkflowError(
+            "Le client a déjà confirmé cette demande le "
+            f"{app.client_consent_at.strftime('%d/%m/%Y à %H:%M')}. "
+            "L'analyse peut débuter."
+        )
+
+    ancienne = app.client_consent_expires
+    app.client_consent_expires = timezone.now() + timezone.timedelta(
+        hours=_consent_window_hours()
+    )
+    app.save(update_fields=["client_consent_expires", "updated_at"])
+
+    _audit_transition(
+        app,
+        actor=agent_sub,
+        action="credits.workflow.consent_renewed",
+        etape="relance_consentement",
+        ancienneEcheance=ancienne.isoformat() if ancienne else None,
+        nouvelleEcheance=app.client_consent_expires.isoformat(),
+        fenetreHeures=_consent_window_hours(),
+    )
+    _notify_client_consent_needed(app)
 
 
 # ── Sérialiseur de dossier ─────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ urlpatterns = [
     path("applications/<str:code>/adjourn/", views.adjourn_application),
     path("applications/<str:code>/reopen-analysis/", views.reopen_analysis),
     path("applications/<str:code>/client-consent/", views.client_consent),
+    path("applications/<str:code>/renew-consent/", views.renew_client_consent),
     # Décaissement (Étape 6)
     path("applications/<str:code>/disbursement/", views.disbursement_detail),
     path("applications/<str:code>/disbursement/request/", views.request_disbursement_view),
