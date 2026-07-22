@@ -13,7 +13,7 @@ from audit.services import record as audit_record
 
 from .models import DASHBOARD_VIEWS, RoleOverride, StaffProfile
 from .permissions import HasCapability
-from .role_registry import CAPABILITIES, ROLE_REGISTRY, get_role
+from .role_registry import CAPABILITIES, ROLE_REGISTRY, canonical_role_id, get_role
 
 
 @api_view(["GET"])
@@ -192,7 +192,27 @@ def user_detail(request, sub):
         )
     data = request.data or {}
     if "role" in data:
-        user.role = data["role"]
+        # Le champ `accounts.FintechUser.role` est un CharField libre : rien n'empêchait
+        # d'y écrire « auditeur », « caissier » ou une faute de frappe. `get_role()` les
+        # faisait alors retomber sur `client` — l'utilisateur perdait tout accès interne
+        # sans qu'aucun écran ne le dise. On refuse l'écriture à la source (principe 6 :
+        # tout nouveau code rejoint le référentiel existant ou n'existe pas), et on
+        # canonicalise les alias de nomenclature connus plutôt que de les stocker tels
+        # quels. Un rôle personnalisé (`RoleOverride`) reste évidemment accepté.
+        demande = (data["role"] or "").strip()
+        canonique = canonical_role_id(demande)
+        if canonique is None and not RoleOverride.objects.filter(id=demande).exists():
+            return Response(
+                {"detail": (
+                    f"Rôle inconnu : « {demande} ». Utilisez un identifiant du registre "
+                    f"(GET /api/rbac/roles) — par exemple « aud_tech »/« aud_fin » pour "
+                    f"un auditeur, « gest_caisse »/« agent_cash » pour une fonction de "
+                    f"caisse. Un rôle non reconnu déclasserait l'utilisateur en client "
+                    f"lecture seule."
+                ), "code": "ROLE_INCONNU"},
+                status=400,
+            )
+        user.role = canonique or demande
         user.save(update_fields=["role"])
     profile, _ = StaffProfile.objects.get_or_create(user=user)
     if "zone" in data:

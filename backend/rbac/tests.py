@@ -1,6 +1,83 @@
 from __future__ import annotations
 
+from django.test import TestCase
+
 from common.testing import AuthedAPITestCase
+
+
+class RoleFallbackTests(TestCase):
+    """Le repli sur `client` doit être BRUYANT, et les alias de nomenclature résolus.
+
+    Le repli muet était le vrai danger : un rôle inconnu (faute de frappe, claim
+    IdP obsolète, nom de vue confondu avec un rôle) faisait de son porteur un
+    client lecture seule — `is_staff_role` à False, tous les gardes `IsStaff` le
+    traitant en externe — sans qu'aucune ligne de log ni aucun écran ne le dise.
+    """
+
+    def test_role_inconnu_retombe_sur_client_EN_LOGGANT(self):
+        from rbac.role_registry import get_role
+
+        with self.assertLogs("rbac.role_registry", level="WARNING") as journal:
+            role = get_role("chef-des-fleurs")
+
+        self.assertEqual(role.id, "client")
+        self.assertEqual(role.type, "Client")
+        trace = "\n".join(journal.output)
+        self.assertIn("chef-des-fleurs", trace)   # le rôle fautif est nommé
+        self.assertIn("client", trace)            # la conséquence est nommée
+
+    def test_auditeur_et_caissier_sont_des_alias_pas_des_clients(self):
+        """« auditeur » et « caissier » sont des VUES de tableau de bord, pas des
+        rôles. Reçus comme rôle, ils doivent résoudre vers le canonique — pas
+        déclasser en client un membre du personnel."""
+        from rbac.role_registry import get_role
+
+        for entree, attendu in (("auditeur", "aud_tech"), ("caissier", "agent_cash")):
+            with self.subTest(entree=entree):
+                with self.assertLogs("rbac.role_registry", level="WARNING") as journal:
+                    role = get_role(entree)
+                self.assertEqual(role.id, attendu)
+                self.assertNotEqual(role.type, "Client")
+                self.assertIn(attendu, "\n".join(journal.output))
+
+    def test_alias_caissier_ne_confere_pas_validate(self):
+        """`gest_caisse` porte `validate`, pas `agent_cash`. Une chaîne dont
+        personne n'a décidé le niveau ne doit pas hériter du plus élevé."""
+        from rbac.role_registry import get_role
+
+        self.assertFalse(get_role("caissier").validate)
+        self.assertTrue(get_role("caissier").disburse)
+
+    def test_role_connu_ne_logge_rien(self):
+        """Le bruit n'a de valeur que s'il est rare."""
+        import logging
+
+        from rbac.role_registry import get_role
+
+        with self.assertNoLogs("rbac.role_registry", level=logging.INFO):
+            self.assertEqual(get_role("gest_credit").id, "gest_credit")
+
+
+class RoleWriteValidationTests(AuthedAPITestCase):
+    """`accounts.FintechUser.role` est un CharField libre : la validation doit se
+    faire à l'écriture, sinon la divergence de nomenclature se réinstalle."""
+
+    def test_patch_role_inconnu_refuse(self):
+        self.login(role="gest_caisse", sub="u-40")
+        self.client.get("/api/rbac/me")
+        self.login(role="admin_it", sub="u-41")
+        res = self.client.patch("/api/rbac/users/u-40", {"role": "chef-des-fleurs"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["code"], "ROLE_INCONNU")
+
+    def test_patch_role_alias_est_canonicalise(self):
+        self.login(role="gest_caisse", sub="u-42")
+        self.client.get("/api/rbac/me")
+        self.login(role="admin_it", sub="u-43")
+        res = self.client.patch("/api/rbac/users/u-42", {"role": "auditeur"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        # Stocké canonique : la chaîne « auditeur » ne survit pas en base.
+        self.assertEqual(res.data["role"], "aud_tech")
 
 
 class RbacMeTests(AuthedAPITestCase):
