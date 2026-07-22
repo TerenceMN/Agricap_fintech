@@ -1,33 +1,77 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Helmet } from 'react-helmet';
 import { motion } from 'framer-motion';
 import Layout from '@/components/Layout';
-import { Card, CardHeader, CardTitle, CardContent, CardFooter } from '@/components/ui/card';
+import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Plus, Briefcase, SlidersHorizontal, Bell, ShieldAlert, BarChart2, Leaf, History } from 'lucide-react';
+import { AlertTriangle, Briefcase, FileText, Loader2, Plus } from 'lucide-react';
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { useToast } from '@/components/ui/use-toast';
 import { api } from '@/services/api';
 import { formatCurrency } from '@/lib/investorSpaceUtils';
 import { buildAllocationView } from '@/lib/investorSpaceWire';
+import PortfolioToolsDialog, { PORTFOLIO_TOOLS } from '@/components/investor-space/PortfolioTools';
+import GlobalReportDialog from '@/components/investor-space/GlobalReportDialog';
 
+/**
+ * GESTION DE PORTEFEUILLES.
+ *
+ * Sept boutons de cet écran appelaient `handleNotAvailable`, un toast « non
+ * disponible » : `Rapport Global`, `Rééquilibrer`, `Alertes`, `Risque`,
+ * `Benchmarks`, `Ind. ESG`, `Historique`. Il n'en reste aucun. Chaque bouton
+ * ouvre soit une mesure réelle, soit l'énoncé précis de la donnée qui manque —
+ * jamais une promesse qui se dérobe.
+ *
+ * Ce qui est RÉELLEMENT calculé, et par qui :
+ *
+ * - `Risque`, `Alertes`, `Rapport Global` lisent `GET /investments/metrics/mine`
+ *   (annexe D) : défaut en valeur ET en nombre, concentration de Herfindahl sur
+ *   deux axes, part de projets en retard, score de santé avec sa formule et ses
+ *   paramètres réellement appliqués, valorisation position par position. Tout
+ *   cela est calculé SERVEUR sur le seul portefeuille du demandeur ; le front
+ *   affiche, convertit les unités déclarées, et n'en dérive rien ;
+ * - `Historique` lit `GET /investments/movements`, borné serveur aux mouvements
+ *   de l'investisseur ;
+ * - `Rééquilibrer` lit `GET /investments/portfolio-allocation` et compare la
+ *   répartition réelle à une cible SAISIE — sans aucun bouton d'exécution,
+ *   parce qu'aucun endpoint ne déplace d'argent entre poches ;
+ * - `Ind. ESG` et `Benchmarks` n'affichent aucun score : la donnée d'entrée
+ *   n'existe pas dans l'institution (`Project.impact_esg` est un texte libre,
+ *   aucun indice de référence n'est collecté). Les deux écrans disent ce qui
+ *   manque, comment ce serait alimenté, et le contrat serveur à créer.
+ *
+ * `GET /investments/metrics/portfolio` — la vue institution — n'est PAS utilisée
+ * ici : elle est refusée en 403 à un client, et à juste titre. Combler un trou
+ * de l'espace investisseur avec des chiffres d'institution serait une fuite.
+ */
 const COLORS = ['#10b981', '#3b82f6', '#f59e0b'];
 
 const Portfolios = () => {
   const { toast } = useToast();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [subPortfolios, setSubPortfolios] = useState([]);
   const [subscriptions, setSubscriptions] = useState([]);
   const [allocation, setAllocation] = useState(null);
+  const [metrics, setMetrics] = useState(null);
+  const [metricsError, setMetricsError] = useState(null);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [newDescription, setNewDescription] = useState('');
   const [saving, setSaving] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [tool, setTool] = useState(null);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
+      // Les métriques sont chargées à part : leur absence (pas de profil
+      // investisseur, par exemple) ne doit pas vider l'écran des portefeuilles,
+      // mais elle doit se voir là où elle empêche une mesure.
       const [portfolios, subs, alloc] = await Promise.all([
         api.investments.subPortfolios.list(),
         api.investments.subscriptions.mine(),
@@ -36,12 +80,24 @@ const Portfolios = () => {
       setSubPortfolios(portfolios);
       setSubscriptions(subs);
       setAllocation(alloc);
+      try {
+        setMetrics(await api.investments.metrics.mine());
+        setMetricsError(null);
+      } catch (err) {
+        setMetrics(null);
+        setMetricsError(err.message || 'Métriques de portefeuille indisponibles.');
+      }
     } catch (err) {
-      toast({ title: 'Erreur', description: err.message || 'Chargement impossible.', variant: 'destructive' });
+      setError({
+        message: err.message || 'Chargement impossible.',
+        errors: err.errors ?? [],
+      });
+    } finally {
+      setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => { loadData(); }, []);
+  useEffect(() => { loadData(); }, [loadData]);
 
   const handleCreate = async () => {
     if (!newName.trim()) return;
@@ -60,11 +116,6 @@ const Portfolios = () => {
     }
   };
 
-  const handleNotAvailable = (label) => toast({
-    title: label,
-    description: "Non disponible : aucune fonctionnalité correspondante côté serveur pour le moment.",
-  });
-
   // `bonds` additionnait les souscriptions ENCAISSÉES et des positions
   // obligataires à montant saisi libre, sous un libellé unique. Deux natures,
   // deux parts : le total ne bouge pas, sa composition devient lisible.
@@ -72,7 +123,62 @@ const Portfolios = () => {
   const totalAUM = allocationView.total;
   const allocationData = allocationView.slices;
 
-  const holdingsFor = (portfolioId) => subscriptions.filter(s => s.subPortfolioId === portfolioId);
+  const holdingsFor = (portfolioId) => subscriptions.filter((s) => s.subPortfolioId === portfolioId);
+
+  const ToolButtons = ({ subPortfolio }) => (
+    <div className="grid grid-cols-3 gap-2">
+      {PORTFOLIO_TOOLS.map((t) => (
+        <Button
+          key={t.key}
+          variant="outline"
+          size="sm"
+          className="w-full text-xs"
+          onClick={() => setTool({ key: t.key, subPortfolio })}
+        >
+          <t.icon className="w-3 h-3 mr-1" /> {t.label}
+        </Button>
+      ))}
+    </div>
+  );
+
+  if (loading) {
+    return (
+      <Layout>
+        <Helmet><title>Mes Portefeuilles - AGRICAP</title></Helmet>
+        <div className="flex items-center justify-center h-96 text-slate-400 gap-3">
+          <Loader2 className="w-6 h-6 animate-spin" /> Chargement de vos portefeuilles…
+        </div>
+      </Layout>
+    );
+  }
+
+  if (error) {
+    return (
+      <Layout>
+        <Helmet><title>Mes Portefeuilles - AGRICAP</title></Helmet>
+        <Card className="glass-effect border-red-500/40 max-w-2xl">
+          <CardHeader>
+            <CardTitle className="text-red-300 flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5" /> Portefeuilles indisponibles
+            </CardTitle>
+            <CardDescription className="text-red-200/80">{error.message}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {error.errors.length > 0 && (
+              <ul className="space-y-1 text-sm text-red-200">
+                {error.errors.map((e, i) => (
+                  <li key={`${e.code}-${i}`}>
+                    <span className="font-mono text-xs text-red-300">{e.code}</span> — {e.message}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <Button variant="outline" className="border-red-500/40" onClick={loadData}>Réessayer</Button>
+          </CardContent>
+        </Card>
+      </Layout>
+    );
+  }
 
   return (
     <Layout>
@@ -84,7 +190,9 @@ const Portfolios = () => {
             <p className="text-gray-400">Vos sous-portefeuilles et la répartition globale de vos actifs.</p>
         </motion.div>
         <div className="flex gap-2">
-            <Button variant="outline" onClick={() => handleNotAvailable('Rapport Global (PDF)')}>Rapport Global</Button>
+            <Button variant="outline" onClick={() => setReportOpen(true)}>
+              <FileText className="w-4 h-4 mr-2" /> Rapport Global
+            </Button>
             <Button className="bg-gradient-to-r from-emerald-500 to-blue-600" onClick={() => setIsCreateOpen(true)}>
                 <Plus className="w-4 h-4 mr-2"/> Créer Portefeuille
             </Button>
@@ -124,6 +232,28 @@ const Portfolios = () => {
         </Card>
       )}
 
+      {/* Les six outils sont aussi accessibles hors de toute poche : les mesures
+          servies portent sur le portefeuille ENTIER, pas sur un sous-portefeuille
+          — et un investisseur qui n'en a créé aucun y a droit comme les autres. */}
+      <Card className="glass-effect mb-8">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-white text-lg">Analyse de votre portefeuille</CardTitle>
+          <CardDescription>
+            Mesures calculées par le serveur sur vos seules souscriptions — avec leur base, leur
+            effectif et leur méthode. Aucun chiffre n’est recomposé par cet écran.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <ToolButtons subPortfolio={null} />
+          {metricsError && (
+            <p className="text-xs text-amber-300">
+              Métriques indisponibles : {metricsError} — « Risque », « Alertes » et « Ind. ESG »
+              le diront plutôt que d’afficher des zéros.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {subPortfolios.length === 0 && (
           <Card className="glass-effect lg:col-span-2">
@@ -153,20 +283,34 @@ const Portfolios = () => {
                         ) : (
                           <p className="text-xs text-slate-400">{holdings.length} souscription(s) rattachée(s)</p>
                         )}
-                        <div className="grid grid-cols-3 gap-2">
-                            <Button variant="outline" size="sm" onClick={() => handleNotAvailable('Rééquilibrage')} className="w-full text-xs"><SlidersHorizontal className="w-3 h-3 mr-1"/> Rééquilibrer</Button>
-                            <Button variant="outline" size="sm" onClick={() => handleNotAvailable('Alertes')} className="w-full text-xs"><Bell className="w-3 h-3 mr-1"/> Alertes</Button>
-                            <Button variant="outline" size="sm" onClick={() => handleNotAvailable('Analyse de Risque (VaR)')} className="w-full text-xs"><ShieldAlert className="w-3 h-3 mr-1"/> Risque</Button>
-                            <Button variant="outline" size="sm" onClick={() => handleNotAvailable('Benchmarks')} className="w-full text-xs"><BarChart2 className="w-3 h-3 mr-1"/> Benchmarks</Button>
-                            <Button variant="outline" size="sm" onClick={() => handleNotAvailable('Score ESG')} className="w-full text-xs"><Leaf className="w-3 h-3 mr-1"/> Ind. ESG</Button>
-                            <Button variant="outline" size="sm" onClick={() => handleNotAvailable('Historique des transactions')} className="w-full text-xs"><History className="w-3 h-3 mr-1"/> Historique</Button>
-                        </div>
+                        <ToolButtons subPortfolio={p} />
                     </CardContent>
                 </Card>
             </motion.div>
           );
         })}
       </div>
+
+      <PortfolioToolsDialog
+        tool={tool?.key ?? null}
+        open={Boolean(tool)}
+        onOpenChange={(open) => { if (!open) setTool(null); }}
+        metrics={metrics}
+        metricsError={metricsError}
+        allocationView={allocationView}
+        subscriptions={subscriptions}
+        subPortfolio={tool?.subPortfolio ?? null}
+      />
+
+      <GlobalReportDialog
+        open={reportOpen}
+        onOpenChange={setReportOpen}
+        metrics={metrics}
+        metricsError={metricsError}
+        allocationView={allocationView}
+        subPortfoliosCount={subPortfolios.length}
+        subscriptionsCount={subscriptions.length}
+      />
 
       <Dialog open={isCreateOpen} onOpenChange={setIsCreateOpen}>
         <DialogContent className="bg-slate-900 border-slate-700 text-white">
