@@ -744,7 +744,18 @@ export interface PerformanceReport {
   forecastCosts: number;
   actualProduction: number;
   forecastProduction: number;
+  /** Écart de REVENU — nom historique, identique à `revenueDeviationPercent`. */
   deviationPercent: number;
+  revenueDeviationPercent: number;
+  costDeviationPercent: number;
+  productionDeviationPercent: number;
+  /** SENS de chaque écart, décidé par le serveur. Un écart de +20 % sur les coûts
+   *  et un écart de +20 % sur le revenu ont la même forme et le sens inverse :
+   *  l'écran lit ce booléen, il ne rejoue pas la règle métier. */
+  unfavorable: { revenue: boolean; costs: boolean; production: boolean };
+  /** Une prévision a-t-elle été posée ? Sans elle, un écart de 0 % ne veut pas
+   *  dire « conforme », il veut dire « rien à comparer ». */
+  hasForecast: { revenue: boolean; costs: boolean; production: boolean };
   deviationComments: string;
   validationStatus: string;
   validatedBy: string;

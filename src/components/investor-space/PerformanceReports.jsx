@@ -8,6 +8,43 @@ import { api } from '@/services/api';
 import { formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
 import { formatPercent } from '@/lib/investorSpaceWire';
 
+/**
+ * Un poste du rapport : réalisé, prévu, écart.
+ *
+ * Trois choses viennent du serveur et ne se rejouent pas ici :
+ *
+ * - **l'écart** (`revenueDeviationPercent`, `costDeviationPercent`,
+ *   `productionDeviationPercent`), calculé et FIGÉ à la soumission du rapport —
+ *   c'est le chiffre qui déclenche l'observation de risque, et deux formules pour
+ *   une grandeur, c'est un incident de données en germe ;
+ * - **le sens** (`unfavorable`) : +20 % sur les coûts et +20 % sur le revenu ont
+ *   la même forme et le sens INVERSE. La règle est métier, elle vit au serveur,
+ *   l'écran lit un booléen ;
+ * - **l'existence d'une prévision** (`hasForecast`) : sans prévision posée, un
+ *   écart de 0 % ne dit pas « conforme », il dit « rien à comparer ». Afficher
+ *   « 0,00 % » serait une conformité inventée.
+ */
+export const DeviationBlock = ({ label, actual, forecast, deviation, unfavorable, hasForecast, format }) => (
+  <div className="p-4 bg-slate-900 rounded border border-slate-700">
+    <p className="text-xs text-slate-400 mb-3">{label}</p>
+    <div className="flex items-baseline justify-between mb-2 gap-3">
+      <span className="text-2xl font-bold text-white">{format(actual)}</span>
+      <span className="text-sm text-slate-500">Prévu : {hasForecast ? format(forecast) : '—'}</span>
+    </div>
+    {!hasForecast ? (
+      <p className="text-sm text-slate-500">Aucune prévision posée : il n’y a pas d’écart à mesurer.</p>
+    ) : (
+      <div className={`flex items-center gap-2 text-sm ${unfavorable ? 'text-red-400' : 'text-emerald-400'}`}>
+        {deviation >= 0 ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
+        <span>
+          {deviation >= 0 ? '+' : ''}{formatPercent(deviation)} vs prévision
+          {unfavorable ? ' — défavorable' : ''}
+        </span>
+      </div>
+    )}
+  </div>
+);
+
 const PerformanceReports = ({ projectCode, projectName }) => {
   const { toast } = useToast();
   const [reports, setReports] = useState([]);
@@ -38,18 +75,8 @@ const PerformanceReports = ({ projectCode, projectName }) => {
         <p className="text-sm text-slate-400">{projectName} - {reports.length} rapport(s) disponible(s)</p>
       </div>
 
-      {reports.map((report) => {
-        // `deviationPercent` est l'écart de REVENU calculé et figé par le serveur
-        // à la soumission du rapport (`services.submit_performance_report`) — le
-        // même chiffre qui déclenche l'observation de risque au-delà de 10 %.
-        // Le recalculer ici produisait un second chiffre pour la même grandeur,
-        // qui aurait divergé au premier changement de formule côté serveur.
-        const revDeviation = report.deviationPercent;
-        // Aucun écart de COÛTS n'est servi : il n'est donc pas affiché. Les deux
-        // montants, réalisé et prévu, restent lisibles côte à côte.
-
-        return (
-          <Card key={report.id} className="bg-slate-800 border-slate-700">
+      {reports.map((report) => (
+        <Card key={report.id} className="bg-slate-800 border-slate-700">
             <CardHeader>
               <div className="flex items-center justify-between">
                 <CardTitle className="text-lg">{report.reportingPeriod || '-'}</CardTitle>
@@ -65,46 +92,34 @@ const PerformanceReports = ({ projectCode, projectName }) => {
             </CardHeader>
 
             <CardContent className="space-y-6">
-              {/* Financial Performance */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="p-4 bg-slate-900 rounded border border-slate-700">
-                  <p className="text-xs text-slate-400 mb-3">Revenus</p>
-                  <div className="flex items-baseline justify-between mb-2">
-                    <span className="text-2xl font-bold text-white">{formatCurrency(report.actualRevenue)}</span>
-                    <span className="text-sm text-slate-500">Prévu: {formatCurrency(report.forecastRevenue)}</span>
-                  </div>
-                  {revDeviation === null || revDeviation === undefined ? (
-                    <p className="text-sm text-slate-500">Écart non communiqué.</p>
-                  ) : (
-                    <div className={`flex items-center gap-2 text-sm ${revDeviation >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {revDeviation >= 0 ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
-                      <span>{revDeviation >= 0 ? '+' : ''}{formatPercent(revDeviation)} vs prévision</span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="p-4 bg-slate-900 rounded border border-slate-700">
-                  <p className="text-xs text-slate-400 mb-3">Coûts</p>
-                  <div className="flex items-baseline justify-between mb-2">
-                    <span className="text-2xl font-bold text-white">{formatCurrency(report.actualCosts)}</span>
-                    <span className="text-sm text-slate-500">Prévu: {formatCurrency(report.forecastCosts)}</span>
-                  </div>
-                  {/* Le serveur ne calcule d'écart que sur le revenu. En dériver
-                      un ici pour les coûts donnerait un chiffre dont personne ne
-                      garantit la formule, à côté d'un autre qui vient du serveur. */}
-                  <p className="text-xs text-slate-500">
-                    Aucun écart de coûts n’est calculé par le serveur : comparez les deux montants.
-                  </p>
-                </div>
-              </div>
-
-              {/* Production */}
-              <div className="p-4 bg-slate-900 rounded border border-slate-700">
-                <p className="text-xs text-slate-400 mb-2">Production Réalisée</p>
-                <div className="flex items-baseline justify-between">
-                  <span className="text-lg font-bold text-white">{report.actualProduction}</span>
-                  <span className="text-sm text-slate-500">Prévu: {report.forecastProduction}</span>
-                </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <DeviationBlock
+                  label="Revenus"
+                  actual={report.actualRevenue}
+                  forecast={report.forecastRevenue}
+                  deviation={report.revenueDeviationPercent ?? report.deviationPercent}
+                  unfavorable={report.unfavorable?.revenue}
+                  hasForecast={report.hasForecast?.revenue}
+                  format={formatCurrency}
+                />
+                <DeviationBlock
+                  label="Coûts"
+                  actual={report.actualCosts}
+                  forecast={report.forecastCosts}
+                  deviation={report.costDeviationPercent}
+                  unfavorable={report.unfavorable?.costs}
+                  hasForecast={report.hasForecast?.costs}
+                  format={formatCurrency}
+                />
+                <DeviationBlock
+                  label="Production réalisée"
+                  actual={report.actualProduction}
+                  forecast={report.forecastProduction}
+                  deviation={report.productionDeviationPercent}
+                  unfavorable={report.unfavorable?.production}
+                  hasForecast={report.hasForecast?.production}
+                  format={(value) => (value ?? 0).toLocaleString('fr-FR')}
+                />
               </div>
 
               {/* Comments */}
@@ -146,9 +161,8 @@ const PerformanceReports = ({ projectCode, projectName }) => {
                 </div>
               )}
             </CardContent>
-          </Card>
-        );
-      })}
+        </Card>
+      ))}
     </div>
   );
 };
