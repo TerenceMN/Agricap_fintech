@@ -165,11 +165,25 @@ def set_expert_valuation(*, project: Project, amount, valuation_date, source: st
 def create_offer(*, project: Project, code: str, coupon_rate: Decimal | str, maturity_months: int,
                   min_ticket: Decimal | str, available_bonds: int, funding_goal: Decimal | str = "0",
                   min_funding_amount: Decimal | str | None = None, oversubscription_policy: str = "",
-                  subscription_deadline=None, by: str = "") -> Offer:
+                  subscription_deadline=None, type_of_title: str = "", by: str = "") -> Offer:
     """Crée une offre. Le plancher de min-funding, s'il n'est pas donné, est dérivé du
-    ratio paramétré en base — jamais d'un nombre écrit dans le code."""
+    ratio paramétré en base — jamais d'un nombre écrit dans le code.
+
+    `type_of_title` gouverne la MÉTHODE DE VALORISATION de toutes les positions issues
+    de cette offre (`metrics._valuation`) : une obligation se valorise au pair avec ses
+    intérêts courus, une action ou une part sociale par expertise datée. Il n'était pas
+    exposé ici : aucune offre en titres de capital ne pouvait donc naître par l'API, et
+    la branche « expertise » de la valorisation était inatteignable en production. Une
+    offre créée sans précision reste une obligation, comme avant.
+    """
     if Offer.objects.filter(code=code).exists():
         raise ValidationFailed(f"Le code offre « {code} » existe déjà.")
+    titre = type_of_title or Offer.TypeOfTitle.OBLIGATION
+    if titre not in Offer.TypeOfTitle.values:
+        raise ValidationFailed(
+            f"Type de titre inconnu : « {titre} ». Valeurs admises : "
+            f"{', '.join(Offer.TypeOfTitle.values)}."
+        )
     goal = to_decimal(funding_goal)
     cfg = InvestmentConfig.active()
     if min_funding_amount in (None, ""):
@@ -185,13 +199,15 @@ def create_offer(*, project: Project, code: str, coupon_rate: Decimal | str, mat
     if politique not in Offer.Oversubscription.values:
         raise ValidationFailed(f"Politique de sursouscription inconnue : « {politique} ».")
     offer = Offer.objects.create(
-        project=project, code=code, coupon_rate=to_decimal(coupon_rate), maturity_months=maturity_months,
+        project=project, code=code, type_of_title=titre,
+        coupon_rate=to_decimal(coupon_rate), maturity_months=maturity_months,
         min_ticket=to_decimal(min_ticket), available_bonds=available_bonds, max_bonds=available_bonds,
         funding_goal=goal, min_funding_amount=plancher, oversubscription_policy=politique,
         subscription_deadline=to_date(subscription_deadline),
     )
     audit_record(actor=by, action="investments.offer.create", entity_type="Offer", entity_id=offer.code,
-                 details={"fundingGoal": str(goal), "minFunding": str(plancher), "policy": politique})
+                 details={"fundingGoal": str(goal), "minFunding": str(plancher), "policy": politique,
+                          "typeOfTitle": titre})
     return offer
 
 

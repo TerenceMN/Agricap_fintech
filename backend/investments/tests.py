@@ -1962,6 +1962,48 @@ class ProjectCreationTests(AuthedAPITestCase):
                                    min_ticket="0", available_bonds=10, funding_goal="1000",
                                    min_funding_amount="2000", by="u")
 
+    def test_offre_en_titres_de_capital_creable_par_lapi(self):
+        """Sans ce paramètre, la branche « expertise » de la valorisation était morte."""
+        p = make_project("OFF-ACT")
+        offre = services.create_offer(project=p, code="OFR-ACT", coupon_rate="0",
+                                       maturity_months=36, min_ticket="0", available_bonds=10,
+                                       funding_goal="1000", type_of_title="ACTION", by="u")
+        self.assertEqual(offre.type_of_title, Offer.TypeOfTitle.ACTION)
+
+    def test_offre_sans_precision_reste_une_obligation(self):
+        p = make_project("OFF-DEF")
+        offre = services.create_offer(project=p, code="OFR-DEF", coupon_rate="9",
+                                       maturity_months=24, min_ticket="0", available_bonds=10,
+                                       funding_goal="1000", by="u")
+        self.assertEqual(offre.type_of_title, Offer.TypeOfTitle.OBLIGATION)
+
+    def test_type_de_titre_inconnu_refuse(self):
+        p = make_project("OFF-BAD3")
+        with self.assertRaises(ValidationFailed):
+            services.create_offer(project=p, code="OFR-BAD3", coupon_rate="9", maturity_months=24,
+                                   min_ticket="0", available_bonds=10, funding_goal="1000",
+                                   type_of_title="OBLIGATION_CONVERTIBLE", by="u")
+
+    def test_chaine_complete_action_expertise_valorisation(self):
+        """De la création de l'offre à la valeur affichée — le chemin qui était coupé."""
+        inv = make_investor("chain-1")
+        p = advance_to(make_project("CHAIN-1"), S.P05)
+        services.create_offer(project=p, code="OFR-CHAIN", coupon_rate="0", maturity_months=36,
+                               min_ticket="0", available_bonds=100, funding_goal="10000",
+                               type_of_title="ACTION", by="mgr")
+        services.clear_conditions(project=p, by="dg", note="Attestation reçue.")
+        p.refresh_from_db()
+        p = services.transition_status(project=p, to_status=S.P06, by="dg",
+                                        reason="Conditions levées, offre publiée.")
+        sub = funding.reserve(investor=inv, offer_id=p.offers.first().pk, bonds=80,
+                               idempotency_key="chain", by="chain-1")
+        funding.settle(subscription=sub, idempotency_key="schain", by="caisse")
+        services.set_expert_valuation(project=p, amount="12000", valuation_date=date.today(),
+                                       source="Cabinet Mbuji", by="dg")
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertIn(metrics.VALUATION_EXPERT, val["byMethod"])
+        self.assertEqual(val["totalValue"], 12000.0)   # 8 000 au pair + 4 000 latents
+
     def test_politique_de_sursouscription_inconnue_refusee(self):
         p = make_project("OFF-2")
         with self.assertRaises(ValidationFailed):

@@ -192,6 +192,13 @@ def project_expert_valuation(request, code):
     C'est le seul intrant de la valorisation des titres de capital : sans elle,
     `metrics` retombe au pair et l'annonce. Acte de personnel — un investisseur ne
     valorise pas lui-même la ligne qu'il détient.
+
+    **Endpoint sans bouton, documenté comme l'exige CLAUDE.md §7.2.** Aucun écran ne
+    l'appelle aujourd'hui : l'onglet back-office qui saisirait une expertise (montant,
+    date, cabinet) reste à construire, et il est hors du périmètre investisseur. Tant
+    qu'il n'existe pas, toute position en titres de capital reste valorisée
+    `PAIR_FAUTE_D_EXPERTISE` — ce qui est honnête, mais ce n'est pas une valorisation.
+    Le trou est côté écran, pas côté serveur.
     """
     project = Project.objects.filter(code=code).first()
     if not project:
@@ -294,7 +301,7 @@ def offers(request):
         project=project, code=data.get("code", ""), coupon_rate=data.get("couponRate", "0"),
         maturity_months=data.get("maturityMonths", 24), min_ticket=data.get("minTicket", "0"),
         available_bonds=data.get("availableBonds", 0), funding_goal=data.get("fundingGoal", "0"),
-        by=getattr(request.user, "sub", ""),
+        type_of_title=data.get("typeOfTitle", ""), by=getattr(request.user, "sub", ""),
     )
     return Response(serializers.offer_row(offer), status=201)
 
