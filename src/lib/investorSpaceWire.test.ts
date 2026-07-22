@@ -33,6 +33,7 @@ import type {
 import {
   UNIT_FRACTION,
   UNIT_PERCENT,
+  buildAllocationView,
   buildExposureBars,
   buildOpenOfferCards,
   buildPipelineStages,
@@ -880,5 +881,66 @@ describe('formatPercent — un seul formateur, séparateur fr-FR', () => {
 
   it('préserve le signe d’un rendement négatif', () => {
     expect(formatPercent(-4.2)).toBe('-4,20 %');
+  });
+});
+
+// ── Allocation : deux natures d'obligation ───────────────────────────────────
+
+describe('buildAllocationView — additionner de l’encaissé et du déclaré est un incident', () => {
+  const alloc = {
+    bonds: 8000, cash: 1200, stocks: 0,
+    bondsFromSubscriptions: 5000, bondsFromObligationPositions: 3000,
+    obligationPositionsCount: 2, reconciliationWarning: null,
+  };
+
+  it('sépare les souscriptions encaissées des positions déclarées', () => {
+    const vue = buildAllocationView(alloc);
+
+    expect(vue.slices.map((s) => s.name)).toEqual([
+      'Souscriptions encaissées', 'Positions obligataires', 'Cash',
+    ]);
+    expect(vue.slices.find((s) => s.basis === 'settled')!.value).toBe(5000);
+    expect(vue.slices.find((s) => s.basis === 'declared')!.value).toBe(3000);
+  });
+
+  it('conserve le total servi — la somme ne change pas, sa composition se lit', () => {
+    // `bonds` valait 8 000 : la ventilation ne déplace pas un franc, elle dit
+    // seulement que 3 000 d'entre eux ne sont jamais passés par un encaissement.
+    expect(buildAllocationView(alloc).total).toBe(8000 + 1200);
+  });
+
+  it('affiche l’avertissement de rapprochement quand le serveur en pose un', () => {
+    const avertissement = 'Les positions obligataires sont absentes de totalInvested.';
+    const vue = buildAllocationView({ ...alloc, reconciliationWarning: avertissement });
+
+    expect(vue.reconciliationWarning).toBe(avertissement);
+  });
+
+  it('ne signale rien quand il n’y a rien à signaler', () => {
+    expect(buildAllocationView(alloc).reconciliationWarning).toBeNull();
+  });
+
+  it('n’attribue rien arbitrairement si le serveur ne ventile pas', () => {
+    // Serveur antérieur à la ventilation : une seule barre, et la note dit
+    // qu'elle peut mêler deux natures. Deviner la répartition serait pire.
+    const vue = buildAllocationView({ bonds: 8000, cash: 0, stocks: 0 });
+
+    expect(vue.slices.map((s) => s.name)).toEqual(['Obligations']);
+    expect(vue.slices[0].note).toContain('Composition non servie');
+  });
+
+  it('masque les parts nulles sans masquer leur existence conceptuelle', () => {
+    // « Actions » à 0 ne s'affiche pas dans le graphique — mais aucune valeur
+    // n'est inventée pour lui donner une part.
+    const vue = buildAllocationView(alloc);
+
+    expect(vue.slices.some((s) => s.name === 'Actions')).toBe(false);
+    expect(vue.slices.every((s) => s.value > 0)).toBe(true);
+  });
+
+  it('rend une vue vide sur une allocation absente', () => {
+    expect(buildAllocationView(null)).toEqual({
+      slices: [], total: 0, reconciliationWarning: null,
+    });
   });
 });

@@ -12,6 +12,7 @@ import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { useToast } from '@/components/ui/use-toast';
 import { api } from '@/services/api';
 import { formatCurrency } from '@/lib/investorSpaceUtils';
+import { buildAllocationView } from '@/lib/investorSpaceWire';
 
 const COLORS = ['#10b981', '#3b82f6', '#f59e0b'];
 
@@ -64,12 +65,12 @@ const Portfolios = () => {
     description: "Non disponible : aucune fonctionnalité correspondante côté serveur pour le moment.",
   });
 
-  const totalAUM = (allocation?.bonds || 0) + (allocation?.cash || 0) + (allocation?.stocks || 0);
-  const allocationData = allocation ? [
-    { name: 'Obligations', value: allocation.bonds },
-    { name: 'Cash', value: allocation.cash },
-    { name: 'Actions', value: allocation.stocks },
-  ].filter(d => d.value > 0) : [];
+  // `bonds` additionnait les souscriptions ENCAISSÉES et des positions
+  // obligataires à montant saisi libre, sous un libellé unique. Deux natures,
+  // deux parts : le total ne bouge pas, sa composition devient lisible.
+  const allocationView = buildAllocationView(allocation);
+  const totalAUM = allocationView.total;
+  const allocationData = allocationView.slices;
 
   const holdingsFor = (portfolioId) => subscriptions.filter(s => s.subPortfolioId === portfolioId);
 
@@ -101,13 +102,27 @@ const Portfolios = () => {
                       <Pie data={allocationData} cx="50%" cy="50%" innerRadius={20} outerRadius={35} dataKey="value">
                         {allocationData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
                       </Pie>
-                      <Tooltip formatter={(v) => formatCurrency(v)} contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px', fontSize: '12px' }} />
+                      <Tooltip
+                        formatter={(v, _n, entry) => [formatCurrency(v), entry?.payload?.name]}
+                        labelFormatter={() => ''}
+                        contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px', fontSize: '12px' }}
+                      />
                     </PieChart>
                   </ResponsiveContainer>
                 ) : <p className="text-xs text-slate-500">Aucun actif.</p>}
               </CardContent>
             </Card>
       </div>
+
+      {/* Rapprochement : le serveur signale quand deux écrans afficheront deux
+          « investi » différents pour le même investisseur. On l'affiche. */}
+      {allocationView.reconciliationWarning && (
+        <Card className="glass-effect border-amber-500/40 mb-8">
+          <CardContent className="p-4 text-sm text-amber-200">
+            {allocationView.reconciliationWarning}
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {subPortfolios.length === 0 && (

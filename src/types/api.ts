@@ -403,8 +403,21 @@ export interface InvestmentMovement {
 }
 
 export interface PortfolioAllocation {
+  /** Total historique — additionne DEUX grandeurs qui ne se valent pas (voir la
+   *  ventilation ci-dessous). Conservé pour compatibilité ; à ne pas afficher
+   *  seul sous le libellé « obligations ». */
   bonds: number;
+  /** Argent reçu et comptabilisé (B10), rapprochable d'une pièce. */
+  bondsFromSubscriptions?: number;
+  /** Positions obligataires à montant saisi libre, aux termes issus des défauts
+   *  du modèle, rattachées à aucune offre : jamais passées par un encaissement. */
+  bondsFromObligationPositions?: number;
+  obligationPositionsCount?: number;
+  /** Non nul = deux écrans afficheront deux « investi » pour le même
+   *  investisseur. À afficher, pas à taire. */
+  reconciliationWarning?: string | null;
   cash: number;
+  /** Aucun produit actions n'existe encore : trou produit assumé, pas inventé. */
   stocks: number;
 }
 

@@ -707,3 +707,99 @@ export function unmeasurableFrom(metrics: InvestorMetrics): MissingMetric[] {
   }
   return trous;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Allocation d'actifs — deux natures d'obligation, jamais une seule barre
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface AllocationSlice {
+  name: string;
+  value: number;
+  /** Nature de la ligne : `settled` = argent encaissé et rapprochable d'une
+   *  pièce comptable ; `declared` = montant saisi, jamais encaissé. */
+  basis: 'settled' | 'declared' | 'cash' | 'none';
+  /** Précision affichée sous la part — la nature ne se devine pas d'un libellé. */
+  note: string;
+}
+
+export interface AllocationView {
+  slices: AllocationSlice[];
+  total: number;
+  /** Avertissement de rapprochement servi par le serveur, `null` s'il n'y a
+   *  rien à signaler. Non nul, il s'affiche : deux « investi » différents pour
+   *  le même investisseur sur deux écrans est un incident, pas un détail. */
+  reconciliationWarning: string | null;
+}
+
+/**
+ * Décompose l'allocation servie en parts de MÊME NATURE.
+ *
+ * `bonds` additionnait deux grandeurs incomparables sous un libellé unique : les
+ * souscriptions encaissées, dont chaque franc se rapproche d'une écriture, et
+ * les positions obligataires, dont le montant est saisi libre et dont les termes
+ * (coupon, taux, maturité) viennent des défauts du modèle sans être rattachés à
+ * une offre. Le total est conservé — c'est la même somme — mais il n'est plus
+ * présenté comme une seule chose.
+ *
+ * Aucun calcul métier ici : les deux composantes sont servies, on les sépare.
+ * Sur un serveur qui ne les sert pas encore, on retombe sur le total unique et
+ * la note le dit plutôt que d'attribuer arbitrairement les montants.
+ */
+export function buildAllocationView(
+  allocation: {
+    bonds: number; cash: number; stocks: number;
+    bondsFromSubscriptions?: number; bondsFromObligationPositions?: number;
+    obligationPositionsCount?: number; reconciliationWarning?: string | null;
+  } | null | undefined,
+): AllocationView {
+  if (!allocation) {
+    return { slices: [], total: 0, reconciliationWarning: null };
+  }
+  const ventile = allocation.bondsFromSubscriptions !== undefined
+    && allocation.bondsFromObligationPositions !== undefined;
+
+  const slices: AllocationSlice[] = [];
+  if (ventile) {
+    slices.push({
+      name: 'Souscriptions encaissées',
+      value: allocation.bondsFromSubscriptions ?? 0,
+      basis: 'settled',
+      note: 'Argent reçu et comptabilisé, rapprochable d’une pièce.',
+    });
+    slices.push({
+      name: 'Positions obligataires',
+      value: allocation.bondsFromObligationPositions ?? 0,
+      basis: 'declared',
+      note: `Montant déclaré, jamais encaissé${
+        allocation.obligationPositionsCount
+          ? ` · ${allocation.obligationPositionsCount} position(s)`
+          : ''}.`,
+    });
+  } else {
+    slices.push({
+      name: 'Obligations',
+      value: allocation.bonds,
+      basis: 'declared',
+      note: 'Composition non servie par le serveur : ce total peut mêler des '
+        + 'souscriptions encaissées et des positions déclarées.',
+    });
+  }
+  slices.push({
+    name: 'Cash',
+    value: allocation.cash,
+    basis: 'cash',
+    note: 'Solde disponible de vos portefeuilles.',
+  });
+  slices.push({
+    name: 'Actions',
+    value: allocation.stocks,
+    basis: 'none',
+    note: 'Aucun produit actions n’existe encore dans le système.',
+  });
+
+  return {
+    slices: slices.filter((s) => s.value > 0),
+    total: slices.reduce((sum, s) => sum + s.value, 0),
+    reconciliationWarning: allocation.reconciliationWarning ?? null,
+  };
+}

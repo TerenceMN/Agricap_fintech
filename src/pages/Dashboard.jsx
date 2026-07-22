@@ -7,6 +7,8 @@ import { useAuth } from '@/contexts/AuthContext.jsx';
 import StatCard from '@/components/StatCard';
 import MultiCurrencyDashboard from '@/components/dashboard/MultiCurrencyDashboard';
 import { api } from '@/services/api';
+import { formatCurrency } from '@/lib/investorSpaceUtils';
+import { buildAllocationView } from '@/lib/investorSpaceWire';
 import {
   DollarSign, TrendingUp, Landmark, Users, AlertTriangle, FileText, CheckCircle, Repeat,
   Wallet, Plus, ArrowRightLeft, ShieldCheck, Briefcase, Activity
@@ -133,18 +135,23 @@ const InvestorDashboard = () => {
     const navigate = useNavigate();
     const [stats, setStats] = useState([]);
     const [recentActivity, setRecentActivity] = useState([]);
-    const [portfolioData, setPortfolioData] = useState([]);
+    const [allocationView, setAllocationView] = useState({ slices: [], total: 0, reconciliationWarning: null });
 
     useEffect(() => {
         Promise.all([
             api.investments.subscriptions.mine().catch(() => []),
             api.investments.investors.me().catch(() => null),
             api.investments.portfolioAllocation().catch(() => null),
-        ]).then(([subs, investor, allocation]) => {
-            const totalInvested = subs.reduce((s, sub) => s + sub.amount, 0);
+            api.investments.metrics.mine().catch(() => null),
+        ]).then(([subs, investor, allocation, metrics]) => {
+            // « Total investi » sommait les montants RÉSERVÉS des souscriptions :
+            // des intentions comptées comme de l'argent placé, et un troisième
+            // chiffre pour une grandeur que l'espace investisseur affiche déjà.
+            // Il vient désormais de `GET /investments/metrics/mine`, qui ne
+            // compte que l'encaissé — une seule source, un seul chiffre.
             setStats([
                 { title: 'Souscriptions actives', value: subs.filter((s) => s.status === 'ACTIVE' || s.status === 'REPAYMENT').length, icon: Briefcase, gradient: 'from-blue-500 to-cyan-600' },
-                { title: 'Total investi', value: `$${totalInvested.toLocaleString()}`, icon: DollarSign, gradient: 'from-emerald-500 to-teal-600' },
+                { title: 'Total investi', value: metrics ? formatCurrency(metrics.totalInvested, metrics.currency) : 'N/D', icon: DollarSign, gradient: 'from-emerald-500 to-teal-600' },
                 { title: 'Statut KYC', value: investor?.kycStatus || 'N/D', icon: ShieldCheck, gradient: 'from-amber-500 to-orange-600' },
                 { title: 'Profil de risque', value: investor?.riskProfile || 'N/D', icon: TrendingUp, gradient: 'from-purple-500 to-indigo-600' },
             ]);
@@ -157,13 +164,7 @@ const InvestorDashboard = () => {
                         amount: s.amount, date: s.subscriptionDate, status: s.status,
                     })),
             );
-            if (allocation) {
-                setPortfolioData([
-                    { name: 'Obligations', value: allocation.bonds },
-                    { name: 'Cash', value: allocation.cash },
-                    { name: 'Actions', value: allocation.stocks },
-                ]);
-            }
+            setAllocationView(buildAllocationView(allocation));
         });
     }, []);
 
@@ -229,19 +230,32 @@ const InvestorDashboard = () => {
                 <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="glass-effect rounded-2xl p-6">
                     <h2 className="text-xl font-bold text-white mb-6">Allocation d'Actifs</h2>
                     <ResponsiveContainer width="100%" height={250}>
-                        <BarChart data={portfolioData} layout="vertical">
+                        <BarChart data={allocationView.slices} layout="vertical">
                              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)"/>
                              <XAxis type="number" stroke="#9ca3af" hide />
-                             <YAxis type="category" dataKey="name" stroke="#9ca3af" width={80} />
+                             <YAxis type="category" dataKey="name" stroke="#9ca3af" width={140} />
                              <Tooltip contentStyle={{ backgroundColor: 'rgba(30,41,59,0.9)', border: 'none' }} cursor={{fill: 'transparent'}} />
                              <Bar dataKey="value" radius={[0, 4, 4, 0]} barSize={30} label={{ position: 'right', fill: 'white' }} fill="#10b981" />
                         </BarChart>
                     </ResponsiveContainer>
-                    <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs">
-                        <div><span className="block w-3 h-3 bg-emerald-500 rounded-full mx-auto mb-1"></span>Obligations</div>
-                        <div><span className="block w-3 h-3 bg-blue-500 rounded-full mx-auto mb-1"></span>Actions</div>
-                        <div><span className="block w-3 h-3 bg-amber-500 rounded-full mx-auto mb-1"></span>Cash</div>
+                    {/* La nature de chaque part est écrite sous elle : « obligations »
+                        recouvrait de l'argent encaissé ET des montants déclarés. */}
+                    <div className="mt-4 space-y-2 text-xs">
+                        {allocationView.slices.length === 0 && (
+                            <p className="text-gray-500">Aucun actif à répartir.</p>
+                        )}
+                        {allocationView.slices.map((slice) => (
+                            <div key={slice.name}>
+                                <p className="text-gray-300">{slice.name}</p>
+                                <p className="text-gray-500">{slice.note}</p>
+                            </div>
+                        ))}
                     </div>
+                    {allocationView.reconciliationWarning && (
+                        <p className="mt-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200">
+                            {allocationView.reconciliationWarning}
+                        </p>
+                    )}
                 </motion.div>
             </div>
         </div>
