@@ -546,6 +546,14 @@ def _branch_dashboard(sub: str) -> dict[str, Any]:
         scope = _perimetre(
             "institution",
             "Institution entière.",
+            # Le régime de rattachement se déclare AUSSI quand il n'y en a pas :
+            # un front qui lit `scope.rattachement` pour choisir sa mention doit
+            # trouver une valeur ici plutôt qu'un trou, sans quoi le périmètre le
+            # plus large de tous serait le seul à ne rien annoncer.
+            # (`dossiers` n'est PAS servi ici : il compte les dossiers d'une
+            # agence, et il n'y a pas d'agence. Deux zéros seraient lus comme
+            # « aucun dossier » alors que la vue en sert toute l'institution.)
+            rattachement="indetermine",
             avertissement=(
                 "Aucune agence d'affectation trouvée pour votre compte : les chiffres "
                 "ci-dessous couvrent TOUTE l'institution, pas votre agence. Faites "

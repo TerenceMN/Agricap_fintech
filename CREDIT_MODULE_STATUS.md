@@ -251,7 +251,7 @@ Routes déclarées dans [credits/urls.py](backend/credits/urls.py), préfixe `/a
 | `POST` | `/api/credits/needs-sheet/parse/` | Upload + parsing feuille de besoins |
 | `GET` | `/api/credits/needs-sheet-template/` | Téléchargement template Excel — **accès public** (`@permission_classes([])`) |
 | `POST` | `/api/credits/simulate/` | Simulation scoring depuis données de référence |
-| `GET` | `/api/credits/applications/` | Liste des dossiers (rôle-dépendant) |
+| `GET` | `/api/credits/applications/` | Liste des dossiers (rôle-dépendant). Filtres : `status`, `client_sub` (staff), `value_chain_code`, `agency` (staff — code d'agence, ou `none` pour les dossiers sans rattachement) |
 | `GET` | `/api/credits/applications/<code>/` | Détail du dossier (sérialisation filtrée par rôle) |
 | `POST` | `/api/credits/applications/<code>/score/` | Re-scorer un dossier existant |
 | `POST` | `/api/credits/applications/<code>/submit/` | Soumission `draft` → `submitted` |
@@ -615,6 +615,44 @@ valeur retenue non nulle. Le gage effectif n'a lieu qu'à la **confirmation par 
 agent**, sous `select_for_update` — c'est là qu'est empêché le double gage.
 
 28 tests ajoutés, dont l'invariant « un actif ne peut être gagé deux fois ».
+
+### ✅ Résolu (juillet 2026) — rattachement dossier ↔ agence
+
+`CreditApplication` ne portait **aucun** lien vers une agence. « Les dossiers de
+mon agence » se déduisait donc des PERSONNES intervenues (`initiated_by_sub`,
+`submitted_by_sub`, `reviewed_by_sub`, `disbursed_by_sub`) : l'approximation
+ratait tout dossier repris par un collègue d'une autre agence, et en attrapait à
+l'inverse qui n'étaient pas les siens.
+
+| Élément | État |
+|---|---|
+| `CreditApplication.agency` (FK `agencies.Agency`, `null=True`, `PROTECT`) | ✅ migration `0013_creditapplication_agency` |
+| `resolve_agency_for_sub()` — règle UNIQUE (`StaffProfile.assignment`, puis `Agency.manager_sub`) | ✅ `credits/models.py` |
+| Renseignement à la création (`POST /applications/`), depuis l'agent, jamais depuis le payload | ✅ `credits/views.py` |
+| Périmètre `_branch_dashboard` : lien direct prioritaire, personnes en repli | ✅ `credits/dashboard.py` |
+| `scope.rattachement` (`exact` / `approche` / `mixte` / `indetermine`) + `scope.dossiers` | ✅ |
+| `agency` dans `serialize_application`, filtre `?agency=<code>` / `?agency=none` (staff) | ✅ |
+
+**Deux régimes cohabitent, et l'écran doit les distinguer** :
+
+- **exact** — le dossier porte `agency` : il est de cette agence, ou il ne l'est
+  pas. Aucune interprétation.
+- **approché** — le dossier n'a pas d'agence (antérieur au champ, ou déposé par
+  le client lui-même) : il est rattaché par les personnes intervenues, comme
+  avant. Sans ce repli, tous les dossiers antérieurs disparaîtraient de la vue
+  agence du jour au lendemain.
+
+**Le champ reste VIDE quand il est indéterminable** — jamais d'agence par défaut :
+elle gonflerait le portefeuille d'une agence qui n'a jamais vu le dossier, sans
+qu'aucun écran ne puisse le détecter. Un dossier sans agence reste visible dans
+TOUTES les vues (client, agent, agence, comité, direction, admin, liste API) ;
+`?agency=none` permet de lister cette population pour la corriger.
+
+**Non couvert** : un dossier créé par le client puis instruit par un agent ne
+reçoit pas d'agence rétroactivement — la prise en charge n'existe pas encore
+(§7.1.2 de `CLAUDE.md`, file d'instruction analyste). Il reste en régime approché.
+
+28 tests ajoutés ([credits/tests_agency.py](backend/credits/tests_agency.py)).
 
 ### Reste à faire sur les chantiers SPEC
 

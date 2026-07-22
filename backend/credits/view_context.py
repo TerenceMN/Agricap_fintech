@@ -67,6 +67,24 @@ _CLIENT_HIDDEN_FIELDS = {
     "approvalComment",    # commentaire interne
 }
 
+# `agency` n'est délibérément PAS dans cette liste — décision, pas oubli.
+#
+# Ce qui est masqué au client relève de deux familles : les identifiants des
+# PERSONNES qui ont manipulé son dossier (`*BySub`, `approvalComment`) et les
+# paramètres du MOTEUR (`scoreResult`, principe 7 : ni barèmes, ni seuils, ni
+# plages). L'agence d'instruction n'est ni l'un ni l'autre : c'est le guichet où
+# le client s'est présenté, une information qu'il détient déjà et dont il a
+# besoin pour savoir à qui s'adresser. La masquer n'aurait protégé personne — et
+# aurait été un masquage de façade, puisque les vues de workflow
+# (`submit`, `client_consent`…) répondent par `serialize_application` sans
+# passer par ce service.
+#
+# Le bloc servi (`{code, name}`) ne porte AUCUN paramètre exploitable : pas de
+# plafond de délégation, pas de statut, pas de gérant. Si un jour l'agence
+# portait un seuil décisionnel, ce seuil resterait côté staff — ce serait alors
+# la donnée à masquer, pas l'agence.
+_CLIENT_VISIBLE_BY_DESIGN = {"agency"}
+
 
 class ViewContextService:
     """

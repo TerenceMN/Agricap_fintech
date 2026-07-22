@@ -680,6 +680,7 @@ def serialize_application(app) -> dict[str, Any]:
             "phone": client.phone,
         },
         "valueChain": {"code": vc.code, "label": vc.label} if vc else None,
+        "agency": _agency_summary(app),
         "isOnBehalfOf": app.is_on_behalf_of,
         "initiatedBySub": app.initiated_by_sub,
         "submittedBySub": app.submitted_by_sub,
@@ -717,6 +718,26 @@ def serialize_application(app) -> dict[str, Any]:
             for a in app.module_allocations.all()
         ],
     }
+
+
+def _agency_summary(app) -> dict | None:
+    """Agence d'instruction du dossier — `None` quand elle est indéterminée.
+
+    `None` n'est PAS une valeur par défaut déguisée : il dit que le dossier n'a
+    pas d'agence en base (antérieur au champ `agency`, ou monté par un compte
+    sans affectation). Servir à la place une agence arbitraire — la première, le
+    siège, celle du lecteur — rendrait ce trou indétectable à l'écran, alors que
+    c'est précisément lui qui fait basculer un périmètre d'agence du régime
+    « exact » au régime « approché » (`credits.dashboard`).
+
+    Le bloc reste volontairement pauvre : `code` et `name` suffisent à afficher
+    et à re-filtrer (`GET /credits/applications/?agency=<code>`). Le statut de
+    l'agence, son gérant ou ses plafonds appartiennent au module `agencies` —
+    les republier ici créerait une seconde source pour la même donnée.
+    """
+    if not app.agency_id:
+        return None
+    return {"code": app.agency.code, "name": app.agency.name}
 
 
 def _disbursement_summary(app) -> dict | None:

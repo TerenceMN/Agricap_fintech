@@ -15,8 +15,10 @@ Endpoints :
 """
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
+from typing import Any
 
 from django.http import HttpResponse
 from rest_framework import status
@@ -44,6 +46,8 @@ from credits.roles import (
     roles_of,
 )
 from credits.view_context import ViewContextService
+
+logger = logging.getLogger(__name__)
 
 
 def _roles(request: Request) -> list[str]:
@@ -626,6 +630,11 @@ def list_applications(request: Request) -> Response:
     """
     GET  /api/credits/applications/           → liste (filtrée par rôle)
     POST /api/credits/applications/           → crée un dossier DRAFT
+
+    Filtres (GET) : `status`, `client_sub` (staff), `value_chain_code`,
+    `agency` (staff — code d'agence, ou `none` pour les dossiers sans agence).
+    AUCUN filtre ne s'applique par défaut : un dossier sans agence reste servi
+    tant que `?agency=` n'est pas demandé explicitement.
     """
     if not _require_read(request):
         return Response({"detail": "Permission refusée."}, status=403)
@@ -635,7 +644,7 @@ def list_applications(request: Request) -> Response:
 
     vcs = _vcs(request)
     qs = CreditApplication.objects.select_related(
-        "client__kyc_profile", "value_chain", "needs_sheet"
+        "client__kyc_profile", "value_chain", "needs_sheet", "agency"
     ).prefetch_related("guarantees")
 
     qs = vcs.filter_qs(qs)
@@ -652,8 +661,60 @@ def list_applications(request: Request) -> Response:
     if request.method == "POST":
         return _create_application(request)
 
+    # Filtre agence — après le POST : c'est un filtre de LECTURE, il n'a rien à
+    # dire d'une création, et il peut refuser la requête (403/400).
+    if raw_agency := request.query_params.get("agency"):
+        qs, refus = _filtre_agence(qs, raw_agency, vcs)
+        if refus is not None:
+            return refus
+
     apps = qs.order_by("-created_at")[:100]
     return Response([vcs.serialize_for_role(a) for a in apps])
+
+
+#: Valeurs de `?agency=` qui désignent la population SANS agence.
+#: Cette population doit rester ATTEIGNABLE : c'est elle que le tableau de bord
+#: d'agence rattache par approximation, et donc elle qu'un responsable doit
+#: pouvoir lister pour la faire corriger. Sans sentinelle, on saurait la compter
+#: (`scope.dossiers.approche`) sans jamais pouvoir l'ouvrir.
+_AGENCE_ABSENTE = {"none", "null", "aucune", "sans", "-"}
+
+
+def _filtre_agence(qs, brut: str, vcs) -> tuple[Any, Response | None]:
+    """Applique `?agency=` — retourne `(queryset, None)` ou `(qs, Response)`.
+
+    Réservé au personnel : un client ne voit déjà que ses propres dossiers, et
+    lui offrir un filtre par agence l'inviterait à sonder la répartition interne
+    de l'institution.
+
+    Un code inconnu est REFUSÉ, pas filtré en silence : « 0 dossier » et
+    « cette agence n'existe pas » ne portent pas la même information, et la
+    première se lit comme une agence sans activité — exactement le genre de zéro
+    qu'un responsable croit sur parole.
+    """
+    if not vcs.is_staff:
+        return qs, Response(
+            {"detail": "Le filtre par agence est réservé au personnel.",
+             "code": "AGENCY_FILTER_STAFF_ONLY"},
+            status=403,
+        )
+
+    valeur = (brut or "").strip()
+    if valeur.lower() in _AGENCE_ABSENTE:
+        return qs.filter(agency__isnull=True), None
+
+    from agencies.models import Agency
+    agence = Agency.objects.filter(code__iexact=valeur).first()
+    if agence is None:
+        return qs, Response(
+            {"detail": (
+                f"Aucune agence ne porte le code « {valeur} ». Utilisez un code "
+                f"d'agence existant, ou `agency=none` pour les dossiers sans "
+                f"rattachement."
+            ), "code": "AGENCY_NOT_FOUND"},
+            status=400,
+        )
+    return qs.filter(agency=agence), None
 
 
 def _create_application(request: Request) -> Response:
@@ -670,7 +731,7 @@ def _create_application(request: Request) -> Response:
       needs_sheet_id      (int, optionnel)
       guarantee_type      (str, optionnel: epargne|morale)
     """
-    from credits.models import CreditApplication, NeedsSheet
+    from credits.models import CreditApplication, NeedsSheet, resolve_agency_for_sub
     from accounts.models import FintechUser
     from reference_data.models import ValueChain
 
@@ -741,6 +802,31 @@ def _create_application(request: Request) -> Response:
 
     guarantee_type = data.get("guarantee_type") or ""
 
+    # ── Agence d'instruction ──────────────────────────────────────────────────
+    # Déduite du COMPTE QUI CRÉE le dossier, jamais lue dans le payload : un
+    # `agency` accepté depuis le corps de la requête laisserait un agent
+    # rattacher son dossier à n'importe quelle agence, et le périmètre de chaque
+    # responsable deviendrait déclaratif au lieu d'être constaté.
+    #
+    # Indéterminable → le champ reste VIDE. Deux cas légitimes : le client qui
+    # dépose lui-même sa demande (aucune affectation, et il n'en a pas à avoir),
+    # et l'agent dont l'affectation n'est pas renseignée. Dans les deux cas, une
+    # agence par défaut serait une invention : elle gonflerait le portefeuille
+    # d'une agence qui n'a jamais vu le dossier, sans qu'aucun écran ne puisse le
+    # détecter. Le dossier reste visible partout (`agency` ne filtre nulle part
+    # sans demande explicite) et le tableau de bord agence le rattache par
+    # approximation, en le disant (`scope.rattachement`).
+    agency = resolve_agency_for_sub(requester_sub)
+    if agency is None and requester_sub != client_sub:
+        # Un agent qui monte un dossier POUR un tiers devrait avoir une agence :
+        # son absence est une donnée manquante côté RBAC, pas un cas normal.
+        logger.warning(
+            "Dossier créé par « %s » pour « %s » sans agence de rattachement "
+            "(ni `StaffProfile.assignment`, ni `Agency.manager_sub`) : le dossier "
+            "restera hors du périmètre exact de toute agence.",
+            requester_sub, client_sub,
+        )
+
     # Génération du code automatique
     from datetime import date
     import random, string
@@ -755,6 +841,7 @@ def _create_application(request: Request) -> Response:
         code=code,
         client=client,
         initiated_by_sub=requester_sub,
+        agency=agency,
         value_chain=vc,
         area_ha=area_ha,
         currency=(data.get("currency") or "USD").upper(),
@@ -781,7 +868,7 @@ def application_detail(request: Request, code: str) -> Response:
 
     try:
         app = CreditApplication.objects.select_related(
-            "client__kyc_profile", "value_chain", "needs_sheet"
+            "client__kyc_profile", "value_chain", "needs_sheet", "agency"
         ).prefetch_related("guarantees").get(code=code)
     except CreditApplication.DoesNotExist:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -798,7 +885,10 @@ def application_detail(request: Request, code: str) -> Response:
 def _load_app(code: str, select_related: list[str] | None = None):
     from credits.models import CreditApplication
     qs = CreditApplication.objects.select_related(
-        "client__kyc_profile", "value_chain", "needs_sheet",
+        # `agency` est sérialisé par `serialize_application` sur TOUTES les
+        # réponses du workflow : sans jointure, chaque transition ajoutait une
+        # requête pour lire le code de l'agence.
+        "client__kyc_profile", "value_chain", "needs_sheet", "agency",
         *(select_related or [])
     )
     try:
