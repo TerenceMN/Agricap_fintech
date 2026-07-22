@@ -21,6 +21,14 @@
  * L'écran instruit sur pièces : `image` et `documents` (JSONField libre) sont
  * consultables ligne à ligne via `AssetEvidence`, et l'absence de pièce est
  * elle-même signalée.
+ *
+ * Second onglet — **historique de vérification** (`GET /api/assets/history`) :
+ * la file ne sert que les `declare`, donc l'acte posé faisait disparaître
+ * l'actif sans laisser de trace consultable. L'agent ne pouvait ni revoir une
+ * valeur qu'il avait retenue, ni relire le motif d'un rejet qu'on lui opposait,
+ * ni constater qu'un actif vérifié était depuis gagé. Une file sans historique
+ * oblige à se souvenir. Cet onglet est en LECTURE SEULE absolue : instruire se
+ * fait par `verify`/`reject`, et aucun bouton d'action n'y figure.
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Helmet } from 'react-helmet';
@@ -36,6 +44,10 @@ import { assetCategory, assetStatus } from '@/components/assets/assetMeta';
 import AssetEvidence from '@/components/assets/AssetEvidence';
 import RetainedValueBreakdown from '@/components/assets/RetainedValueBreakdown';
 import { fmtAmount, fmtDate, fmtDateTime } from './wire';
+import {
+  anomalies, ecartDeclareRetenu, effectifsParStatut, recitActe, STATUTS_HISTORIQUE,
+  type StatutHistorique,
+} from './assetHistoryWire';
 
 /** Résultat d'un acte de vérification, conservé pour montrer la valeur retenue. */
 interface Outcome {
@@ -57,7 +69,276 @@ function pieceCount(asset: AssetRow): number {
   return (asset.documents?.length ?? 0) + (asset.image && asset.image.trim() ? 1 : 0);
 }
 
+/** Libellés des filtres de l'historique — les codes viennent du backend. */
+const FILTRE_LABELS: Record<StatutHistorique, string> = {
+  verifie: 'Vérifiés',
+  gage: 'Gagés',
+  libere: 'Libérés',
+  rejete: 'Rejetés',
+};
+
+/**
+ * Historique de vérification — `GET /api/assets/history`, lecture seule.
+ *
+ * Le filtre de statut est envoyé AU SERVEUR (`?status=`) plutôt qu'appliqué sur
+ * la liste déjà chargée : filtrer côté navigateur ferait mentir `total_rows`,
+ * qui décrirait alors un périmètre différent de ce qui est affiché.
+ */
+const VerificationHistory: React.FC = () => {
+  const [items, setItems] = useState<AssetRow[]>([]);
+  const [totalRows, setTotalRows] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [forbidden, setForbidden] = useState(false);
+  const [errors, setErrors] = useState<FieldError[]>([]);
+  const [statut, setStatut] = useState<StatutHistorique | ''>('');
+  const [detailOuvert, setDetailOuvert] = useState<number[]>([]);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setErrors([]);
+    setForbidden(false);
+    try {
+      const res = await api.assets.history(statut || undefined);
+      setItems(res.items || []);
+      setTotalRows(res.total_rows ?? (res.items || []).length);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 403) {
+        setForbidden(true);
+      } else {
+        setErrors(toFieldErrors(e));
+      }
+      setItems([]);
+      setTotalRows(0);
+    } finally {
+      setLoading(false);
+    }
+  }, [statut]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const effectifs = useMemo(() => effectifsParStatut(items), [items]);
+  const toggleDetail = (id: number) => {
+    setDetailOuvert((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  if (forbidden) {
+    return (
+      <Forbidden
+        message="Historique de vérification réservé aux agents de terrain."
+        detail="Le serveur applique à l'historique la même garde qu'à la file (403). Groupe requis : CAN_VERIFY_ASSET."
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white/5 border border-white/10 rounded-xl p-4 text-sm text-slate-300">
+        <p className="font-semibold text-white mb-1">Lecture seule</p>
+        <p className="text-slate-400 leading-relaxed">
+          Tout ce qui a déjà été instruit : vérifié, rejeté, gagé, libéré. Aucun acte ne se pose
+          depuis cet onglet — une valeur retenue ne se corrige pas, on ré-instruit l'actif depuis
+          la file après une nouvelle déclaration du client.
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setStatut('')}
+          aria-pressed={statut === ''}
+          className={`px-3 py-1.5 rounded-lg text-sm border ${
+            statut === ''
+              ? 'bg-white/15 border-white/25 text-white'
+              : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
+          }`}
+        >
+          Tous les actes
+        </button>
+        {STATUTS_HISTORIQUE.map((code) => (
+          <button
+            key={code}
+            type="button"
+            onClick={() => setStatut(code)}
+            aria-pressed={statut === code}
+            className={`px-3 py-1.5 rounded-lg text-sm border ${
+              statut === code
+                ? 'bg-white/15 border-white/25 text-white'
+                : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
+            }`}
+          >
+            {FILTRE_LABELS[code]}
+            {statut === '' && (
+              <span className="ml-1.5 text-xs text-slate-500">({effectifs[code] ?? 0})</span>
+            )}
+          </button>
+        ))}
+        <button
+          type="button"
+          onClick={() => void load()}
+          className="ml-auto px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-sm"
+        >
+          Rafraîchir
+        </button>
+      </div>
+
+      <ErrorPanel errors={errors} title="Historique indisponible" />
+
+      <div className="flex flex-wrap gap-3 text-xs text-slate-400">
+        <span className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10">
+          {items.length} actif(s) affiché(s) — <code className="font-mono">total_rows</code> = {totalRows}
+        </span>
+        <span className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10">
+          Périmètre : {statut ? `actifs « ${FILTRE_LABELS[statut]} »` : 'tous les actifs instruits'},
+          toutes agences — tri sur la date de vérification, la plus récente en tête
+        </span>
+      </div>
+
+      <div className="space-y-3">
+        {items.map((asset) => {
+          const cat = assetCategory(asset.type);
+          const st = assetStatus(asset.status);
+          const ecart = ecartDeclareRetenu(asset);
+          const signaux = anomalies(asset);
+          const ouvert = detailOuvert.includes(asset.id);
+
+          return (
+            <div
+              key={asset.id}
+              className={`bg-white/5 border border-white/10 border-l-4 rounded-xl p-4 ${st.accent}`}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="font-semibold text-white flex items-center gap-2 flex-wrap">
+                    {asset.name || `Actif #${asset.id}`}
+                    <span className={`px-2 py-0.5 rounded-full border text-[11px] font-normal ${st.badge}`}>
+                      {st.label}
+                    </span>
+                  </p>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    <span className={cat.color}>{cat.label}</span>
+                    {' '}· déclaré le {fmtDate(asset.createdAt)}
+                    {' '}· instruit le {fmtDateTime(asset.verifieLe)}
+                  </p>
+                  <p className="text-sm text-slate-300 mt-2">
+                    Propriétaire :{' '}
+                    <span className="text-white font-medium">
+                      {asset.owner?.displayName || asset.owner?.sub || '—'}
+                    </span>
+                    {asset.owner?.phone && <span className="text-slate-500"> · {asset.owner.phone}</span>}
+                  </p>
+                  <p className="text-sm text-slate-400 mt-1">{recitActe(asset)}</p>
+                  {asset.verifieParSub && (
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      Acte posé par <span className="font-mono">{asset.verifieParSub}</span>
+                    </p>
+                  )}
+                </div>
+
+                <div className="text-right shrink-0">
+                  <p className="text-xs text-slate-400">Valeur retenue</p>
+                  <p className={`text-xl font-bold ${
+                    asset.valeurRetenue == null ? 'text-slate-500' : 'text-emerald-300'
+                  }`}>
+                    {asset.valeurRetenue == null ? 'aucune' : fmtAmount(asset.valeurRetenue, asset.currency)}
+                  </p>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Déclarée : {fmtAmount(asset.value, asset.currency)}
+                  </p>
+                  {ecart !== null && (
+                    <p className="text-[11px] text-slate-500">
+                      Écart déclaré → retenu : {fmtAmount(ecart, asset.currency)}
+                    </p>
+                  )}
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Mobilisable en garantie :{' '}
+                    <span className={asset.isPledgeable ? 'text-emerald-300' : 'text-slate-400'}>
+                      {asset.isPledgeable ? 'oui' : 'non'}
+                    </span>
+                  </p>
+                </div>
+              </div>
+
+              {asset.status === 'rejete' && (
+                <p className="mt-3 text-sm text-red-100 bg-red-500/10 border border-red-500/30 rounded-lg p-3">
+                  <span className="block text-[11px] uppercase tracking-wide text-red-300/80 mb-1">
+                    Motif du rejet transmis au client
+                  </span>
+                  {asset.motifRejet || '— aucun motif enregistré —'}
+                </p>
+              )}
+
+              {asset.gageApplication && (
+                <p className="mt-3 text-sm text-orange-100 bg-orange-500/10 border border-orange-500/30 rounded-lg p-3 flex flex-wrap items-center gap-2">
+                  <span>
+                    Nanti sur le dossier{' '}
+                    <span className="font-mono font-semibold">{asset.gageApplication}</span>
+                  </span>
+                  <Link
+                    to={`/credit/dossiers/${asset.gageApplication}`}
+                    className="px-2 py-1 rounded-md bg-white/10 hover:bg-white/20 text-xs"
+                  >
+                    Ouvrir le dossier
+                  </Link>
+                </p>
+              )}
+
+              {signaux.length > 0 && (
+                <ul className="mt-3 space-y-2">
+                  {signaux.map((s) => (
+                    <li
+                      key={s.code}
+                      className="text-xs text-amber-100 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2.5"
+                    >
+                      <p>{s.fait}</p>
+                      <p className="text-amber-200/70 mt-1">Question à poser : {s.question}</p>
+                      <p className="text-[10px] font-mono text-amber-200/50 mt-1">{s.code}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <button
+                type="button"
+                onClick={() => toggleDetail(asset.id)}
+                aria-expanded={ouvert}
+                className="mt-3 text-xs px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-slate-300"
+              >
+                {ouvert ? 'Masquer' : 'Revoir'} la déclaration et les pièces ({pieceCount(asset)})
+              </button>
+
+              {ouvert && (
+                <div className="mt-3 space-y-2">
+                  {asset.localisation && (
+                    <p className="text-sm text-slate-400">Localisation : {asset.localisation}</p>
+                  )}
+                  {asset.description && (
+                    <p className="text-sm text-slate-400">{asset.description}</p>
+                  )}
+                  <AssetEvidence image={asset.image} documents={asset.documents} />
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {loading && <Loading label="Chargement de l'historique…" />}
+      {!loading && items.length === 0 && errors.length === 0 && (
+        <div className="bg-white/5 border border-white/10 rounded-xl">
+          <Empty
+            title={statut
+              ? `Aucun actif au statut « ${FILTRE_LABELS[statut]} ».`
+              : 'Aucun actif instruit à ce jour.'}
+            hint="Les actifs vérifiés, rejetés, gagés ou libérés apparaissent ici dès que l'acte est posé."
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AssetVerification: React.FC = () => {
+  const [onglet, setOnglet] = useState<'file' | 'historique'>('file');
   const [items, setItems] = useState<AssetRow[]>([]);
   const [totalRows, setTotalRows] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -195,24 +476,56 @@ const AssetVerification: React.FC = () => {
         <div>
           <h1 className="text-2xl font-bold">Vérification des actifs</h1>
           <p className="text-sm text-slate-400 mt-1">
-            Actifs déclarés par les clients, en attente d'un contrôle sur place.
-            Un actif non vérifié n'existe pas comme garantie.
+            {onglet === 'file'
+              ? "Actifs déclarés par les clients, en attente d'un contrôle sur place. "
+                + "Un actif non vérifié n'existe pas comme garantie."
+              : 'Ce qui a déjà été instruit — pour revoir une valeur retenue, relire un motif '
+                + 'de rejet, ou constater qu’un actif vérifié est depuis gagé.'}
           </p>
         </div>
         <div className="flex gap-2">
           <Link to="/credit/dossiers" className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm">
             File d'instruction
           </Link>
-          <button
-            type="button"
-            onClick={() => void load()}
-            className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm"
-          >
-            Rafraîchir
-          </button>
+          {onglet === 'file' && (
+            <button
+              type="button"
+              onClick={() => void load()}
+              className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-sm"
+            >
+              Rafraîchir
+            </button>
+          )}
         </div>
       </div>
 
+      {/* Deux surfaces, deux endpoints, deux gardes serveur identiques : la file
+          (`/assets/pending`, actionnable) et l'historique (`/assets/history`,
+          lecture seule). Les mélanger ferait croire qu'un acte se repose. */}
+      <div role="tablist" aria-label="Vues de la vérification des actifs" className="flex gap-2 border-b border-white/10">
+        {([
+          ['file', "File d'attente"],
+          ['historique', 'Historique de vérification'],
+        ] as const).map(([code, label]) => (
+          <button
+            key={code}
+            type="button"
+            role="tab"
+            aria-selected={onglet === code}
+            onClick={() => setOnglet(code)}
+            className={`px-4 py-2 text-sm -mb-px border-b-2 ${
+              onglet === code
+                ? 'border-primary text-white font-medium'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {onglet === 'historique' ? <VerificationHistory /> : (
+      <>
       <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 text-sm text-blue-100">
         <p className="font-semibold mb-1">Comment est fixée la valeur retenue</p>
         <p className="text-blue-100/80 leading-relaxed">
@@ -457,6 +770,8 @@ const AssetVerification: React.FC = () => {
             </div>
           )}
         </>
+      )}
+      </>
       )}
     </div>
   );
