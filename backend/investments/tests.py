@@ -101,6 +101,42 @@ def advance_to(project: Project, target: str, *, quorum_voters=("cm1", "cm2", "c
     return project
 
 
+def funded_project(code: str, investor: Investor, bonds: int = 80) -> tuple[Project, Offer, Subscription]:
+    """Projet P06 doté d'une souscription ENCAISSÉE — la brique des tests de métriques.
+
+    80 titres × 100 = 8 000 encaissés sur un objectif de 10 000 (plancher dérivé à
+    7 000) : la levée est clôturable, les chiffres sont ronds et vérifiables à la main.
+    """
+    project = advance_to(make_project(code), S.P06)
+    offer = project.offers.first()
+    sub = funding.reserve(investor=investor, offer_id=offer.pk, bonds=bonds,
+                           idempotency_key=f"r-{code}", by="t")
+    funding.settle(subscription=sub, idempotency_key=f"s-{code}", by="caisse")
+    project.refresh_from_db()
+    sub.refresh_from_db()
+    return project, offer, sub
+
+
+def to_p10(project: Project, offer: Offer, *, amount: str = "8000", due_in_days: int = 30) -> Project:
+    """Amène un projet doté jusqu'à la phase de remboursement, échéancier compris."""
+    project = funding.close_fundraising(project=project, by="dg", reason="Clôture de la levée.")
+    project = funding.disburse(project=project, amount=amount,
+                                idempotency_key=f"d-{project.code}", by="dg")
+    project = services.transition_status(project=project, to_status=S.P09, by="mgr",
+                                          reason="Fonds reçus par le promoteur.")
+    RepaymentSchedule.objects.create(offer=offer, due_date=date.today() + timedelta(days=due_in_days),
+                                      amount_due=Decimal("8800"))
+    return services.transition_status(project=project, to_status=S.P10, by="mgr",
+                                       reason="Échéancier de retour démarré.")
+
+
+def funded_subs(investor: Investor) -> list[Subscription]:
+    return list(
+        Subscription.objects.filter(investor=investor, status__in=Subscription.FUNDED_STATUSES)
+        .select_related("offer__project")
+    )
+
+
 def settle_all(project: Project, prefix: str = "k") -> None:
     for i, sub in enumerate(Subscription.objects.filter(offer__project=project,
                                                          status=Subscription.Status.RESERVED)):
@@ -933,6 +969,444 @@ class PortfolioMetricsTests(AuthedAPITestCase):
         self.assertEqual(res["positionsCount"], 0)
 
 
+# ── 8 bis. Annexe D : valorisation, retard, échéance, contexte des KPI ───────
+
+class ValuationTests(AuthedAPITestCase):
+    """Les trois méthodes de valorisation de l'Annexe D, chacune sur un cas chiffré."""
+
+    def test_le_capital_restant_du_ne_diminue_que_des_remboursements_de_capital(self):
+        inv = make_investor("v-cap")
+        p, offer, _ = funded_project("V-CAP", inv)
+        p = to_p10(p, offer)
+
+        funding.record_return(project=p, amount="1000", idempotency_key="rc1", by="caisse")
+        p.refresh_from_db()
+        funding.distribute(offer=offer, amount="1000", kind=Distribution.Kind.COUPON,
+                            idempotency_key="dc1", by="dg")
+        val = metrics.latent_value(funded_subs(inv))
+        # Un coupon rémunère le capital, il ne le rembourse pas : 8 000 restent dus.
+        self.assertEqual(val["capitalOutstanding"], 8000.0)
+
+        p.refresh_from_db()
+        funding.record_return(project=p, amount="2000", idempotency_key="rc2", by="caisse")
+        p.refresh_from_db()
+        funding.distribute(offer=offer, amount="2000", kind=Distribution.Kind.CAPITAL,
+                            idempotency_key="dc2", by="dg")
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["capitalOutstanding"], 6000.0)
+
+    def test_interets_courus_sont_nets_des_coupons_deja_verses(self):
+        inv = make_investor("v-int")
+        p, offer, sub = funded_project("V-INT", inv)
+        self.assertEqual(sub.coupon_rate_snapshot, Decimal("9.000"))
+        Subscription.objects.filter(pk=sub.pk).update(settled_at=timezone.now() - timedelta(days=365))
+
+        # 8 000 × 9 % × 365/365 = 720 d'intérêts courus, aucun coupon encore versé.
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["latentGain"], 720.0)
+        self.assertTrue(val["latentGainIsLatent"])
+
+        p = to_p10(p, offer)
+        funding.record_return(project=p, amount="1000", idempotency_key="ri1", by="caisse")
+        p.refresh_from_db()
+        funding.distribute(offer=offer, amount="1000", kind=Distribution.Kind.COUPON,
+                            idempotency_key="di1", by="dg")
+        # 1 000 déjà encaissés > 720 courus : plus rien n'est latent, et surtout pas 720
+        # une seconde fois.
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["latentGain"], 0.0)
+
+    def test_projet_en_defaut_valorise_au_taux_de_recouvrement_constate(self):
+        inv = make_investor("v-def1")
+        p, offer, _ = funded_project("V-DEF1", inv)
+        p = to_p10(p, offer)
+        p = services.transition_status(project=p, to_status=S.P12, by="dg",
+                                        reason="Promoteur insolvable, récolte perdue.")
+        funding.record_return(project=p, amount="2000", idempotency_key="rd1", by="caisse")
+        # 2 000 recouvrés sur 8 000 décaissés = 25 % → 8 000 × 25 % = 2 000 de valeur retenue.
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["capitalOutstanding"], 2000.0)
+        self.assertIn(metrics.VALUATION_PROVISION, val["byMethod"])
+        self.assertIn("recouvrement constaté", " ".join(val["methodNotes"]))
+
+    def test_defaut_sans_recouvrement_applique_la_provision_parametree_en_base(self):
+        from .models import InvestmentConfig
+        InvestmentConfig.objects.create(p12_provision_rate=Decimal("0.6000"))
+        inv = make_investor("v-def2")
+        p, offer, _ = funded_project("V-DEF2", inv)
+        p = to_p10(p, offer)
+        services.transition_status(project=p, to_status=S.P12, by="dg", reason="Défaut constaté.")
+        # Aucun recouvrement : provision de 60 % → 8 000 × 40 % = 3 200.
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["capitalOutstanding"], 3200.0)
+
+    def test_defaut_provisionne_a_cent_pour_cent_par_defaut(self):
+        inv = make_investor("v-def3")
+        p, offer, _ = funded_project("V-DEF3", inv)
+        p = to_p10(p, offer)
+        services.transition_status(project=p, to_status=S.P12, by="dg", reason="Défaut constaté.")
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["capitalOutstanding"], 0.0)
+
+    def test_titre_de_capital_valorise_par_expertise_datee(self):
+        inv = make_investor("v-act")
+        p, offer, _ = funded_project("V-ACT", inv)
+        Offer.objects.filter(pk=offer.pk).update(type_of_title=Offer.TypeOfTitle.ACTION)
+        Project.objects.filter(pk=p.pk).update(
+            expert_valuation=Decimal("10000"), expert_valuation_date=date.today(),
+            expert_valuation_source="Cabinet Mbuji — rapport d'évaluation 2026",
+        )
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["capitalOutstanding"], 8000.0)
+        self.assertEqual(val["latentGain"], 2000.0)     # 10 000 expertisés − 8 000 au pair
+        self.assertEqual(val["totalValue"], 10000.0)
+        self.assertIn(metrics.VALUATION_EXPERT, val["byMethod"])
+
+    def test_expertise_perimee_retombe_au_pair_et_le_dit(self):
+        inv = make_investor("v-act2")
+        p, offer, _ = funded_project("V-ACT2", inv)
+        Offer.objects.filter(pk=offer.pk).update(type_of_title=Offer.TypeOfTitle.ACTION)
+        Project.objects.filter(pk=p.pk).update(
+            expert_valuation=Decimal("10000"),
+            expert_valuation_date=date.today() - timedelta(days=400),
+            expert_valuation_source="Cabinet Mbuji",
+        )
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["totalValue"], 8000.0)
+        self.assertIn(metrics.VALUATION_PAR_NO_EXPERT, val["byMethod"])
+        self.assertIn("périmée", " ".join(val["methodNotes"]))
+
+    def test_expertise_sans_date_nest_pas_une_expertise(self):
+        inv = make_investor("v-act3")
+        p, offer, _ = funded_project("V-ACT3", inv)
+        Offer.objects.filter(pk=offer.pk).update(type_of_title=Offer.TypeOfTitle.PART_SOCIALE)
+        Project.objects.filter(pk=p.pk).update(expert_valuation=Decimal("99000"))
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["totalValue"], 8000.0)
+        self.assertIn(metrics.VALUATION_PAR_NO_EXPERT, val["byMethod"])
+
+    def test_nature_de_distribution_inconnue_refusee(self):
+        inv = make_investor("v-kind")
+        p, offer, _ = funded_project("V-KIND", inv)
+        p = to_p10(p, offer)
+        funding.record_return(project=p, amount="1000", idempotency_key="rk", by="caisse")
+        p.refresh_from_db()
+        with self.assertRaises(ValidationFailed):
+            funding.distribute(offer=offer, amount="1000", kind="CADEAU",
+                                idempotency_key="dk", by="dg")
+
+    def test_valeur_totale_capital_plus_latent(self):
+        inv = make_investor("v-tot")
+        p, offer, sub = funded_project("V-TOT", inv)
+        Subscription.objects.filter(pk=sub.pk).update(settled_at=timezone.now() - timedelta(days=365))
+        val = metrics.latent_value(funded_subs(inv))
+        self.assertEqual(val["totalValue"], val["capitalOutstanding"] + val["latentGain"])
+        self.assertEqual(val["totalValue"], 8720.0)
+
+
+class ExpertValuationTests(AuthedAPITestCase):
+    def setUp(self):
+        self.project = make_project("EV-1")
+
+    def test_valorisation_sans_date_refusee(self):
+        with self.assertRaises(ValidationFailed):
+            services.set_expert_valuation(project=self.project, amount="1000",
+                                           valuation_date=None, source="Cabinet", by="u")
+
+    def test_valorisation_sans_source_refusee(self):
+        with self.assertRaises(ValidationFailed):
+            services.set_expert_valuation(project=self.project, amount="1000",
+                                           valuation_date=date.today(), source="", by="u")
+
+    def test_valorisation_future_refusee(self):
+        with self.assertRaises(ValidationFailed):
+            services.set_expert_valuation(project=self.project, amount="1000",
+                                           valuation_date=date.today() + timedelta(days=1),
+                                           source="Cabinet", by="u")
+
+    def test_valorisation_enregistree_et_journalisee(self):
+        from audit.models import AuditEntry
+        services.set_expert_valuation(project=self.project, amount="12500.50",
+                                       valuation_date=date.today(), source="Cabinet Mbuji", by="dg")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.expert_valuation, Decimal("12500.50"))
+        self.assertTrue(AuditEntry.objects.filter(
+            action="investments.project.expert_valuation", entity_id="EV-1").exists())
+
+    def test_endpoint_reserve_au_personnel_habilite(self):
+        self.login(role="invest", sub="inv-ev")
+        res = self.client.post(f"/api/investments/projects/{self.project.code}/expert-valuation",
+                                {"amount": "999999", "valuationDate": date.today().isoformat(),
+                                 "source": "Moi-même"}, format="json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_endpoint_expose_les_trois_champs_ensemble(self):
+        self.login(role="gest_port", sub="staff-ev")
+        res = self.client.post(f"/api/investments/projects/{self.project.code}/expert-valuation",
+                                {"amount": "12500", "valuationDate": date.today().isoformat(),
+                                 "source": "Cabinet Mbuji"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["expertValuation"], 12500.0)
+        self.assertEqual(res.data["expertValuationDate"], date.today().isoformat())
+        self.assertEqual(res.data["expertValuationSource"], "Cabinet Mbuji")
+
+
+class LateAndNextPaymentTests(AuthedAPITestCase):
+    def test_retard_constate_sur_les_dates_et_non_sur_un_statut_jamais_pose(self):
+        inv = make_investor("l-1")
+        p, offer, _ = funded_project("L-1", inv)
+        p = to_p10(p, offer, due_in_days=-10)   # échéance dépassée de 10 jours
+        subs = funded_subs(inv)
+        # Le statut est resté PENDING : aucun producteur ne pose OVERDUE dans ce module.
+        self.assertEqual(RepaymentSchedule.objects.get(offer=offer).status,
+                          RepaymentSchedule.Status.PENDING)
+        retard = metrics._late(subs)
+        self.assertEqual(retard["share"], Decimal("1.0000"))
+        self.assertEqual(retard["lateProjects"], 1)
+        self.assertEqual(retard["totalProjects"], 1)
+
+    def test_echeance_payee_nest_pas_un_retard(self):
+        inv = make_investor("l-2")
+        p, offer, _ = funded_project("L-2", inv)
+        to_p10(p, offer, due_in_days=-10)
+        RepaymentSchedule.objects.filter(offer=offer).update(status=RepaymentSchedule.Status.PAID)
+        self.assertEqual(metrics.late_share(funded_subs(inv)), Decimal("0"))
+
+    def test_absence_decheancier_est_signalee_et_ne_se_deguise_pas_en_zero_retard(self):
+        inv = make_investor("l-3")
+        funded_project("L-3", inv)
+        retard = metrics._late(funded_subs(inv))
+        self.assertEqual(retard["projectsWithSchedule"], 0)
+        self.assertIsNotNone(retard["scheduleCoverageWarning"])
+
+    def test_prochain_paiement_est_le_min_des_echeances_a_venir(self):
+        inv = make_investor("n-1")
+        p, offer, _ = funded_project("N-1", inv)
+        to_p10(p, offer, due_in_days=60)
+        RepaymentSchedule.objects.create(offer=offer, due_date=date.today() + timedelta(days=15),
+                                          amount_due=Decimal("500"))
+        RepaymentSchedule.objects.create(offer=offer, due_date=date.today() - timedelta(days=5),
+                                          amount_due=Decimal("500"))
+        res = metrics._next_payment(funded_subs(inv))
+        self.assertEqual(res["nextPaymentDate"], (date.today() + timedelta(days=15)).isoformat())
+        self.assertEqual(res["nextPaymentSource"], "repayment_schedule")
+        self.assertEqual(res["upcomingCount"], 2)
+
+    def test_prochain_paiement_ignore_les_echeances_deja_payees(self):
+        inv = make_investor("n-2")
+        p, offer, _ = funded_project("N-2", inv)
+        to_p10(p, offer, due_in_days=15)
+        RepaymentSchedule.objects.filter(offer=offer).update(status=RepaymentSchedule.Status.PAID)
+        RepaymentSchedule.objects.create(offer=offer, due_date=date.today() + timedelta(days=90),
+                                          amount_due=Decimal("500"))
+        res = metrics._next_payment(funded_subs(inv))
+        self.assertEqual(res["nextPaymentDate"], (date.today() + timedelta(days=90)).isoformat())
+
+    def test_sans_echeancier_la_date_est_nulle_avec_son_motif_jamais_inventee(self):
+        inv = make_investor("n-3")
+        funded_project("N-3", inv)
+        res = metrics._next_payment(funded_subs(inv))
+        self.assertIsNone(res["nextPaymentDate"])
+        self.assertIsNone(res["nextPaymentSource"])
+        self.assertIsNotNone(res["unavailableReason"])
+
+
+class KpiContextTests(AuthedAPITestCase):
+    """« Pas de moyenne sans effectif, pas de pourcentage sans base » — vérifié."""
+
+    def setUp(self):
+        self.inv = make_investor("k-1")
+        self.project, self.offer, _ = funded_project("K-1", self.inv)
+
+    def test_metriques_investisseur_portent_periode_devise_et_effectif(self):
+        res = metrics.investor_metrics(self.inv)
+        self.assertEqual(res["currency"], "USD")
+        self.assertIn("conversionRate", res)
+        self.assertFalse(res["mixedCurrency"])
+        self.assertEqual(res["period"]["flowsCount"], 1)
+        self.assertIsNotNone(res["period"]["from"])
+        self.assertEqual(res["positionsCount"], 1)
+        self.assertEqual(res["defaultRates"]["totalProjects"], 1)
+        self.assertEqual(res["concentration"]["sectorsCount"], 1)
+        self.assertEqual(res["concentration"]["locationsCount"], 1)
+        self.assertEqual(res["expectedCouponPositions"], 1)
+        self.assertEqual(res["expectedCouponBasis"], 8000.0)
+
+    def test_metriques_portefeuille_portent_periode_devise_et_effectif(self):
+        res = metrics.portfolio_metrics()
+        self.assertEqual(res["currency"], "USD")
+        self.assertEqual(res["subscriptionsCount"], 1)
+        self.assertEqual(res["period"]["flowsCount"], 1)
+        self.assertIn("totalValue", res)
+        self.assertIn("nextPayment", res)
+
+    def test_trois_grandeurs_distinctes_investi_valeur_rendement(self):
+        res = metrics.investor_metrics(self.inv)
+        self.assertEqual(res["totalInvested"], 8000.0)
+        self.assertEqual(res["totalValue"], res["valuation"]["totalValue"])
+        # Aucune distribution : le rendement réalisé n'existe pas encore et le dit.
+        self.assertIsNone(res["realizedReturn"])
+        self.assertTrue(res["realizedReturnUnavailableReason"])
+        # Le taux contractuel n'est PAS un rendement : grandeur séparée.
+        self.assertEqual(res["expectedCouponRate"], 9.0)
+
+    def test_devise_etrangere_est_signalee_jamais_additionnee_en_silence(self):
+        p = to_p10(self.project, self.offer)
+        funding.record_return(project=p, amount="1000", idempotency_key="rk1", by="caisse")
+        p.refresh_from_db()
+        funding.distribute(offer=self.offer, amount="1000", idempotency_key="dk1", by="dg")
+        Distribution.objects.all().update(currency="CDF")
+        res = metrics.portfolio_metrics()
+        self.assertTrue(res["mixedCurrency"])
+        self.assertIn("CDF", res["currenciesObserved"])
+        self.assertIsNotNone(res["mixedCurrencyWarning"])
+
+    def test_exposition_par_secteur_et_par_zone_est_servie(self):
+        res = metrics.investor_metrics(self.inv)
+        secteurs = res["concentration"]["exposureBySector"]
+        self.assertEqual(len(secteurs), 1)
+        self.assertEqual(secteurs[0]["key"], "Maïs")
+        self.assertEqual(secteurs[0]["amount"], 8000.0)
+        self.assertEqual(secteurs[0]["share"], 1.0)
+        self.assertEqual(res["concentration"]["exposureByLocation"][0]["key"], "Kongo-Central")
+
+    def test_chaque_taux_declare_son_unite(self):
+        res = metrics.investor_metrics(self.inv)
+        self.assertEqual(res["units"]["realizedReturn"], "fraction")
+        self.assertEqual(res["units"]["expectedCouponRate"], "percent")
+        self.assertEqual(res["units"]["health.score"], "points_sur_100")
+
+    def test_detail_par_position_seulement_cote_investisseur(self):
+        res = metrics.investor_metrics(self.inv)
+        positions = res["valuation"]["positions"]
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["projectCode"], "K-1")
+        self.assertEqual(positions[0]["settledAmount"], 8000.0)
+        self.assertEqual(positions[0]["valuationMethod"], metrics.VALUATION_PAR)
+        self.assertIsNone(positions[0]["recoveryRate"])
+        # La vue institution ne déverse pas les positions de tous les investisseurs.
+        self.assertNotIn("positions", metrics.portfolio_metrics()["valuation"])
+
+    def test_position_en_defaut_porte_sa_perte_estimee(self):
+        p = to_p10(self.project, self.offer)
+        p = services.transition_status(project=p, to_status=S.P12, by="dg",
+                                        reason="Promoteur en cessation d'activité.")
+        funding.record_return(project=p, amount="2000", idempotency_key="rkd", by="caisse")
+        position = metrics.investor_metrics(self.inv)["valuation"]["positions"][0]
+        self.assertEqual(position["projectStatus"], "P12")
+        self.assertEqual(position["recoveryRate"], 0.25)
+        self.assertEqual(position["capitalOutstanding"], 2000.0)
+        self.assertEqual(position["impairment"], 6000.0)   # 8 000 − 2 000 recouvrables
+        self.assertIn("défaut", position["valuationNote"])
+
+    def test_offres_ouvertes_portent_les_bornes_de_souscription(self):
+        ligne = next(o for o in metrics.open_offers_summary() if o["projectCode"] == "K-1")
+        self.assertEqual(ligne["minBonds"], 1)
+        self.assertEqual(ligne["maxBonds"], 100)
+        self.assertEqual(ligne["typeOfTitle"], "OBLIGATION")
+        self.assertIn("riskScore", ligne)
+
+    def test_dashboard_institution_porte_devise_et_effectifs(self):
+        self.login(role="gest_port", sub="staff-kpi")
+        res = self.client.get("/api/investments/dashboard-metrics")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["currency"], "USD")
+        self.assertFalse(res.data["mixedCurrency"])
+        self.assertEqual(res.data["totalInvested"], 8000.0)
+        self.assertEqual(res.data["settledSubscriptionsCount"], 1)
+        self.assertEqual(res.data["reservedSubscriptionsCount"], 0)
+
+    def test_seuil_dalerte_de_defaut_vient_de_la_base(self):
+        from .models import InvestmentConfig
+        InvestmentConfig.objects.create(default_rate_alert=Decimal("0.0100"))
+        p = to_p10(self.project, self.offer)
+        services.transition_status(project=p, to_status=S.P12, by="dg", reason="Défaut.")
+        res = metrics.portfolio_metrics()
+        self.assertEqual(res["defaultRates"]["alertThreshold"], 0.01)
+        self.assertTrue(res["defaultRates"]["alert"])
+
+
+class HealthScoreNumericCaseTests(AuthedAPITestCase):
+    """Cas chiffrés du score de santé — exécutés, pas décrits."""
+
+    def test_cas_chiffre_avec_les_coefficients_par_defaut(self):
+        # 100 − 4×0,05×100 − 50×(0,26−0,25)×100 − 1×0,20×100 = 100 − 20 − 50 − 20 = 10
+        res = metrics.health_score(default_rate=Decimal("0.05"), hhi=Decimal("0.26"),
+                                    late=Decimal("0.20"))
+        self.assertEqual(res["penalties"]["default"], 20.0)
+        self.assertEqual(res["penalties"]["concentration"], 50.0)
+        self.assertEqual(res["penalties"]["late"], 20.0)
+        self.assertEqual(res["score"], 10.0)
+        self.assertFalse(res["clamped"])
+
+    def test_le_meme_cas_recalibre_en_base_donne_un_autre_score(self):
+        from .models import InvestmentConfig
+        InvestmentConfig.objects.create(health_coeff_concentration=Decimal("5"))
+        # 100 − 20 − 5×0,01×100 (=5) − 20 = 55
+        res = metrics.health_score(default_rate=Decimal("0.05"), hhi=Decimal("0.26"),
+                                    late=Decimal("0.20"))
+        self.assertEqual(res["score"], 55.0)
+        self.assertEqual(res["parameters"]["b"], 5.0)
+
+    def test_le_score_publie_ses_entrees_pour_etre_refait_a_la_main(self):
+        res = metrics.health_score(default_rate=Decimal("0.05"), hhi=Decimal("0.26"),
+                                    late=Decimal("0.20"))
+        self.assertEqual(res["inputs"]["defaultRate"], 0.05)
+        self.assertEqual(res["inputs"]["herfindahl"], 0.26)
+        self.assertEqual(res["inputs"]["lateShare"], 0.20)
+        self.assertEqual(res["formula"], metrics.HEALTH_FORMULA)
+
+    def test_ecretage_a_zero_est_signale(self):
+        res = metrics.health_score(default_rate=Decimal("1"), hhi=Decimal("1"), late=Decimal("1"))
+        self.assertEqual(res["score"], 0.0)
+        self.assertTrue(res["clamped"])
+        self.assertLess(res["rawScore"], 0.0)
+
+
+class XirrNumericCaseTests(AuthedAPITestCase):
+    """Cas chiffré du XIRR — flux datés irréguliers, résultat vérifié à 1e-4."""
+
+    def test_cas_chiffre_flux_irreguliers(self):
+        flux = [
+            (date(2025, 1, 1), Decimal("-10000")),
+            (date(2025, 7, 1), Decimal("2000")),
+            (date(2026, 1, 1), Decimal("9500")),
+        ]
+        taux = metrics.xirr(flux)
+        # Racine vérifiée hors module par Newton-Raphson : 0,16610954, VAN nulle à 1e-9.
+        # (VAN = −10 000 + 2 000/(1+r)^(181/365) + 9 500/(1+r)^(365/365).)
+        self.assertAlmostEqual(float(taux), 0.166110, places=5)
+        self.assertEqual(taux, Decimal("0.166110"))
+
+    def test_le_xirr_nest_pas_une_moyenne_ponderee_de_taux_affiches(self):
+        """Même capital, même rendement nominal, dates différentes → TRI différents.
+
+        C'est exactement ce que la « moyenne pondérée de taux » du prototype ne pouvait
+        pas voir : elle aurait rendu 10 % dans les deux cas.
+        """
+        tot = metrics.xirr([(date(2025, 1, 1), Decimal("-1000")),
+                             (date(2026, 1, 1), Decimal("1100"))])
+        tard = metrics.xirr([(date(2025, 1, 1), Decimal("-1000")),
+                              (date(2027, 1, 1), Decimal("1100"))])
+        self.assertAlmostEqual(float(tot), 0.10, places=3)
+        self.assertLess(float(tard), float(tot))
+
+    def test_xirr_sur_les_flux_reels_dun_investisseur(self):
+        inv = make_investor("x-1")
+        p, offer, sub = funded_project("X-1", inv)
+        Subscription.objects.filter(pk=sub.pk).update(settled_at=timezone.now() - timedelta(days=365))
+        p = to_p10(p, offer)
+        funding.record_return(project=p, amount="8800", idempotency_key="rx1", by="caisse")
+        p.refresh_from_db()
+        funding.distribute(offer=offer, amount="8800", idempotency_key="dx1", by="dg")
+        flux = metrics.investor_flows(inv)
+        self.assertEqual(len(flux), 2)
+        res = metrics.investor_metrics(inv)
+        # −8 000 il y a un an, +8 800 aujourd'hui → 10 % l'an, sur flux réels.
+        self.assertAlmostEqual(res["realizedReturn"], 0.10, places=3)
+        self.assertIsNone(res["realizedReturnUnavailableReason"])
+
+
 # ── 9. Asymétrie d'information ───────────────────────────────────────────────
 
 class InformationAsymmetryTests(AuthedAPITestCase):
@@ -993,6 +1467,100 @@ class InformationAsymmetryTests(AuthedAPITestCase):
         self.login(role="invest", sub="inv-asym7")
         self.assertEqual(self.client.get("/api/investments/metrics/portfolio").status_code, 403)
         self.assertEqual(self.client.get("/api/investments/dashboard-metrics").status_code, 403)
+
+    # --- Satellites du dossier : offre, garanties, échéancier, observations,
+    # reporting. Tous étaient servis par des vues gardées par la seule capacité
+    # `read` — que le rôle `invest` PORTE (rbac/role_registry.py). Connaître un code
+    # projet suffisait donc à lire le montage d'un dossier en due diligence.
+
+    def test_investisseur_ne_voit_pas_les_offres_dun_dossier_en_due_diligence(self):
+        Offer.objects.create(project=self.due_diligence, code="OFR-DD", funding_goal=Decimal("50000"))
+        self.login(role="invest", sub="inv-asym8")
+        res = self.client.get("/api/investments/offers")
+        self.assertEqual(res.status_code, 200)
+        self.assertNotIn("OFR-DD", {o["code"] for o in res.data})
+        cible = self.client.get(f"/api/investments/offers?project={self.due_diligence.code}")
+        self.assertEqual(cible.data, [])
+
+    def test_personnel_voit_les_offres_des_dossiers_en_instruction(self):
+        Offer.objects.create(project=self.due_diligence, code="OFR-DD2", funding_goal=Decimal("50000"))
+        self.login(role="gest_port", sub="staff-off")
+        res = self.client.get("/api/investments/offers")
+        self.assertIn("OFR-DD2", {o["code"] for o in res.data})
+
+    def test_investisseur_ne_voit_pas_les_garanties_dun_dossier_en_due_diligence(self):
+        offre = Offer.objects.create(project=self.due_diligence, code="OFR-DD3")
+        Collateral.objects.create(offer=offre, debt_type="Nantissement", collateral_value="9000")
+        self.login(role="invest", sub="inv-asym9")
+        res = self.client.get(f"/api/investments/offers/{offre.pk}/collateral")
+        self.assertEqual(res.status_code, 404)
+
+    def test_investisseur_ne_voit_pas_les_echeanciers_dun_dossier_en_due_diligence(self):
+        offre = Offer.objects.create(project=self.due_diligence, code="OFR-DD4")
+        RepaymentSchedule.objects.create(offer=offre, due_date=date.today(), amount_due="1000")
+        self.login(role="invest", sub="inv-asym10")
+        self.assertEqual(self.client.get("/api/investments/schedules").data, [])
+
+    def test_investisseur_ne_voit_pas_les_observations_dun_dossier_en_due_diligence(self):
+        AnalystObservation.objects.create(project=self.due_diligence, risk_flag="HIGH",
+                                           observation="Promoteur déjà en défaut ailleurs.")
+        self.login(role="invest", sub="inv-asym11")
+        res = self.client.get(f"/api/investments/observations?project={self.due_diligence.code}")
+        self.assertEqual(res.data, [])
+
+    def test_investisseur_ne_redige_pas_dobservation_danalyste(self):
+        self.login(role="invest", sub="inv-asym12")
+        res = self.client.post("/api/investments/observations",
+                                {"projectCode": self.ouvert.code, "riskFlag": "LOW",
+                                 "observation": "Tout va bien."}, format="json")
+        self.assertEqual(res.status_code, 403)
+        self.assertFalse(AnalystObservation.objects.filter(project=self.ouvert).exists())
+
+    def test_investisseur_ne_voit_pas_le_reporting_dun_dossier_en_due_diligence(self):
+        services.submit_performance_report(project=self.due_diligence,
+                                            data={"actualRevenue": 1, "forecastRevenue": 1}, by="u")
+        self.login(role="invest", sub="inv-asym13")
+        self.assertEqual(self.client.get("/api/investments/performance-reports").data, [])
+
+    def test_investisseur_ne_depose_pas_de_reporting_promoteur(self):
+        self.login(role="invest", sub="inv-asym14")
+        res = self.client.post("/api/investments/performance-reports",
+                                {"projectCode": self.ouvert.code, "actualRevenue": 10,
+                                 "forecastRevenue": 1000}, format="json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_investisseur_ne_voit_pas_les_questions_des_autres(self):
+        autre = make_investor("autre-q")
+        ProjectQuestion.objects.create(project=self.ouvert, investor=autre,
+                                        question="Quelle est la garantie réelle ?")
+        self.login(role="invest", sub="inv-asym15")
+        res = self.client.get("/api/investments/questions?all=1")
+        self.assertEqual(res.data, [])
+        self.login(role="gest_port", sub="staff-q2")
+        self.assertEqual(len(self.client.get("/api/investments/questions?all=1").data), 1)
+
+    def test_les_metriques_dun_investisseur_ne_contiennent_que_son_argent(self):
+        a = make_investor("asym-a")
+        b = make_investor("asym-b")
+        offre = self.ouvert.offers.first()
+        Offer.objects.filter(pk=offre.pk).update(min_funding_amount=Decimal("0"))
+        for inv, bonds, cle in ((a, 60, "aa"), (b, 20, "bb")):
+            sub = funding.reserve(investor=inv, offer_id=offre.pk, bonds=bonds,
+                                   idempotency_key=cle, by=cle)
+            funding.settle(subscription=sub, idempotency_key=f"s{cle}", by="caisse")
+        res = metrics.investor_metrics(a)
+        self.assertEqual(res["totalInvested"], 6000.0)
+        self.assertEqual(res["positionsCount"], 1)
+        self.assertEqual(res["defaultRates"]["totalValue"], 6000.0)
+        self.assertEqual(res["concentration"]["basisAmount"], 6000.0)
+        self.assertEqual(res["scope"], "Portefeuille de cet investisseur uniquement.")
+
+    def test_investisseur_ne_cree_pas_doffre(self):
+        self.login(role="invest", sub="inv-asym16")
+        res = self.client.post("/api/investments/offers",
+                                {"projectCode": self.ouvert.code, "code": "OFR-PIRATE",
+                                 "couponRate": "50", "fundingGoal": "1"}, format="json")
+        self.assertEqual(res.status_code, 403)
 
 
 # ── 10. API ──────────────────────────────────────────────────────────────────

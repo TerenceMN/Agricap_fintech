@@ -527,6 +527,15 @@ def distribute(*, offer: Offer, amount, kind: str = Distribution.Kind.COUPON,
     montant = _q(to_decimal(amount))
     if montant <= Decimal("0"):
         raise ValidationFailed("Le montant distribué doit être positif.")
+    if kind not in Distribution.Kind.values:
+        # La NATURE de la distribution n'est pas décorative : `metrics` amortit le
+        # capital restant dû sur les seules distributions CAPITAL et nette les intérêts
+        # courus des seules distributions COUPON. Un `kind` fantaisiste accepté ici
+        # fausserait durablement la valorisation du portefeuille.
+        raise ValidationFailed(
+            f"Nature de distribution inconnue : « {kind} ». Valeurs admises : "
+            f"{', '.join(Distribution.Kind.values)}."
+        )
     if project.status not in (Project.Status.P10, Project.Status.P09):
         raise ConflictError(
             "Les distributions ont lieu pendant la phase de remboursement du projet "

@@ -65,6 +65,21 @@ def _visible_projects(request):
     return qs.filter(status__in=PUBLIC_PROJECT_STATUSES)
 
 
+def _visible_offers(request):
+    """Offres visibles par l'appelant.
+
+    Une offre est un satellite de son projet : si le dossier est en due diligence, son
+    offre — objectif de levée, taux de coupon, garanties — l'est aussi. Sans ce
+    filtre, `GET /offers` révélait à n'importe quel investisseur l'existence, le
+    montage et le montant de chaque dossier P01→P05 (le rôle `invest` porte `read`).
+    """
+    qs = Offer.objects.filter(project__in=_visible_projects(request))
+    if _is_staff(request):
+        return qs
+    #: Un brouillon d'offre n'est pas une offre : il n'est pas encore opposable.
+    return qs.exclude(status__in=(Offer.Status.DRAFT, Offer.Status.PREPARATION))
+
+
 def _committee_error(exc) -> Response:
     """Les exceptions du comité viennent de `credits.committee` : elles portent leur
     `code` et leur `http_status` mais ne dérivent pas de `BusinessError`, donc le
@@ -171,6 +186,26 @@ def project_clear_conditions(request, code):
 
 @api_view(["POST"])
 @permission_classes([HasCapability("validate")])
+def project_expert_valuation(request, code):
+    """Enregistre la valorisation d'expert DATÉE d'un projet (Annexe D).
+
+    C'est le seul intrant de la valorisation des titres de capital : sans elle,
+    `metrics` retombe au pair et l'annonce. Acte de personnel — un investisseur ne
+    valorise pas lui-même la ligne qu'il détient.
+    """
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    project = services.set_expert_valuation(
+        project=project, amount=data.get("amount", "0"), valuation_date=data.get("valuationDate"),
+        source=data.get("source", ""), by=getattr(request.user, "sub", ""),
+    )
+    return Response(serializers.project_detail_row(project))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
 def project_action(request, code):
     """Transition explicite de la machine à états. Le motif est obligatoire.
 
@@ -244,12 +279,12 @@ def project_committee_votes(request, code):
 @permission_classes([HasCapability("read")])
 def offers(request):
     if request.method == "GET":
-        qs = Offer.objects.all()
+        qs = _visible_offers(request)
         project_code = request.GET.get("project")
         if project_code:
             qs = qs.filter(project__code=project_code)
         return Response([serializers.offer_row(o) for o in qs])
-    if not _require(request, "create"):
+    if not _is_staff(request) or not _require(request, "create"):
         return Response({"detail": "Capacité requise : create."}, status=403)
     data = request.data or {}
     project = Project.objects.filter(code=data.get("projectCode")).first()
@@ -396,7 +431,7 @@ def accounting_events(request):
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def offer_collateral(request, offer_id):
-    offer = Offer.objects.filter(pk=offer_id).first()
+    offer = _visible_offers(request).filter(pk=offer_id).first()
     if not offer:
         return Response({"detail": "Offre introuvable."}, status=404)
     collateral = Collateral.objects.filter(offer=offer).first()
@@ -587,7 +622,9 @@ def movements(request):
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def schedules(request):
-    qs = RepaymentSchedule.objects.all()
+    """Échéanciers de retour (B12) — bornés aux offres visibles par l'appelant : un
+    échéancier révèle le montage financier de son offre, donc de son projet."""
+    qs = RepaymentSchedule.objects.filter(offer__in=_visible_offers(request))
     offer_id = request.GET.get("offer")
     if offer_id:
         qs = qs.filter(offer_id=offer_id)
@@ -621,8 +658,13 @@ def sub_portfolios(request):
 @api_view(["GET", "POST"])
 @permission_classes([HasCapability("read")])
 def observations(request):
+    """Observations d'analyste. En lecture, elles suivent la visibilité du PROJET :
+    les remarques de risque d'un dossier en due diligence ne s'affichent pas à un
+    investisseur qui connaîtrait le code. En écriture, elles sont un acte d'analyste —
+    donc du personnel : un investisseur ne rédige pas l'analyse de risque du dossier
+    dans lequel il place son argent."""
     project_code = request.GET.get("project") if request.method == "GET" else (request.data or {}).get("projectCode")
-    project = Project.objects.filter(code=project_code).first()
+    project = _visible_projects(request).filter(code=project_code).first()
     if request.method == "GET":
         qs = AnalystObservation.objects.filter(project=project) if project else AnalystObservation.objects.none()
         return Response([
@@ -630,6 +672,8 @@ def observations(request):
              "observation": o.observation, "recommendation": o.recommendation}
             for o in qs
         ])
+    if not _is_staff(request) or not _require(request, "create"):
+        return Response({"detail": "Capacité requise : create (personnel de l'institution)."}, status=403)
     if not project:
         return Response({"detail": "Projet introuvable."}, status=404)
     data = request.data or {}
@@ -647,7 +691,11 @@ def questions(request):
     if request.method == "GET":
         investor = _my_investor(request)
         qs = ProjectQuestion.objects.filter(investor=investor) if investor else ProjectQuestion.objects.none()
-        if request.GET.get("all") and _require(request, "read"):
+        # `?all=1` était gardé par la capacité `read` — que le rôle `invest` PORTE :
+        # n'importe quel investisseur récupérait ainsi les questions de tous les autres
+        # (leur identifiant, leurs projets, leurs préoccupations). La corbeille des
+        # questions est un écran de personnel.
+        if request.GET.get("all") and _is_staff(request) and _require(request, "read"):
             qs = ProjectQuestion.objects.all()
         project_code = request.GET.get("project")
         if project_code:
@@ -684,12 +732,18 @@ def question_answer(request, question_id):
 @api_view(["GET", "POST"])
 @permission_classes([HasCapability("read")])
 def performance_reports(request):
+    """Reporting du promoteur. Lecture bornée à la visibilité du projet (un
+    investisseur suit les projets ouverts et ceux où il a mis de l'argent, pas les
+    dossiers en instruction) ; dépôt réservé au personnel, qui saisit le reporting
+    reçu du promoteur — celui-ci n'est pas un utilisateur du système."""
     if request.method == "GET":
-        qs = PerformanceReport.objects.all()
+        qs = PerformanceReport.objects.filter(project__in=_visible_projects(request))
         project_code = request.GET.get("project")
         if project_code:
             qs = qs.filter(project__code=project_code)
         return Response([serializers.performance_report_row(r) for r in qs])
+    if not _is_staff(request) or not _require(request, "create"):
+        return Response({"detail": "Capacité requise : create (personnel de l'institution)."}, status=403)
     data = request.data or {}
     project = Project.objects.filter(code=data.get("projectCode")).first()
     if not project:
@@ -811,9 +865,18 @@ def dashboard_metrics(request):
         "totalProjects": Project.objects.count(),
         "totalInvested": float(encaisse),
         "totalReserved": float(reserve),
+        # Effectifs des deux agrégats : « 120 000 investis » ne dit rien sans le nombre
+        # de souscriptions qui le composent.
+        "settledSubscriptionsCount": Subscription.objects.filter(
+            status__in=Subscription.FUNDED_STATUSES).count(),
+        "reservedSubscriptionsCount": Subscription.objects.filter(
+            status=Subscription.Status.RESERVED).count(),
         "activeInvestors": Investor.objects.filter(status=Investor.Status.ACTIVE).count(),
         "kycPending": Investor.objects.filter(kyc_status=Investor.KycStatus.EN_ATTENTE).count(),
-        "currency": "USD",
+        # Devise VÉRIFIÉE sur les flux, pas affirmée : `currency_note` signale toute
+        # devise étrangère plutôt que de laisser l'écran additionner des CDF et des USD.
+        **metrics.currency_note(distributions=Distribution.objects.all(),
+                                  movements=Movement.objects.all()),
         "scope": "Toutes agences, tous projets.",
         "asOf": timezone.now().date().isoformat(),
     })

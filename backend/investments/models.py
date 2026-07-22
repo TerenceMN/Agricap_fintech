@@ -42,6 +42,16 @@ class InvestmentConfig(models.Model):
     #: Seuil d'alerte du taux de défaut en valeur (5 % par défaut, Annexe D).
     default_rate_alert = models.DecimalField(max_digits=5, decimal_places=4, default=Decimal("0.05"))
 
+    #: Décote de provision appliquée au capital non remboursé d'un projet en défaut
+    #: (P12) pour la valorisation latente — Annexe D, « décote de provision pour P12 ».
+    #: 1,0000 = provision à 100 %, donc valeur retenue nulle. Un recouvrement
+    #: RÉELLEMENT encaissé prime toujours sur ce paramètre : un fait bat une hypothèse.
+    p12_provision_rate = models.DecimalField(max_digits=5, decimal_places=4, default=Decimal("1.0000"))
+    #: Âge maximal d'une valorisation d'expert avant péremption (Annexe D exige une
+    #: expertise DATÉE pour les titres de capital). Au-delà, on retombe au pair et on
+    #: le dit — une expertise de 2023 n'est pas une valeur de 2026.
+    expert_valuation_max_age_months = models.PositiveIntegerField(default=12)
+
     #: Politique appliquée aux offres qui ne précisent rien (voir `Offer.Oversubscription`).
     default_oversubscription_policy = models.CharField(max_length=10, default="QUEUE")
     #: Part de l'objectif en deçà de laquelle la levée échoue à l'échéance (min-funding).
@@ -114,6 +124,16 @@ class Project(models.Model):
 
     start_date = models.DateField(null=True, blank=True)
     expected_maturity = models.DateField(null=True, blank=True)
+
+    #: Valorisation d'expert des titres de capital (Annexe D : « valorisation d'expert
+    #: DATÉE pour les actions »). Trois champs indissociables — une valeur sans date ni
+    #: source n'est pas une expertise, c'est une opinion : la valorisation n'est retenue
+    #: que si les trois sont renseignés et que la date n'est pas périmée
+    #: (`InvestmentConfig.expert_valuation_max_age_months`). Sinon : au pair, et la
+    #: méthode affichée le dit.
+    expert_valuation = models.DecimalField(max_digits=16, decimal_places=2, null=True, blank=True)
+    expert_valuation_date = models.DateField(null=True, blank=True)
+    expert_valuation_source = models.CharField(max_length=200, blank=True)
 
     manager_sub = models.CharField(max_length=255, blank=True)
     manager_name = models.CharField(max_length=150, blank=True)

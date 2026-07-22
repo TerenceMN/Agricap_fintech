@@ -30,6 +30,13 @@ def project_detail_row(p: Project) -> dict:
         "promoterContact": p.promoter_contact,
         "startDate": p.start_date.isoformat() if p.start_date else None,
         "expectedMaturity": p.expected_maturity.isoformat() if p.expected_maturity else None,
+        # Valorisation d'expert : les trois champs voyagent ENSEMBLE. Servir la valeur
+        # sans sa date permettrait à un écran d'afficher une expertise de 2023 comme si
+        # elle datait d'aujourd'hui — exactement ce que l'Annexe D interdit.
+        "expertValuation": float(p.expert_valuation) if p.expert_valuation is not None else None,
+        "expertValuationDate": (p.expert_valuation_date.isoformat()
+                                 if p.expert_valuation_date else None),
+        "expertValuationSource": p.expert_valuation_source,
     }
     latest_offer = p.offers.order_by("-created_at").first()
     if latest_offer:

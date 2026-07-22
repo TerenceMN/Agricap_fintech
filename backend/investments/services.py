@@ -115,6 +115,53 @@ def clear_conditions(*, project: Project, by: str = "", note: str = "") -> Proje
 
 
 @transaction.atomic
+def set_expert_valuation(*, project: Project, amount, valuation_date, source: str = "",
+                          by: str = "") -> Project:
+    """Enregistre la valorisation d'expert d'un projet — Annexe D, titres de capital.
+
+    Les trois éléments sont indissociables : une valeur sans date ni source n'est pas
+    une expertise, c'est une opinion, et `metrics._expert_valuation()` la refusera. On
+    refuse donc de l'enregistrer plutôt que de l'enregistrer pour la voir écartée en
+    silence à l'affichage. Une expertise antidatée du futur n'existe pas non plus.
+
+    Aucun écrasement muet : l'ancienne valeur part au journal d'audit, qui est
+    append-only — la trajectoire des valorisations successives est elle-même une
+    donnée (une action réévaluée trois fois en six mois se remarque).
+    """
+    montant = to_decimal(amount)
+    if montant < Decimal("0"):
+        raise ValidationFailed("Une valorisation d'expert ne peut pas être négative.")
+    jour = to_date(valuation_date)
+    if jour is None:
+        raise ValidationFailed(
+            "La date de la valorisation d'expert est obligatoire : une valeur sans date "
+            "n'est pas une expertise."
+        )
+    if jour > timezone.now().date():
+        raise ValidationFailed("La date de la valorisation d'expert ne peut pas être future.")
+    if not (source or "").strip():
+        raise ValidationFailed(
+            "La source de la valorisation d'expert est obligatoire (cabinet, rapport, "
+            "référence) : une valorisation sans auteur n'est pas opposable."
+        )
+    ancien = {
+        "amount": str(project.expert_valuation) if project.expert_valuation is not None else None,
+        "date": project.expert_valuation_date.isoformat() if project.expert_valuation_date else None,
+        "source": project.expert_valuation_source,
+    }
+    project.expert_valuation = montant
+    project.expert_valuation_date = jour
+    project.expert_valuation_source = source.strip()
+    project.save(update_fields=["expert_valuation", "expert_valuation_date",
+                                 "expert_valuation_source", "updated_at"])
+    audit_record(actor=by, action="investments.project.expert_valuation", entity_type="Project",
+                 entity_id=project.code,
+                 details={"previous": ancien, "amount": str(montant), "date": jour.isoformat(),
+                          "source": project.expert_valuation_source})
+    return project
+
+
+@transaction.atomic
 def create_offer(*, project: Project, code: str, coupon_rate: Decimal | str, maturity_months: int,
                   min_ticket: Decimal | str, available_bonds: int, funding_goal: Decimal | str = "0",
                   min_funding_amount: Decimal | str | None = None, oversubscription_policy: str = "",
