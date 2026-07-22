@@ -1,40 +1,50 @@
-"""Services investissements — le mouvement d'argent réel est TOUJOURS délégué à
-`transactions`/`caisses` (référencé en FK sur `Movement.transaction`) ; cette app ne
-détient jamais elle-même le solde, elle ne fait qu'orchestrer projets/offres/souscriptions."""
+"""Services investissements — façade du module.
+
+Le mouvement d'argent réel est TOUJOURS délégué à `transactions`/`caisses` (référencé en
+FK sur `Movement.transaction`) ; cette app ne détient jamais elle-même le solde. Elle
+orchestre le cycle et produit les événements que la comptabilité consomme.
+
+Répartition des responsabilités depuis le lot « cycle de vie » :
+
+- `workflow.py` : machine à états P01→P13, gardes, journal des transitions ;
+- `committee.py` : quorum du comité d'investissement (P04) ;
+- `funding.py` : réservation, encaissement, clôture, décaissement, retours, distributions ;
+- `metrics.py` : XIRR, défaut, concentration, score de santé ;
+- ce fichier : création des entités et opérations sans effet monétaire.
+"""
 from __future__ import annotations
 
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import F, Sum
+from django.db.models import Sum
+from django.utils import timezone
 
 from audit.services import record as audit_record
-from common import idempotency
-from common.exceptions import ConflictError, NotFoundError, ValidationFailed
-from common.parsing import to_decimal
+from common.exceptions import ValidationFailed
+from common.parsing import to_date, to_decimal
 
-from . import serializers
+from . import funding, workflow
 from .models import (
-    AnalystObservation, Investor, Movement, Offer, PerformanceReport, Project, Subscription,
+    AnalystObservation, FinancialAnalysis, InvestmentConfig, Investor, Offer, PerformanceReport,
+    Project, Subscription, TechnicalAnalysis,
 )
 
-# Workflow P01→P13 : dictionnaire des transitions autorisées (P12 Défaut / P13 Annulé sont
-# des sorties terminales, atteignables depuis plusieurs étapes).
-ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    Project.Status.P01: {Project.Status.P02, Project.Status.P13},
-    Project.Status.P02: {Project.Status.P03, Project.Status.P13},
-    Project.Status.P03: {Project.Status.P04, Project.Status.P13},
-    Project.Status.P04: {Project.Status.P05, Project.Status.P13},
-    Project.Status.P05: {Project.Status.P06, Project.Status.P13},
-    Project.Status.P06: {Project.Status.P07, Project.Status.P13},
-    Project.Status.P07: {Project.Status.P08, Project.Status.P13},
-    Project.Status.P08: {Project.Status.P09, Project.Status.P12},
-    Project.Status.P09: {Project.Status.P10, Project.Status.P12},
-    Project.Status.P10: {Project.Status.P11, Project.Status.P12},
-    Project.Status.P11: set(),
-    Project.Status.P12: set(),
-    Project.Status.P13: set(),
-}
+#: Ré-export : le graphe canonique vit dans `workflow.py`, un seul endroit.
+ALLOWED_TRANSITIONS = workflow.ALLOWED_TRANSITIONS
+
+#: Ré-exports des services monétaires — les appelants historiques n'ont pas à savoir
+#: dans quel module la mécanique a été rangée.
+reserve = funding.reserve
+settle = funding.settle
+cancel_reservation = funding.cancel_reservation
+close_offer = funding.close_offer
+close_fundraising = funding.close_fundraising
+disburse = funding.disburse
+record_return = funding.record_return
+distribute = funding.distribute
+refund_project = funding.refund_project
+cancel_project = funding.cancel_project
 
 
 @transaction.atomic
@@ -53,73 +63,96 @@ def create_project(*, code: str, title: str, sector: str = "", location: str = "
     return project
 
 
+def transition_status(*, project: Project, to_status: str, by: str = "", reason: str = "",
+                       actor_role: str = "", details: dict | None = None) -> Project:
+    """Façade de `workflow.transition` — point d'entrée unique du changement de statut.
+
+    Aucun motif de complaisance n'est fabriqué ici : « Passage en P08 » n'explique rien.
+    Un appelant qui ne fournit pas de motif reçoit `TRANSITION_REASON_REQUIRED`.
+    """
+    return workflow.transition(project, to_status=to_status, actor_sub=by, reason=reason,
+                                actor_role=actor_role, details=details)
+
+
 @transaction.atomic
-def transition_status(*, project: Project, to_status: str, by: str = "") -> Project:
-    allowed = ALLOWED_TRANSITIONS.get(project.status, set())
-    if to_status not in allowed:
-        raise ValidationFailed(f"Transition {project.status} → {to_status} non autorisée.")
-    project.status = to_status
-    project.save(update_fields=["status", "updated_at"])
-    audit_record(actor=by, action="investments.project.transition", entity_type="Project", entity_id=project.code,
-                 details={"to": to_status})
+def approve_analysis(*, project: Project, kind: str, by: str = "") -> Project:
+    """Approuve l'analyse technique ou financière — condition d'entrée en comité (P04).
+
+    L'approbation est un acte humain daté et signé : c'est elle que la garde de P04
+    vérifie, pas la simple existence d'un enregistrement d'analyse.
+    """
+    kind = (kind or "").strip().lower()
+    modele = {"technical": TechnicalAnalysis, "financial": FinancialAnalysis}.get(kind)
+    if modele is None:
+        raise ValidationFailed("Type d'analyse inconnu : attendu « technical » ou « financial ».")
+    analysis = modele.objects.filter(project=project).first()
+    if analysis is None:
+        raise ValidationFailed(
+            f"Aucune analyse {kind} enregistrée sur ce projet : il n'y a rien à approuver."
+        )
+    analysis.approved_at = timezone.now()
+    analysis.approved_by = by
+    analysis.save(update_fields=["approved_at", "approved_by", "updated_at"])
+    audit_record(actor=by, action=f"investments.analysis.{kind}.approve", entity_type="Project",
+                 entity_id=project.code, details={"kind": kind})
+    return project
+
+
+@transaction.atomic
+def clear_conditions(*, project: Project, by: str = "", note: str = "") -> Project:
+    """Déclare levées les conditions posées par le comité — condition d'entrée en P06."""
+    if project.status != Project.Status.P05:
+        raise ValidationFailed(
+            "Les conditions ne se lèvent que sur un projet en approbation conditionnelle (P05)."
+        )
+    if not (project.committee_conditions or "").strip():
+        raise ValidationFailed("Aucune condition n'a été enregistrée pour ce projet.")
+    project.conditions_cleared_at = timezone.now()
+    project.save(update_fields=["conditions_cleared_at", "updated_at"])
+    audit_record(actor=by, action="investments.project.conditions_cleared", entity_type="Project",
+                 entity_id=project.code, details={"note": note})
     return project
 
 
 @transaction.atomic
 def create_offer(*, project: Project, code: str, coupon_rate: Decimal | str, maturity_months: int,
                   min_ticket: Decimal | str, available_bonds: int, funding_goal: Decimal | str = "0",
-                  by: str = "") -> Offer:
+                  min_funding_amount: Decimal | str | None = None, oversubscription_policy: str = "",
+                  subscription_deadline=None, by: str = "") -> Offer:
+    """Crée une offre. Le plancher de min-funding, s'il n'est pas donné, est dérivé du
+    ratio paramétré en base — jamais d'un nombre écrit dans le code."""
     if Offer.objects.filter(code=code).exists():
         raise ValidationFailed(f"Le code offre « {code} » existe déjà.")
+    goal = to_decimal(funding_goal)
+    cfg = InvestmentConfig.active()
+    if min_funding_amount in (None, ""):
+        plancher = (goal * Decimal(cfg.default_min_funding_ratio)).quantize(Decimal("0.01"))
+    else:
+        plancher = to_decimal(min_funding_amount)
+    if plancher > goal:
+        raise ValidationFailed(
+            f"Le plancher de min-funding ({plancher}) ne peut pas dépasser l'objectif ({goal})."
+        )
+    politique = (oversubscription_policy or cfg.default_oversubscription_policy or
+                 Offer.Oversubscription.QUEUE)
+    if politique not in Offer.Oversubscription.values:
+        raise ValidationFailed(f"Politique de sursouscription inconnue : « {politique} ».")
     offer = Offer.objects.create(
         project=project, code=code, coupon_rate=to_decimal(coupon_rate), maturity_months=maturity_months,
         min_ticket=to_decimal(min_ticket), available_bonds=available_bonds, max_bonds=available_bonds,
-        funding_goal=to_decimal(funding_goal),
+        funding_goal=goal, min_funding_amount=plancher, oversubscription_policy=politique,
+        subscription_deadline=to_date(subscription_deadline),
     )
-    audit_record(actor=by, action="investments.offer.create", entity_type="Offer", entity_id=offer.code)
+    audit_record(actor=by, action="investments.offer.create", entity_type="Offer", entity_id=offer.code,
+                 details={"fundingGoal": str(goal), "minFunding": str(plancher), "policy": politique})
     return offer
 
 
-@transaction.atomic
 def subscribe(*, investor: Investor, offer_id: int, bonds: int, idempotency_key: str,
               by: str = "") -> Subscription:
-    if bonds <= 0:
-        raise ValidationFailed("Le nombre d'obligations souscrites doit être positif.")
-
-    rec = idempotency.begin(
-        scope="investments.subscribe", key=idempotency_key,
-        params={"investor": investor.pk, "offer": offer_id, "bonds": bonds}, by=by,
-    )
-
-    offer = Offer.objects.select_for_update().select_related("project").filter(pk=offer_id).first()
-    if not offer:
-        raise NotFoundError("Offre introuvable.")
-    if offer.project.status != Project.Status.P06:
-        raise ConflictError("Ce projet n'est pas ouvert à la souscription.")
-    if bonds < offer.min_bonds or bonds > offer.available_bonds:
-        raise ValidationFailed(
-            f"Nombre d'obligations hors bornes (min={offer.min_bonds}, disponible={offer.available_bonds})."
-        )
-
-    amount = (offer.bond_unit_value * bonds).quantize(Decimal("0.01"))
-    subscription = Subscription.objects.create(
-        investor=investor, offer=offer, amount=amount, bonds=bonds,
-        coupon_rate_snapshot=offer.coupon_rate, created_by=by,
-    )
-    Offer.objects.filter(pk=offer.pk).update(
-        available_bonds=F("available_bonds") - bonds, funded_amount=F("funded_amount") + amount,
-    )
-    Project.objects.filter(pk=offer.project_id).update(funded_amount=F("funded_amount") + amount)
-    Movement.objects.create(
-        type=Movement.Type.SUBSCRIPTION, investor=investor, project=offer.project, subscription=subscription,
-        assigned_manager_sub=offer.project.manager_sub, amount=amount, currency="USD",
-    )
-
-    audit_record(actor=by, action="investments.subscribe", entity_type="Subscription", entity_id=str(subscription.pk),
-                 details={"offer": offer.code, "bonds": bonds, "amount": str(amount)})
-    idempotency.complete(rec, response=serializers.subscription_row(subscription),
-                          entity_type="Subscription", entity_id=str(subscription.pk))
-    return subscription
+    """Alias historique de `funding.reserve` — une souscription RÉSERVE, elle n'encaisse pas."""
+    return funding.reserve(investor=investor, offer_id=offer_id, bonds=bonds,
+                            idempotency_key=idempotency_key, by=by)
 
 
 def submit_performance_report(*, project: Project, data: dict, by: str = "") -> PerformanceReport:
@@ -163,10 +196,18 @@ def investor_action(*, investor: Investor, action: str, by: str = "") -> Investo
 
 
 def portfolio_allocation(*, investor: Investor) -> dict:
+    """Allocation du portefeuille — sur l'argent RÉELLEMENT placé.
+
+    Une souscription seulement réservée ne pèse pas dans une allocation d'actifs :
+    elle n'est pas un actif, elle est une intention. Seuls les montants encaissés
+    comptent (`settled_amount` sur les souscriptions vivantes).
+    """
     from caisses.models import ClientWallet
 
     from .models import ObligationPosition
-    bonds_total = Subscription.objects.filter(investor=investor).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    bonds_total = Subscription.objects.filter(
+        investor=investor, status__in=Subscription.FUNDED_STATUSES,
+    ).aggregate(total=Sum("settled_amount"))["total"] or Decimal("0")
     obligations_total = ObligationPosition.objects.filter(investor=investor).aggregate(
         total=Sum("invested_amount"))["total"] or Decimal("0")
     cash_total = ClientWallet.objects.filter(user=investor.user).aggregate(total=Sum("balance"))["total"] or Decimal("0")

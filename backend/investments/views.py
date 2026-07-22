@@ -1,6 +1,13 @@
 """API investissements — Project/Offer/Investor/Subscription/Movement + produits
 obligataires. Alimente `AdminConsole.jsx`, `AdminInvestments.jsx`, `InvestorSpace.jsx`,
-`Obligations.jsx`, `Conversions.jsx`, `Holdings.jsx`, `Opportunities.jsx`, `Portfolios.jsx`."""
+`Obligations.jsx`, `Conversions.jsx`, `Holdings.jsx`, `Opportunities.jsx`, `Portfolios.jsx`.
+
+**Asymétrie d'information (§5.2 du prompt HAZINA).** Un investisseur voit SON argent et
+les projets OUVERTS. Il ne voit ni les données des autres investisseurs, ni les dossiers
+en due diligence (P01→P05) autrement qu'en pipeline agrégé anonymisé. La règle est
+appliquée ici, dans le filtrage des vues — pas dans l'affichage : un front ne protège
+rien.
+"""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -15,11 +22,20 @@ from common import idempotency
 from rbac.permissions import HasCapability
 from rbac.role_registry import get_role
 
-from . import serializers, services
+from . import committee, funding, metrics, serializers, services, workflow
 from .models import (
-    AnalystObservation, BondConversion, BondWithdrawal, Collateral, FinancialAnalysis, Investor,
-    Movement, Offer, ObligationPosition, PerformanceReport, Project, ProjectQuestion,
-    RepaymentSchedule, SecondaryMarketListing, Subscription, SubPortfolio, TechnicalAnalysis,
+    AnalystObservation, BondConversion, BondWithdrawal, Collateral, Distribution,
+    FinancialAnalysis, InvestmentEvent, Investor, Movement, Offer, ObligationPosition,
+    PerformanceReport, Project, ProjectQuestion, ProjectTransition, RepaymentSchedule,
+    SecondaryMarketListing, Subscription, SubPortfolio, TechnicalAnalysis,
+)
+
+#: Statuts d'un projet visibles par un investisseur : la levée ouverte et tout ce qui
+#: suit (il a le droit de suivre un projet dans lequel il a mis de l'argent). Les
+#: étapes P01→P05 relèvent de l'instruction interne.
+PUBLIC_PROJECT_STATUSES = (
+    Project.Status.P06, Project.Status.P07, Project.Status.P08, Project.Status.P09,
+    Project.Status.P10, Project.Status.P11, Project.Status.P12,
 )
 
 
@@ -31,18 +47,46 @@ def _require(request, capability: str) -> bool:
     return bool(getattr(get_role(getattr(request.user, "role", "")), capability, False))
 
 
+def _is_staff(request) -> bool:
+    """Personnel de l'institution, par TYPE de rôle et non par capacité.
+
+    Le rôle `invest` porte `create` (il crée ses souscriptions) : tester `create` pour
+    distinguer le personnel du client donnerait l'instruction des dossiers aux
+    investisseurs. Le type du rôle est le seul discriminant correct.
+    """
+    return getattr(get_role(getattr(request.user, "role", "")), "type", "Client") != "Client"
+
+
+def _visible_projects(request):
+    """Projets visibles par l'appelant — tout pour le personnel, P06+ pour un client."""
+    qs = Project.objects.all()
+    if _is_staff(request):
+        return qs
+    return qs.filter(status__in=PUBLIC_PROJECT_STATUSES)
+
+
+def _committee_error(exc) -> Response:
+    """Les exceptions du comité viennent de `credits.committee` : elles portent leur
+    `code` et leur `http_status` mais ne dérivent pas de `BusinessError`, donc le
+    handler global ne les mappe pas. On les mappe ici, à l'identique du module crédit."""
+    return Response({"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+                     status=exc.http_status)
+
+
 # --- Projects ----------------------------------------------------------------
 
 @api_view(["GET", "POST"])
 @permission_classes([HasCapability("read")])
 def projects(request):
     if request.method == "GET":
-        qs = Project.objects.all()
+        qs = _visible_projects(request)
         status = request.GET.get("status")
         if status:
             qs = qs.filter(status=status)
+        # Forme de liste conservée telle quelle : le front existant la consomme ainsi,
+        # et cette liste n'est jamais tronquée (pas de `total_rows` à annoncer).
         return Response([serializers.project_row(p) for p in qs])
-    if not _require(request, "create"):
+    if not _is_staff(request) or not _require(request, "create"):
         return Response({"detail": "Capacité requise : create."}, status=403)
     data = request.data or {}
     project = services.create_project(
@@ -57,11 +101,13 @@ def projects(request):
 @api_view(["GET", "PATCH"])
 @permission_classes([HasCapability("read")])
 def project_detail(request, code):
-    project = Project.objects.filter(code=code).first()
+    project = _visible_projects(request).filter(code=code).first()
     if not project:
+        # 404 volontaire et non 403 : révéler l'existence d'un dossier en due
+        # diligence est déjà une fuite d'information.
         return Response({"detail": "Projet introuvable."}, status=404)
     if request.method == "PATCH":
-        if not _require(request, "create"):
+        if not _is_staff(request) or not _require(request, "create"):
             return Response({"detail": "Capacité requise : create."}, status=403)
         data = request.data or {}
         for field, model_field in (
@@ -78,7 +124,7 @@ def project_detail(request, code):
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def project_technical_analysis(request, code):
-    project = Project.objects.filter(code=code).first()
+    project = _visible_projects(request).filter(code=code).first()
     if not project:
         return Response({"detail": "Projet introuvable."}, status=404)
     analysis = TechnicalAnalysis.objects.filter(project=project).first()
@@ -90,7 +136,7 @@ def project_technical_analysis(request, code):
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def project_financial_analysis(request, code):
-    project = Project.objects.filter(code=code).first()
+    project = _visible_projects(request).filter(code=code).first()
     if not project:
         return Response({"detail": "Projet introuvable."}, status=404)
     analysis = FinancialAnalysis.objects.filter(project=project).first()
@@ -101,13 +147,95 @@ def project_financial_analysis(request, code):
 
 @api_view(["POST"])
 @permission_classes([HasCapability("validate")])
-def project_action(request, code):
+def project_analysis_approve(request, code):
+    """Approbation datée d'une analyse — condition d'entrée en comité (P04)."""
     project = Project.objects.filter(code=code).first()
     if not project:
         return Response({"detail": "Projet introuvable."}, status=404)
-    to_status = (request.data or {}).get("toStatus")
-    project = services.transition_status(project=project, to_status=to_status, by=getattr(request.user, "sub", ""))
+    kind = (request.data or {}).get("kind", "")
+    project = services.approve_analysis(project=project, kind=kind, by=getattr(request.user, "sub", ""))
     return Response(serializers.project_row(project))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def project_clear_conditions(request, code):
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    project = services.clear_conditions(project=project, by=getattr(request.user, "sub", ""),
+                                         note=data.get("note", ""))
+    return Response(serializers.project_row(project))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def project_action(request, code):
+    """Transition explicite de la machine à états. Le motif est obligatoire.
+
+    Les transitions à effet monétaire (clôture de souscription, décaissement,
+    annulation avec remboursement) ont leurs propres endpoints : elles ne sont pas
+    un simple changement de statut et ne passent pas par ici.
+    """
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    to_status = data.get("toStatus")
+    if to_status in (Project.Status.P07, Project.Status.P08):
+        return Response(
+            {"detail": "Cette étape a son propre endpoint (clôture de souscription, "
+                       "décaissement) : elle ne se déclenche pas par un changement de statut.",
+             "code": "USE_DEDICATED_ENDPOINT"},
+            status=409,
+        )
+    project = services.transition_status(
+        project=project, to_status=to_status, by=getattr(request.user, "sub", ""),
+        reason=data.get("reason", ""), actor_role=getattr(request.user, "role", ""),
+    )
+    return Response(serializers.project_row(project))
+
+
+@api_view(["GET"])
+@permission_classes([HasCapability("read")])
+def project_transitions(request, code):
+    """Historique append-only des transitions d'un projet — lecture seule absolue."""
+    project = _visible_projects(request).filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    rows = [
+        {"fromStatus": t.from_status, "toStatus": t.to_status, "actor": t.actor_sub,
+         "actorRole": t.actor_role, "reason": t.reason, "details": t.details,
+         "createdAt": t.created_at.isoformat()}
+        for t in ProjectTransition.objects.filter(project=project)
+    ]
+    return Response({"projectCode": project.code, "currentStatus": project.status,
+                     "allowedTargets": sorted(workflow.allowed_targets(project.status)),
+                     "transitions": rows, "totalRows": len(rows)})
+
+
+# --- Comité d'investissement (P04) -------------------------------------------
+
+@api_view(["GET", "POST"])
+@permission_classes([HasCapability("validate")])
+def project_committee_votes(request, code):
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    if request.method == "GET":
+        payload = committee.votes_summary(project)
+        payload["procesVerbal"] = committee.proces_verbal(project)
+        return Response(payload)
+    data = request.data or {}
+    try:
+        result = committee.cast_vote(
+            project, voter_sub=getattr(request.user, "sub", ""), decision=data.get("decision", ""),
+            comment=data.get("comment", ""), conditions=data.get("conditions", ""),
+        )
+    except committee.CommitteeError as exc:
+        return _committee_error(exc)
+    return Response(result, status=201)
 
 
 # --- Offers --------------------------------------------------------------
@@ -139,8 +267,130 @@ def offers(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def offers_open(request):
-    qs = Offer.objects.filter(status=Offer.Status.OUVERT, project__status=Project.Status.P06)
-    return Response([serializers.offer_row(o) for o in qs])
+    """Offres réellement ouvertes — le seul détail projet auquel un investisseur a droit
+    avant d'engager son argent."""
+    return Response(metrics.open_offers_summary())
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def offer_close(request, offer_id):
+    offer = Offer.objects.filter(pk=offer_id).first()
+    if not offer:
+        return Response({"detail": "Offre introuvable."}, status=404)
+    offer = funding.close_offer(offer=offer, by=getattr(request.user, "sub", ""))
+    return Response(serializers.offer_row(offer))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def offer_distribute(request, offer_id):
+    """Distribution au prorata des souscriptions ENCAISSÉES (B13)."""
+    offer = Offer.objects.select_related("project").filter(pk=offer_id).first()
+    if not offer:
+        return Response({"detail": "Offre introuvable."}, status=404)
+    data = request.data or {}
+    key = data.get("idempotencyKey")
+    if not key:
+        return Response({"detail": "idempotencyKey requis."}, status=400)
+    try:
+        distribution = funding.distribute(
+            offer=offer, amount=data.get("amount", "0"),
+            kind=data.get("kind", Distribution.Kind.COUPON), idempotency_key=key,
+            by=getattr(request.user, "sub", ""), value_date=data.get("valueDate"),
+        )
+    except idempotency.IdempotentReplay as exc:
+        return idempotency.replay_response(exc)
+    return Response(serializers.distribution_row(distribution), status=201)
+
+
+# --- Levée : clôture, décaissement, retours ----------------------------------
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def project_close_fundraising(request, code):
+    """P06 → P07 (min-funding atteint) ou P06 → P13 avec remboursements (min-funding raté)."""
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    project = funding.close_fundraising(project=project, by=getattr(request.user, "sub", ""),
+                                         reason=data.get("reason", ""))
+    return Response(serializers.project_row(project))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("disburse")])
+def project_disburse(request, code):
+    """P07 → P08 : décaissement vers le promoteur (B11). Jamais avant clôture."""
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    key = data.get("idempotencyKey")
+    if not key:
+        return Response({"detail": "idempotencyKey requis."}, status=400)
+    try:
+        project = funding.disburse(project=project, amount=data.get("amount", "0"),
+                                    idempotency_key=key, by=getattr(request.user, "sub", ""),
+                                    reason=data.get("reason", ""))
+    except idempotency.IdempotentReplay as exc:
+        return idempotency.replay_response(exc)
+    return Response(serializers.project_row(project))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def project_record_return(request, code):
+    """Encaissement d'un retour du projet (B12) — préalable à toute distribution."""
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    key = data.get("idempotencyKey")
+    if not key:
+        return Response({"detail": "idempotencyKey requis."}, status=400)
+    try:
+        project = funding.record_return(project=project, amount=data.get("amount", "0"),
+                                         idempotency_key=key, by=getattr(request.user, "sub", ""),
+                                         value_date=data.get("valueDate"),
+                                         reason=data.get("reason", ""))
+    except idempotency.IdempotentReplay as exc:
+        return idempotency.replay_response(exc)
+    return Response(serializers.project_row(project))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def project_cancel(request, code):
+    """P13 : annulation avec remboursement des souscriptions encaissées."""
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    project = funding.cancel_project(project=project, by=getattr(request.user, "sub", ""),
+                                      reason=data.get("reason", ""))
+    return Response(serializers.project_row(project))
+
+
+@api_view(["GET"])
+@permission_classes([HasCapability("audit")])
+def accounting_events(request):
+    """File des événements métier destinés au moteur d'écritures (B10→B13).
+
+    Lecture seule : `investments` produit, `accounting` consomme. Le filtre
+    `?pending=1` sert le consommateur ; l'auditeur, lui, relit tout.
+    """
+    qs = InvestmentEvent.objects.all()
+    if request.GET.get("pending"):
+        qs = qs.filter(consumed_at__isnull=True)
+    if request.GET.get("project"):
+        qs = qs.filter(project__code=request.GET["project"])
+    if request.GET.get("type"):
+        qs = qs.filter(event_type=request.GET["type"])
+    total = qs.count()
+    rows = [serializers.investment_event_row(e) for e in qs[:500]]
+    return Response({"results": rows, "totalRows": total, "returned": len(rows)})
 
 
 @api_view(["GET"])
@@ -161,8 +411,11 @@ def offer_collateral(request, offer_id):
 @permission_classes([HasCapability("read")])
 def investors(request):
     if request.method == "GET":
+        # Un investisseur ne voit jamais les autres investisseurs.
+        if not _is_staff(request):
+            return Response({"detail": "Réservé au personnel de l'institution."}, status=403)
         return Response([serializers.investor_row(i) for i in Investor.objects.all()])
-    if not _require(request, "create"):
+    if not _is_staff(request) or not _require(request, "create"):
         return Response({"detail": "Capacité requise : create."}, status=403)
     data = request.data or {}
     from accounts.models import FintechUser
@@ -200,11 +453,21 @@ def investor_action(request, investor_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def subscriptions(request):
+    """POST = RÉSERVATION, pas encaissement (voir `subscription_settle`).
+
+    En lecture, un investisseur ne voit que SES souscriptions : le filtre `?investor=`
+    n'est honoré que pour le personnel. Sans cette règle, `?investor=42` exposerait le
+    portefeuille du voisin.
+    """
     if request.method == "GET":
-        qs = Subscription.objects.all()
-        investor_id = request.GET.get("investor")
-        if investor_id:
-            qs = qs.filter(investor_id=investor_id)
+        if _is_staff(request):
+            qs = Subscription.objects.all()
+            investor_id = request.GET.get("investor")
+            if investor_id:
+                qs = qs.filter(investor_id=investor_id)
+        else:
+            investor = _my_investor(request)
+            qs = Subscription.objects.filter(investor=investor) if investor else Subscription.objects.none()
         return Response([serializers.subscription_row(s) for s in qs])
     data = request.data or {}
     key = data.get("idempotencyKey")
@@ -212,13 +475,48 @@ def subscriptions(request):
         return Response({"detail": "idempotencyKey requis."}, status=400)
     investor, _ = Investor.objects.get_or_create(user=request.user)
     try:
-        sub = services.subscribe(
+        sub = funding.reserve(
             investor=investor, offer_id=data.get("offerId"), bonds=data.get("bonds", 0),
             idempotency_key=key, by=getattr(request.user, "sub", ""),
         )
     except idempotency.IdempotentReplay as exc:
         return idempotency.replay_response(exc)
     return Response(serializers.subscription_row(sub), status=201)
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def subscription_settle(request, subscription_id):
+    """Encaissement d'une souscription réservée (B10) — événement distinct de la
+    réservation, réservé au personnel qui constate l'arrivée des fonds."""
+    sub = Subscription.objects.filter(pk=subscription_id).first()
+    if not sub:
+        return Response({"detail": "Souscription introuvable."}, status=404)
+    data = request.data or {}
+    key = data.get("idempotencyKey")
+    if not key:
+        return Response({"detail": "idempotencyKey requis."}, status=400)
+    try:
+        sub = funding.settle(subscription=sub, idempotency_key=key,
+                              by=getattr(request.user, "sub", ""), amount=data.get("amount"),
+                              value_date=data.get("valueDate"))
+    except idempotency.IdempotentReplay as exc:
+        return idempotency.replay_response(exc)
+    return Response(serializers.subscription_row(sub))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def subscription_cancel(request, subscription_id):
+    """Annulation d'une réservation NON encaissée — par son titulaire ou le personnel."""
+    sub = Subscription.objects.filter(pk=subscription_id).first()
+    if not sub:
+        return Response({"detail": "Souscription introuvable."}, status=404)
+    if not _is_staff(request) and sub.investor_id != getattr(_my_investor(request), "pk", None):
+        return Response({"detail": "Souscription introuvable."}, status=404)
+    sub = funding.cancel_reservation(subscription=sub, by=getattr(request.user, "sub", ""),
+                                      reason=(request.data or {}).get("reason", ""))
+    return Response(serializers.subscription_row(sub))
 
 
 @api_view(["GET"])
@@ -230,18 +528,59 @@ def my_subscriptions(request):
     return Response([serializers.subscription_row(s) for s in investor.subscriptions.all()])
 
 
+# --- Métriques (Annexe D) ----------------------------------------------------
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def my_metrics(request):
+    """Le tableau de bord de l'investisseur — SON argent, sur SES flux réels."""
+    investor, _ = Investor.objects.get_or_create(user=request.user)
+    return Response(metrics.investor_metrics(investor))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def pipeline(request):
+    """Pipeline P01→P05 : agrégé et anonymisé pour un client, détaillé pour le personnel."""
+    if _is_staff(request):
+        return Response({
+            "stages": metrics.anonymised_pipeline(),
+            "projects": [serializers.project_row(p) for p in Project.objects.filter(
+                status__in=[Project.Status.P01, Project.Status.P02, Project.Status.P03,
+                            Project.Status.P04, Project.Status.P05])],
+        })
+    return Response({"stages": metrics.anonymised_pipeline(), "projects": []})
+
+
+@api_view(["GET"])
+@permission_classes([HasCapability("read")])
+def portfolio_metrics(request):
+    """Métriques institution — XIRR sur flux réels, défaut valeur ET nombre,
+    Herfindahl, score de santé avec sa formule et ses paramètres."""
+    if not _is_staff(request):
+        return Response({"detail": "Réservé au personnel de l'institution."}, status=403)
+    return Response(metrics.portfolio_metrics())
+
+
 # --- Movements / schedules / sub-portfolios --------------------------------
 
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def movements(request):
-    qs = Movement.objects.all()
-    investor_id = request.GET.get("investor")
-    zone = request.GET.get("zone")
-    if investor_id:
-        qs = qs.filter(investor_id=investor_id)
-    if zone:
-        qs = qs.filter(geographic_zone=zone)
+    if _is_staff(request):
+        qs = Movement.objects.all()
+        investor_id = request.GET.get("investor")
+        if investor_id:
+            qs = qs.filter(investor_id=investor_id)
+        zone = request.GET.get("zone")
+        if zone:
+            qs = qs.filter(geographic_zone=zone)
+    else:
+        # Un investisseur ne voit que SES mouvements — jamais ceux d'un autre.
+        investor = _my_investor(request)
+        qs = Movement.objects.filter(investor=investor) if investor else Movement.objects.none()
+    # Forme de liste conservée (le front la consomme telle quelle) ; la troncature à
+    # 500 lignes et la pagination associée sont à traiter dans le lot front.
     return Response([serializers.movement_row(m) for m in qs[:500]])
 
 
@@ -459,12 +798,24 @@ def secondary_market(request):
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def dashboard_metrics(request):
-    total_invested = Subscription.objects.aggregate(total=Sum("amount"))["total"] or 0
+    """KPI institution. `totalInvested` compte l'argent ENCAISSÉ, pas les réservations :
+    additionner des intentions et les appeler « investi » gonflerait le chiffre le plus
+    regardé du module."""
+    if not _is_staff(request):
+        return Response({"detail": "Réservé au personnel de l'institution."}, status=403)
+    encaisse = Subscription.objects.filter(
+        status__in=Subscription.FUNDED_STATUSES).aggregate(total=Sum("settled_amount"))["total"] or 0
+    reserve = Subscription.objects.filter(
+        status=Subscription.Status.RESERVED).aggregate(total=Sum("amount"))["total"] or 0
     return Response({
         "totalProjects": Project.objects.count(),
-        "totalInvested": float(total_invested),
+        "totalInvested": float(encaisse),
+        "totalReserved": float(reserve),
         "activeInvestors": Investor.objects.filter(status=Investor.Status.ACTIVE).count(),
         "kycPending": Investor.objects.filter(kyc_status=Investor.KycStatus.EN_ATTENTE).count(),
+        "currency": "USD",
+        "scope": "Toutes agences, tous projets.",
+        "asOf": timezone.now().date().isoformat(),
     })
 
 

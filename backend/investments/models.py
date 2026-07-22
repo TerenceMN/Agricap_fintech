@@ -14,6 +14,53 @@ from django.db.models import Q
 from common.choices import FlowStatus
 
 
+class InvestmentConfig(models.Model):
+    """Paramètres du module investissement — principe 8 : « les règles vivent en base ».
+
+    Un seul enregistrement actif. Tout ce qui gouverne une décision (quorum du comité,
+    coefficients du score de santé, seuils d'alerte, politique de sursouscription par
+    défaut) vit ici et non dans le code : le comité doit pouvoir recalibrer sans
+    redéploiement, et la formule affichée à l'investisseur doit correspondre
+    exactement aux paramètres appliqués.
+    """
+
+    is_active = models.BooleanField(default=True)
+
+    #: Quorum du comité d'investissement. `null` = on hérite du quorum du comité de
+    #: crédit (`credits.committee.committee_quorum()`, lui-même lu dans
+    #: `InstitutionConfig`) — un seul paramétrage de gouvernance tant que
+    #: l'institution n'a pas voulu les dissocier.
+    committee_quorum = models.PositiveIntegerField(null=True, blank=True)
+
+    # Score de santé /100 (Annexe D) :
+    #   100 − a×taux_défaut − b×max(0, H−h₀)×100 − c×part_projets_en_retard
+    health_coeff_default = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("4"))     # a
+    health_coeff_concentration = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("50"))  # b
+    health_coeff_late = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("1"))        # c
+    #: h₀ — seuil de Herfindahl au-delà duquel la concentration pénalise (Annexe D).
+    concentration_threshold = models.DecimalField(max_digits=5, decimal_places=4, default=Decimal("0.25"))
+    #: Seuil d'alerte du taux de défaut en valeur (5 % par défaut, Annexe D).
+    default_rate_alert = models.DecimalField(max_digits=5, decimal_places=4, default=Decimal("0.05"))
+
+    #: Politique appliquée aux offres qui ne précisent rien (voir `Offer.Oversubscription`).
+    default_oversubscription_policy = models.CharField(max_length=10, default="QUEUE")
+    #: Part de l'objectif en deçà de laquelle la levée échoue à l'échéance (min-funding).
+    default_min_funding_ratio = models.DecimalField(max_digits=5, decimal_places=4, default=Decimal("0.7000"))
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Configuration investissement"
+
+    @classmethod
+    def active(cls) -> "InvestmentConfig":
+        cfg = cls.objects.filter(is_active=True).order_by("-pk").first()
+        return cfg or cls(is_active=True)  # instance non persistée = valeurs par défaut
+
+    def __str__(self) -> str:
+        return f"InvestmentConfig(actif={self.is_active})"
+
+
 class Project(models.Model):
     class Status(models.TextChoices):
         P01 = "P01", "Prospection"
@@ -45,7 +92,20 @@ class Project(models.Model):
     image_url = models.CharField(max_length=500, blank=True)
 
     funding_target = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    #: Σ souscriptions ENCAISSÉES (B10). Une réservation n'est pas de l'argent : elle
+    #: n'entre jamais ici (principe 8 du prompt HAZINA, §3 de la mission).
     funded_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    #: Σ décaissée au promoteur (B11), Σ retours encaissés (B12), Σ distribuée (B13).
+    disbursed_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    returned_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    distributed_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+
+    #: Conditions posées par le comité en P05 — « approbation conditionnelle » n'a de
+    #: sens que si les conditions sont écrites et leur levée tracée.
+    committee_conditions = models.TextField(blank=True)
+    conditions_cleared_at = models.DateTimeField(null=True, blank=True)
+    defaulted_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
 
     status = models.CharField(max_length=3, choices=Status.choices, default=Status.P01)
     risk_category = models.CharField(max_length=80, blank=True)
@@ -103,6 +163,20 @@ class Offer(models.Model):
         ANNUAL = "annual", "Annuel"
         BULLET = "bullet", "In fine (à terme)"
 
+    class Oversubscription(models.TextChoices):
+        """Traitement des souscriptions au-delà de l'objectif — paramétrable par offre.
+
+        QUEUE   : premier arrivé premier servi ; le surplus part en liste d'attente et
+                  n'est servi que si une réservation antérieure tombe.
+        PRORATA : toutes les réservations sont acceptées ; à la clôture, chacune est
+                  réduite au prorata et le surplus n'est jamais encaissé.
+        REJECT  : la réservation qui dépasse l'objectif est refusée sur-le-champ.
+        """
+
+        QUEUE = "QUEUE", "File d'attente (premier arrivé)"
+        PRORATA = "PRORATA", "Prorata à la clôture"
+        REJECT = "REJECT", "Refus au-delà de l'objectif"
+
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="offers")
     code = models.CharField(max_length=32, unique=True, db_index=True)
     type_of_title = models.CharField(max_length=16, choices=TypeOfTitle.choices, default=TypeOfTitle.OBLIGATION)
@@ -115,7 +189,18 @@ class Offer(models.Model):
     max_bonds = models.IntegerField(default=0)
     available_bonds = models.IntegerField(default=0)
     funding_goal = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    #: RÉSERVÉ ≠ ENCAISSÉ. `reserved_amount` = engagements pris (souscriptions vivantes,
+    #: hors liste d'attente) ; `funded_amount` = argent réellement reçu (B10).
+    reserved_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
     funded_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    #: Seuil de min-funding : en deçà, la levée échoue à l'échéance et les souscripteurs
+    #: sont remboursés (P13). 0 = pas de plancher (dérivé de la config à la création).
+    min_funding_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    subscription_deadline = models.DateField(null=True, blank=True)
+    oversubscription_policy = models.CharField(
+        max_length=10, choices=Oversubscription.choices, default=Oversubscription.QUEUE,
+    )
+    closed_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.OUVERT)
     collateral_value = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
     loan_to_value = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("0"))
@@ -188,13 +273,31 @@ class SubPortfolio(models.Model):
 
 
 class Subscription(models.Model):
+    """Une souscription RÉSERVE, elle n'encaisse pas.
+
+    `RESERVED` = engagement pris, aucun franc n'a bougé. `SETTLED` = argent reçu et
+    comptabilisé (B10) — c'est le seul état qui alimente `funded_amount`, qui autorise
+    le décaissement et qui compte dans le XIRR. `WAITLISTED` = au-delà de l'objectif,
+    en file d'attente (politique QUEUE). `REFUNDED` = souscription encaissée puis
+    remboursée (min-funding non atteint ou annulation P13, contrepassation de B10).
+    """
+
     class Status(models.TextChoices):
-        PENDING = "PENDING", "En attente"
+        RESERVED = "RESERVED", "Réservée (non encaissée)"
+        WAITLISTED = "WAITLISTED", "Liste d'attente"
+        SETTLED = "SETTLED", "Encaissée"
+        PENDING = "PENDING", "En attente (hérité)"
         ACTIVE = "ACTIVE", "Actif"
         REPAYMENT = "REPAYMENT", "Remboursement"
         COMPLETED = "COMPLETED", "Terminé"
         DEFAULTED = "DEFAULTED", "Défaut"
+        REFUNDED = "REFUNDED", "Remboursée"
         CANCELLED = "CANCELLED", "Annulé"
+
+    #: États dans lesquels la souscription pèse sur l'objectif de l'offre.
+    LIVE_STATUSES = ("RESERVED", "SETTLED", "ACTIVE", "REPAYMENT", "COMPLETED", "DEFAULTED")
+    #: États dans lesquels l'argent a réellement été reçu.
+    FUNDED_STATUSES = ("SETTLED", "ACTIVE", "REPAYMENT", "COMPLETED", "DEFAULTED")
 
     class PaymentStatus(models.TextChoices):
         PAID = "PAID", "Payé"
@@ -205,12 +308,24 @@ class Subscription(models.Model):
     offer = models.ForeignKey(Offer, on_delete=models.PROTECT, related_name="subscriptions")
     sub_portfolio = models.ForeignKey(SubPortfolio, null=True, blank=True, on_delete=models.SET_NULL,
                                        related_name="subscriptions")
+    #: Montant RÉSERVÉ. Il ne bouge pas : la réduction prorata s'inscrit dans
+    #: `allocated_amount`, et l'encaissement dans `settled_amount` — pour qu'un
+    #: auditeur voie ce qui a été promis ET ce qui a été servi.
     amount = models.DecimalField(max_digits=16, decimal_places=2)
+    allocated_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    settled_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    refunded_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
     bonds = models.IntegerField(default=0)
-    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    #: Rang dans la file (politique QUEUE) — 0 pour les souscriptions servies.
+    queue_rank = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.RESERVED)
     payment_status = models.CharField(max_length=10, choices=PaymentStatus.choices, default=PaymentStatus.UNPAID)
     coupon_rate_snapshot = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("0"))
     subscription_date = models.DateField(auto_now_add=True)
+    reserved_at = models.DateTimeField(null=True, blank=True)
+    #: Horodatage de l'encaissement : c'est LA date de flux du XIRR côté investisseur.
+    settled_at = models.DateTimeField(null=True, blank=True)
+    refunded_at = models.DateTimeField(null=True, blank=True)
     next_payment_date = models.DateField(null=True, blank=True)
     total_received = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
     created_by = models.CharField(max_length=255, blank=True)
@@ -221,8 +336,16 @@ class Subscription(models.Model):
         ordering = ["-created_at"]
         constraints = [
             models.CheckConstraint(condition=Q(amount__gte=0), name="subscription_amount_nonneg"),
+            models.CheckConstraint(
+                condition=Q(settled_amount__gte=0) & Q(allocated_amount__gte=0) & Q(refunded_amount__gte=0),
+                name="subscription_lifecycle_amounts_nonneg",
+            ),
         ]
         indexes = [models.Index(fields=["investor", "status"]), models.Index(fields=["offer"])]
+
+    @property
+    def is_funded(self) -> bool:
+        return self.status in Subscription.FUNDED_STATUSES
 
     def __str__(self) -> str:
         return f"Sub({self.investor_id}->{self.offer_id}) {self.amount}"
@@ -231,7 +354,18 @@ class Subscription(models.Model):
 class Movement(models.Model):
     class Type(models.TextChoices):
         DEPOSIT = "DEPOSIT", "Dépôt"
-        SUBSCRIPTION = "SUBSCRIPTION", "Souscription"
+        #: Réservation — trace applicative, AUCUN mouvement d'argent (pas d'écriture).
+        SUBSCRIPTION = "SUBSCRIPTION", "Souscription (réservation)"
+        #: Encaissement de la souscription — B10.
+        SETTLEMENT = "SETTLEMENT", "Encaissement souscription"
+        #: Remboursement d'une souscription encaissée — contrepassation de B10.
+        REFUND = "REFUND", "Remboursement souscription"
+        #: Décaissement vers le projet — B11.
+        DISBURSEMENT = "DISBURSEMENT", "Décaissement projet"
+        #: Retour du projet — B12.
+        PROJECT_RETURN = "PROJECT_RETURN", "Encaissement retour projet"
+        #: Distribution aux investisseurs au prorata — B13.
+        DISTRIBUTION = "DISTRIBUTION", "Distribution investisseurs"
         COUPON_REPAYMENT = "COUPON_REPAYMENT", "Remboursement coupon"
         CAPITAL_REPAYMENT = "CAPITAL_REPAYMENT", "Remboursement capital"
         WITHDRAWAL = "WITHDRAWAL", "Retrait"
@@ -283,6 +417,170 @@ class RepaymentSchedule(models.Model):
 
     def __str__(self) -> str:
         return f"{self.offer.code} {self.kind} {self.due_date}"
+
+
+class ProjectTransition(models.Model):
+    """Journal append-only des transitions P01→P13 — acteur, horodatage, motif.
+
+    Double du journal d'audit (`audit.services.record`, seul journal transverse) : ici
+    la trace est interrogeable PAR PROJET sans traverser tout l'audit, ce dont a besoin
+    l'écran « historique du dossier ». Jamais d'UPDATE ni de DELETE (principe 3) : on
+    n'annule pas une transition, on en pose une nouvelle.
+    """
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="transitions")
+    from_status = models.CharField(max_length=3)
+    to_status = models.CharField(max_length=3)
+    actor_sub = models.CharField(max_length=255, blank=True)
+    actor_role = models.CharField(max_length=64, blank=True)
+    #: Motif obligatoire — une transition sans motif n'est pas reconstituable.
+    reason = models.TextField()
+    details = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [models.Index(fields=["project", "created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.project_id}: {self.from_status}→{self.to_status}"
+
+
+class InvestmentCommitteeVote(models.Model):
+    """Vote nominatif au comité d'investissement (P04) — append-only.
+
+    Structure et règles calquées sur `credits.models.CommitteeVote` (même sémantique :
+    un vote par membre, motif obligatoire, quorum figé au moment du vote). Le modèle est
+    distinct parce que l'objet voté l'est : un `CreditApplication` n'est pas un `Project`,
+    et une FK ne se généralise pas sans table polymorphe — voir `investments/committee.py`
+    pour ce qui est effectivement réutilisé du module crédit.
+    """
+
+    class Decision(models.TextChoices):
+        APPROVE = "approve", "Pour l'approbation"
+        REJECT = "reject", "Pour le rejet"
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="committee_votes")
+    voter_sub = models.CharField(max_length=255)
+    decision = models.CharField(max_length=10, choices=Decision.choices)
+    comment = models.TextField()
+    conditions = models.TextField(blank=True)
+    quorum_at_vote = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["project", "voter_sub"],
+                                     name="unique_investment_committee_vote_per_member"),
+        ]
+        indexes = [models.Index(fields=["project", "created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.project_id} {self.voter_sub}:{self.decision}"
+
+
+class InvestmentEvent(models.Model):
+    """Événement métier append-only — le SEUL contrat entre `investments` et la
+    comptabilité (`accounting`, construit par un autre agent).
+
+    Ce module ne passe aucune écriture : il déclare que quelque chose s'est produit
+    (encaissement d'une souscription, décaissement d'un projet, retour, distribution,
+    remboursement) avec son montant, sa devise, son cantonnement d'offre et sa date.
+    Le moteur d'écritures consomme la file (`consumed_at` / `journal_reference`) et
+    applique le catalogue B10→B13. Aucun consommateur n'est requis pour que le module
+    fonctionne : l'événement est produit, qu'il soit lu ou non.
+    """
+
+    class Type(models.TextChoices):
+        #: B10 — encaissement souscription : 501/511 → 419-OFF.
+        SUBSCRIPTION_SETTLED = "SUBSCRIPTION_SETTLED", "Encaissement souscription (B10)"
+        #: Contrepassation B10 — remboursement d'une souscription encaissée.
+        SUBSCRIPTION_REFUNDED = "SUBSCRIPTION_REFUNDED", "Remboursement souscription (B10 contrepassé)"
+        #: B11 — décaissement projet : 419-OFF → 501/511.
+        PROJECT_DISBURSED = "PROJECT_DISBURSED", "Décaissement projet (B11)"
+        #: B12 — encaissement retour projet : 501/511 → 719 + 419-OFF.
+        PROJECT_RETURN_RECEIVED = "PROJECT_RETURN_RECEIVED", "Encaissement retour projet (B12)"
+        #: B13 — distribution investisseur au prorata : 419-OFF → 501/511.
+        DISTRIBUTION_PAID = "DISTRIBUTION_PAID", "Distribution investisseur (B13)"
+        #: Sans écriture — signale à la compta qu'une provision est à constituer.
+        PROJECT_DEFAULTED = "PROJECT_DEFAULTED", "Défaut projet (provision à constituer)"
+
+    event_type = models.CharField(max_length=32, choices=Type.choices, db_index=True)
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.PROTECT,
+                                 related_name="accounting_events")
+    offer = models.ForeignKey(Offer, null=True, blank=True, on_delete=models.PROTECT,
+                               related_name="accounting_events")
+    subscription = models.ForeignKey(Subscription, null=True, blank=True, on_delete=models.PROTECT,
+                                      related_name="accounting_events")
+    investor = models.ForeignKey(Investor, null=True, blank=True, on_delete=models.PROTECT,
+                                  related_name="accounting_events")
+    amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    currency = models.CharField(max_length=3, default="USD")
+    #: Sous-compte de cantonnement attendu par la compta (419-OFF-xxxx, Annexe A).
+    segregation_account = models.CharField(max_length=32, blank=True)
+    occurred_at = models.DateTimeField(db_index=True)
+    actor_sub = models.CharField(max_length=255, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    #: Renseignés par le consommateur comptable — jamais par ce module.
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    journal_reference = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["occurred_at", "id"]
+        indexes = [
+            models.Index(fields=["event_type", "occurred_at"]),
+            models.Index(fields=["consumed_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.event_type} {self.amount} {self.currency}"
+
+
+class Distribution(models.Model):
+    """Distribution au prorata des souscriptions ENCAISSÉES d'une offre (B13).
+
+    Une distribution ne peut jamais excéder ce qui a été effectivement encaissé du
+    projet (B12) et non encore distribué : « pas de distribution sans encaissement ».
+    """
+
+    class Kind(models.TextChoices):
+        COUPON = "COUPON", "Coupon / rendement"
+        CAPITAL = "CAPITAL", "Remboursement de capital"
+        REFUND = "REFUND", "Remboursement de souscription"
+
+    offer = models.ForeignKey(Offer, on_delete=models.PROTECT, related_name="distributions")
+    kind = models.CharField(max_length=10, choices=Kind.choices, default=Kind.COUPON)
+    total_amount = models.DecimalField(max_digits=16, decimal_places=2)
+    currency = models.CharField(max_length=3, default="USD")
+    value_date = models.DateField()
+    executed_by = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-value_date", "-id"]
+
+    def __str__(self) -> str:
+        return f"Distribution({self.offer_id}) {self.kind} {self.total_amount}"
+
+
+class DistributionLine(models.Model):
+    """Part d'un investisseur dans une distribution — la quote-part se calcule sur les
+    montants ENCAISSÉS, jamais sur les montants réservés."""
+
+    distribution = models.ForeignKey(Distribution, on_delete=models.CASCADE, related_name="lines")
+    subscription = models.ForeignKey(Subscription, on_delete=models.PROTECT, related_name="distribution_lines")
+    investor = models.ForeignKey(Investor, on_delete=models.PROTECT, related_name="distribution_lines")
+    share = models.DecimalField(max_digits=9, decimal_places=8, default=Decimal("0"))
+    amount = models.DecimalField(max_digits=16, decimal_places=2)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(fields=["distribution", "subscription"],
+                                     name="unique_distribution_line_per_subscription"),
+        ]
 
 
 class AnalystObservation(models.Model):
@@ -377,6 +675,9 @@ class TechnicalAnalysis(models.Model):
     yield_forecast = models.FloatField(default=0)
     climate_risk = models.TextField(blank=True)
     mitigation = models.TextField(blank=True)
+    #: Approbation explicite — condition d'entrée en comité (P04, Annexe C).
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.CharField(max_length=255, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
 
@@ -390,6 +691,9 @@ class FinancialAnalysis(models.Model):
     dscr = models.FloatField(default=0)
     irr = models.FloatField(default=0)
     financial_score = models.FloatField(default=0)
+    #: Approbation explicite — condition d'entrée en comité (P04, Annexe C).
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.CharField(max_length=255, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
 
