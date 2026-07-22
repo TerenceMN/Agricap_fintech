@@ -33,6 +33,39 @@ def _gen_code() -> str:
     return f"CRED-{dt.strftime('%Y%m%d')}-{seq}"
 
 
+def resolve_agency_for_sub(sub: str):
+    """Agence de rattachement d'un membre du personnel — ou ``None``.
+
+    UNE seule règle de résolution pour tout le module (principe 6) : elle sert à
+    renseigner `CreditApplication.agency` à la création du dossier comme à
+    déterminer le périmètre d'un responsable d'agence (`credits.dashboard`). Deux
+    résolutions parallèles finiraient par diverger, et un dossier serait alors
+    « dans » l'agence pour l'écran et « hors » d'elle pour le filtre.
+
+    Ordre de résolution, tel qu'il était déjà appliqué par le tableau de bord :
+      1. affectation nominative — `rbac.StaffProfile.assignment` ;
+      2. gérance nommée — `agencies.Agency.manager_sub` (un gérant peut ne pas
+         avoir de profil staff).
+
+    Aucun repli au-delà : un compte sans rattachement déterminable ne reçoit PAS
+    d'agence par défaut. Une agence inventée contaminerait tous les périmètres
+    qui s'appuient dessus, sans qu'aucun écran ne puisse le détecter.
+    """
+    if not sub:
+        return None
+
+    from rbac.models import StaffProfile
+
+    profil = (
+        StaffProfile.objects.select_related("assignment").filter(user_id=sub).first()
+    )
+    if profil is not None and profil.assignment_id:
+        return profil.assignment
+
+    from agencies.models import Agency
+    return Agency.objects.filter(manager_sub=sub).first()
+
+
 class NeedsSheet(models.Model):
     """Feuille de Besoins parsée depuis un classeur Excel (feuilles 2-7)."""
 
@@ -121,6 +154,29 @@ class CreditApplication(models.Model):
         "accounts.FintechUser", on_delete=models.PROTECT, related_name="credit_applications",
     )
     initiated_by_sub = models.CharField(max_length=255, blank=True)  # agent si on_behalf_of
+
+    # ── Agence d'instruction ──────────────────────────────────────────────────
+    # Rattachement DIRECT du dossier à l'agence qui l'instruit. Jusqu'ici, le
+    # périmètre d'un responsable d'agence se déduisait des PERSONNES intervenues
+    # sur le dossier (`credits.dashboard`) : une approximation qui ratait tout
+    # dossier repris par un collègue d'une autre agence, et en attrapait à
+    # l'inverse qui n'étaient pas les siens.
+    #
+    # `null=True` — deux populations légitimes n'ont pas d'agence : les dossiers
+    # antérieurs à ce champ, et ceux montés par un compte sans rattachement
+    # déterminable. Le champ reste vide et l'écran le dit ; il n'y a JAMAIS
+    # d'agence par défaut (cf. `resolve_agency_for_sub`).
+    # `PROTECT` — une agence qui a instruit des dossiers ne disparaît pas :
+    # supprimer l'agence effacerait le périmètre de dossiers probants
+    # (principe 3). On ferme une agence (`Agency.Status.FERMEE`), on ne
+    # l'efface pas.
+    agency = models.ForeignKey(
+        "agencies.Agency", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="credit_applications",
+        help_text="Agence d'instruction, déduite de l'agent qui monte le dossier. "
+                  "Vide = rattachement indéterminé (dossier antérieur au champ, "
+                  "ou créateur sans affectation).",
+    )
 
     # Chaîne de valeur & version référentiel (figés à la soumission)
     value_chain = models.ForeignKey(

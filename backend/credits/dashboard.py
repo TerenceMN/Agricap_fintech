@@ -54,10 +54,14 @@ _ANALYSIS_PENDING_APPROVAL = ("in_analysis",)
 
 #: Champs qui rattachent un dossier à un membre du personnel.
 #:
-#: `CreditApplication` n'a AUCUN champ d'affectation (pas de `assigned_to`) : la
+#: `CreditApplication` n'a pas de champ d'AFFECTATION (pas de `assigned_to`) : la
 #: notion « SES dossiers » (§7.1) se lit donc comme « ceux sur lesquels il est
 #: intervenu ». C'est une approximation assumée et documentée — la vraie prise en
 #: charge (file d'instruction analyste, §7.1.2) demandera un champ d'affectation.
+#:
+#: Le rattachement à une AGENCE, lui, n'est plus une approximation : il passe par
+#: `CreditApplication.agency` (cf. `_dossiers_de_l_agence`). Ces champs n'y
+#: servent plus que de repli, et seulement pour les dossiers sans agence.
 _CHAMPS_INTERVENANT = (
     "initiated_by_sub", "submitted_by_sub", "reviewed_by_sub", "disbursed_by_sub",
 )
@@ -190,9 +194,17 @@ def _agregat_usd(qs, field: str) -> dict:
 
 # ── Périmètre servi (§7.2 : chaque carte précise son périmètre) ───────────────
 
-def _perimetre(type_: str, libelle: str, avertissement: str = "") -> dict:
-    """Périmètre RÉEL du queryset servi — jamais le périmètre souhaité."""
+def _perimetre(type_: str, libelle: str, avertissement: str = "", **extra) -> dict:
+    """Périmètre RÉEL du queryset servi — jamais le périmètre souhaité.
+
+    `extra` porte les précisions propres à un type de périmètre — notamment
+    `rattachement` (« exact » / « approche » / « mixte ») pour la vue agence :
+    un périmètre calculé sur un lien direct et un périmètre déduit des personnes
+    ne se présentent pas de la même façon, et l'écran doit pouvoir dire lequel il
+    affiche sans avoir à le deviner.
+    """
     bloc = {"type": type_, "libelle": libelle}
+    bloc.update({k: v for k, v in extra.items() if v is not None})
     if avertissement:
         bloc["avertissement"] = avertissement
     return bloc
@@ -220,31 +232,25 @@ def _mes_dossiers(qs, sub: str):
 def _equipe_agence(sub: str):
     """(subs de l'équipe, agence) du responsable d'agence `sub`, ou (None, None).
 
-    `CreditApplication` ne porte AUCUN lien vers une agence : un dossier ne peut
-    donc pas être filtré par agence directement. Le rattachement passe par les
-    personnes — l'agence d'affectation du responsable (`rbac.StaffProfile.
-    assignment`, ou `agencies.Agency.manager_sub` s'il en est le gérant nommé),
-    puis l'ensemble du personnel affecté à cette même agence. « Les dossiers de
-    mon agence » = « les dossiers montés/instruits par mon équipe ».
+    L'agence du demandeur est résolue par `credits.models.resolve_agency_for_sub`
+    — la MÊME règle que celle qui renseigne `CreditApplication.agency` à la
+    création du dossier. Deux règles distinctes finiraient par diverger, et un
+    dossier serait alors « dans » l'agence pour le filtre et « hors » d'elle pour
+    l'écran.
+
+    L'équipe (personnel affecté à la même agence) reste nécessaire : elle sert de
+    REPLI pour les dossiers antérieurs au champ `agency`, qui n'ont pas d'autre
+    rattachement possible que les personnes intervenues.
     """
+    from credits.models import resolve_agency_for_sub
     from rbac.models import StaffProfile
 
-    profil = StaffProfile.objects.filter(user_id=sub).first() if sub else None
-    agence_id = getattr(profil, "assignment_id", None)
-
-    if agence_id is None and sub:
-        from agencies.models import Agency
-        agence_id = (
-            Agency.objects.filter(manager_sub=sub).values_list("pk", flat=True).first()
-        )
-
-    if agence_id is None:
+    agence = resolve_agency_for_sub(sub)
+    if agence is None:
         return None, None
 
-    from agencies.models import Agency
-    agence = Agency.objects.filter(pk=agence_id).first()
     equipe = set(
-        StaffProfile.objects.filter(assignment_id=agence_id)
+        StaffProfile.objects.filter(assignment_id=agence.pk)
         .values_list("user_id", flat=True)
     )
     if sub:
@@ -252,15 +258,33 @@ def _equipe_agence(sub: str):
     return equipe, agence
 
 
-def _dossiers_agence(qs, subs: set[str]):
-    """Dossiers montés ou instruits par l'un des membres de `subs`."""
-    membres = {s for s in subs if s}
+def _dossiers_de_l_agence(qs, agence, equipe: set[str]):
+    """Dossiers de `agence` : lien direct quand il existe, repli sinon.
+
+    Deux populations cohabitent, et cohabiteront tant que les dossiers d'avant le
+    champ `agency` vivront :
+
+      - **rattachement exact** — le dossier porte `agency` : il est de cette
+        agence, ou il ne l'est pas. Aucune interprétation.
+      - **rattachement approché** — le dossier n'a PAS d'agence : on retombe sur
+        les personnes intervenues (`_CHAMPS_INTERVENANT`), c'est-à-dire sur
+        l'ancienne heuristique. Sans ce repli, tous les dossiers antérieurs
+        disparaîtraient de la vue agence du jour au lendemain.
+
+    Le repli ne s'applique QU'aux dossiers sans agence (`agency__isnull=True`).
+    Un dossier rattaché à une AUTRE agence n'entre pas dans le périmètre même si
+    un membre de l'équipe y est intervenu : c'est exactement ce que le lien
+    direct vient trancher — sinon il ne servirait à rien.
+    """
+    exact = Q(agency=agence)
+    membres = {s for s in equipe or () if s}
     if not membres:
-        return qs.none()
-    condition = Q()
+        return qs.filter(exact)
+
+    intervenu = Q()
     for champ in _CHAMPS_INTERVENANT:
-        condition |= Q(**{f"{champ}__in": membres})
-    return qs.filter(condition)
+        intervenu |= Q(**{f"{champ}__in": membres})
+    return qs.filter(exact | (Q(agency__isnull=True) & intervenu))
 
 
 # ── Vue client ────────────────────────────────────────────────────────────────
@@ -342,7 +366,9 @@ def _agent_dashboard(sub: str, roles: set[str] | None = None) -> dict[str, Any]:
             "Vos dossiers — ceux que vous avez initiés, soumis, instruits ou décaissés.",
             avertissement=(
                 "`CreditApplication` n'a pas de champ d'affectation : le rattachement "
-                "se fait par intervention, pas par prise en charge."
+                "se fait par intervention, pas par prise en charge. Le champ `agency` "
+                "ne résout pas cette approximation-ci — il rattache le dossier à une "
+                "AGENCE, pas à une personne (file d'instruction, §7.1.2)."
             ),
         )
     else:
@@ -464,28 +490,55 @@ def _committee_dashboard() -> dict[str, Any]:
 # ── Vue branch_manager ────────────────────────────────────────────────────────
 
 def _branch_dashboard(sub: str) -> dict[str, Any]:
-    """Vue agence — désormais restreinte à l'agence du demandeur.
+    """Vue agence — restreinte à l'agence du demandeur, par lien direct.
 
     Le `sub` reçu était ignoré (`CreditApplication.objects.all()`) : un
     responsable de zone lisait les chiffres de l'institution entière comme si
     c'étaient ceux de son agence. Quand le rattachement est introuvable (aucune
     affectation en base), on NE feint PAS un périmètre d'agence : on sert
     l'institution et `scope.avertissement` le dit explicitement.
+
+    Le périmètre repose désormais sur `CreditApplication.agency` pour les
+    dossiers qui le portent, et sur l'ancienne heuristique par les personnes pour
+    ceux qui n'en ont pas. `scope.rattachement` dit lequel des deux compose la
+    vue affichée (`exact`, `approche` ou `mixte`), et `scope.dossiers` donne les
+    effectifs de chacun : un chiffre calculé sur un lien direct et un chiffre
+    déduit d'une intervention n'ont pas la même autorité (§4.6).
     """
     from credits.models import CreditApplication
 
     base = CreditApplication.objects.all()
     equipe, agence = _equipe_agence(sub)
 
-    if equipe:
-        qs = _dossiers_agence(base, equipe)
+    if agence is not None:
+        qs = _dossiers_de_l_agence(base, agence, equipe or set())
+        exacts = qs.filter(agency=agence).count()
+        approches = qs.count() - exacts
+        rattachement = (
+            "exact" if not approches else ("approche" if not exacts else "mixte")
+        )
+        libelle = (
+            f"Agence « {agence.name} » ({agence.code}) — {exacts} dossier(s) "
+            f"rattaché(s) à l'agence"
+        )
+        if approches:
+            libelle += (
+                f", plus {approches} dossier(s) sans agence rattaché(s) par les "
+                f"{len(equipe or ())} membres affectés"
+            )
         scope = _perimetre(
             "branch",
-            f"Agence « {agence.name} » ({agence.code}) — dossiers montés ou "
-            f"instruits par les {len(equipe)} membres affectés.",
+            libelle + ".",
+            rattachement=rattachement,
+            dossiers={"exact": exacts, "approche": approches},
             avertissement=(
-                "`CreditApplication` ne porte pas d'agence : le rattachement passe "
-                "par les personnes affectées (`rbac.StaffProfile.assignment`)."
+                (
+                    f"{approches} dossier(s) de cette vue n'ont pas d'agence en base "
+                    "(antérieurs au champ, ou montés par un compte sans affectation) : "
+                    "ils sont rattachés par approximation, via les personnes "
+                    "intervenues. Les dossiers portant une agence, eux, sont exacts."
+                )
+                if approches else ""
             ),
         )
     else:
