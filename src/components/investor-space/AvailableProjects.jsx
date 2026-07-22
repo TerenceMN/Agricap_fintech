@@ -11,13 +11,26 @@ import {
   Search, Filter, MapPin, TrendingUp, Shield, Eye, Leaf
 } from 'lucide-react';
 import { api } from '@/services/api';
-import { formatCurrency, getRiskLabel } from '@/lib/investorSpaceUtils';
+import { formatCurrency, formatDate, getRiskLabel } from '@/lib/investorSpaceUtils';
+import { buildOpenOfferCards } from '@/lib/investorSpaceWire';
 import ProjectDetailsModal from './ProjectDetailsModal';
 
+/**
+ * Les offres OUVERTES — le seul détail projet auquel un investisseur a droit
+ * avant d'engager son argent.
+ *
+ * La liste vient de `GET /investments/offers/open`, jointe aux projets visibles
+ * pour récupérer le SCORE : afficher une opportunité sans son score de risque,
+ * c'est vendre la promesse en taisant le risque. Les montants (encaissé,
+ * réservé, avancement) sont ceux du serveur ; aucun pourcentage n'est recalculé
+ * ici.
+ */
 const AvailableProjects = ({ onInvest }) => {
   const { toast } = useToast();
   const [projects, setProjects] = useState([]);
   const [filteredProjects, setFilteredProjects] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [sectorFilter, setSectorFilter] = useState('all');
   const [locationFilter, setLocationFilter] = useState('all');
@@ -34,28 +47,22 @@ const AvailableProjects = ({ onInvest }) => {
   }, [projects, searchQuery, sectorFilter, locationFilter, riskFilter]);
 
   const loadProjects = async () => {
+    setLoading(true);
+    setError(null);
     try {
       const [openOffers, allProjects] = await Promise.all([
         api.investments.offers.open(),
         api.investments.projects.list(),
       ]);
-      const merged = openOffers.map((offer) => {
-        const project = allProjects.find((p) => p.id === offer.projectId);
-        if (!project) return null;
-        return {
-          id: project.id, code: project.code, name: project.title,
-          sector: project.sector, location: project.location, status: project.status,
-          riskScore: project.riskScore,
-          offerId: offer.id, offerCode: offer.code,
-          raisedAmount: offer.fundedAmount, targetAmount: offer.fundingGoal,
-          minimumTicket: offer.minTicket, expectedReturn: offer.couponRate,
-          minBonds: offer.minBonds, maxBonds: offer.maxBonds,
-          availableBonds: offer.availableBonds, bondUnitValue: offer.bondUnitValue,
-        };
-      }).filter(Boolean);
-      setProjects(merged);
+      setProjects(buildOpenOfferCards(openOffers, allProjects));
     } catch (err) {
-      toast({ title: 'Erreur', description: err.message || 'Chargement impossible.', variant: 'destructive' });
+      const detail = err.errors?.length
+        ? err.errors.map((e) => e.message).join(' · ')
+        : (err.message || 'Chargement impossible.');
+      setError(detail);
+      toast({ title: 'Erreur', description: detail, variant: 'destructive' });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -83,7 +90,9 @@ const AvailableProjects = ({ onInvest }) => {
         'high': [6, 10],
       };
       const [min, max] = riskRange[riskFilter];
-      filtered = filtered.filter(p => p.riskScore >= min && p.riskScore <= max);
+      // Un score absent ne se range dans aucune tranche : `null >= 0` vaut `true`
+      // en JavaScript et ferait apparaître les offres sans score dans « faible ».
+      filtered = filtered.filter(p => p.riskScore !== null && p.riskScore >= min && p.riskScore <= max);
     }
 
     setFilteredProjects(filtered);
@@ -156,9 +165,17 @@ const AvailableProjects = ({ onInvest }) => {
       {/* Results Count */}
       <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.1 }}>
         <p className="text-sm text-slate-400">
-          {filteredProjects.length} projet{filteredProjects.length !== 1 ? 's' : ''} trouvé{filteredProjects.length !== 1 ? 's' : ''}
+          {loading
+            ? 'Chargement des offres ouvertes…'
+            : `${filteredProjects.length} offre${filteredProjects.length !== 1 ? 's' : ''} ouverte${filteredProjects.length !== 1 ? 's' : ''}`}
         </p>
       </motion.div>
+
+      {error && (
+        <Card className="bg-red-500/10 border-red-500/30">
+          <CardContent className="p-4 text-sm text-red-300">{error}</CardContent>
+        </Card>
+      )}
 
       {/* Projects Grid */}
       <motion.div
@@ -171,14 +188,21 @@ const AvailableProjects = ({ onInvest }) => {
           <div className="col-span-full text-center py-16">
             <div className="text-slate-500 mb-4">
               <Filter className="w-16 h-16 mx-auto mb-4 opacity-50" />
-              <p className="text-lg">Aucun projet ne correspond à vos critères</p>
-              <p className="text-sm mt-2">Essayez de modifier vos filtres</p>
+              <p className="text-lg">
+                {loading
+                  ? 'Chargement…'
+                  : projects.length === 0
+                    ? 'Aucune levée de fonds n’est ouverte actuellement'
+                    : 'Aucune offre ne correspond à vos critères'}
+              </p>
+              {!loading && projects.length > 0 && <p className="text-sm mt-2">Essayez de modifier vos filtres</p>}
             </div>
           </div>
         ) : (
           filteredProjects.map((project, index) => {
-            const fundingProgress = project.targetAmount > 0 ? (project.raisedAmount / project.targetAmount) * 100 : 0;
-            const riskInfo = getRiskLabel(project.riskScore);
+            // Avancement SERVEUR (`Project.progress_percent`) — jamais redivisé ici.
+            const fundingProgress = project.progressPercent;
+            const riskInfo = project.riskScore === null ? null : getRiskLabel(project.riskScore);
 
             return (
               <motion.div
@@ -196,14 +220,21 @@ const AvailableProjects = ({ onInvest }) => {
                       </Badge>
                     </div>
                     <div className="absolute top-3 right-3">
-                      <div className={`px-2 py-1 rounded ${riskInfo.bg} backdrop-blur-sm`}>
-                        <div className="flex items-center gap-1">
-                          <Shield className={`w-3 h-3 ${riskInfo.color}`} />
-                          <span className={`text-xs font-bold ${riskInfo.color}`}>
-                            Risque {riskInfo.label}
-                          </span>
+                      {riskInfo ? (
+                        <div className={`px-2 py-1 rounded ${riskInfo.bg} backdrop-blur-sm`}>
+                          <div className="flex items-center gap-1">
+                            <Shield className={`w-3 h-3 ${riskInfo.color}`} />
+                            <span className={`text-xs font-bold ${riskInfo.color}`}>
+                              Risque {riskInfo.label} ({project.riskScore}/10)
+                            </span>
+                          </div>
                         </div>
-                      </div>
+                      ) : (
+                        // Pas de score servi : on l'écrit, on n'en invente pas un.
+                        <div className="px-2 py-1 rounded bg-slate-700/60 backdrop-blur-sm">
+                          <span className="text-xs font-bold text-slate-300">Score non communiqué</span>
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -224,28 +255,44 @@ const AvailableProjects = ({ onInvest }) => {
                   <CardContent className="space-y-4 flex-1">
                     <div className="space-y-2">
                       <div className="flex justify-between text-xs text-slate-400">
-                        <span>Financement</span>
-                        <span className="font-bold text-white">{fundingProgress.toFixed(0)}%</span>
+                        <span>Financement encaissé</span>
+                        <span className="font-bold text-white">
+                          {fundingProgress === null ? '—' : `${fundingProgress} %`}
+                        </span>
                       </div>
-                      <Progress value={fundingProgress} className="h-2" />
+                      <Progress value={fundingProgress ?? 0} className="h-2" />
                       <div className="flex justify-between text-xs">
                         <span className="text-emerald-400">{formatCurrency(project.raisedAmount)}</span>
                         <span className="text-slate-500">/ {formatCurrency(project.targetAmount)}</span>
                       </div>
+                      {/* Engagements pris mais pas encore encaissés : une intention
+                          n'est pas de l'argent reçu, les deux se lisent séparément. */}
+                      <p className="text-xs text-slate-500">
+                        Dont {formatCurrency(project.reservedAmount)} réservés (non encaissés)
+                      </p>
                     </div>
 
                     <div className="grid grid-cols-2 gap-3 pt-2">
                       <div className="p-3 bg-slate-800/50 rounded border border-slate-700">
-                        <p className="text-xs text-slate-400 mb-1">Ticket Min.</p>
+                        <p className="text-xs text-slate-400 mb-1">Ticket min.</p>
                         <p className="font-bold text-white text-sm">{formatCurrency(project.minimumTicket)}</p>
                       </div>
                       <div className="p-3 bg-slate-800/50 rounded border border-slate-700">
-                        <p className="text-xs text-slate-400 mb-1">Rendement</p>
+                        <p className="text-xs text-slate-400 mb-1">Coupon promis</p>
                         <p className="font-bold text-emerald-400 text-sm flex items-center gap-1">
                           <TrendingUp className="w-3 h-3" />
-                          {project.expectedReturn}%
+                          {project.expectedReturn} %
                         </p>
                       </div>
+                    </div>
+
+                    <div className="text-xs text-slate-500 space-y-1">
+                      <p>Maturité : {project.maturityMonths} mois</p>
+                      <p>
+                        Clôture des souscriptions :{' '}
+                        {project.subscriptionDeadline ? formatDate(project.subscriptionDeadline) : 'non fixée'}
+                      </p>
+                      <p>Titres disponibles : {project.availableBonds}</p>
                     </div>
                   </CardContent>
 

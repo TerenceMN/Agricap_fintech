@@ -89,7 +89,10 @@ const allMenuItems = {
       { icon: CreditCard, label: 'Crédits Agricoles', path: '/credits' },
       { icon: CreditCard, label: 'Analyse de crédit', path: '/credit' },
       { icon: PiggyBank, label: 'Épargne', path: '/savings' },
-      { icon: TrendingUp, label: 'Investissements', path: '/investments' },
+      // Pointait sur `/investments`, un second espace investisseur redondant,
+      // aujourd'hui supprimé. La gestion des investissements côté institution
+      // vit dans le back-office `/admin/investments`.
+      { icon: TrendingUp, label: 'Investissements', path: '/admin/investments' },
       { icon: Repeat, label: 'Transactions', path: '/transactions' },
       { icon: Wallet, label: 'Portefeuilles', path: '/wallets' },
     // Les écrans du backoffice crédit n'avaient AUCUNE entrée de navigation :

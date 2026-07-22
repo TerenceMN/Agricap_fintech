@@ -306,8 +306,12 @@ export interface InvestmentProject {
   promoter: string;
   status: string; // P01..P13
   fundingTarget: number;
+  /** ENCAISSÉ (B10) — jamais les réservations, qui vivent sur l'offre. */
   fundedAmount: number;
   progressPercent: number;
+  disbursedAmount: number;
+  returnedAmount: number;
+  distributedAmount: number;
   riskScore: number;
   globalScore: number;
   managerName: string;
@@ -319,6 +323,7 @@ export interface InvestmentOffer {
   id: number;
   code: string;
   projectId: number;
+  /** `investments.Offer.TypeOfTitle` : OBLIGATION (dette) | ACTION (capital). */
   typeOfTitle: string;
   couponRate: number;
   maturityMonths: number;
@@ -328,7 +333,14 @@ export interface InvestmentOffer {
   maxBonds: number;
   availableBonds: number;
   fundingGoal: number;
+  /** Engagements pris (réservations) — une intention, pas de l'argent reçu. */
+  reservedAmount: number;
+  /** Argent réellement encaissé sur l'offre. */
   fundedAmount: number;
+  minFundingAmount: number;
+  oversubscriptionPolicy: string;
+  subscriptionDeadline: string | null;
+  closedAt: string | null;
   status: string;
 }
 
@@ -346,12 +358,23 @@ export interface InvestmentSubscription {
   id: number;
   investorId: number;
   offerId: number;
+  /** RÉSERVÉ — un engagement, pas un placement. */
   amount: number;
+  /** Servi après arbitrage de sursouscription. */
+  allocatedAmount: number;
+  /** Réellement ENCAISSÉ (B10) — la seule grandeur qui vaut « investi ». */
+  settledAmount: number;
+  refundedAmount: number;
   bonds: number;
+  queueRank: number | null;
   status: string;
   paymentStatus: string;
+  /** Taux de coupon FIGÉ à la souscription, en POURCENTS (ex. 12.5). */
   couponRate: number;
   subscriptionDate: string;
+  reservedAt: string | null;
+  settledAt: string | null;
+  refundedAt: string | null;
   nextPaymentDate: string | null;
   totalReceived: number;
   subPortfolioId: number | null;
@@ -373,6 +396,80 @@ export interface PortfolioAllocation {
   bonds: number;
   cash: number;
   stocks: number;
+}
+
+// --- Métriques investisseur (backend `investments/metrics.py`, annexe D du prompt
+// HAZINA). Ces chiffres sont CALCULÉS PAR LE SERVEUR sur flux datés réels : le front
+// les affiche, il ne les recompose pas.
+//
+// ATTENTION AUX UNITÉS, elles diffèrent d'un champ à l'autre côté serveur :
+//   - `realizedReturn` est un XIRR, donc une FRACTION (0.12 = 12 %) ;
+//   - `expectedCouponRate` est une moyenne de `coupon_rate_snapshot`, donc déjà en
+//     POURCENTS (12.5 = 12,5 %).
+// Les confondre affiche « 0,12 % » là où le serveur dit 12 %.
+
+export interface InvestorValuation {
+  capitalOutstanding: number;
+  /** Gain LATENT — non encaissé. Ne jamais l'additionner au réalisé. */
+  latentGain: number;
+  latentGainIsLatent: boolean;
+  /** Méthode de valorisation, à afficher avec le chiffre (annexe D). */
+  method: string;
+}
+
+export interface InvestorMetrics {
+  totalInvested: number;
+  totalSettled: number;
+  totalRefunded: number;
+  totalDistributed: number;
+  positionsCount: number;
+  /** XIRR sur flux réels, en FRACTION. `null` = n'existe pas encore. */
+  realizedReturn: number | null;
+  /** Motif d'indisponibilité, destiné à être AFFICHÉ tel quel. */
+  realizedReturnUnavailableReason: string | null;
+  /** Coupon contractuel pondéré, en POURCENTS. */
+  expectedCouponRate: number;
+  valuation: InvestorValuation;
+  nextPaymentDate: string | null;
+  currency: string;
+  asOf: string;
+}
+
+export interface InvestmentPipelineStage {
+  stage: string;
+  label: string;
+  count: number;
+  aggregateTarget: number;
+}
+
+/** `GET /investments/pipeline` — `projects` est TOUJOURS vide pour un investisseur
+ *  (asymétrie d'information : les dossiers P01→P05 ne sortent qu'agrégés). */
+export interface InvestmentPipeline {
+  stages: InvestmentPipelineStage[];
+  projects: InvestmentProject[];
+}
+
+/** `GET /investments/offers/open` — `metrics.open_offers_summary()`. Forme DISTINCTE
+ *  de `InvestmentOffer` : c'est une projection restreinte, et elle ne porte ni
+ *  `minBonds`/`maxBonds`, ni `typeOfTitle`, ni le score du projet. */
+export interface OpenOfferSummary {
+  offerId: number;
+  offerCode: string;
+  projectCode: string;
+  title: string;
+  sector: string;
+  location: string;
+  couponRate: number;
+  maturityMonths: number;
+  minTicket: number;
+  bondUnitValue: number;
+  availableBonds: number;
+  fundingGoal: number;
+  reservedAmount: number;
+  fundedAmount: number;
+  minFundingAmount: number;
+  oversubscriptionPolicy: string;
+  subscriptionDeadline: string | null;
 }
 
 export interface ObligationPosition {

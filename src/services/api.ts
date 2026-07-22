@@ -7,8 +7,9 @@ import type {
   AgencyComplianceScore, AnalyseFormPayload, AnalysisResult, AnalystObservation, ApplicationSummary, AssetRow, BesoinInput,
   BondConversion, BondWithdrawal, CashRegisterSessionRow, ClientLoan, Collateral, DataSource,
   EvolutionPlanRow, FinancialAnalysis, InvestmentMovement,
-  InvestmentOffer, InvestmentProject, InvestmentSubscription, InvestorProfile, KycMine, LedgerAccount, LoanAlert,
-  LoanConfig, LoanRow, LoanTxn, Me, ObligationPosition, PerformanceReport, PortfolioAllocation,
+  InvestmentOffer, InvestmentPipeline, InvestmentProject, InvestmentSubscription, InvestorMetrics,
+  InvestorProfile, KycMine, LedgerAccount, LoanAlert,
+  LoanConfig, LoanRow, LoanTxn, Me, ObligationPosition, OpenOfferSummary, PerformanceReport, PortfolioAllocation,
   ProjectQuestion, RbacMe, RbacRole, RbacUser, ReferenceRange, RegularizationOrderRow, ScheduleRow, SourceTablesResponse,
   SummaryCard, TechnicalAnalysis, TicketMessage, TicketRow, VenteInput, WithdrawalRequestRow,
 } from '@/types/api';
@@ -709,7 +710,9 @@ export const api = {
     offers: {
       list: (projectCode?: string) =>
         request<InvestmentOffer[]>(`/investments/offers${projectCode ? `?project=${projectCode}` : ''}`),
-      open: () => request<InvestmentOffer[]>('/investments/offers/open'),
+      // Forme restreinte (`metrics.open_offers_summary`), PAS un `InvestmentOffer` :
+      // pas de `minBonds`/`maxBonds`, pas de `typeOfTitle`, pas de score projet.
+      open: () => request<OpenOfferSummary[]>('/investments/offers/open'),
       create: (data: Record<string, unknown>) =>
         request<InvestmentOffer>('/investments/offers', { method: 'POST', body: data }),
       collateral: (offerId: number) => request<Collateral>(`/investments/offers/${offerId}/collateral`),
@@ -730,7 +733,21 @@ export const api = {
         request<InvestmentSubscription>('/investments/subscriptions', {
           method: 'POST', body: { offerId, bonds, idempotencyKey: crypto.randomUUID() },
         }),
+      // Annulation d'une réservation NON encaissée, par son titulaire.
+      cancel: (subscriptionId: number, reason = '') =>
+        request<InvestmentSubscription>(`/investments/subscriptions/${subscriptionId}/cancel`, {
+          method: 'POST', body: { reason },
+        }),
     },
+    // Annexe D — métriques calculées SERVEUR. `mine` = le tableau de bord de
+    // l'investisseur connecté (son argent seulement) ; `portfolio` = la vue
+    // institution, refusée en 403 à un client, et qui n'a donc rien à faire dans
+    // l'espace investisseur.
+    metrics: {
+      mine: () => request<InvestorMetrics>('/investments/metrics/mine'),
+      portfolio: () => request<Record<string, unknown>>('/investments/metrics/portfolio'),
+    },
+    pipeline: () => request<InvestmentPipeline>('/investments/pipeline'),
     movements: (filters?: { investor?: number; zone?: string }) => {
       const q = new URLSearchParams();
       if (filters?.investor) q.set('investor', String(filters.investor));

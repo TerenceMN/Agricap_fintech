@@ -47,87 +47,25 @@ export const buildCommitments = (subscriptions = [], offers = [], projects = [])
 };
 
 // ==========================================
-// PORTFOLIO METRICS CALCULATION
+// MÉTRIQUES DE PORTEFEUILLE — DÉLIBÉRÉMENT ABSENTES D'ICI
 // ==========================================
-
-/** Calcule les métriques de portefeuille à partir de données réelles (souscriptions +
- * projets déjà chargés par l'appelant depuis l'API) — ne lit plus de données mock. */
-export const calculatePortfolioMetrics = (commitments = [], projects = [], availableCash = 0) => {
-  const activeCommitments = commitments.filter(c => c.status === 'Active' || c.status === 'Repayment');
-  
-  const totalInvested = commitments.reduce((sum, c) => sum + c.amount, 0);
-  const totalValue = commitments.reduce((sum, c) => {
-    if (c.status === 'Completed') return sum + c.amount + c.totalReceived;
-    if (c.status === 'Defaulted') return sum + c.totalReceived;
-    // For active, estimate current value
-    const monthsElapsed = Math.floor((new Date() - new Date(c.subscriptionDate)) / (1000 * 60 * 60 * 24 * 30));
-    const estimatedInterest = c.amount * (c.couponRate / 100) * (monthsElapsed / 12);
-    return sum + c.amount + estimatedInterest;
-  }, 0);
-
-  const weightedReturnRate = activeCommitments.length > 0
-    ? activeCommitments.reduce((sum, c) => sum + c.couponRate * c.amount, 0) / activeCommitments.reduce((sum, c) => sum + c.amount, 0)
-    : 0;
-
-  const defaultedAmount = commitments.filter(c => c.status === 'Defaulted').reduce((sum, c) => sum + c.amount, 0);
-  const defaultRate = totalInvested > 0 ? (defaultedAmount / totalInvested) * 100 : 0;
-
-  // Next payment
-  const upcomingPayments = activeCommitments
-    .filter(c => c.nextPaymentDate)
-    .sort((a, b) => new Date(a.nextPaymentDate) - new Date(b.nextPaymentDate));
-  const nextPayment = upcomingPayments.length > 0 ? upcomingPayments[0] : null;
-
-  // Average duration
-  const avgDuration = activeCommitments.length > 0
-    ? activeCommitments.reduce((sum, c) => {
-        const remaining = Math.max(0, (new Date(c.expectedMaturity) - new Date()) / (1000 * 60 * 60 * 24 * 30));
-        return sum + remaining;
-      }, 0) / activeCommitments.length
-    : 0;
-
-  // Sector exposure
-  const sectorExposure = {};
-  commitments.forEach(c => {
-    const project = projects.find(p => p.id === c.projectId);
-    if (project) {
-      sectorExposure[project.sector] = (sectorExposure[project.sector] || 0) + c.amount;
-    }
-  });
-
-  // Geographic exposure
-  const geoExposure = {};
-  commitments.forEach(c => {
-    const project = projects.find(p => p.id === c.projectId);
-    if (project) {
-      geoExposure[project.location] = (geoExposure[project.location] || 0) + c.amount;
-    }
-  });
-
-  // Risk concentration (Herfindahl index)
-  const totalActiveInvested = activeCommitments.reduce((sum, c) => sum + c.amount, 0);
-  const riskConcentration = totalActiveInvested > 0
-    ? activeCommitments.reduce((sum, c) => {
-        const weight = c.amount / totalActiveInvested;
-        return sum + weight * weight;
-      }, 0) * 100
-    : 0;
-
-  return {
-    totalInvested,
-    totalValue,
-    weightedReturnRate,
-    defaultRate,
-    availableCash,
-    nextPayment,
-    avgDuration,
-    sectorExposure,
-    geoExposure,
-    riskConcentration,
-    activeCount: activeCommitments.length,
-    totalCount: commitments.length,
-  };
-};
+//
+// `calculatePortfolioMetrics` et `calculatePortfolioHealth` vivaient ici. Elles
+// recomposaient dans le navigateur le total investi, la valeur du portefeuille,
+// le « TRI pondéré », le taux de défaut, l'indice de concentration et un score de
+// santé — à partir de constantes locales (2 % par point de défaut, −10 au-delà de
+// 30 % de concentration) qui n'existaient nulle part ailleurs dans le système.
+// Deux conséquences, l'une pire que l'autre :
+//
+//   - le « TRI pondéré » était une moyenne de taux AFFICHÉS, pas un XIRR : un
+//     chiffre qui porte le nom d'un autre ;
+//   - la valeur du portefeuille était extrapolée (`monthsElapsed × coupon`), donc
+//     un gain latent présenté sans être étiqueté latent.
+//
+// Ces grandeurs sont désormais calculées par `backend/investments/metrics.py`
+// (annexe D) sur flux datés réels, et servies par `GET /investments/metrics/mine`.
+// Les projections d'affichage vivent dans `src/lib/investorSpaceWire.ts`.
+// Ne réintroduisez pas de calcul financier dans ce fichier.
 
 // ==========================================
 // STATUS CODE HELPERS
@@ -150,6 +88,10 @@ export const isProjectInvestable = (statusCode) => {
 // ==========================================
 
 export const formatCurrency = (amount, currency = 'USD') => {
+  // `0` reste `0 $` : un montant nul est une information, pas une absence. Seuls
+  // l'absence réelle et le non-numérique donnent un tiret — sans ce garde, un
+  // champ manquant faisait planter l'écran entier sur `.toLocaleString`.
+  if (amount === null || amount === undefined || Number.isNaN(Number(amount))) return '—';
   if (currency === 'USD') {
     return `${amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })} $`;
   }
@@ -211,51 +153,10 @@ export const getCommitmentStatusColor = (status) => {
   return colors[status] || 'bg-gray-500/20 text-gray-400 border-gray-500/30';
 };
 
-// ==========================================
-// CHART DATA TRANSFORMERS
-// ==========================================
-
-export const transformSectorExposure = (sectorExposure) => {
-  return Object.entries(sectorExposure).map(([sector, amount]) => ({
-    name: sector,
-    value: amount,
-  }));
-};
-
-export const transformGeoExposure = (geoExposure) => {
-  return Object.entries(geoExposure).map(([location, amount]) => ({
-    name: location,
-    value: amount,
-  }));
-};
-
-// ==========================================
-// PORTFOLIO HEALTH SCORE
-// ==========================================
-
-export const calculatePortfolioHealth = (metrics) => {
-  let score = 100;
-  
-  // Penalize high default rate
-  score -= metrics.defaultRate * 2;
-  
-  // Penalize high concentration
-  if (metrics.riskConcentration > 30) score -= 10;
-  if (metrics.riskConcentration > 50) score -= 20;
-  
-  // Reward diversification
-  const sectorCount = Object.keys(metrics.sectorExposure).length;
-  if (sectorCount >= 4) score += 5;
-  
-  // Ensure between 0-100
-  score = Math.max(0, Math.min(100, score));
-  
-  let status = 'Excellent';
-  let color = 'text-green-400';
-  if (score < 80) { status = 'Bon'; color = 'text-blue-400'; }
-  if (score < 60) { status = 'Acceptable'; color = 'text-yellow-400'; }
-  if (score < 40) { status = 'Préoccupant'; color = 'text-orange-400'; }
-  if (score < 20) { status = 'Critique'; color = 'text-red-400'; }
-  
-  return { score, status, color };
-};
+// Les transformateurs d'exposition sectorielle et géographique ont été retirés
+// avec les graphiques qu'ils alimentaient : ils agrégeaient les montants par
+// secteur et par zone côté navigateur, à côté d'un indice de concentration
+// calculé localement. Le serveur mesure déjà la concentration (Herfindahl) — mais
+// au niveau institution seulement. Tant qu'il ne la sert pas par investisseur,
+// l'espace investisseur affiche l'absence de la mesure plutôt qu'une mesure
+// maison (`MISSING_INVESTOR_METRICS` dans `investorSpaceWire.ts`).

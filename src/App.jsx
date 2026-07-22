@@ -63,7 +63,6 @@ import AuditLog from '@/pages/AuditLog';
 import ApiPartners from '@/pages/ApiPartners';
 import ApiDocs from '@/pages/ApiDocs';
 import Supervision from '@/pages/Supervision';
-import Investments from '@/pages/Investments';
 import Agencies from '@/pages/Agencies';
 import AdminInvestments from '@/pages/AdminInvestments';
 import AdminConsole from '@/pages/AdminConsole';
@@ -174,7 +173,13 @@ const AppRoutes = () => {
       <Route path="/audit-log" element={<PrivateRoute roles={['admin', 'auditeur']}><AuditLog /></PrivateRoute>} />
       <Route path="/api-partners" element={<PrivateRoute roles={['admin']}><ApiPartners /></PrivateRoute>} />
       <Route path="/api-docs" element={<PrivateRoute roles={['admin']}><ApiDocs /></PrivateRoute>} />
-      <Route path="/investments" element={<PrivateRoute roles={['admin']}><Investments /></PrivateRoute>} />
+      {/* `/investments` servait un SECOND espace investisseur, redondant avec
+          `/investor-space` : deux écrans, deux « total investi » qui ne comptaient
+          pas la même grandeur. L'écran a été supprimé et ses acquis repris dans
+          l'espace unique. La redirection reste pour les liens déjà diffusés — un
+          404 sur une URL d'investisseur se lit comme une perte d'accès à son
+          argent. Côté back-office, la gestion reste `/admin/investments`. */}
+      <Route path="/investments" element={<Navigate to="/investor-space" replace />} />
       <Route path="/admin/investments" element={<PrivateRoute roles={['admin']}><AdminInvestments /></PrivateRoute>} />
       <Route path="/admin/console" element={<PrivateRoute roles={['admin']}><AdminConsole /></PrivateRoute>} />
       <Route path="/admin/approvers" element={<PrivateRoute roles={['admin']}><Layout><ApproversConfig /></Layout></PrivateRoute>} />
