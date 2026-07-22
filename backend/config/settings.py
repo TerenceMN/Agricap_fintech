@@ -68,6 +68,7 @@ INSTALLED_APPS = [
     "alerts",
     "reference_data",
     "credits",
+    "accounting",
 ]
 
 MIDDLEWARE = [
