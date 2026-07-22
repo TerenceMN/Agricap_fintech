@@ -1,7 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Helmet } from 'react-helmet';
 import { Link, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '@/services/api';
+import {
+  dimensionRetenueParLeServeur, etatDimensionProjet, libelleUnite,
+} from '@/components/simulateur/dimension';
+import { CriteresClient } from '@/components/simulateur/SimulationResult';
 import type { CreditPrefillResult, NeedsParseResult, CreditSimulateResult } from '@/types/api';
 
 // ─── Step indicator ────────────────────────────────────────────────────────────
@@ -47,7 +51,14 @@ const CreditAnalysis: React.FC = () => {
   const [clients, setClients] = useState<Array<{ sub: string; name: string; email: string; roleLabel: string }>>([]);
   const [clientsErreur, setClientsErreur] = useState('');
   const [vcCode, setVcCode] = useState('');
-  const [areaHa, setAreaHa] = useState('');
+  // Dimension du projet : la grandeur à laquelle le référentiel de la filière
+  // rapporte ses coûts unitaires. Ce n'est PLUS une superficie en hectares par
+  // construction — une filière apicole se dimensionne en ruches, une
+  // bioconversion en m². `uniteSaisie` mémorise l'unité dans laquelle la valeur
+  // a été tapée : c'est ce qui permet de détecter, quand le serveur révèle
+  // l'unité de la filière, que la valeur ne veut plus dire ce qu'elle disait.
+  const [quantiteReference, setQuantiteReference] = useState('');
+  const [uniteSaisie, setUniteSaisie] = useState('');
   const [amountRequested, setAmountRequested] = useState('');
   const [currency, setCurrency] = useState('USD');
 
@@ -69,7 +80,14 @@ const CreditAnalysis: React.FC = () => {
       .then((data) => {
         setPrefill(data);
         if (data.defaults.value_chain_code) setVcCode(data.defaults.value_chain_code);
-        if (data.defaults.area_ha) setAreaHa(String(data.defaults.area_ha));
+        if (data.defaults.area_ha) {
+          // Le préremplissage ne connaît qu'une superficie : elle n'est donc
+          // reprise QUE comme une valeur exprimée en hectares, et l'unité de
+          // saisie l'accompagne. Si la filière se mesure autrement, l'écart
+          // sera signalé au lieu d'être hérité en silence.
+          setQuantiteReference(String(data.defaults.area_ha));
+          setUniteSaisie('ha');
+        }
         if (data.defaults.currency) setCurrency(data.defaults.currency);
       })
       .catch(() => {}); // prefill optionnel
@@ -95,10 +113,48 @@ const CreditAnalysis: React.FC = () => {
       ));
   }, []);
 
+  // ── Dimension du projet, dans l'unité de la filière ──
+  // L'unité vient du serveur (filière du préremplissage, puis référentiel
+  // réellement résolu par la simulation) — jamais d'une table filière → unité
+  // recopiée ici, qui serait un référentiel de plus dans le navigateur.
+  const valueChain = useMemo(
+    () => prefill?.valueChains.find((vc) => vc.code === vcCode) ?? null,
+    [prefill, vcCode],
+  );
+  const dimension = useMemo(
+    () => etatDimensionProjet({
+      quantite: quantiteReference,
+      uniteSaisie,
+      valueChain,
+      refData: simResult?.refData,
+    }),
+    [quantiteReference, uniteSaisie, valueChain, simResult],
+  );
+  // Ce que le SERVEUR a retenu : tant que `simulate_scoring` ne relaie pas la
+  // dimension canonique, un dossier apicole est simulé en hectares sans que
+  // rien ne le dise. On le dit.
+  const dimensionServeur = useMemo(
+    () => dimensionRetenueParLeServeur({
+      refData: simResult?.refData,
+      quantiteEnvoyee: quantiteReference,
+      uniteEnvoyee: dimension.uniteEffective,
+    }),
+    [simResult, quantiteReference, dimension.uniteEffective],
+  );
+
+  const majQuantite = (valeur: string) => {
+    setQuantiteReference(valeur);
+    setUniteSaisie(dimension.uniteEffective);
+  };
+
   // ── Step 0 → 1: validate form ──
   const handleStep0Next = () => {
     if (!amountRequested || parseFloat(amountRequested) <= 0) {
       setError('Veuillez saisir un montant demandé positif.');
+      return;
+    }
+    if (dimension.verdict.bloquant) {
+      setError(dimension.verdict.message ?? 'Dimension du projet à corriger.');
       return;
     }
     setError(null);
@@ -113,7 +169,10 @@ const CreditAnalysis: React.FC = () => {
       const fd = new FormData();
       fd.append('file', nsFile);
       if (vcCode) fd.append('value_chain_code', vcCode);
-      if (areaHa) fd.append('area_ha', areaHa);
+      // `parse/` ne connaît que `area_ha` (il alimente `NeedsSheet.area_ha`) :
+      // on ne le renseigne donc QUE pour les filières mesurées en hectares.
+      // Y écrire 30 ruches ferait entrer « 30 ha » dans la feuille.
+      if (dimension.payload.area_ha != null) fd.append('area_ha', String(dimension.payload.area_ha));
       if (currency) fd.append('currency', currency);
       const result = await api.credits.parseNeedsSheet(fd);
       setNsResult(result);
@@ -135,7 +194,7 @@ const CreditAnalysis: React.FC = () => {
       const result = await api.credits.simulate({
         value_chain_code: vcCode || undefined,
         needs_sheet_id: nsResult?.id,
-        area_ha: areaHa ? parseFloat(areaHa) : undefined,
+        ...dimension.payload,
         amount_requested: parseFloat(amountRequested),
         currency,
       });
@@ -156,12 +215,19 @@ const CreditAnalysis: React.FC = () => {
       const app = await api.credits.create({
         client_sub: clientSub || undefined,
         value_chain_code: vcCode || undefined,
-        area_ha: areaHa ? parseFloat(areaHa) : undefined,
+        ...dimension.payload,
         currency,
         amount_requested: parseFloat(amountRequested),
         needs_sheet_id: nsResult?.id,
         guarantee_type: guaranteeType || undefined,
-        prefill_snapshot: prefill ? { vcCode, areaHa, amountRequested } : {},
+        prefill_snapshot: prefill
+          ? {
+            vcCode,
+            quantiteReference,
+            uniteReference: dimension.uniteEffective,
+            amountRequested,
+          }
+          : {},
       });
       setAppCode(app.code);
       // Submit
@@ -268,15 +334,53 @@ const CreditAnalysis: React.FC = () => {
                 </select>
               </div>
 
+              {/* Dimension du projet — l'unité n'est PAS un choix : c'est celle
+                  du référentiel de la filière. Un champ « superficie (ha) » en
+                  dur rendait tout dossier non agricole indimensionnable
+                  autrement que par l'API, et faisait échouer l'analyse en 422
+                  DIMENSION_INCOHERENTE sans que personne ne sache pourquoi. */}
               <div>
-                <label className="text-xs text-slate-400 block mb-1">Superficie (ha)</label>
-                <input
-                  type="number"
-                  className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm"
-                  placeholder="Ex: 5"
-                  value={areaHa}
-                  onChange={(e) => setAreaHa(e.target.value)}
-                />
+                <label className="text-xs text-slate-400 block mb-1">
+                  Dimension du projet
+                  {dimension.unite ? ` (${dimension.unite})` : ''}
+                </label>
+                <div className="flex items-stretch">
+                  <input
+                    type="number"
+                    min="0"
+                    className="w-full bg-white/5 border border-white/10 rounded-l-lg px-3 py-2 text-sm"
+                    placeholder={dimension.uniteEffective === 'ha' ? 'Ex: 5' : 'Ex: 30'}
+                    value={quantiteReference}
+                    onChange={(e) => majQuantite(e.target.value)}
+                    aria-describedby="aide-dimension"
+                  />
+                  <span className="px-3 py-2 text-sm text-slate-300 bg-white/10 border border-l-0 border-white/10 rounded-r-lg whitespace-nowrap">
+                    {libelleUnite(dimension.uniteEffective, Number(quantiteReference) || 2)
+                      || dimension.uniteEffective}
+                  </span>
+                </div>
+                <p id="aide-dimension" className="text-xs text-slate-500 mt-1">
+                  {dimension.unite
+                    ? `Cette filière se mesure en « ${dimension.unite} »`
+                      + `${dimension.source === 'simulation' ? ' (référentiel du moteur)' : ''}.`
+                      + ' Aucune conversion n\'est faite : la quantité doit être exprimée dans'
+                      + ' cette unité.'
+                    : "L'unité de référence de cette filière n'est pas encore servie par le "
+                      + 'serveur : la valeur est prise en hectares et sera confrontée au '
+                      + 'référentiel à la simulation.'}
+                </p>
+                {dimension.verdict.etat === 'incoherente' && (
+                  <div className="mt-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3">
+                    <p className="text-xs text-red-200">{dimension.verdict.message}</p>
+                    <button
+                      type="button"
+                      className="mt-2 text-xs px-2 py-1 rounded bg-white/10 text-slate-100"
+                      onClick={() => { setQuantiteReference(''); setUniteSaisie(dimension.unite ?? ''); }}
+                    >
+                      Ressaisir en {libelleUnite(dimension.unite, 2) || dimension.unite}
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div>
@@ -396,10 +500,46 @@ const CreditAnalysis: React.FC = () => {
             {/* Score card */}
             <div className="bg-white/5 border border-white/10 rounded-xl p-6">
               <h2 className="font-bold text-lg mb-4">Résultat de simulation</h2>
+              {/* Le serveur ne sert PAS de score quand aucun critère n'est
+                  calculable : il refuse de laisser passer un 0 qui se lirait
+                  comme une mauvaise note. L'écran affiche le motif, pas un
+                  chiffre inventé. */}
+              {simResult.score === null && (
+                <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                  <p className="text-sm text-amber-100">
+                    {simResult.unavailable?.message
+                      || "Le score n'est pas calculable en l'état ; le détail par critère en donne la raison."}
+                  </p>
+                  {simResult.unavailable?.code && (
+                    <p className="text-[11px] text-amber-300/80 mt-1 font-mono">{simResult.unavailable.code}</p>
+                  )}
+                </div>
+              )}
+              {/* La dimension effectivement retenue par le serveur : tant qu'il
+                  ignore `quantite_reference`, un dossier non agricole est simulé
+                  sur une autre grandeur que celle saisie — et la fiabilité
+                  technique sort « non calculable » sans explication visible. */}
+              {dimensionServeur && !dimensionServeur.retenue && (
+                <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                  <p className="text-sm text-amber-100">
+                    Le serveur n'a pas retenu la dimension saisie : il a scoré sur{' '}
+                    <span className="font-semibold">
+                      {dimensionServeur.quantiteServeur ?? '—'}{' '}
+                      {libelleUnite(dimensionServeur.uniteServeur, dimensionServeur.quantiteServeur)
+                        || dimensionServeur.uniteServeur || '—'}
+                    </span>{' '}
+                    au lieu de {quantiteReference || '—'}{' '}
+                    {libelleUnite(dimension.uniteEffective, Number(quantiteReference) || 2)}.
+                    La fiabilité technique de cette simulation est à lire avec cette réserve.
+                  </p>
+                </div>
+              )}
               <div className="flex items-center gap-6 mb-4">
                 <div className="text-center">
                   <p className="text-xs text-slate-400">Score estimé</p>
-                  <p className={`text-5xl font-black ${scoreColor(simResult.score)}`}>{simResult.score}</p>
+                  <p className={`text-5xl font-black ${simResult.score == null ? 'text-slate-500' : scoreColor(simResult.score)}`}>
+                    {simResult.score ?? '—'}
+                  </p>
                   <p className="text-xs text-slate-400">/100</p>
                 </div>
                 <div>
@@ -410,28 +550,21 @@ const CreditAnalysis: React.FC = () => {
                   {simResult.proposedRate && (
                     <p className="text-sm mt-1">Taux indicatif : <span className="font-bold text-blue-300">{simResult.proposedRate}% / an</span></p>
                   )}
-                  {simResult.minScoreRequired && (
-                    <p className="text-xs text-slate-500 mt-1">Score minimum requis : {simResult.minScoreRequired}</p>
-                  )}
+                  {/* Ex-« Score minimum requis : 60 ». C'est un SEUIL du moteur,
+                      et cet écran figure dans le menu du CLIENT (« Analyse de
+                      crédit ») : le principe 7 l'interdit — connaître la barre,
+                      c'est pouvoir viser la barre. L'éligibilité, elle, reste
+                      annoncée : c'est le verdict, pas la règle. */}
                 </div>
               </div>
 
-              {simResult.breakdown && simResult.breakdown.length > 0 && (
-                <table className="w-full text-sm mt-2">
-                  <thead className="text-slate-400 border-b border-white/10">
-                    <tr><th className="text-left py-1.5">Critère</th><th className="text-right py-1.5">Points</th><th className="text-right py-1.5">Max</th></tr>
-                  </thead>
-                  <tbody>
-                    {simResult.breakdown.map((b, i) => (
-                      <tr key={i} className="border-t border-white/5">
-                        <td className="py-1.5">{b.label || b.code}</td>
-                        <td className="py-1.5 text-right font-bold text-emerald-300">{b.points}</td>
-                        <td className="py-1.5 text-right text-slate-400">{b.maxPoints}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+              {/* Détail par critère en version CLIENT (libellés, critères non
+                  évalués), pas la grille pondérée : ce parcours est ouvert au
+                  demandeur. Le détail chiffré — points, poids, bandes, plages —
+                  vit sur `/credit/dossiers/<code>/scoring`, réservé au staff. */}
+              <div className="mt-2">
+                <CriteresClient simResult={simResult} />
+              </div>
             </div>
 
             {/* Guarantee selection */}
@@ -505,7 +638,8 @@ const CreditAnalysis: React.FC = () => {
               <button
                 onClick={() => {
                   setStep(0); setNsFile(null); setNsResult(null); setSimResult(null);
-                  setAmountRequested(''); setAreaHa(''); setGuaranteeType(''); setAppCode(null);
+                  setAmountRequested(''); setQuantiteReference(''); setUniteSaisie('');
+                  setGuaranteeType(''); setAppCode(null);
                 }}
                 className="px-6 py-2 rounded-lg bg-white/10 text-sm"
               >

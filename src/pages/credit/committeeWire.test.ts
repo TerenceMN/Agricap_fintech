@@ -33,6 +33,10 @@ function analyse(over: Partial<CreditAnalyse> = {}): CreditAnalyse {
     },
     scoreGlobal: 62,
     recommandation: 'revue',
+    // Bloc servi par `serialiser_analyse_staff` depuis l'unification du moteur.
+    // `null` = analyse antérieure à la grille unique, cas le plus neutre pour
+    // ce fixture : le comité y lit la lettre et la recommandation, pas le taux.
+    tarification: null,
     dscr: 1.12,
     dscrStress: 0.87,
     criteres: {

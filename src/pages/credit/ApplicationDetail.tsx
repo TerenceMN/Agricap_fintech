@@ -429,10 +429,35 @@ const ApplicationDetail: React.FC = () => {
         <InfoCard label="Créé le" value={fmt(app.createdAt)} />
       </div>
 
-      {/* Scoring */}
-      {score && (
+      {/* Scoring — projection de la dernière analyse (`credits/scoring.py`).
+          Sans analyse exécutée, les clés `score` et `proposedRate` sont ABSENTES
+          (et non nulles) : les lire sans garde afficherait « undefined/100 » et,
+          pire, un `undefined >= 70` silencieusement faux. L'absence est donc
+          traitée comme un état à part entière, avec son code serveur. */}
+      {score && (score.analyseDisponible === false || score.score === undefined) && (
         <section className="bg-white/5 border border-white/10 rounded-xl p-6">
-          <h3 className="font-bold text-lg mb-4">Résultat de scoring</h3>
+          <h3 className="font-bold text-lg mb-2">Scoring</h3>
+          <p className="text-sm text-slate-300">
+            {score.unavailable?.message
+              || score.valuationNote
+              || "Aucune analyse n'a encore été exécutée sur ce dossier."}
+          </p>
+          <p className="text-xs text-slate-500 mt-2">
+            <span className="font-mono">{score.unavailable?.code || 'ANALYSE_REQUISE'}</span> — aucun
+            score ni taux n'est servi tant que le moteur n'a pas tourné : le front n'en fabrique
+            aucun.
+          </p>
+        </section>
+      )}
+
+      {score && score.score !== undefined && score.analyseDisponible !== false && (
+        <section className="bg-white/5 border border-white/10 rounded-xl p-6">
+          <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+            <h3 className="font-bold text-lg">Résultat de scoring</h3>
+            <Link to={`/credit/dossiers/${code}/scoring`} className="text-sm text-primary underline">
+              Comment ce score est-il obtenu ? →
+            </Link>
+          </div>
           <div className="flex items-center gap-6 mb-4">
             <div className="text-center">
               <p className="text-sm text-slate-400">Score global</p>
@@ -446,7 +471,7 @@ const ApplicationDetail: React.FC = () => {
                 {score.eligible ? '✓ Éligible' : '✗ Non éligible'}
               </p>
               <p className="text-sm text-slate-400">{score.valuationNote}</p>
-              {score.proposedRate && (
+              {score.proposedRate != null && (
                 <p className="text-sm text-white mt-1 [&>option]:bg-slate-800 [&>option]:text-white">Taux proposé : <span className="font-bold text-blue-300">{score.proposedRate}%</span> / an</p>
               )}
             </div>
@@ -456,15 +481,24 @@ const ApplicationDetail: React.FC = () => {
               <thead className="text-slate-400 border-b border-white/10">
                 <tr>
                   <th className="text-left py-2">Critère</th>
+                  {/* « Points » sont des points PONDÉRÉS (score × poids / 100) et
+                      « Poids » leur maximum : la colonne se lit « 8,5 / 25 » et
+                      sa somme tombe sur le score global. L'en-tête disait
+                      « Maximum » sans dire de quoi. */}
                   <th className="text-right py-2">Points</th>
-                  <th className="text-right py-2">Maximum</th>
+                  <th className="text-right py-2">Poids</th>
                 </tr>
               </thead>
               <tbody>
                 {score.breakdown.map((b, i) => (
                   <tr key={i} className="border-t border-white/5">
                     <td className="py-2">{b.label || b.code}</td>
-                    <td className="py-2 text-right font-bold text-emerald-300">{b.points}</td>
+                    {/* `points: null` = critère NON CALCULABLE, exclu de la
+                        pondération. Afficher 0 en ferait une mauvaise note
+                        alors que c'est une absence de mesure. */}
+                    <td className="py-2 text-right font-bold text-emerald-300">
+                      {b.points == null ? <span className="text-slate-500 font-normal">non calculable</span> : b.points}
+                    </td>
                     <td className="py-2 text-right text-slate-400">{b.maxPoints}</td>
                   </tr>
                 ))}

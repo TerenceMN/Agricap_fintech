@@ -15,6 +15,7 @@ import Settings from '@/pages/Settings';
 import CreditAnalysis from '@/pages/credit/CreditAnalysis';
 import Applications from '@/pages/credit/Applications';
 import ApplicationDetail from '@/pages/credit/ApplicationDetail';
+import Scoring from '@/pages/credit/Scoring';
 import AssetVerification from '@/pages/credit/AssetVerification';
 import Committee from '@/pages/credit/Committee';
 import AuditJournal from '@/pages/credit/AuditJournal';
@@ -95,6 +96,13 @@ const AppRoutes = () => {
       <Route path="/credit" element={<PrivateRoute><Layout><CreditAnalysis /></Layout></PrivateRoute>} />
       <Route path="/credit/dossiers" element={<PrivateRoute><Layout><Applications /></Layout></PrivateRoute>} />
       <Route path="/credit/dossiers/:code" element={<PrivateRoute><Layout><ApplicationDetail /></Layout></PrivateRoute>} />
+      {/* Page de scoring (staff) : la mécanique du score et du taux. Comme les
+          autres écrans backoffice, volontairement SANS prop `roles` — c'est le
+          serveur qui décide (403 sur `analyse/`), et la page restitue ce refus
+          telle quelle. Un garde front reposerait sur `menuKeyFor`, qui écrase
+          les 16 rôles canoniques en 5 clés de menu et fermerait la page à des
+          rôles qui y ont droit. */}
+      <Route path="/credit/dossiers/:code/scoring" element={<PrivateRoute><Layout><Scoring /></Layout></PrivateRoute>} />
       {/* Backoffice crédit. Volontairement SANS prop `roles` : l'autorisation de ces trois
           écrans est décidée par le serveur (403 sur /assets/pending, ?view=committee et
           /audit/entries), et chacun la restitue explicitement. Un garde `roles` côté front

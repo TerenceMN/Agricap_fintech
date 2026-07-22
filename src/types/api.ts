@@ -775,20 +775,56 @@ export interface CreditNeedsSheet {
 export interface CreditScoreBreakdown {
   code: string;
   label: string;
-  points: number;
+  /** Points PONDÉRÉS déjà calculés par le serveur (`score × poids / 100`).
+   *  Leur somme tombe exactement sur le score global — c'est l'invariant que
+   *  l'analyste vérifie de tête (CLAUDE.md §5.2). `null` = critère NON
+   *  CALCULABLE, exclu de la pondération : ne jamais l'afficher comme un 0,
+   *  ce serait une note fabriquée par l'écran. */
+  points: number | null;
+  /** Poids du critère : la colonne se lit « 8,5 / 25 ». */
   maxPoints: number;
   weight?: number;
-  weightedScore?: number;
+  weightedScore?: number | null;
+  /** Score du critère sur 100, `null` quand il n'est pas calculable. */
+  score?: number | null;
+  /** Servi par le simulateur (`dataio_simulate`) : `false` porte la RAISON dans
+   *  `detail`. Absent sur `scoring.py`, qui ne projette que des critères calculés. */
+  calculable?: boolean;
   detail?: string;
 }
 
+/** Projection de la dernière analyse dans l'ancien format `score_result`
+ *  (`credits/scoring.py::CreditScoringEngine`).
+ *
+ *  ⚠ Sans analyse exécutée, `score` et `proposedRate` sont **ABSENTS** — pas
+ *  nuls. C'est un contrat, pas un hasard (`_sans_analyse`) : une clé absente se
+ *  détecte, une clé nulle se propage en `NaN`. Ne jamais lire `score` sans
+ *  garder `analyseDisponible` (ou l'absence de la clé) d'abord. */
 export interface CreditScoreResult {
-  score: number;
+  score?: number;
   eligible: boolean;
   valuationNote: string;
   proposedRate?: number;
   minScoreRequired?: number;
   breakdown?: CreditScoreBreakdown[];
+  /** `false` = le moteur n'a jamais tourné sur ce dossier. `unavailable` en dit
+   *  la raison et l'action (`ANALYSE_REQUISE`). */
+  analyseDisponible?: boolean;
+  unavailable?: { code: string; message: string };
+  /** Provenance du score : quelle analyse, quelle feuille de besoins, quel
+   *  moteur. Sans elle, `score_result` serait un chiffre sans auteur. */
+  analyse?: {
+    id: number;
+    recommandation: CreditRecommandation;
+    scoreLettre: 'A' | 'B' | 'C' | 'D';
+    dscr: number | null;
+    dscrStress: number | null;
+    executeLe: string | null;
+    versionMoteur: string;
+    needsSourceId: number | null;
+    needsSourceRevision: number | null;
+    needsSourceSha256: string;
+  };
   scheduleDraft?: Array<{ month: number; payment: number; principal: number; interest: number; balance: number }>;
   // Totaux servis par le serveur (`dataio_simulator.dataio_simulate`) : le front
   // ne somme jamais l'échéancier lui-même.
@@ -947,6 +983,17 @@ export interface CreditPrefillResult {
     cost_per_hectare_usd: number;
     base_rate: number;
     min_score_required: number;
+    /** Unité de référence de la filière (`ha`, `ruche`, `sujet`, `m2`, `sac`,
+     *  `t`), telle que la porte `ReferentielFiliere.unite_reference`.
+     *
+     *  OPTIONNELLE parce que `credits/prefill.py::_get_active_value_chains` ne
+     *  la sert PAS encore (il ne lit que `ValueChain`, qui n'a pas ce champ).
+     *  Tant qu'elle manque, le formulaire ne peut pas nommer l'unité d'un
+     *  dossier apicole avant la première simulation : il retombe sur celle que
+     *  le serveur renvoie dans `refData.uniteReference`. Manque serveur signalé,
+     *  non comblé côté front — inventer une table filière → unité dans le
+     *  navigateur serait un référentiel de plus (principes 6 et 8). */
+    unite_reference?: string | null;
   }>;
   suggestedValueChainCode: string | null;
   onBehalfOf: boolean;
@@ -990,14 +1037,56 @@ export interface CreditModuleFinancingLine {
   partDemandee: number;
 }
 
+/** Dimension du projet telle que le SERVEUR l'a retenue pour la simulation.
+ *
+ *  Sous-ensemble volontairement étroit de `refData` (`dataio_simulate`). Le bloc
+ *  complet porte aussi `refTotals` (les montants de référence du référentiel),
+ *  `dscr`, `rateAnnual`, `durationMonths`, `source`… : ce sont des PLAGES et des
+ *  paramètres de moteur, que le principe 7 interdit de servir au demandeur. Ils
+ *  ne sont pas typés ici pour qu'aucun écran client ne puisse les lire sans
+ *  d'abord les déclarer — et donc sans que la question se pose.
+ *
+ *  Ce qui EST typé : l'unité de référence de la filière et la dimension
+ *  effectivement utilisée. Une unité n'est ni un barème ni un seuil ; sans elle
+ *  le demandeur ne peut pas dimensionner son projet (30 ruches, 100 m², 5 ha),
+ *  et c'est précisément ce qui déclenche `DIMENSION_INCOHERENTE` à l'analyse. */
+export interface CreditSimulateRefData {
+  /** Unité EXIGÉE par le référentiel de la filière (`ha`, `ruche`, `sujet`,
+   *  `m2`, `sac`, `t`). `null` quand aucun référentiel n'est actif. */
+  uniteReference?: string | null;
+  /** Unité de la dimension que le serveur a effectivement utilisée. */
+  uniteDossier?: string | null;
+  /** Quantité retenue, dans `uniteDossier`. */
+  quantiteReference?: number | null;
+  /** Code du `ReferentielFiliere` retenu — sert à dire d'où vient l'unité. */
+  referentielFiliere?: string | null;
+}
+
 // Résultat simulate
 export interface CreditSimulateResult {
-  score: number;
+  /** `null` quand AUCUN critère n'est calculable : le serveur refuse alors de
+   *  servir un 0 qui passerait pour une note (`unavailable.code =
+   *  SCORE_NON_CALCULABLE`). L'écran affiche l'état vide, jamais un zéro. */
+  score: number | null;
   eligible: boolean;
   valuationNote: string;
   proposedRate: number;
   minScoreRequired: number;
   breakdown: CreditScoreBreakdown[];
+  /** Motif d'un score non servi — jamais un message générique (principe 5). */
+  unavailable?: { code: string; message: string };
+  /** Base de calcul de la note quand un critère a été exclu : « pas de moyenne
+   *  sans effectif » (CLAUDE.md §4.6). */
+  scoreCouverture?: {
+    poidsCalculable: number;
+    poidsTotal: number;
+    nbCriteresExclus: number;
+    renormalise: boolean;
+  };
+  /** Dimension retenue par le serveur (cf. `CreditSimulateRefData`). */
+  refData?: CreditSimulateRefData;
+  /** Lignage de la feuille de besoins scorée, servi en mode `application_code`. */
+  needsSource?: { id?: number; revision?: number | null; sha256?: string | null };
   /** Détail du financement par module (contrat §1). Présent uniquement quand
    *  `module_financing` a été envoyé ET que le backend le prend en charge : un
    *  serveur pas encore à jour ne sert pas ces champs, d'où l'optionnalité. Le
@@ -1219,6 +1308,18 @@ export interface CreditAnalyseCritere {
     totalReferentiel?: number;
     ecartMoyenPct?: number;
     referentiel?: string;
+    /** Dimension du projet retenue par le moteur, DANS L'UNITÉ DU RÉFÉRENTIEL
+     *  (`scorer_technique`). `null` = dimension absente du dossier : le critère
+     *  technique vaut alors 0 et le dit, il n'est pas inventé. */
+    quantiteReference?: number | null;
+    /** Unité de cette dimension (`ha`, `ruche`, `sujet`, `m2`, `sac`, `t`).
+     *  C'est celle du référentiel : le moteur REFUSE (422 `DIMENSION_INCOHERENTE`)
+     *  plutôt que de convertir des ruches en hectares. */
+    uniteReference?: string;
+    /** Conservé pour l'historique du contrat, et `null` dès que la filière ne se
+     *  mesure pas en hectares — afficher « 30 ha » pour 30 ruches serait pire
+     *  que ne rien afficher. Préférer `quantiteReference` + `uniteReference`. */
+    superficieHa?: number | null;
     ecartsHorsPlage?: Array<{
       indicateur: string;
       valeur?: number;
@@ -1281,6 +1382,40 @@ export interface CreditEcheancierLigne {
   crd: number;
 }
 
+/** Tarification figée AVEC l'analyse (`analyse.py::_tarification_api`).
+ *
+ *  Le taux n'est pas un nombre isolé : c'est un chemin — taux de base de la
+ *  filière, bande de score atteinte, ajustement de cette bande, plancher de
+ *  sécurité, taux proposé. Servi entier pour qu'un analyste (et un auditeur deux
+ *  ans plus tard) puisse refaire le raisonnement sans ouvrir la base.
+ *
+ *  ⚠ STAFF UNIQUEMENT (principe 7) : la grille apprendrait au demandeur qu'un
+ *  point de score de plus lui fait gagner 2 points de taux. Aucun écran client
+ *  ne doit lire ce bloc.
+ *
+ *  Chaque champ hors `tauxPropose` peut manquer : les analyses antérieures à la
+ *  grille unique n'ont rien figé, et le serveur ne les re-tarife PAS avec la
+ *  grille d'aujourd'hui (principe 3 — on ne réécrit pas ce qu'un analyste a lu). */
+export interface CreditTarification {
+  /** Taux annuel proposé, en points (20.5 = 20,5 %/an). */
+  tauxPropose: number;
+  /** Assiette : le taux de base de la FILIÈRE, jamais le taux d'instruction. */
+  tauxBase?: number | null;
+  /** Borne basse de la bande de score atteinte. `null` = aucune bande
+   *  applicable (grille incomplète) — le serveur l'a loggé, l'écran le dit. */
+  bandeScoreMin?: number | null;
+  /** Ajustement de la bande, en points de taux (signé). */
+  ajustement?: number | null;
+  /** Plancher de sécurité : la bonification ne descend pas sous ce taux. */
+  plancher?: number | null;
+  /** `true` = le plancher a mordu, le taux proposé n'est PAS base + ajustement. */
+  plancherApplique?: boolean | null;
+  /** `bareme` = grille lue en base (recalibrable par le comité, principe 8) ;
+   *  `defaut` = grille de secours du code, à faire vivre en base. */
+  origineGrille?: 'bareme' | 'defaut' | string | null;
+  devise?: string;
+}
+
 /** Résultat complet d'une exécution du moteur — vue ANALYSTE.
  *
  *  Immuable : une ré-analyse crée une nouvelle ligne, elle n'en modifie aucune
@@ -1305,6 +1440,9 @@ export interface CreditAnalyse {
   };
   scoreGlobal: number;
   recommandation: CreditRecommandation;
+  /** Tarification figée à l'exécution. `null` pour une analyse antérieure à la
+   *  grille unique : l'écran affiche « non tarifée », il ne recalcule rien. */
+  tarification: CreditTarification | null;
   dscr: number | null;
   dscrStress: number | null;
   criteres: {

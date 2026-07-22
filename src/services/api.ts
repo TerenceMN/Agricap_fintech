@@ -375,6 +375,19 @@ export const api = {
       value_chain_code?: string;
       needs_sheet_id?: number;
       area_ha?: number;
+      /** Dimension du projet dans l'unité de la FILIÈRE (30 ruches, 1 000 sujets,
+       *  100 m², 2 000 sacs, 300 t usinées) — `area_ha` ne couvre que les filières
+       *  mesurées en hectares.
+       *
+       *  ⚠ `credits/views.py::simulate_scoring` ne relaie PAS encore ces deux
+       *  champs à `dataio_simulate`, qui les accepte pourtant (signature
+       *  `quantite_reference` / `unite_reference`). Ils sont envoyés dès
+       *  maintenant pour que le câblage serveur suffise à les honorer, et
+       *  l'écran VÉRIFIE dans `refData` ce que le serveur a réellement retenu :
+       *  tant qu'il ignore la dimension, l'utilisateur le voit au lieu de le
+       *  découvrir en 422 `DIMENSION_INCOHERENTE` à l'analyse. */
+      quantite_reference?: number;
+      unite_reference?: string;
       amount_requested?: number;
       currency?: string;
       /** Financement par module (contrat §1) : `{ moduleCode: pct }`, pct entier
@@ -396,6 +409,14 @@ export const api = {
       client_sub?: string;
       value_chain_code?: string;
       area_ha?: number;
+      /** Dimension du projet dans l'unité de la filière — cf. `simulate`.
+       *  `CreditApplication` porte bien `quantite_reference` / `unite_reference`
+       *  en base (c'est ce que lit `analyse.resoudre_quantite_reference`), mais
+       *  `_create_application` ne les lit pas encore du corps de la requête :
+       *  manque serveur signalé. Envoyés dès à présent pour qu'un dossier
+       *  apicole cesse d'être dimensionnable par la seule API. */
+      quantite_reference?: number;
+      unite_reference?: string;
       currency?: string;
       amount_requested: number;
       needs_sheet_id?: number;

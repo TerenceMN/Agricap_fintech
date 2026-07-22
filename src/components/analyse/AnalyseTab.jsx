@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
-import { RefreshCw, Lock } from 'lucide-react';
+import { RefreshCw, Lock, Calculator } from 'lucide-react';
 import { Loading, Empty, ErrorPanel, Forbidden, toFieldErrors } from '@/components/backoffice/States';
 import RecommendationBanner from './RecommendationBanner';
 import CriteriaTable from './CriteriaTable';
@@ -122,16 +123,29 @@ const AnalyseTab = ({ code, state }) => {
           <Lock className="w-3 h-3" aria-hidden="true" />
           Vue analyste — barèmes, tolérances et plages du référentiel. Ne jamais restituer au client.
         </p>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 px-2 text-xs text-slate-300 hover:bg-slate-700"
-          onClick={reload}
-          disabled={loading}
-        >
-          <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} aria-hidden="true" />
-          Actualiser
-        </Button>
+        <div className="flex items-center gap-3">
+          {/* La page de scoring montre la MÉCANIQUE (critères × poids, chemin du
+              taux, dimension, provenance des règles) ; cet onglet montre le
+              RÉSULTAT. Deux lectures distinctes du même objet — d'où le lien
+              plutôt qu'une duplication de panneaux. */}
+          <Link
+            to={`/credit/dossiers/${code}/scoring`}
+            className="flex items-center gap-1.5 text-xs text-primary underline"
+          >
+            <Calculator className="w-3.5 h-3.5" aria-hidden="true" />
+            Comment ce score est-il obtenu ?
+          </Link>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-xs text-slate-300 hover:bg-slate-700"
+            onClick={reload}
+            disabled={loading}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} aria-hidden="true" />
+            Actualiser
+          </Button>
+        </div>
       </div>
 
       <RecommendationBanner

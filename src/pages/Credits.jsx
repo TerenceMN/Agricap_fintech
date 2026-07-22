@@ -32,8 +32,11 @@ import NeedsSheetPanel, { NeedsSheetErrorList, NeedsSheetFailure } from '@/compo
 import { isFileValidationError, transportErrorMessage } from '@/components/simulateur/needsSheetErrors';
 import ModuleGrid from '@/components/simulateur/ModuleGrid';
 import {
-  DonutChartScore, ModuleFinancingSummary, ScoreBreakdown, SchedulePreview, scoreLetterOf,
+  DonutChartScore, ModuleFinancingSummary, CriteresClient, SchedulePreview, scoreLetterOf,
 } from '@/components/simulateur/SimulationResult';
+import {
+  dimensionPayload, dimensionRetenueParLeServeur, etatDimensionProjet, libelleUnite,
+} from '@/components/simulateur/dimension';
 
 // =================================================================
 // ===== CLIENT VIEW COMPONENTS (EXISTING & UPDATED) ===============
@@ -59,14 +62,45 @@ const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
   const handleCurrencyChange = (value) => setFormData(prev => ({ ...prev, currency: value }));
   const handleVcChange = (value) => setFormData(prev => ({ ...prev, vcCode: value }));
 
-  // Filière et superficie sont exigées ici, pas au moment de soumettre : le
+  // ── Dimension du projet ────────────────────────────────────────────────────
+  // Le champ « Superficie (ha) » supposait que TOUT projet se mesure en
+  // hectares. Un rucher se dimensionne en ruches, une bioconversion en m², une
+  // unité de transformation en tonnes usinées : le moteur compare le plan aux
+  // coûts PAR unité de la filière et refuse toute conversion (422
+  // `DIMENSION_INCOHERENTE`). L'unité est donc imposée par le serveur, pas
+  // choisie ici — et jamais devinée à partir d'une table filière → unité
+  // recopiée dans le navigateur (principes 6 et 8).
+  const valueChain = (prefill?.valueChains || []).find(vc => vc.code === formData.vcCode) || null;
+  const dimension = etatDimensionProjet({
+    quantite: formData.quantiteReference,
+    uniteSaisie: formData.uniteSaisie,
+    valueChain,
+    refData: formData.simResult?.refData,
+  });
+
+  const majQuantite = (e) => {
+    const { value } = e.target;
+    setFormData(prev => ({
+      ...prev,
+      quantiteReference: value,
+      // L'unité de saisie accompagne TOUJOURS la valeur : sans elle, on ne
+      // saurait pas plus tard dans quelle unité « 5 » avait été tapé.
+      uniteSaisie: dimension.uniteEffective,
+    }));
+  };
+
+  const ressaisirDansUniteFiliere = () => setFormData(prev => ({
+    ...prev, quantiteReference: '', uniteSaisie: dimension.unite || '',
+  }));
+
+  // Filière et dimension sont exigées ici, pas au moment de soumettre : le
   // dossier brouillon est créé dès l'étape 2 (le téléversement de la feuille en
   // a besoin), et `submit` les refuserait de toute façon
   // (`FILIERE_MANQUANTE`, `SUPERFICIE_MANQUANTE`). Autant le dire tout de suite.
   const hasChainChoice = prefill?.valueChains?.length > 0;
   const isValid = Boolean(
     formData.montant && parseFloat(formData.montant) > 0
-    && formData.superficie && parseFloat(formData.superficie) > 0
+    && !dimension.verdict.bloquant
     && (hasChainChoice ? formData.vcCode : true),
   );
 
@@ -92,7 +126,48 @@ const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
             <Input id="culture" name="culture" value={formData.culture} onChange={handleChange} placeholder="Ex: Café, Maïs..." className="bg-white/5" />
           )}
         </div>
-        <div><Label htmlFor="superficie">Superficie (ha) *</Label><Input type="number" id="superficie" name="superficie" value={formData.superficie} onChange={handleChange} className="bg-white/5" /></div>
+        <div>
+          <Label htmlFor="quantiteReference">
+            Dimension du projet{dimension.unite ? ` (${dimension.unite})` : ''} *
+          </Label>
+          <div className="flex items-stretch">
+            <Input
+              type="number"
+              min="0"
+              id="quantiteReference"
+              name="quantiteReference"
+              value={formData.quantiteReference}
+              onChange={majQuantite}
+              placeholder={dimension.uniteEffective === 'ha' ? 'Ex : 5' : 'Ex : 30'}
+              className="bg-white/5 rounded-r-none"
+              aria-describedby="aide-dimension"
+            />
+            <span className="px-3 flex items-center text-sm text-gray-300 bg-white/10 border border-l-0 border-white/10 rounded-r-md whitespace-nowrap">
+              {libelleUnite(dimension.uniteEffective, Number(formData.quantiteReference) || 2)
+                || dimension.uniteEffective}
+            </span>
+          </div>
+          <p id="aide-dimension" className="text-xs text-gray-500 mt-1.5">
+            {dimension.unite
+              ? `Votre filière se mesure en ${libelleUnite(dimension.unite, 2)}. `
+                + 'Indiquez la taille de votre projet dans cette unité — elle sert à comparer '
+                + 'votre feuille de besoins à des projets de taille comparable.'
+              : 'Taille de votre projet. Elle sert à comparer votre feuille de besoins à des '
+                + 'projets de taille comparable.'}
+          </p>
+          {dimension.verdict.etat === 'incoherente' && (
+            <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+              <p className="text-xs text-amber-100">{dimension.verdict.message}</p>
+              <button
+                type="button"
+                onClick={ressaisirDansUniteFiliere}
+                className="mt-2 text-xs px-2 py-1 rounded bg-white/10 text-gray-100"
+              >
+                Saisir en {libelleUnite(dimension.unite, 2) || dimension.unite}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -230,6 +305,13 @@ const SimulateurIntelligent = ({
     );
   }, [simResult, simFinancing, financing]);
   const staleSimulation = staleRevision || staleFinancing;
+  // Constat sur la réponse serveur, pas un calcul : la dimension envoyée a-t-elle
+  // été celle utilisée pour scorer ?
+  const dimensionServeur = dimensionRetenueParLeServeur({
+    refData: simResult?.refData,
+    quantiteEnvoyee: formData.quantiteReference,
+    uniteEnvoyee: formData.uniteSaisie,
+  });
   // Les chiffres serveur (montant ajusté, part par module) ne valent que pour la
   // demande réellement scorée : on ne les montre pas s'ils sont périmés.
   const montantAjuste = !staleSimulation ? (simResult?.montantDemandeAjuste ?? null) : null;
@@ -441,6 +523,29 @@ const SimulateurIntelligent = ({
         </div>
       )}
 
+      {/* Dimension réellement retenue par le serveur. Tant que
+          `credits/views.py::simulate_scoring` ne relaie pas `quantite_reference`,
+          un projet non mesuré en hectares est simulé sur une autre grandeur que
+          celle saisie : la comparaison au référentiel devient impossible côté
+          serveur, et sans ce bandeau le demandeur ne verrait qu'un critère
+          « non calculable » sans cause. */}
+      {dimensionServeur && !dimensionServeur.retenue && (
+        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/[0.08] p-4 flex items-start gap-3">
+          <AlertTriangle className="w-4 h-4 text-amber-300 mt-0.5 shrink-0" aria-hidden="true" />
+          <p className="text-sm text-amber-100/90">
+            Cette simulation n'a pas été calculée sur la dimension que vous avez indiquée
+            ({formData.quantiteReference || '—'}{' '}
+            {libelleUnite(formData.uniteSaisie, Number(formData.quantiteReference) || 2)
+              || formData.uniteSaisie || 'ha'}) mais sur{' '}
+            {dimensionServeur.quantiteServeur ?? '—'}{' '}
+            {libelleUnite(dimensionServeur.uniteServeur, dimensionServeur.quantiteServeur)
+              || dimensionServeur.uniteServeur || '—'}.
+            Signalez-le à votre agent AGRICAP avant de poursuivre : la comparaison de votre
+            feuille de besoins à des projets comparables en dépend.
+          </p>
+        </div>
+      )}
+
       <NeedsSheetFailure failure={simFailure} onRetry={handleSimulate} />
       <NeedsSheetErrorList errors={simErrors} title="La simulation n'a pas pu être lancée" />
 
@@ -453,7 +558,10 @@ const SimulateurIntelligent = ({
 
       {!staleSimulation && <ModuleFinancingSummary simResult={simResult} currency={formData.currency} />}
 
-      <ScoreBreakdown simResult={simResult} />
+      {/* Restitution CLIENT des critères : les libellés, pas les poids ni les
+          points (principe 7). Le détail chiffré du calcul est sur la page de
+          scoring, réservée au personnel. */}
+      <CriteresClient simResult={simResult} />
       <SchedulePreview simResult={simResult} currency={formData.currency} />
 
       <div className="flex flex-col sm:flex-row justify-between items-stretch sm:items-end gap-3">
@@ -705,7 +813,16 @@ const FicheSynthese = ({ formData, prevStep, submitApplication, guaranteeSet, su
         <h3 className="text-2xl font-bold text-white mb-6">Fiche de Synthèse Finale</h3>
         <div className="grid grid-cols-2 md:grid-cols-3 gap-6">
           <div className="bg-white/5 p-4 rounded-lg"><p className="text-sm text-gray-400">Demandeur</p><p className="font-bold">{formData.demandeur}</p></div>
-          <div className="bg-white/5 p-4 rounded-lg"><p className="text-sm text-gray-400">Superficie</p><p className="font-bold">{formData.superficie} ha</p></div>
+          <div className="bg-white/5 p-4 rounded-lg">
+            <p className="text-sm text-gray-400">Dimension du projet</p>
+            <p className="font-bold">
+              {formData.quantiteReference || '—'}{' '}
+              <span className="font-normal text-gray-300">
+                {libelleUnite(formData.uniteSaisie, Number(formData.quantiteReference) || 2)
+                  || formData.uniteSaisie || 'ha'}
+              </span>
+            </p>
+          </div>
           <div className="bg-white/5 p-4 rounded-lg"><p className="text-sm text-gray-400">Culture</p><p className="font-bold">{formData.culture}</p></div>
           <div className="bg-white/5 p-4 rounded-lg col-span-2 md:col-span-1"><p className="text-sm text-gray-400">Montant total financé</p><p className="font-bold text-2xl text-emerald-400">{formatMontant(formData.totalFinanced, formData.currency, { decimals: 0 })}</p></div>
           {/* Score du moteur ; `formData.scoreLetter` n'était jamais alimenté. */}
@@ -1070,7 +1187,11 @@ const Credits = () => {
   // Causes d'un refus de soumission, une entrée par cause.
   const [submitErrors, setSubmitErrors] = useState([]);
   const [formData, setFormData] = useState({
-    demandeur: '', localisation: '', superficie: '', culture: '',
+    demandeur: '', localisation: '', culture: '',
+    // Dimension du projet dans l'unité de la filière (ex-`superficie`, qui
+    // supposait l'hectare pour toutes les filières) + l'unité dans laquelle
+    // elle a été saisie.
+    quantiteReference: '', uniteSaisie: '',
     montant: '', currency: 'USD',
     vcCode: '', nsResult: null, simResult: null, modules: null, totalFinanced: 0,
   });
@@ -1110,7 +1231,12 @@ const Credits = () => {
             ...prev,
             demandeur: data.client?.displayName || prev.demandeur,
             vcCode: data.defaults?.value_chain_code || '',
-            superficie: data.defaults?.area_ha ? String(data.defaults.area_ha) : '',
+            // Le préremplissage ne connaît qu'une superficie : elle est donc
+            // reprise comme une valeur EN HECTARES, unité de saisie explicite à
+            // l'appui. Si la filière se mesure autrement, l'écart sera signalé
+            // plutôt qu'hérité en silence.
+            quantiteReference: data.defaults?.area_ha ? String(data.defaults.area_ha) : '',
+            uniteSaisie: data.defaults?.area_ha ? 'ha' : '',
             currency: data.defaults?.currency || 'USD',
           }));
         })
@@ -1190,7 +1316,11 @@ const Credits = () => {
     const fd = formDataRef.current;
     const app = await api.credits.create({
       value_chain_code: fd.vcCode || undefined,
-      area_ha: fd.superficie ? parseFloat(fd.superficie) : undefined,
+      // `area_ha` n'est renseigné que pour les filières mesurées en hectares :
+      // `dimensionPayload` s'en charge. Le dossier porte en plus la dimension
+      // canonique (`quantite_reference` + `unite_reference`), seule forme
+      // exploitable par le moteur pour une filière apicole ou hors-sol.
+      ...dimensionPayload({ quantite: fd.quantiteReference, unite: fd.uniteSaisie }),
       currency: fd.currency,
       amount_requested: parseFloat(fd.montant) || 0,
       prefill_snapshot: { demandeur: fd.demandeur, localisation: fd.localisation },
@@ -1275,7 +1405,7 @@ const Credits = () => {
     setSubmitErrors([]);
     setFormData({
       demandeur: prefill?.client?.displayName || '',
-      localisation: '', superficie: '', culture: '', montant: '',
+      localisation: '', quantiteReference: '', uniteSaisie: '', culture: '', montant: '',
       currency: prefill?.defaults?.currency || 'USD',
       vcCode: prefill?.defaults?.value_chain_code || '',
       nsResult: null, simResult: null, modules: null, totalFinanced: 0,

@@ -97,48 +97,68 @@ export const DonutChartScore = ({ score }) => {
   );
 };
 
-/** Détail par critère — barème non exposé, seuls les points le sont. */
-export const ScoreBreakdown = ({ simResult }) => {
+/**
+ * Critères examinés — restitution CLIENT (principe 7, anti-gaming).
+ *
+ * CE QUI A ÉTÉ RETIRÉ ET POURQUOI. Ce panneau s'appelait `ScoreBreakdown` et
+ * affichait, sur l'espace du DEMANDEUR : le poids de chaque critère
+ * (`maxPoints` / `weight`), ses points pondérés, le nom du référentiel de
+ * comparaison, le DSCR calculé, la durée, le différé et le taux annuel retenus.
+ * C'est la carte du moteur. Le principe 7 l'interdit mot pour mot — « il ne voit
+ * JAMAIS : les barèmes, les seuils, les tolérances par module, les plages du
+ * référentiel » — et pour une raison concrète : un demandeur qui sait que
+ * l'historique comportemental pèse 30 points et que le technique en pèse 25
+ * n'améliore pas son projet, il déplace ses chiffres vers le critère le plus
+ * rentable. Le détail chiffré vit désormais sur `/credit/dossiers/<code>/scoring`,
+ * réservé au personnel.
+ *
+ * CE QUI RESTE, et qui est légitime : la LISTE des critères examinés. Savoir que
+ * son dossier est jugé sur la cohérence technique, la capacité de remboursement,
+ * la résilience, l'historique et les garanties aide le demandeur à préparer son
+ * dossier ; cela ne lui dit ni combien vaut chaque critère, ni où se trouve la
+ * barre. Un critère non calculable est signalé, parce que c'est actionnable.
+ *
+ * ⚠ Ne pas réintroduire `points`, `weight`, `maxPoints`, `detail`, `refData`,
+ * `tarification` ni `proposedRate` ici : `detail` porte des phrases d'analyste
+ * (« Écart moyen de 42 % au référentiel MAIS-v3 »), et `tarification` porte la
+ * grille de taux. Ces trois blocs sont servis par le backend au même endpoint,
+ * mais ils ne sont pas destinés à cet écran.
+ */
+export const CriteresClient = ({ simResult }) => {
   if (!simResult?.breakdown?.length) return null;
+  const nonCalculables = simResult.breakdown.filter(c => c.calculable === false);
   return (
     <div className="glass-effect p-5 rounded-2xl space-y-3">
-      <h4 className="font-bold text-white mb-1">Analyse par critère</h4>
-      {simResult.breakdown.map((c) => (
-        <div key={c.code}>
-          <div className="flex justify-between text-sm mb-1 gap-3">
-            <span className="text-gray-300">{c.label}</span>
-            <span className="font-semibold text-white shrink-0 tabular-nums">
-              {c.points}/100{' '}
-              <span className="text-gray-500 font-normal">
-                × {Math.round(c.weight * 100)}% = {c.weightedScore.toFixed(1)} pts
-              </span>
+      <div className="flex items-baseline justify-between gap-3 flex-wrap">
+        <h4 className="font-bold text-white">Ce que votre dossier fait examiner</h4>
+        <span className="text-xs text-gray-500 flex items-center gap-1">
+          <Lock className="w-3 h-3" aria-hidden="true" /> détail du calcul réservé à l'analyste
+        </span>
+      </div>
+      <ul className="space-y-1.5">
+        {simResult.breakdown.map((c) => (
+          <li key={c.code} className="flex items-start gap-2 text-sm text-gray-300">
+            <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-emerald-400/70 shrink-0" aria-hidden="true" />
+            <span>
+              {c.label}
+              {c.calculable === false && (
+                <span className="text-amber-300/90"> — non évalué à ce stade</span>
+              )}
             </span>
-          </div>
-          <div className="w-full bg-white/10 rounded-full h-1.5">
-            <div
-              className="h-1.5 rounded-full"
-              style={{
-                width: `${c.points}%`,
-                background: c.points >= 70 ? '#10b981' : c.points >= 50 ? '#f59e0b' : '#ef4444',
-              }}
-            />
-          </div>
-          {c.detail && <p className="text-xs text-gray-500 mt-0.5">{c.detail}</p>}
-        </div>
-      ))}
-      {simResult.refData && (
-        <div className="mt-2 pt-2 border-t border-white/10 text-xs text-gray-500 space-y-0.5">
-          <p>Référentiel : <span className="text-gray-400">{simResult.refData.source}</span></p>
-          {simResult.refData.dscr && (
-            <p>DSCR calculé : <span className="text-blue-300">{simResult.refData.dscr}</span></p>
-          )}
-          <p>
-            Durée : {simResult.refData.durationMonths} mois · Différé :{' '}
-            {simResult.refData.deferredMonths} mois · Taux :{' '}
-            {(simResult.refData.rateAnnual * 100).toFixed(1)} %/an
-          </p>
-        </div>
+          </li>
+        ))}
+      </ul>
+      {nonCalculables.length > 0 && (
+        <p className="text-xs text-gray-500">
+          {nonCalculables.length === 1 ? 'Un critère n’a pas pu être évalué' : `${nonCalculables.length} critères n’ont pas pu être évalués`}
+          {' '}avec les informations disponibles : votre agent AGRICAP peut vous dire ce qui manque.
+        </p>
       )}
+      <p className="text-xs text-gray-500">
+        Votre score global et sa lettre sont affichés ci-dessus. Le détail du calcul — poids de
+        chaque critère, barèmes, plages de référence — relève de l'instruction du dossier par
+        AGRICAP.
+      </p>
       {simResult.needsSource?.revision != null && (
         <p className="text-[11px] text-gray-600 pt-1">
           Simulation calculée sur la révision {simResult.needsSource.revision} de votre feuille de
