@@ -52,6 +52,12 @@ class InvestmentConfig(models.Model):
     #: le dit — une expertise de 2023 n'est pas une valeur de 2026.
     expert_valuation_max_age_months = models.PositiveIntegerField(default=12)
 
+    #: Écart (en %) au-delà duquel un rapport de performance déclenche une observation
+    #: de risque. Était codé en dur à 10 dans `submit_performance_report` — un seuil
+    #: métier dans le code est un seuil que le comité ne peut pas corriger (principe 8).
+    performance_deviation_alert_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("10.00"))
+
     #: Politique appliquée aux offres qui ne précisent rien (voir `Offer.Oversubscription`).
     default_oversubscription_policy = models.CharField(max_length=10, default="QUEUE")
     #: Part de l'objectif en deçà de laquelle la levée échoue à l'échéance (min-funding).
@@ -667,7 +673,17 @@ class PerformanceReport(models.Model):
     forecast_costs = models.FloatField(default=0)
     actual_production = models.FloatField(default=0)
     forecast_production = models.FloatField(default=0)
+    #: Écart de REVENU (réalisé − prévu) / prévu × 100. Le nom est générique pour des
+    #: raisons historiques : il est consommé tel quel par le front. Ses deux frères
+    #: ci-dessous lèvent l'ambiguïté plutôt que de le renommer sous les pieds d'un
+    #: écran livré.
     deviation_percent = models.FloatField(default=0)
+    #: Écart de COÛTS. Attention au sens : un écart POSITIF est défavorable (les coûts
+    #: dépassent la prévision), là où un écart de revenu positif est favorable. Deux
+    #: grandeurs de même forme et de sens opposé — d'où `unfavorable_deviations`.
+    cost_deviation_percent = models.FloatField(default=0)
+    #: Écart de PRODUCTION (positif = favorable, comme le revenu).
+    production_deviation_percent = models.FloatField(default=0)
     deviation_comments = models.TextField(blank=True)
     validation_status = models.CharField(max_length=10, choices=ValidationStatus.choices,
                                           default=ValidationStatus.PENDING)

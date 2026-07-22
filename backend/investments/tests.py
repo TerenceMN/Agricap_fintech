@@ -23,7 +23,7 @@ from common.exceptions import ConflictError, ValidationFailed
 from common.idempotency import IdempotentReplay
 from common.testing import AuthedAPITestCase
 
-from . import committee, funding, metrics, services, workflow
+from . import committee, funding, metrics, serializers, services, workflow
 from .models import (
     AnalystObservation, BondConversion, BondWithdrawal, Collateral, Distribution,
     FinancialAnalysis, InvestmentCommitteeVote, InvestmentEvent, Investor, Offer,
@@ -1743,6 +1743,67 @@ class PerformanceReportTests(AuthedAPITestCase):
         project = make_project("PR-2")
         services.submit_performance_report(
             project=project, data={"actualRevenue": 980, "forecastRevenue": 1000}, by="u")
+        self.assertFalse(AnalystObservation.objects.filter(project=project).exists())
+
+    def test_les_trois_ecarts_sont_calcules_par_le_serveur(self):
+        project = make_project("PR-3")
+        rapport = services.submit_performance_report(
+            project=project,
+            data={"actualRevenue": 900, "forecastRevenue": 1000,
+                  "actualCosts": 1200, "forecastCosts": 1000,
+                  "actualProduction": 45, "forecastProduction": 50}, by="u")
+        self.assertEqual(rapport.deviation_percent, -10.0)          # (900−1000)/1000
+        self.assertEqual(rapport.cost_deviation_percent, 20.0)      # (1200−1000)/1000
+        self.assertEqual(rapport.production_deviation_percent, -10.0)
+
+    def test_le_sens_de_lecart_de_couts_est_inverse_de_celui_du_revenu(self):
+        project = make_project("PR-4")
+        rapport = services.submit_performance_report(
+            project=project,
+            data={"actualRevenue": 1200, "forecastRevenue": 1000,
+                  "actualCosts": 1200, "forecastCosts": 1000}, by="u")
+        ligne = serializers.performance_report_row(rapport)
+        # Même écart de +20 %, sens opposé : le revenu dépasse (favorable), les coûts
+        # dérapent (défavorable). L'écran n'a pas à connaître cette règle.
+        self.assertEqual(ligne["revenueDeviationPercent"], 20.0)
+        self.assertEqual(ligne["costDeviationPercent"], 20.0)
+        self.assertFalse(ligne["unfavorable"]["revenue"])
+        self.assertTrue(ligne["unfavorable"]["costs"])
+
+    def test_derapage_de_couts_seul_declenche_lobservation(self):
+        project = make_project("PR-5")
+        services.submit_performance_report(
+            project=project,
+            data={"actualRevenue": 1000, "forecastRevenue": 1000,
+                  "actualCosts": 1500, "forecastCosts": 1000}, by="u")
+        obs = AnalystObservation.objects.filter(project=project, risk_flag="HIGH").first()
+        self.assertIsNotNone(obs)
+        self.assertIn("coûts", obs.observation)
+
+    def test_couts_inferieurs_a_la_prevision_ne_declenchent_rien(self):
+        project = make_project("PR-6")
+        services.submit_performance_report(
+            project=project,
+            data={"actualRevenue": 1000, "forecastRevenue": 1000,
+                  "actualCosts": 500, "forecastCosts": 1000}, by="u")
+        self.assertFalse(AnalystObservation.objects.filter(project=project).exists())
+
+    def test_seuil_dalerte_vient_de_la_base(self):
+        from .models import InvestmentConfig
+        InvestmentConfig.objects.create(performance_deviation_alert_percent=Decimal("30.00"))
+        project = make_project("PR-7")
+        services.submit_performance_report(
+            project=project, data={"actualRevenue": 800, "forecastRevenue": 1000}, by="u")
+        # −20 % ne dépasse plus le seuil recalibré à 30 %.
+        self.assertFalse(AnalystObservation.objects.filter(project=project).exists())
+
+    def test_absence_de_prevision_nest_pas_un_ecart_nul(self):
+        project = make_project("PR-8")
+        rapport = services.submit_performance_report(
+            project=project, data={"actualRevenue": 900, "forecastRevenue": 0}, by="u")
+        ligne = serializers.performance_report_row(rapport)
+        self.assertEqual(ligne["revenueDeviationPercent"], 0.0)
+        self.assertFalse(ligne["hasForecast"]["revenue"])
         self.assertFalse(AnalystObservation.objects.filter(project=project).exists())
 
 

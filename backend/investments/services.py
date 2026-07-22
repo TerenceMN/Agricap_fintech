@@ -202,27 +202,76 @@ def subscribe(*, investor: Investor, offer_id: int, bonds: int, idempotency_key:
                             idempotency_key=idempotency_key, by=by)
 
 
+def _deviation_percent(actual, forecast) -> Decimal:
+    """`(réalisé − prévu) / prévu × 100`, en `Decimal`, quantifié à 0,01.
+
+    Sans prévision, il n'y a pas d'écart — pas un écart de 0 % : `0` signifierait
+    « conforme à la prévision », ce qui est faux quand aucune prévision n'a été posée.
+    On retourne 0 faute de champ nullable dans un modèle déjà consommé, mais
+    `has_forecast` ci-dessous permet à l'appelant de distinguer les deux cas.
+    """
+    prevu = to_decimal(forecast or 0)
+    if prevu == 0:
+        return Decimal("0.00")
+    return ((to_decimal(actual or 0) - prevu) / prevu * Decimal("100")).quantize(Decimal("0.01"))
+
+
 def submit_performance_report(*, project: Project, data: dict, by: str = "") -> PerformanceReport:
-    actual_revenue = float(data.get("actualRevenue", 0) or 0)
-    forecast_revenue = float(data.get("forecastRevenue", 0) or 0)
-    deviation = round(((actual_revenue - forecast_revenue) / forecast_revenue) * 100, 2) if forecast_revenue else 0.0
+    """Enregistre le reporting du promoteur ET calcule SES écarts — les trois.
+
+    L'écart de revenu était seul calculé côté serveur : les écrans recalculaient donc
+    l'écart de coûts eux-mêmes, avec leur propre formule, pour une grandeur qui décide
+    d'une observation de risque. Deux formules pour une grandeur, c'est l'incident de
+    données du principe 11 en germe. Les trois écarts sont désormais calculés ici, une
+    fois, et figés avec le rapport.
+
+    Le seuil d'alerte vient de `InvestmentConfig` (principe 8), et le sens de chaque
+    écart est respecté : des coûts SUPÉRIEURS à la prévision sont défavorables, des
+    revenus supérieurs ne le sont pas.
+    """
+    cfg = InvestmentConfig.active()
+    seuil = Decimal(cfg.performance_deviation_alert_percent)
+
+    revenu = _deviation_percent(data.get("actualRevenue"), data.get("forecastRevenue"))
+    couts = _deviation_percent(data.get("actualCosts"), data.get("forecastCosts"))
+    production = _deviation_percent(data.get("actualProduction"), data.get("forecastProduction"))
+
     report = PerformanceReport.objects.create(
         project=project, reporting_period=data.get("reportingPeriod", ""),
-        actual_revenue=actual_revenue, forecast_revenue=forecast_revenue,
-        actual_costs=float(data.get("actualCosts", 0) or 0), forecast_costs=float(data.get("forecastCosts", 0) or 0),
-        actual_production=float(data.get("actualProduction", 0) or 0),
-        forecast_production=float(data.get("forecastProduction", 0) or 0),
-        deviation_percent=deviation, deviation_comments=data.get("deviationComments", ""),
+        actual_revenue=float(to_decimal(data.get("actualRevenue", 0) or 0)),
+        forecast_revenue=float(to_decimal(data.get("forecastRevenue", 0) or 0)),
+        actual_costs=float(to_decimal(data.get("actualCosts", 0) or 0)),
+        forecast_costs=float(to_decimal(data.get("forecastCosts", 0) or 0)),
+        actual_production=float(to_decimal(data.get("actualProduction", 0) or 0)),
+        forecast_production=float(to_decimal(data.get("forecastProduction", 0) or 0)),
+        deviation_percent=float(revenu), cost_deviation_percent=float(couts),
+        production_deviation_percent=float(production),
+        deviation_comments=data.get("deviationComments", ""),
     )
-    if abs(deviation) > 10:
+
+    # Un écart de revenu ou de production s'apprécie en valeur absolue (une prévision
+    # dépassée de 40 % est autant un signal sur la QUALITÉ de la prévision qu'un bon
+    # résultat — CLAUDE.md §4.3) ; un écart de coûts ne se signale que s'il DÉPASSE.
+    alertes = []
+    if abs(revenu) > seuil:
+        alertes.append(f"revenu {revenu:+} %")
+    if couts > seuil:
+        alertes.append(f"coûts {couts:+} % au-dessus de la prévision")
+    if abs(production) > seuil:
+        alertes.append(f"production {production:+} %")
+    if alertes:
         AnalystObservation.objects.create(
             project=project, category=AnalystObservation.Category.RISK,
             risk_flag=AnalystObservation.RiskFlag.HIGH,
-            observation=f"Écart de {deviation}% détecté sur le rapport de performance "
-                        f"{report.reporting_period or report.pk}.",
+            observation=(
+                f"Écart supérieur au seuil de {seuil} % sur le rapport de performance "
+                f"{report.reporting_period or report.pk} : {' ; '.join(alertes)}."
+            ),
         )
     audit_record(actor=by, action="investments.performance_report.submit", entity_type="PerformanceReport",
-                 entity_id=str(report.pk), details={"deviation_percent": deviation})
+                 entity_id=str(report.pk),
+                 details={"deviation_percent": str(revenu), "cost_deviation_percent": str(couts),
+                          "production_deviation_percent": str(production), "threshold": str(seuil)})
     return report
 
 

@@ -186,7 +186,24 @@ def performance_report_row(r) -> dict:
         "actualRevenue": r.actual_revenue, "forecastRevenue": r.forecast_revenue,
         "actualCosts": r.actual_costs, "forecastCosts": r.forecast_costs,
         "actualProduction": r.actual_production, "forecastProduction": r.forecast_production,
-        "deviationPercent": r.deviation_percent, "deviationComments": r.deviation_comments,
+        # Trois écarts CALCULÉS ET FIGÉS par le serveur. `deviationPercent` reste
+        # l'écart de revenu (nom historique consommé tel quel). `unfavorable` dit le
+        # sens : un écart de coûts positif est défavorable, un écart de revenu positif
+        # ne l'est pas — l'écran n'a pas à connaître cette règle métier.
+        "deviationPercent": r.deviation_percent,
+        "revenueDeviationPercent": r.deviation_percent,
+        "costDeviationPercent": r.cost_deviation_percent,
+        "productionDeviationPercent": r.production_deviation_percent,
+        "unfavorable": {
+            "revenue": r.deviation_percent < 0,
+            "costs": r.cost_deviation_percent > 0,
+            "production": r.production_deviation_percent < 0,
+        },
+        "hasForecast": {
+            "revenue": bool(r.forecast_revenue), "costs": bool(r.forecast_costs),
+            "production": bool(r.forecast_production),
+        },
+        "deviationComments": r.deviation_comments,
         "validationStatus": r.validation_status, "validatedBy": r.validated_by,
         "validationDate": r.validation_date.isoformat() if r.validation_date else None,
     }
