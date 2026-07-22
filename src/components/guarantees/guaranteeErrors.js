@@ -189,7 +189,7 @@ export function guaranteeErrorMessage(err, fallback = "Le serveur a refusé cett
  * Liste **toutes** les causes d'un refus, une entrée par cause.
  *
  * `submit` agrège plusieurs manques (`APPLICATION_INCOMPLETE` avec
- * `errors: [{SUPERFICIE_MANQUANTE}, {GUARANTEE_TYPE_NOT_ELIGIBLE}, …]`).
+ * `errors: [{DIMENSION_MANQUANTE}, {GUARANTEE_TYPE_NOT_ELIGIBLE}, …]`).
  * N'afficher que la première ferait redécouvrir les autres une par une, à
  * chaque tentative — CLAUDE.md principe 5 : « une erreur par cause, jamais un
  * message générique », et le standard frontend « 422 structuré → affichage par

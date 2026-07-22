@@ -96,7 +96,7 @@ const DemandeInitiale = ({ formData, setFormData, nextStep, prefill }) => {
   // Filière et dimension sont exigées ici, pas au moment de soumettre : le
   // dossier brouillon est créé dès l'étape 2 (le téléversement de la feuille en
   // a besoin), et `submit` les refuserait de toute façon
-  // (`FILIERE_MANQUANTE`, `SUPERFICIE_MANQUANTE`). Autant le dire tout de suite.
+  // (`FILIERE_MANQUANTE`, `DIMENSION_MANQUANTE`). Autant le dire tout de suite.
   const hasChainChoice = prefill?.valueChains?.length > 0;
   const isValid = Boolean(
     formData.montant && parseFloat(formData.montant) > 0

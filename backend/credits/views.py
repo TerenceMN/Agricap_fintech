@@ -514,7 +514,76 @@ def simulate_scoring(request: Request) -> Response:
     if "error" in result:
         return Response({"detail": result["error"]}, status=400)
 
-    return Response(result)
+    return Response(_filtrer_simulation(result, request))
+
+
+#: Clés de `refData` qui décrivent le MOTEUR, pas le dossier du client.
+#: `refTotals` porte les coûts de référence par module (les plages du
+#: référentiel), `rateAnnual`/`durationMonths`/`deferredMonths` les paramètres
+#: de calcul, `dscr`/`dscrStress` des indicateurs d'instruction.
+_REF_DATA_STAFF = (
+    "refTotals", "dscr", "dscrStress", "rateAnnual",
+    "durationMonths", "deferredMonths", "grandTotalNS",
+)
+
+#: Champs de `breakdown[]` qui exposent la PONDÉRATION du barème.
+_BREAKDOWN_STAFF = ("maxPoints", "weight", "weightedScore", "score")
+
+
+def _filtrer_simulation(result: dict, request: Request) -> dict:
+    """Retire du résultat de simulation ce qu'un client ne doit jamais voir.
+
+    PRINCIPE 7 — anti-gaming par asymétrie d'information. Le client voit son
+    score, sa lettre et des pistes ; il ne voit JAMAIS les barèmes, les seuils,
+    les tolérances par module, les plages du référentiel ni les règles du moteur.
+
+    Ce filtre existe parce qu'il manquait. `dataio_simulator` documentait
+    pourtant l'intention à la lettre — « la grille ne descend jamais au client
+    (principe 7) ; c'est la vue qui filtre » — mais aucune vue ne filtrait :
+    `simulate/` renvoyait `result` brut, et `_require_read` laisse passer un
+    client. La grille de taux (bande, ajustement, plancher), les coûts de
+    référence par module et le score minimum requis descendaient donc jusqu'au
+    navigateur du demandeur. Un commentaire qui décrit une garantie non
+    implémentée est pire qu'un silence : il fait croire la porte fermée.
+
+    Le front avait cessé de les AFFICHER ; les données continuaient de partir.
+    Un onglet réseau ouvert suffisait à lire le barème et à caler son dossier
+    juste au-dessus de la barre — exactement le comportement que §4.3 apprend
+    à détecter.
+    """
+    if getattr(getattr(request, "user", None), "is_staff_role", False):
+        return result
+
+    filtre = dict(result)
+    # La grille qui EXPLIQUE le taux est un barème ; le taux lui-même reste
+    # servi (`proposedRate`) — le client a le droit de savoir ce qu'on lui
+    # propose, pas comment la bande a été franchie.
+    filtre.pop("tarification", None)
+    # Un seuil d'éligibilité est une règle du moteur : `eligible` suffit à
+    # informer, `minScoreRequired` dirait où viser.
+    filtre.pop("minScoreRequired", None)
+
+    if isinstance(filtre.get("refData"), dict):
+        filtre["refData"] = {k: v for k, v in filtre["refData"].items()
+                             if k not in _REF_DATA_STAFF}
+
+    if isinstance(filtre.get("breakdown"), list):
+        filtre["breakdown"] = [
+            {k: v for k, v in ligne.items() if k not in _BREAKDOWN_STAFF}
+            if isinstance(ligne, dict) else ligne
+            for ligne in filtre["breakdown"]
+        ]
+
+    # `poidsCalculable`/`poidsTotal` sont la somme des poids du barème : on garde
+    # l'honnêteté de la couverture (combien de critères n'ont pas pu être évalués)
+    # sans livrer la pondération elle-même.
+    couverture = filtre.get("scoreCouverture")
+    if isinstance(couverture, dict):
+        filtre["scoreCouverture"] = {
+            k: v for k, v in couverture.items()
+            if k in ("nbCriteresExclus", "renormalise")
+        }
+    return filtre
 
 
 def _load_needs_totals(app):

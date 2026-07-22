@@ -193,7 +193,7 @@ export function verifierDimension(args: {
  *
  * `area_ha` reste envoyé QUAND ET SEULEMENT QUAND l'unité est l'hectare : c'est
  * le champ que `credits/workflow.py` exige encore à la soumission
- * (`SUPERFICIE_MANQUANTE`), et le remplir avec 30 ruches ferait entrer « 30 ha »
+ * (`DIMENSION_MANQUANTE`), et le remplir avec 30 ruches ferait entrer « 30 ha »
  * dans le dossier — précisément la confusion que ce lot supprime.
  */
 export function dimensionPayload(args: {

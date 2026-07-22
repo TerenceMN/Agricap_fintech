@@ -65,7 +65,7 @@ class SubmitErrorCodesTests(TestCase):
         self.assertEqual(exc.code, "APPLICATION_INCOMPLETE")
         self.assertEqual(
             {e["code"] for e in exc.as_errors()},
-            {"FILIERE_MANQUANTE", "SUPERFICIE_MANQUANTE", "MONTANT_MANQUANT"},
+            {"FILIERE_MANQUANTE", "DIMENSION_MANQUANTE", "MONTANT_MANQUANT"},
         )
         # Chaque entrée est exploitable telle quelle par une interface.
         for entry in exc.as_errors():

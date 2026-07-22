@@ -331,9 +331,25 @@ def submit(app, submitter_sub: str) -> None:
     if not app.value_chain_id:
         errors.append({"code": "FILIERE_MANQUANTE",
                        "message": "Filière (chaîne de valeur) non renseignée."})
-    if not app.area_ha or app.area_ha <= 0:
-        errors.append({"code": "SUPERFICIE_MANQUANTE",
-                       "message": "Superficie (area_ha) manquante ou nulle."})
+    # La dimension du projet, pas forcément une SUPERFICIE.
+    #
+    # Exiger `area_ha` supposait que tout projet se mesure en hectares. Depuis
+    # la généralisation du référentiel, une filière se dimensionne dans SON
+    # unité : ruches, sujets, m², sacs, tonnes. Un dossier apicole parfaitement
+    # renseigné en `quantite_reference` était donc INSOUMETTABLE — la règle
+    # bloquait des dossiers que le moteur savait analyser.
+    #
+    # `area_ha` reste accepté : c'est la forme historique, et les dossiers en
+    # hectares la portent toujours.
+    a_une_dimension = (
+        (app.area_ha and app.area_ha > 0)
+        or (getattr(app, "quantite_reference", None) and app.quantite_reference > 0)
+    )
+    if not a_une_dimension:
+        errors.append({"code": "DIMENSION_MANQUANTE",
+                       "message": "La dimension du projet n'est pas renseignée "
+                                  "(superficie, nombre de ruches, m², tonnes… "
+                                  "selon la filière choisie)."})
     if not app.amount_requested or app.amount_requested <= 0:
         errors.append({"code": "MONTANT_MANQUANT",
                        "message": "Montant demandé manquant ou nul."})
