@@ -10,6 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { ArrowRightLeft, TrendingUp, Clock, CheckCircle2 } from 'lucide-react';
 import { useToast } from '@/components/ui/use-toast';
 import { api } from '@/services/api';
+import { formatPercent, rowRateToPercent } from '@/lib/investorSpaceWire';
 
 const FLOW_STATUS_LABEL = { EN_ATTENTE: 'En attente', APPROUVE: 'Approuvé', REJETE: 'Rejeté' };
 const FLOW_STATUS_COLOR = {
@@ -170,7 +171,9 @@ const Conversions = () => {
                 </div>
 
                 <div className="flex flex-col md:items-end text-sm text-gray-400 gap-1">
-                  <p>Taux: <span className="text-white">{position.rate}% / an</span></p>
+                  <p>Taux: <span className="text-white">
+                    {formatPercent(rowRateToPercent(position, 'rate', position.rate))} / an
+                  </span></p>
                   <p>Échéance: {position.termMonths} mois</p>
                 </div>
 

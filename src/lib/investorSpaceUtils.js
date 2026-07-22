@@ -1,4 +1,5 @@
 import { PROJECT_STATUS_CODES } from './investorSpaceData';
+import { rowRateToPercent } from './investorSpaceWire';
 
 // ==========================================
 // SUBSCRIPTION -> COMMITMENT ADAPTER
@@ -40,6 +41,11 @@ export const buildCommitments = (subscriptions = [], offers = [], projects = [])
       expectedMaturity,
       status: SUBSCRIPTION_STATUS_LABEL[s.status] || s.status,
       couponRate: s.couponRate,
+      // Le taux converti selon l'unité DÉCLARÉE par la souscription : c'est ce
+      // champ qui s'affiche. `subscription_row` sert des points de pourcentage,
+      // `metrics/mine` des fractions — deux endpoints, deux conventions, et une
+      // seule façon sûre de les lire.
+      couponRatePercent: rowRateToPercent(s, 'couponRate', s.couponRate),
       nextPaymentDate: s.nextPaymentDate,
       totalReceived: s.totalReceived,
     };

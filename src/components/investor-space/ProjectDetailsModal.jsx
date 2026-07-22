@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/services/api';
 import { formatCurrency, formatDate, getRiskLabel, getRiskFlagColor } from '@/lib/investorSpaceUtils';
+import { UNIT_FRACTION, formatPercent, rowRateToPercent } from '@/lib/investorSpaceWire';
 import InvestmentDecisionModals from './InvestmentDecisionModals';
 import ProjectQA from './ProjectQA';
 
@@ -133,7 +134,7 @@ const ProjectDetailsModal = ({ project, isOpen, onClose, onInvest }) => {
                       <div className="grid grid-cols-2 gap-4">
                         <div className="p-3 bg-slate-900 rounded">
                           <p className="text-xs text-slate-400 mb-1">Rendement Attendu</p>
-                          <p className="text-2xl font-bold text-emerald-400">{project.expectedReturn}%</p>
+                          <p className="text-2xl font-bold text-emerald-400">{formatPercent(project.expectedReturnPercent)}</p>
                         </div>
                         <div className="p-3 bg-slate-900 rounded">
                           <p className="text-xs text-slate-400 mb-1">Ticket Minimum</p>
@@ -352,7 +353,7 @@ const ProjectDetailsModal = ({ project, isOpen, onClose, onInvest }) => {
                       <div className="grid grid-cols-2 gap-4">
                         <div>
                           <p className="text-xs text-slate-400 mb-1">Taux Coupon</p>
-                          <p className="text-2xl font-bold text-emerald-400">{project.expectedReturn}%</p>
+                          <p className="text-2xl font-bold text-emerald-400">{formatPercent(project.expectedReturnPercent)}</p>
                         </div>
                         <div>
                           <p className="text-xs text-slate-400 mb-1">Maturité</p>
@@ -393,7 +394,17 @@ const ProjectDetailsModal = ({ project, isOpen, onClose, onInvest }) => {
                               </div>
                               <div>
                                 <p className="text-xs text-slate-400 mb-1">Loan-to-Value</p>
-                                <p className="text-lg font-bold text-blue-400">{collateral.loanToValue}%</p>
+                                {/* `loanToValue` est une FRACTION (0,6 = 60 %),
+                                    contrairement au coupon de la même table qui est
+                                    en points de pourcentage. Collé à un « % », il
+                                    s'affichait « 0.6% » : un ratio de couverture
+                                    divisé par cent, sur l'écran qui sert à décider
+                                    d'engager son argent. L'unité est désormais lue. */}
+                                <p className="text-lg font-bold text-blue-400">
+                                  {formatPercent(rowRateToPercent(
+                                    collateral, 'loanToValue', collateral.loanToValue, UNIT_FRACTION,
+                                  ))}
+                                </p>
                               </div>
                             </div>
                           </div>

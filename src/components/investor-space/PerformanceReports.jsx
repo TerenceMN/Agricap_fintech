@@ -6,6 +6,7 @@ import { TrendingUp, TrendingDown, Download, CheckCircle, Clock } from 'lucide-r
 import { useToast } from '@/components/ui/use-toast';
 import { api } from '@/services/api';
 import { formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
+import { formatPercent } from '@/lib/investorSpaceWire';
 
 const PerformanceReports = ({ projectCode, projectName }) => {
   const { toast } = useToast();
@@ -38,8 +39,14 @@ const PerformanceReports = ({ projectCode, projectName }) => {
       </div>
 
       {reports.map((report) => {
-        const revDeviation = report.forecastRevenue ? ((report.actualRevenue - report.forecastRevenue) / report.forecastRevenue) * 100 : 0;
-        const costDeviation = report.forecastCosts ? ((report.actualCosts - report.forecastCosts) / report.forecastCosts) * 100 : 0;
+        // `deviationPercent` est l'écart de REVENU calculé et figé par le serveur
+        // à la soumission du rapport (`services.submit_performance_report`) — le
+        // même chiffre qui déclenche l'observation de risque au-delà de 10 %.
+        // Le recalculer ici produisait un second chiffre pour la même grandeur,
+        // qui aurait divergé au premier changement de formule côté serveur.
+        const revDeviation = report.deviationPercent;
+        // Aucun écart de COÛTS n'est servi : il n'est donc pas affiché. Les deux
+        // montants, réalisé et prévu, restent lisibles côte à côte.
 
         return (
           <Card key={report.id} className="bg-slate-800 border-slate-700">
@@ -66,10 +73,14 @@ const PerformanceReports = ({ projectCode, projectName }) => {
                     <span className="text-2xl font-bold text-white">{formatCurrency(report.actualRevenue)}</span>
                     <span className="text-sm text-slate-500">Prévu: {formatCurrency(report.forecastRevenue)}</span>
                   </div>
-                  <div className={`flex items-center gap-2 text-sm ${revDeviation >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {revDeviation >= 0 ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
-                    <span>{revDeviation >= 0 ? '+' : ''}{revDeviation.toFixed(1)}% vs prévision</span>
-                  </div>
+                  {revDeviation === null || revDeviation === undefined ? (
+                    <p className="text-sm text-slate-500">Écart non communiqué.</p>
+                  ) : (
+                    <div className={`flex items-center gap-2 text-sm ${revDeviation >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {revDeviation >= 0 ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
+                      <span>{revDeviation >= 0 ? '+' : ''}{formatPercent(revDeviation)} vs prévision</span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="p-4 bg-slate-900 rounded border border-slate-700">
@@ -78,10 +89,12 @@ const PerformanceReports = ({ projectCode, projectName }) => {
                     <span className="text-2xl font-bold text-white">{formatCurrency(report.actualCosts)}</span>
                     <span className="text-sm text-slate-500">Prévu: {formatCurrency(report.forecastCosts)}</span>
                   </div>
-                  <div className={`flex items-center gap-2 text-sm ${costDeviation <= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {costDeviation >= 0 ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
-                    <span>{costDeviation >= 0 ? '+' : ''}{costDeviation.toFixed(1)}% vs prévision</span>
-                  </div>
+                  {/* Le serveur ne calcule d'écart que sur le revenu. En dériver
+                      un ici pour les coûts donnerait un chiffre dont personne ne
+                      garantit la formule, à côté d'un autre qui vient du serveur. */}
+                  <p className="text-xs text-slate-500">
+                    Aucun écart de coûts n’est calculé par le serveur : comparez les deux montants.
+                  </p>
                 </div>
               </div>
 

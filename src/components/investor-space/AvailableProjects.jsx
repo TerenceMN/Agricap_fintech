@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/services/api';
 import { formatCurrency, formatDate, getRiskLabel } from '@/lib/investorSpaceUtils';
-import { buildOpenOfferCards } from '@/lib/investorSpaceWire';
+import { buildOpenOfferCards, formatPercent } from '@/lib/investorSpaceWire';
 import ProjectDetailsModal from './ProjectDetailsModal';
 
 /**
@@ -293,7 +293,7 @@ const AvailableProjects = ({ onInvest }) => {
                         <p className="text-xs text-slate-400 mb-1">Coupon promis</p>
                         <p className="font-bold text-emerald-400 text-sm flex items-center gap-1">
                           <TrendingUp className="w-3 h-3" />
-                          {project.expectedReturn} %
+                          {formatPercent(project.expectedReturnPercent)}
                         </p>
                       </div>
                     </div>

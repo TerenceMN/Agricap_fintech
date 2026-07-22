@@ -18,6 +18,7 @@ import {
   ArrowRightLeft, Clock, Activity, CheckCircle, Wallet, Calculator, AlertTriangle,
 } from 'lucide-react';
 import { api } from '@/services/api';
+import { formatPercent, rowRateToPercent } from '@/lib/investorSpaceWire';
 
 // --- Termes réels du produit (défauts backend `investments.ObligationPosition`) ---
 const COUPON_VALUE = 250;
@@ -253,7 +254,9 @@ const Obligations = () => {
                 <TableCell>{Math.floor(p.investedAmount / p.couponAmount)}</TableCell>
                 <TableCell className="text-emerald-400 font-mono">{p.investedAmount.toLocaleString()} $</TableCell>
                 <TableCell className="text-blue-400 font-mono">{Math.round(calculateMaturityValue(p.investedAmount, p.termMonths / 12)).toLocaleString()} $</TableCell>
-                <TableCell className="text-white font-bold">{p.rate}% / an</TableCell>
+                <TableCell className="text-white font-bold">
+                  {formatPercent(rowRateToPercent(p, 'rate', p.rate))} / an
+                </TableCell>
                 <TableCell><Badge variant="outline" className={STATUS_COLORS[STATUS_LABEL[p.status]]}>{STATUS_LABEL[p.status] || p.status}</Badge></TableCell>
                 <TableCell className="text-right space-x-2">
                   {p.status === 'ACTIF' && (

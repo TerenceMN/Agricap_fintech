@@ -31,6 +31,8 @@ import type {
   ValuationPosition,
 } from '@/types/api';
 import {
+  UNIT_FRACTION,
+  UNIT_PERCENT,
   buildExposureBars,
   buildOpenOfferCards,
   buildPipelineStages,
@@ -40,8 +42,10 @@ import {
   movementTypeLabel,
   positionsInDefault,
   projectStatusLabel,
+  formatPercent,
   rateToPercent,
   rateUnit,
+  rowRateToPercent,
   subscriptionStatusLabel,
   titleTypeLabel,
   unmeasurableFrom,
@@ -71,6 +75,9 @@ function subscription(over: Partial<InvestmentSubscription> = {}): InvestmentSub
     nextPaymentDate: '2026-04-20',
     totalReceived: 156.25,
     subPortfolioId: null,
+    // `subscription_row` déclare son unité depuis que l'inventaire a montré que
+    // le module stocke ses taux dans deux conventions, jusque dans la même table.
+    units: { couponRate: 'percent' },
     ...over,
   };
 }
@@ -536,6 +543,7 @@ function openOffer(over: Partial<OpenOfferSummary> = {}): OpenOfferSummary {
     minFundingAmount: 30000,
     oversubscriptionPolicy: 'REJECT',
     subscriptionDeadline: '2026-06-30',
+    units: { couponRate: 'percent' },
     ...over,
   };
 }
@@ -793,5 +801,84 @@ describe('valuationMethodLabel', () => {
 
   it('affiche une méthode inconnue telle quelle', () => {
     expect(valuationMethodLabel('MARK_TO_MODEL')).toBe('MARK_TO_MODEL');
+  });
+});
+
+// ── Unités déclarées ligne par ligne ─────────────────────────────────────────
+
+describe('rowRateToPercent — deux conventions coexistent, on lit celle servie', () => {
+  it('n’applique aucune conversion à un taux déclaré en points de pourcentage', () => {
+    // `Offer.coupon_rate` vaut 9,000 en base : le multiplier donnerait 900 %.
+    const ligne = { units: { couponRate: UNIT_PERCENT } };
+
+    expect(rowRateToPercent(ligne, 'couponRate', 9)).toBe(9);
+  });
+
+  it('convertit un taux déclaré en fraction', () => {
+    // `Offer.loan_to_value` vaut 0,600 dans la MÊME table que le coupon
+    // ci-dessus. Collé à un « % » sans conversion, un LTV de 60 % s'affichait
+    // « 0.6% » sur l'écran qui sert à décider d'engager son argent.
+    const ligne = { units: { loanToValue: UNIT_FRACTION } };
+
+    expect(rowRateToPercent(ligne, 'loanToValue', 0.6, UNIT_FRACTION)).toBeCloseTo(60, 10);
+  });
+
+  it('utilise le repli de l’APPELANT quand le serveur ne déclare rien', () => {
+    // Aucun repli universel n'est sûr : « fraction » partout afficherait 900 %
+    // sur un coupon, « percent » partout afficherait 0,6 % sur un LTV. C'est
+    // l'appelant, qui sait de quel endpoint vient sa ligne, qui tranche.
+    expect(rowRateToPercent({}, 'couponRate', 9, UNIT_PERCENT)).toBe(9);
+    expect(rowRateToPercent({}, 'loanToValue', 0.6, UNIT_FRACTION)).toBeCloseTo(60, 10);
+    expect(rowRateToPercent(null, 'rate', 9, UNIT_PERCENT)).toBe(9);
+  });
+
+  it('préserve l’absence de taux', () => {
+    expect(rowRateToPercent({ units: { rate: UNIT_PERCENT } }, 'rate', null)).toBeNull();
+  });
+});
+
+describe('buildPositions / buildOpenOfferCards — le taux affiché est celui converti', () => {
+  it('expose le coupon de la souscription selon l’unité qu’elle déclare', () => {
+    const { positions } = buildPositions([subscription({ couponRate: 9 })], [offer()], [project()], 7);
+
+    // Valeur brute conservée pour la traçabilité, valeur d'affichage à côté.
+    expect(positions[0].couponRate).toBe(9);
+    expect(positions[0].couponRatePercent).toBe(9);
+  });
+
+  it('convertirait le coupon si la souscription le déclarait en fraction', () => {
+    const { positions } = buildPositions(
+      [subscription({ couponRate: 0.09, units: { couponRate: 'fraction' } })],
+      [offer()], [project()], 7,
+    );
+
+    expect(positions[0].couponRatePercent).toBeCloseTo(9, 10);
+  });
+
+  it('expose le coupon de l’offre ouverte selon l’unité qu’elle déclare', () => {
+    const [carte] = buildOpenOfferCards([openOffer({ couponRate: 12.5 })]);
+
+    expect(carte.expectedReturn).toBe(12.5);
+    expect(carte.expectedReturnPercent).toBe(12.5);
+  });
+});
+
+describe('formatPercent — un seul formateur, séparateur fr-FR', () => {
+  it('formate un taux avec deux décimales et une virgule', () => {
+    expect(formatPercent(12.5)).toBe('12,50 %');
+    expect(formatPercent(9)).toBe('9,00 %');
+  });
+
+  it('affiche 0 comme un chiffre, pas comme une absence', () => {
+    expect(formatPercent(0)).toBe('0,00 %');
+  });
+
+  it('affiche un tiret sur un taux absent', () => {
+    expect(formatPercent(null)).toBe('—');
+    expect(formatPercent(undefined)).toBe('—');
+  });
+
+  it('préserve le signe d’un rendement négatif', () => {
+    expect(formatPercent(-4.2)).toBe('-4,20 %');
   });
 });

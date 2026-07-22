@@ -14,7 +14,7 @@ import { api } from '@/services/api';
 import { formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
 import {
   buildOpenOfferCards, buildPipelineStages, buildPositions, buildReturnColumns,
-  positionsInDefault,
+  formatPercent, positionsInDefault, rateToPercent, rateUnit,
 } from '@/lib/investorSpaceWire';
 import ReturnColumns from '@/components/investor-space/ReturnColumns';
 import InvestorRiskPanel from '@/components/investor-space/InvestorRiskPanel';
@@ -240,9 +240,10 @@ const InvestorSpace = () => {
                           <div>
                             <p className="text-xs text-slate-400">Taux de recouvrement</p>
                             <p className="font-mono text-white">
-                              {p.valuation.recoveryRate === null
-                                ? '—'
-                                : `${(p.valuation.recoveryRate * 100).toFixed(2).replace('.', ',')} %`}
+                              {formatPercent(rateToPercent(
+                                p.valuation.recoveryRate,
+                                rateUnit(metrics, 'valuation.positions[].recoveryRate'),
+                              ))}
                             </p>
                           </div>
                           <div>

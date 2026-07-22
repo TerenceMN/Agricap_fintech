@@ -4,6 +4,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { TrendingUp, Hourglass, Target, Info } from 'lucide-react';
 import { formatCurrency } from '@/lib/investorSpaceUtils';
+import { formatPercent } from '@/lib/investorSpaceWire';
 
 const ICONS = { realized: TrendingUp, latent: Hourglass, expected: Target };
 const TONES = {
@@ -11,8 +12,6 @@ const TONES = {
   latent: 'from-amber-900/30 to-slate-900 border-amber-500/30 text-amber-400',
   expected: 'from-blue-900/40 to-slate-900 border-blue-500/30 text-blue-400',
 };
-
-const formatRate = (rate) => `${rate.toFixed(2).replace('.', ',')} %`;
 
 /**
  * Les trois colonnes de rendement — réalisé, latent, attendu — côte à côte.
@@ -70,7 +69,7 @@ const ReturnColumns = ({ columns, currency = 'USD', asOf }) => (
                 ) : (
                   <p className="text-3xl font-bold text-white">
                     {column.unit === 'percent'
-                      ? formatRate(column.rate ?? 0)
+                      ? formatPercent(column.rate)
                       : formatCurrency(column.amount ?? 0, currency)}
                   </p>
                 )}

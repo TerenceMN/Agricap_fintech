@@ -177,8 +177,11 @@ export interface InvestorPosition {
   refundedAmount: number;
   totalReceived: number;
   bonds: number;
-  /** Coupon contractuel figé à la souscription, en POURCENTS. */
+  /** Coupon contractuel figé à la souscription, valeur BRUTE du serveur. */
   couponRate: number;
+  /** Le même, converti selon l'unité déclarée par la souscription — c'est CE
+   *  champ qui s'affiche. `subscription_row` sert des points de pourcentage. */
+  couponRatePercent: number | null;
   status: string;
   statusLabel: string;
   subscriptionDate: string;
@@ -256,6 +259,7 @@ export function buildPositions(
       totalReceived: s.totalReceived,
       bonds: s.bonds,
       couponRate: s.couponRate,
+      couponRatePercent: rowRateToPercent(s, 'couponRate', s.couponRate),
       status: s.status,
       statusLabel: subscriptionStatusLabel(s.status),
       subscriptionDate: s.subscriptionDate,
@@ -298,12 +302,51 @@ export interface ReturnColumn {
   isLatent: boolean;
 }
 
-/** Unité déclarée pour un taux, lue dans `metrics.units` (chemin pointé, ex.
- *  `defaultRates.byValue`). Repli sur `fraction`, convention unique du module —
- *  et repli LOGGÉ nulle part exprès : un champ absent du dictionnaire est un
- *  champ que le serveur n'a pas déclaré, pas un champ dans une autre unité. */
-export function rateUnit(metrics: Pick<InvestorMetrics, 'units'>, path: string): string {
-  return metrics.units?.[path] ?? 'fraction';
+/** Les deux unités du module, à l'identique de `investments/serializers.py`. */
+export const UNIT_PERCENT = 'percent';    // 9,0 = 9 %
+export const UNIT_FRACTION = 'fraction';  // 0,09 = 9 %
+
+/** Toute réponse qui porte un taux porte aussi son dictionnaire d'unités. */
+export interface RateBearing {
+  units?: Record<string, string>;
+}
+
+/**
+ * Unité déclarée d'un taux, lue dans le `units` de la réponse qui le porte.
+ *
+ * `path` est la clé telle que le serveur la déclare : plate sur une ligne
+ * (`couponRate`), pointée sur un agrégat (`defaultRates.byValue`).
+ *
+ * **Le repli est un paramètre, pas une valeur par défaut universelle.** Le module
+ * stocke ses taux dans DEUX unités jusque dans la même table — `coupon_rate` à
+ * 9,000 à côté de `loan_to_value` à 0,600. Supposer « fraction » partout
+ * afficherait 900 % sur un coupon ; supposer « percent » partout afficherait
+ * 0,6 % sur un LTV de 60 %. L'appelant, qui sait de quel endpoint vient sa
+ * ligne, déclare donc le repli applicable à SA source ; il ne sert que face à un
+ * serveur antérieur à la publication des unités.
+ */
+export function rateUnit(
+  source: RateBearing | null | undefined,
+  path: string,
+  fallback: string = UNIT_FRACTION,
+): string {
+  return source?.units?.[path] ?? fallback;
+}
+
+/** Taux d'une ligne, converti en pourcentage d'affichage selon SON unité. */
+export function rowRateToPercent(
+  source: RateBearing | null | undefined,
+  field: string,
+  value: number | null | undefined,
+  fallback: string = UNIT_PERCENT,
+): number | null {
+  return rateToPercent(value, rateUnit(source, field, fallback));
+}
+
+/** Formatage unique d'un taux : deux décimales, séparateur fr-FR, symbole. */
+export function formatPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+  return `${Number(value).toFixed(2).replace('.', ',')} %`;
 }
 
 /**
@@ -462,8 +505,13 @@ export interface OpenOfferCard {
   targetAmount: number;
   minFundingAmount: number;
   minimumTicket: number;
-  /** Coupon promis, en POINTS DE POURCENTAGE — `offers/open` ne convertit pas. */
+  /** Coupon promis, valeur BRUTE du serveur. */
   expectedReturn: number;
+  /** Le même, converti selon l'unité déclarée par l'offre — c'est CE champ qui
+   *  s'affiche. `offers/open` déclare `couponRate: "percent"`, contrairement à
+   *  `metrics/mine` qui sert des fractions : sans lecture de l'unité, l'un des
+   *  deux écrans se trompe d'un facteur 100. */
+  expectedReturnPercent: number | null;
   maturityMonths: number;
   paymentFrequency: string;
   bondUnitValue: number;
@@ -513,6 +561,7 @@ export function buildOpenOfferCards(offers: OpenOfferSummary[]): OpenOfferCard[]
       minFundingAmount: o.minFundingAmount,
       minimumTicket: o.minTicket,
       expectedReturn: o.couponRate,
+      expectedReturnPercent: rowRateToPercent(o, 'couponRate', o.couponRate),
       maturityMonths: o.maturityMonths,
       paymentFrequency: o.paymentFrequency,
       bondUnitValue: o.bondUnitValue,

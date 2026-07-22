@@ -14,6 +14,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { api } from '@/services/api';
 import { buildCommitments, formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
+import { formatPercent } from '@/lib/investorSpaceWire';
 
 const TYPE_LABEL = { OBLIGATION: 'Obligation', ACTION: 'Action', PART_SOCIALE: 'Part sociale' };
 
@@ -47,7 +48,7 @@ const DetailsDialog = ({ open, onOpenChange, holding }) => (
                     <div className="grid grid-cols-2 gap-2">
                         <div className="bg-white/5 p-3 rounded-lg">
                             <Label className="text-gray-400 text-xs uppercase">Taux</Label>
-                            <p className="font-bold text-lg">{holding?.couponRate}%</p>
+                            <p className="font-bold text-lg">{formatPercent(holding?.couponRatePercent)}</p>
                         </div>
                          <div className="bg-white/5 p-3 rounded-lg">
                             <Label className="text-gray-400 text-xs uppercase">Maturité</Label>
@@ -293,7 +294,7 @@ const Holdings = () => {
                         </TableCell>
                         <TableCell><Badge variant="outline" className="border-white/20 text-gray-300">{TYPE_LABEL[h.typeOfTitle] || h.typeOfTitle || '-'}</Badge></TableCell>
                         <TableCell className="text-right font-mono text-emerald-400 font-bold">{h.amount.toLocaleString()}</TableCell>
-                        <TableCell className="text-right">{h.couponRate}%</TableCell>
+                        <TableCell className="text-right">{formatPercent(h.couponRatePercent)}</TableCell>
                         <TableCell>{formatDate(h.expectedMaturity)}</TableCell>
                         <TableCell>
                             <Badge className={h.status === 'Active' || h.status === 'Repayment' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-purple-500/20 text-purple-400'}>

@@ -8,6 +8,7 @@ import { useToast } from '@/components/ui/use-toast';
 import { DollarSign, TrendingUp, Calendar, Shield } from 'lucide-react';
 import { api } from '@/services/api';
 import { formatCurrency } from '@/lib/investorSpaceUtils';
+import { formatPercent } from '@/lib/investorSpaceWire';
 
 const InvestmentDecisionModals = ({ project, isOpen, onClose, onInvest }) => {
   const { toast } = useToast();
@@ -122,7 +123,7 @@ const InvestmentDecisionModals = ({ project, isOpen, onClose, onInvest }) => {
                   </div>
                   <span className="text-xs text-slate-400">Rendement</span>
                 </div>
-                <p className="text-2xl font-bold text-blue-400">{project.expectedReturn}%</p>
+                <p className="text-2xl font-bold text-blue-400">{formatPercent(project.expectedReturnPercent)}</p>
               </CardContent>
             </Card>
           </div>

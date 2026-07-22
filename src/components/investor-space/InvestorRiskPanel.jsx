@@ -8,11 +8,11 @@ import {
 } from 'recharts';
 import { AlertTriangle, Activity, Clock, PieChart } from 'lucide-react';
 import { formatCurrency } from '@/lib/investorSpaceUtils';
-import { buildExposureBars, rateToPercent, rateUnit } from '@/lib/investorSpaceWire';
+import {
+  buildExposureBars, formatPercent, rateToPercent, rateUnit,
+} from '@/lib/investorSpaceWire';
 
 const COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316', '#14b8a6'];
-
-const pct = (value) => `${(value ?? 0).toFixed(2).replace('.', ',')} %`;
 
 const ExposureChart = ({ title, description, bars, currency }) => (
   <Card className="bg-slate-900 border-slate-800">
@@ -36,7 +36,7 @@ const ExposureChart = ({ title, description, bars, currency }) => (
             <Tooltip
               contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b' }}
               formatter={(value, _name, entry) => [
-                `${formatCurrency(value, currency)} · ${pct(entry?.payload?.sharePercent)}`,
+                `${formatCurrency(value, currency)} · ${formatPercent(entry?.payload?.sharePercent)}`,
                 'Exposition',
               ]}
             />
@@ -102,11 +102,11 @@ const InvestorRiskPanel = ({ metrics }) => {
               <Badge className={defaultRates.alert
                 ? 'bg-red-500/20 text-red-300 border-0'
                 : 'bg-emerald-500/20 text-emerald-300 border-0'}>
-                {defaultRates.alert ? `Au-dessus de ${pct(alertThreshold)}` : 'Sous le seuil'}
+                {defaultRates.alert ? `Au-dessus de ${formatPercent(alertThreshold)}` : 'Sous le seuil'}
               </Badge>
             </div>
             <h3 className="text-sm text-slate-400 mb-1">Taux de défaut — en valeur</h3>
-            <p className="text-3xl font-bold text-white">{pct(defaultByValue)}</p>
+            <p className="text-3xl font-bold text-white">{formatPercent(defaultByValue)}</p>
             <p className="text-xs text-slate-500 mt-2">
               {formatCurrency(defaultRates.defaultedValue, currency)} en défaut sur{' '}
               {formatCurrency(defaultRates.totalValue, currency)} encaissés
@@ -114,7 +114,7 @@ const InvestorRiskPanel = ({ metrics }) => {
             {/* Les deux taux, toujours : un projet sur trente pèse peu en nombre
                 et peut peser énormément en valeur. */}
             <p className="text-xs text-slate-400 mt-3 pt-3 border-t border-slate-800">
-              En nombre : <span className="text-white font-semibold">{pct(defaultByCount)}</span>{' '}
+              En nombre : <span className="text-white font-semibold">{formatPercent(defaultByCount)}</span>{' '}
               ({defaultRates.defaultedProjects} projet(s) sur {defaultRates.totalProjects})
             </p>
           </CardContent>
@@ -151,7 +151,7 @@ const InvestorRiskPanel = ({ metrics }) => {
               <Activity className="w-6 h-6 text-blue-400" />
             </div>
             <h3 className="text-sm text-slate-400 mb-1">Plus grosse exposition</h3>
-            <p className="text-3xl font-bold text-white">{pct(largestShare)}</p>
+            <p className="text-3xl font-bold text-white">{formatPercent(largestShare)}</p>
             <p className="text-xs text-slate-500 mt-2">
               {concentration.largestExposureProject ?? 'Aucun engagement'}
             </p>
@@ -167,7 +167,7 @@ const InvestorRiskPanel = ({ metrics }) => {
               <Clock className="w-6 h-6 text-purple-400" />
             </div>
             <h3 className="text-sm text-slate-400 mb-1">Projets en retard</h3>
-            <p className="text-3xl font-bold text-white">{pct(lateShare)}</p>
+            <p className="text-3xl font-bold text-white">{formatPercent(lateShare)}</p>
             <p className="text-xs text-slate-500 mt-2">
               {lateProjects.lateProjects} sur {lateProjects.totalProjects} projet(s)
             </p>

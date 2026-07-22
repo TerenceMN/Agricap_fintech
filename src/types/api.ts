@@ -342,6 +342,11 @@ export interface InvestmentOffer {
   subscriptionDeadline: string | null;
   closedAt: string | null;
   status: string;
+  /** Unité de chaque taux de cette ligne, déclarée par le serveur (`units`).
+   *  Le module stocke ses taux dans DEUX unités jusque dans la même table :
+   *  `couponRate` en points de pourcentage (9.0), `loanToValue` en fraction
+   *  (0.6). Lire ce dictionnaire — jamais supposer. */
+  units?: Record<string, string>;
 }
 
 export interface InvestorProfile {
@@ -378,6 +383,11 @@ export interface InvestmentSubscription {
   nextPaymentDate: string | null;
   totalReceived: number;
   subPortfolioId: number | null;
+  /** Unité de chaque taux de cette ligne, déclarée par le serveur (`units`).
+   *  Le module stocke ses taux dans DEUX unités jusque dans la même table :
+   *  `couponRate` en points de pourcentage (9.0), `loanToValue` en fraction
+   *  (0.6). Lire ce dictionnaire — jamais supposer. */
+  units?: Record<string, string>;
 }
 
 export interface InvestmentMovement {
@@ -620,6 +630,10 @@ export interface OpenOfferSummary {
   minFundingAmount: number;
   oversubscriptionPolicy: string;
   subscriptionDeadline: string | null;
+  /** Unité de chaque taux de cette projection (`{couponRate: "percent"}`).
+   *  `metrics/mine` sert des fractions, `offers/open` des points de
+   *  pourcentage : deux endpoints, deux conventions, les deux DÉCLARÉES. */
+  units?: Record<string, string>;
 }
 
 export interface ObligationPosition {
@@ -631,6 +645,11 @@ export interface ObligationPosition {
   termMonths: number;
   status: string;
   dateCreated: string;
+  /** Unité de chaque taux de cette ligne, déclarée par le serveur (`units`).
+   *  Le module stocke ses taux dans DEUX unités jusque dans la même table :
+   *  `couponRate` en points de pourcentage (9.0), `loanToValue` en fraction
+   *  (0.6). Lire ce dictionnaire — jamais supposer. */
+  units?: Record<string, string>;
 }
 
 export interface BondWithdrawal {
@@ -641,6 +660,11 @@ export interface BondWithdrawal {
   reason: string;
   status: string;
   date: string;
+  /** Unité de chaque taux de cette ligne, déclarée par le serveur (`units`).
+   *  Le module stocke ses taux dans DEUX unités jusque dans la même table :
+   *  `couponRate` en points de pourcentage (9.0), `loanToValue` en fraction
+   *  (0.6). Lire ce dictionnaire — jamais supposer. */
+  units?: Record<string, string>;
 }
 
 export interface BondConversion {
@@ -680,7 +704,13 @@ export interface Collateral {
   debtType: string;
   guarantees: string[];
   collateralValue: number;
+  /** FRACTION (0.6 = 60 %) — l'unité est déclarée dans `units`. */
   loanToValue: number;
+  /** Unité de chaque taux de cette ligne, déclarée par le serveur (`units`).
+   *  Le module stocke ses taux dans DEUX unités jusque dans la même table :
+   *  `couponRate` en points de pourcentage (9.0), `loanToValue` en fraction
+   *  (0.6). Lire ce dictionnaire — jamais supposer. */
+  units?: Record<string, string>;
 }
 
 export interface AnalystObservation {

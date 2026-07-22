@@ -10,7 +10,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Filter, Search, TrendingUp } from 'lucide-react';
 import { formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
 import {
-  subscriptionStatusClass, projectStatusClass, valuationMethodLabel,
+  subscriptionStatusClass, projectStatusClass, valuationMethodLabel, formatPercent,
 } from '@/lib/investorSpaceWire';
 import PerformanceReports from './PerformanceReports';
 
@@ -55,7 +55,7 @@ const MyInvestments = ({ positions }) => {
         : true))
       .sort((a, b) => {
         if (sortBy === 'amount') return b.settledAmount - a.settledAmount;
-        if (sortBy === 'return') return b.couponRate - a.couponRate;
+        if (sortBy === 'return') return (b.couponRatePercent ?? 0) - (a.couponRatePercent ?? 0);
         return b.subscriptionDate.localeCompare(a.subscriptionDate);
       });
   }, [positions, statusFilter, typeFilter, searchQuery, sortBy]);
@@ -196,7 +196,9 @@ const MyInvestments = ({ positions }) => {
                       <TableCell className="text-xs text-slate-400" title={p.valuation?.valuationNote || ''}>
                         {p.valuation ? valuationMethodLabel(p.valuation.valuationMethod) : 'Non valorisée'}
                       </TableCell>
-                      <TableCell className="text-right font-bold text-purple-400">{p.couponRate} %</TableCell>
+                      <TableCell className="text-right font-bold text-purple-400">
+                        {formatPercent(p.couponRatePercent)}
+                      </TableCell>
                       <TableCell className="text-slate-300">{formatDate(p.subscriptionDate)}</TableCell>
                       <TableCell>
                         <Badge variant="outline" className={subscriptionStatusClass(p.status)}>
