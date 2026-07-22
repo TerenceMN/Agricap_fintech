@@ -82,15 +82,17 @@ class Command(BaseCommand):
                 self._ingest_one(path)
 
         # ── Vérification du chargement du référentiel (lecture seule) ──────────
-        # Le loader construit un référentiel PAR HECTARE : il lit la superficie de
-        # référence et ramène chaque coût à l'unité de surface. Certaines filières
-        # ne se mesurent pas en hectares (apiculture → ruches, élevage → sujets,
-        # transformation → tonnes usinées). Le loader REFUSE alors, plutôt que
-        # d'inventer une superficie (principe 1) : ce n'est pas un fichier corrompu,
-        # c'est une couverture de modèle manquante — on le dit tel quel.
+        # Le loader construit un référentiel PAR UNITÉ DE RÉFÉRENCE, lue dans le
+        # classeur lui-même : hectares pour les cultures, ruches pour l'apiculture,
+        # sujets pour l'élevage, m² pour la bioconversion, sacs pour la myciculture,
+        # tonnes usinées pour la transformation. Il ne refuse plus que ce qu'il ne
+        # sait PAS lire — une dimension de référence absente ou non nommée — et ne
+        # l'invente jamais (principe 1).
         self.stdout.write("")
-        self.stdout.write("Vérification du chargement du référentiel (par hectare) :")
+        self.stdout.write("Vérification du chargement du référentiel "
+                          "(par unité de référence) :")
         lus = non_couverts = 0
+        unites: dict[str, int] = {}
         for source in simulateurs_disponibles():
             try:
                 spec = charger_depuis_simulateur(source)
@@ -103,18 +105,21 @@ class Command(BaseCommand):
                 continue
             lus += 1
             lignage = spec["_lignage"]
+            unite = spec["unite_reference"]
+            unites[unite] = unites.get(unite, 0) + 1
             modules = ", ".join(sorted(spec["couts_modules"]))
             self.stdout.write(self.style.SUCCESS(
                 f"  [ok] {source.original_name} (rev {source.revision}) - "
-                f"{lignage['totalCycleLu']} USD sur {lignage['superficieReference']} "
-                f"{spec['unite_reference']} ; modules : {modules}"))
+                f"{lignage['totalCycleLu']} USD sur {lignage['quantiteReference']} "
+                f"{unite} (« {lignage['libelleDimension']} ») ; modules : {modules}"))
 
         total = lus + non_couverts
         style = self.style.SUCCESS if non_couverts == 0 else self.style.WARNING
+        repartition = ", ".join(f"{n} en {u}" for u, n in sorted(unites.items()))
         self.stdout.write(style(
-            f"Simulateurs courants : {total} — {lus} référentiel(s) par hectare chargé(s), "
-            f"{non_couverts} filière(s) hors modèle hectare "
-            f"(unité de référence autre — signalé, jamais inventé)."))
+            f"Simulateurs courants : {total} — {lus} referentiel(s) charge(s) "
+            f"({repartition or 'aucune unite'}), {non_couverts} sans dimension de "
+            f"reference lisible (signale, jamais invente)."))
 
     # ──────────────────────────────────────────────────────────────────────────
     def _ingest_one(self, path: str) -> None:

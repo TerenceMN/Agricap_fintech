@@ -27,13 +27,19 @@ DIXIEME = Decimal("0.1")
 
 #: Critères qu'un barème pilote, dans l'ordre canonique de `credits.analyse`.
 #: DECISION ne pilote aucun score de critère : il déplace la recommandation et la
-#: lettre (seuils + grille), recalculées à part.
+#: lettre (seuils + grille), recalculées à part. TAUX non plus : il ne touche ni
+#: au score ni au verdict, seulement au PRIX — dont l'impact se prévisualise
+#: différemment (taux avant / après, et non score avant / après).
 AFFECTED_CRITERIA = {
     "DSCR": ("dscr", "stress"),
     "ECART_TECHNIQUE": ("technique",),
     "COUVERTURE_GARANTIES": ("garanties",),
     "DECISION": (),
+    "TAUX": (),
 }
+
+#: Barèmes qui ne sont pas des courbes mais des jeux de règles (`parametres`).
+CODES_REGLES = ("DECISION", "TAUX")
 
 #: Taille du golden set : dernières analyses réelles, une par dossier.
 GOLDEN_LIMIT = 200
@@ -96,17 +102,20 @@ def _eval_curve(points, x) -> Decimal:
 
 
 def is_courbe(code: str) -> bool:
-    return code != "DECISION"
+    return code not in CODES_REGLES
 
 
 # ── Validation du contenu proposé ─────────────────────────────────────────────
 
 def valider_contenu(code: str, points, parametres) -> None:
     """Garde-fou minimal : une courbe exploitable, un jeu de règles non vide."""
-    if code == "DECISION":
+    if code == "TAUX":
+        _valider_grille_taux(parametres)
+        return
+    if code in CODES_REGLES:
         if not isinstance(parametres, dict) or not parametres:
             raise BaremeContenuInvalide(
-                "Le barème DECISION exige des paramètres (seuils de décision, "
+                f"Le barème {code} exige des paramètres (seuils de décision, "
                 "grille de lettres) — la courbe `points` ne le décrit pas."
             )
         return
@@ -133,6 +142,70 @@ def valider_contenu(code: str, points, parametres) -> None:
         raise BaremeContenuInvalide(
             "Deux points de la courbe partagent la même abscisse x."
         )
+
+
+def _valider_grille_taux(parametres) -> None:
+    """La grille de tarification : des bandes de score, des ajustements en points.
+
+    Contrôles volontairement serrés — c'est un PRIX qui se règle ici, et une
+    grille mal formée qui passerait en production tarifierait tous les dossiers
+    d'une même bande à côté :
+      - au moins une bande, et une qui parte de 0 (sinon un score bas n'est
+        couvert par aucun palier et sort sans ajustement) ;
+      - bandes distinctes, dans [0, 100] ;
+      - ajustements bornés à ±20 points de taux : au-delà, c'est une faute de
+        frappe (2 000 au lieu de 20) plus probablement qu'une décision de comité.
+    """
+    if not isinstance(parametres, dict):
+        raise BaremeContenuInvalide("Le barème TAUX exige un objet de paramètres.")
+    grille = parametres.get("grille")
+    if not isinstance(grille, list) or not grille:
+        raise BaremeContenuInvalide(
+            "Le barème TAUX exige une « grille » d'au moins une bande "
+            "{score_min, ajustement}."
+        )
+    seuils = []
+    for bande in grille:
+        try:
+            seuil = Decimal(str(bande["score_min"]))
+            ajustement = Decimal(str(bande["ajustement"]))
+        except Exception as exc:  # noqa: BLE001
+            raise BaremeContenuInvalide(
+                "Chaque bande de la grille de taux doit porter un « score_min » et "
+                "un « ajustement » numériques."
+            ) from exc
+        if not (Decimal(0) <= seuil <= Decimal(100)):
+            raise BaremeContenuInvalide(
+                f"Une bande de score doit rester dans [0, 100] : trouvé {seuil}."
+            )
+        if abs(ajustement) > Decimal(20):
+            raise BaremeContenuInvalide(
+                f"Ajustement de taux hors de portée : {ajustement} points. "
+                "Au-delà de ±20 points, corrigez la saisie plutôt que la grille."
+            )
+        seuils.append(seuil)
+    if len(set(seuils)) != len(seuils):
+        raise BaremeContenuInvalide(
+            "Deux bandes de la grille de taux partagent le même « score_min »."
+        )
+    if Decimal(0) not in seuils:
+        raise BaremeContenuInvalide(
+            "La grille de taux doit couvrir les scores les plus bas : ajoutez une "
+            "bande « score_min: 0 », sinon un dossier faible ne serait tarifé par "
+            "aucun palier."
+        )
+    ratio = parametres.get("plancher_ratio_base")
+    if ratio is not None:
+        try:
+            valeur = Decimal(str(ratio))
+        except Exception as exc:  # noqa: BLE001
+            raise BaremeContenuInvalide(
+                "« plancher_ratio_base » doit être un nombre (part du taux de base)."
+            ) from exc
+        if not (Decimal(0) < valeur <= Decimal(1)):
+            raise BaremeContenuInvalide(
+                f"« plancher_ratio_base » doit rester dans ]0, 1] : trouvé {valeur}."
+            )
 
 
 # ── Golden set ────────────────────────────────────────────────────────────────
@@ -201,6 +274,12 @@ def previsualiser_impact(bareme, *, points=None, parametres=None) -> dict:
     points = points if points is not None else bareme.points
     parametres = parametres if parametres is not None else bareme.parametres
     courbe = is_courbe(code)
+
+    if code == "TAUX":
+        # Une grille de taux ne déplace ni score ni recommandation : elle déplace
+        # un PRIX. Prévisualiser son impact en « score avant / après » afficherait
+        # 0 partout et laisserait croire qu'un recalibrage est sans conséquence.
+        return _previsualiser_taux(bareme, parametres)
 
     decision_actif = BaremeScore.objects.filter(code="DECISION", actif=True).first()
     regles_actives = (decision_actif.parametres if decision_actif else {}) or {}
@@ -293,6 +372,82 @@ def previsualiser_impact(bareme, *, points=None, parametres=None) -> dict:
     }
 
 
+def _previsualiser_taux(bareme, parametres) -> dict:
+    """Impact d'une grille de tarification proposée : des taux, pas des scores.
+
+    Rejoue `proposer_taux` sur le score global et le taux de BASE figés dans
+    chaque analyse du golden set. Une analyse antérieure à la grille unique n'a
+    pas de taux de base figé : elle est déclarée non évaluable plutôt que
+    re-tarifée sur une assiette devinée.
+    """
+    from credits.analyse import proposer_taux
+
+    golden = _golden_analyses()
+    impacts: list[dict] = []
+    deltas: list[Decimal] = []
+    nb_eval = nb_change = 0
+
+    for a in golden:
+        fige = (a.baremes_appliques or {}).get("_tarification") or {}
+        base = fige.get("tauxBase")
+        if base is None or a.taux_propose is None:
+            impacts.append({"applicationCode": a.application.code, "evaluable": False})
+            continue
+        avant = Decimal(str(a.taux_propose))
+        apres = proposer_taux(a.score_global, base, parametres)["_taux"]
+        delta = (apres - avant).quantize(Decimal("0.01"))
+        nb_eval += 1
+        deltas.append(delta)
+        if delta != 0:
+            nb_change += 1
+        impacts.append({
+            "applicationCode": a.application.code,
+            "evaluable": True,
+            "scoreGlobal": float(a.score_global),
+            "tauxBase": float(Decimal(str(base))),
+            "tauxAvant": float(avant),
+            "tauxApres": float(apres),
+            "deltaTaux": float(delta),
+        })
+
+    # Grille lisible même sur une base fraîche : ce que la nouvelle grille donne
+    # sur un taux de base de 18 %, aux scores charnières.
+    ancienne = bareme.parametres or {}
+    sample = []
+    for score in (Decimal("95"), Decimal("85"), Decimal("75"), Decimal("70"),
+                  Decimal("60"), Decimal("55"), Decimal("40")):
+        avant = proposer_taux(score, Decimal("18"), ancienne)["_taux"]
+        apres = proposer_taux(score, Decimal("18"), parametres)["_taux"]
+        sample.append({
+            "x": float(score),
+            "scoreAvant": float(avant),      # « taux avant », clé du contrat existant
+            "scoreApres": float(apres),
+            "delta": float((apres - avant).quantize(Decimal("0.01"))),
+        })
+
+    delta_moyen = (sum(deltas, Decimal(0)) / Decimal(len(deltas))) if deltas else Decimal(0)
+    delta_max = max((abs(d) for d in deltas), default=Decimal(0))
+    return {
+        "baremeCode": "TAUX",
+        "type": "regles",
+        "unite": "points de taux annuel",
+        "goldenSet": {
+            "nbDossiers": len(golden),
+            "nbEvalues": nb_eval,
+            "source": "AnalyseCredit — dernière analyse par dossier",
+        },
+        "sampleGrid": sample,
+        "impacts": impacts,
+        "resume": {
+            "nbScoreChange": nb_change,
+            "nbRecommandationFlip": 0,
+            "nbLettreFlip": 0,
+            "deltaScoreMoyen": float(delta_moyen.quantize(Decimal("0.01"))),
+            "deltaScoreMax": float(delta_max.quantize(Decimal("0.01"))),
+        },
+    }
+
+
 def _sample_grid(anciens_points, nouveaux_points) -> list[dict]:
     """Ancienne vs nouvelle courbe sur les abscisses clés + points milieux."""
     if not nouveaux_points:
@@ -351,7 +506,7 @@ def serialize_bareme(bareme, *, include_history: bool = False) -> dict:
     data = {
         "code": bareme.code,
         "libelle": bareme.libelle or None,
-        "type": "regles" if bareme.code == "DECISION" else "courbe",
+        "type": "courbe" if is_courbe(bareme.code) else "regles",
         "points": bareme.points,
         "parametres": bareme.parametres,
         "actif": bareme.actif,

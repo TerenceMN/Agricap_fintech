@@ -82,6 +82,33 @@ BAREMES = [
                         {"lettre": "C", "min": "50"}, {"lettre": "D", "min": "0"}],
         },
     },
+    {
+        # GRILLE DE TARIFICATION UNIQUE — elle vivait en dur et en DOUBLE :
+        # `scoring._propose_rate` surcotait de +2,5 sur la bande [55, 70[ quand
+        # `dataio_simulator` surcotait de +2,0 sur la même bande. Deux taux pour un
+        # même client selon l'écran (20,5 % contre 20,0 % sur une base de 18 %).
+        #
+        # Arbitrage : +2,0 — la valeur déjà annoncée au client par le simulateur,
+        # et la seule qui rende la grille symétrique du bonus de −2,0. Le comité
+        # qui veut 2,5 le décide désormais par révision de barème (maker ≠ checker,
+        # impact prévisualisé sur le golden set), sans redéploiement.
+        "code": "TAUX",
+        "libelle": "Grille de tarification — bande de score → ajustement du taux",
+        "points": [],
+        "parametres": {
+            "grille": [
+                {"score_min": "85", "ajustement": "-2.0",
+                 "libelle": "Excellent — bonification"},
+                {"score_min": "70", "ajustement": "0.0",
+                 "libelle": "Solide — taux de base"},
+                {"score_min": "55", "ajustement": "2.0",
+                 "libelle": "Recevable — surcote de risque"},
+                {"score_min": "0", "ajustement": "5.0",
+                 "libelle": "Limite — surcote maximale"},
+            ],
+            "plancher_ratio_base": "0.7",
+        },
+    },
 ]
 
 #: Les référentiels filière ne sont PLUS écrits ici.
@@ -161,7 +188,8 @@ class Command(BaseCommand):
             verbe = "créé" if cree else "réécrit (--force)"
             self.stdout.write(self.style.SUCCESS(
                 f"  + {obj.code} : {verbe} v{obj.version} — "
-                f"{lignage['totalCycleLu']} USD sur {lignage['superficieReference']} ha "
+                f"{lignage['totalCycleLu']} USD sur {lignage['quantiteReference']} "
+                f"{lignage['uniteReference']} "
                 f"(source dataio #{lignage['dataSourceId']} rev {lignage['revision']})"))
 
         self.stdout.write(self.style.SUCCESS(

@@ -668,7 +668,9 @@ class SeedTests(TestCase):
         """
         from django.core.management import call_command
         call_command("seed_analyse", verbosity=0)
-        self.assertEqual(BaremeScore.objects.filter(actif=True).count(), 4)
+        # 5 barèmes : les 3 courbes de la SPEC §5, le barème de DECISION, et la
+        # grille de TARIFICATION unique (la seule source du taux proposé).
+        self.assertEqual(BaremeScore.objects.filter(actif=True).count(), 5)
         self.assertEqual(ReferentielFiliere.objects.count(), 0)
 
     def test_le_moteur_refuse_d_analyser_sans_referentiel(self):

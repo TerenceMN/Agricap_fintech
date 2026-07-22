@@ -1,16 +1,47 @@
 """
-Simulateur de crédit agricole basé sur les données de référence ingérées (dataio).
+Simulateur INDICATIF de crédit agricole, adossé au moteur unique (`credits.analyse`).
+
+Rôle et frontière — ce module sert le parcours AVANT qu'un dossier soit
+instruit : le client (ou l'agent) explore un montant, une filière, un plan de
+financement par module, sans qu'aucune `AnalyseCredit` n'existe encore. Il ne
+persiste rien et ne décide rien.
+
+Ce qu'il n'est PLUS : un second moteur de scoring. Il portait ses propres
+courbes (DSCR par paliers 1,8 / 1,5 / 1,25 / 1,0 codés en dur), ses propres
+poids, sa propre règle de fiabilité technique (« ±30 % par module »), sa propre
+formule d'échéancier et sa propre grille de taux (+2,0 là où `credits.scoring`
+appliquait +2,5 sur la même bande de score). Un client simulait donc à un taux et
+à un score que l'instruction ne reproduisait pas.
+
+Désormais, tout ce qui juge vient du moteur unique :
+  - courbes de score  → `BaremeScore` (DSCR, ECART_TECHNIQUE, COUVERTURE_GARANTIES) ;
+  - pondération       → `analyse.poids_effectifs()` (`InstitutionConfig`) ;
+  - fiabilité technique → `analyse.scorer_technique` (le MÊME calcul, sur le même
+    `ReferentielFiliere`) ;
+  - comportemental    → `analyse.scorer_comportemental` ;
+  - recommandation    → `analyse.recommander` ;
+  - taux              → `scoring.taux_pour_score` → `analyse.proposer_taux` ;
+  - échéancier        → `credits.echeancier.construire_echeancier` (`Decimal`).
+
+Ce qui reste propre à ce module, et qui justifie qu'il existe : la SIMULATION —
+trouver la source de référence, estimer un DSCR quand aucune trésorerie n'est
+déclarée, appliquer le financement par module, et dire ce qui n'est pas
+calculable. Une différence entre la simulation et l'analyse ne peut donc plus
+venir que des DONNÉES (feuille non encore ingérée, garanties non constituées,
+DSCR estimé et non calculé sur échéancier réel), jamais des RÈGLES.
 
 Lit les tables du fichier SIMULATEUR courant :
-  - 5_Synthese_Besoins       → totaux de référence par module
-  - 10_Capacite_Remboursement → paramètres du prêt (taux, durée, DSCR, TEG)
-  - 12_Analyse_Credit         → critères de scoring avec poids
+  - 5_Synthese_Besoins        → totaux de référence par module (repli)
+  - 10_Capacite_Remboursement → paramètres du prêt (taux, durée, DSCR, EBE)
   - 18_Controles_Vraisemblance → plages de référence pour vraisemblance
 """
 from __future__ import annotations
 
-import math
+import logging
+from decimal import Decimal
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ── Mapping rubrique Excel → code module Python ──────────────────────────────
@@ -108,44 +139,44 @@ def normalize_module_financing(raw: dict | None) -> dict[str, int]:
     return out
 
 
-def _referentiel_filiere_totals(value_chain, area_ha) -> tuple[dict[str, float], str | None]:
-    """Coûts de référence par module (absolus) depuis `ReferentielFiliere`.
+def _referentiel_filiere(value_chain):
+    """`ReferentielFiliere` actif de la filière, ou `None`.
 
-    C'est LE référentiel de la filière au sens du principe 1 : celui qu'`analyse.py`
-    (`resoudre_referentiel`) utilise, lu des simulateurs ingérés. Le simulateur
-    indicatif s'y aligne pour que sa fiabilité technique soit calculable dès qu'un
-    référentiel existe pour la filière — c'était la cause du « 50 muet ».
-
-    `couts_modules` porte des coûts À L'HECTARE (`ref` = coût/ha) : on les ramène
-    au total du dossier via la superficie. Sans superficie, on ne peut pas produire
-    de totaux absolus → `({}, None)` et l'appelant tentera une autre source.
-
-    Retourne `(totaux, code_referentiel)`.
+    Mêmes clés de résolution que `analyse.resoudre_referentiel` : le simulateur et
+    le moteur doivent désigner LE MÊME référentiel pour une filière donnée, sinon
+    ils compareraient le plan du client à deux références différentes.
     """
-    if value_chain is None or not area_ha:
-        return {}, None
+    if value_chain is None:
+        return None
     try:
         from credits.models import ReferentielFiliere
-    except Exception:
-        return {}, None
-
+    except Exception:  # noqa: BLE001
+        return None
     qs = ReferentielFiliere.objects.filter(actif=True)
-    ref = (qs.filter(value_chain_code=value_chain.code).first()
-           or qs.filter(filiere__iexact=getattr(value_chain, "label", "") or "").first())
-    if ref is None:
-        return {}, None
+    return (qs.filter(value_chain_code=value_chain.code).first()
+            or qs.filter(filiere__iexact=getattr(value_chain, "label", "") or "").first())
 
-    import decimal
-    area = decimal.Decimal(str(area_ha))
+
+def _referentiel_filiere_totals(referentiel, quantite) -> dict[str, float]:
+    """Coûts de référence par module (absolus) = coût unitaire × quantité.
+
+    `couts_modules` porte des coûts PAR UNITÉ DE RÉFÉRENCE (`ref` = coût/ha, mais
+    aussi coût/ruche, coût/sujet, coût/m², coût/sac, coût/tonne usinée depuis la
+    généralisation du modèle hectare). La quantité passée doit être exprimée dans
+    l'unité du référentiel — la cohérence est établie par l'appelant.
+    """
+    if referentiel is None or not quantite:
+        return {}
+    quantite = Decimal(str(quantite))
     totals: dict[str, float] = {}
-    for module, cfg in (ref.couts_modules or {}).items():
+    for module, cfg in (referentiel.couts_modules or {}).items():
         try:
-            per_ha = decimal.Decimal(str(cfg.get("ref", 0)))
-        except (decimal.InvalidOperation, AttributeError):
+            unitaire = Decimal(str(cfg.get("ref", 0)))
+        except Exception:  # noqa: BLE001
             continue
-        if per_ha > 0:
-            totals[module] = float((per_ha * area).quantize(decimal.Decimal("0.01")))
-    return totals, (ref.code if totals else None)
+        if unitaire > 0:
+            totals[module] = float((unitaire * quantite).quantize(Decimal("0.01")))
+    return totals
 
 
 def _safe_float(val) -> float | None:
@@ -219,21 +250,12 @@ def _get_records(source, name_fragment: str) -> list[dict]:
 
 # ── Lecture des tables de référence ──────────────────────────────────────────
 
-def _read_scoring_criteria(source) -> list[dict]:
-    """Table 12 : critères de scoring avec poids et scores de référence."""
-    criteria = []
-    for row in _get_records(source, "Analyse_Credit"):
-        label = row.get("Critère") or row.get("Critere") or ""
-        poid  = _safe_float(row.get("Pondération") or row.get("Ponderation") or row.get("Pond\xe9ration"))
-        score = _safe_float(row.get("Score /100"))
-        pts   = _safe_float(row.get("Points"))
-        if not label or poid is None:
-            continue
-        ul = label.upper()
-        if "GLOBAL" in ul or "SUGGESTION" in ul or "COUVERTURE" in ul:
-            continue
-        criteria.append({"label": label, "weight": poid, "ref_score": score or 0, "ref_points": pts or 0})
-    return criteria
+#: La table 12 (`Analyse_Credit`) du classeur porte AUSSI une pondération des
+#: critères. Elle n'est plus lue : la pondération du moteur vit dans
+#: `InstitutionConfig` (principe 8), elle est institutionnelle et non
+#: filière-dépendante, et deux sources de poids donneraient deux scores globaux
+#: pour les mêmes scores de critères. Le classeur reste la source des COÛTS et des
+#: paramètres de prêt — pas des règles de notation.
 
 
 def _read_reference_totals(source) -> dict[str, float]:
@@ -308,172 +330,216 @@ def _read_coherence_ranges(source) -> list[dict]:
     return ranges
 
 
-# ── Calcul du score par critère ───────────────────────────────────────────────
+# ── Calcul du score par critère — AUCUNE courbe ici, tout vient des barèmes ──
 
-def _score_fiabilite(
-    ns_totals: dict[str, float], ref_totals: dict[str, float]
-) -> tuple[float | None, str, bool]:
+def _q1(value) -> Decimal:
+    """Quantize des scores et des points — le même que `analyse.q1`."""
+    from decimal import ROUND_HALF_UP
+    return Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+
+
+def _points_ponderes(score, poids) -> Decimal:
+    """`points = score × poids / 100`, arrondi au dixième — cf. `analyse._points`.
+
+    L'arrondi se fait critère par critère et le total est la somme des points
+    arrondis : c'est ce que l'analyste additionne à l'écran, la colonne doit
+    tomber juste.
     """
-    Fiabilité technique : cohérence entre la feuille de besoins et le référentiel.
-    - Pour chaque module présent dans les deux : vérifie si l'écart est ≤ 30 %.
-    - Score 100 si tous OK, pondéré par la proportion de modules dans la plage.
+    return _q1(Decimal(str(score)) * Decimal(str(poids)) / Decimal(100))
 
-    Retourne `(score, note, calculable)`. Quand aucun référentiel n'existe pour la
-    filière (filière hors-modèle hectare — apiculture, élevage, BSF, champignons,
-    transformation), le score n'est PAS calculable : on renvoie `(None, motif,
-    False)` avec le motif explicite, jamais un 50 muet (contrat §1). L'ancienne
-    version renvoyait « Données insuffisantes » à 50/100 dès que `ref_totals`
-    était vide — un demi-score inventé qui masquait l'absence de référence et
-    tirait le score global vers un faux milieu.
+
+def _choc_stress(baremes: dict) -> Decimal:
+    """Amplitude du choc de revenus, lue dans le barème DECISION (principe 8).
+
+    Le −25 % était codé en dur ici (`* 0.75`) alors que le moteur le lit en base :
+    le comité pouvait durcir le stress test de l'instruction sans que la
+    simulation suive.
     """
-    if not ref_totals:
-        return None, (
-            "Fiabilité technique non calculable : aucun référentiel de coûts "
-            "n'existe pour cette filière (filière hors-modèle hectare, ou "
-            "référentiel non encore importé). Le réalisme des coûts ne peut être "
-            "établi sans référence — le critère est exclu du score plutôt que "
-            "noté à un milieu arbitraire."
-        ), False
-    if not ns_totals:
-        return None, (
-            "Fiabilité technique non calculable : la feuille de besoins ne porte "
-            "aucun montant par module à comparer au référentiel."
-        ), False
-
-    ok = 0
-    ko = 0
-    details = []
-    grand_ns = sum(ns_totals.values()) or 1
-    grand_ref = sum(ref_totals.values()) or 1
-
-    for mod, ref_val in ref_totals.items():
-        ns_val = ns_totals.get(mod, 0)
-        if ref_val == 0:
-            continue
-        ratio = ns_val / ref_val
-        if 0.70 <= ratio <= 1.30:
-            ok += 1
-        else:
-            ko += 1
-            pct = round((ratio - 1) * 100, 1)
-            details.append(f"{mod} : {'+' if pct > 0 else ''}{pct}% vs référentiel")
-
-    total_modules = ok + ko
-    score = round(100 * ok / total_modules, 1) if total_modules > 0 else 60.0
-
-    # Cohérence globale (grand total)
-    ratio_global = grand_ns / grand_ref
-    if ratio_global > 1.50:
-        score = min(score, 60.0)
-        details.insert(0, f"Total feuille {round(grand_ns):,} vs référentiel {round(grand_ref):,} ({round((ratio_global-1)*100)}% au-dessus)")
-    elif ratio_global < 0.50:
-        score = min(score, 50.0)
-        details.insert(0, f"Total feuille {round(grand_ns):,} nettement inférieur au référentiel {round(grand_ref):,}")
-
-    note = ", ".join(details) if details else f"{ok}/{total_modules} modules dans la plage de référence."
-    return score, note, True
+    from credits.analyse import choc_stress, regles_decision
+    return choc_stress(regles_decision(baremes.get("DECISION")))
 
 
-def _score_dscr(dscr: float | None) -> tuple[float, str]:
-    """Capacité financière : DSCR → score /100."""
-    if dscr is None:
-        return 50.0, "DSCR non calculable."
-    if dscr >= 1.8:
-        s = 100.0
-    elif dscr >= 1.5:
-        s = 80.0 + (dscr - 1.5) / 0.3 * 20
-    elif dscr >= 1.25:
-        s = 60.0 + (dscr - 1.25) / 0.25 * 20
-    elif dscr >= 1.0:
-        s = 30.0 + (dscr - 1.0) / 0.25 * 30
-    else:
-        s = max(0.0, dscr / 1.0 * 30)
-    return round(s, 1), f"DSCR = {dscr:.2f} ({'satisfaisante' if dscr >= 1.25 else 'limite' if dscr >= 1.0 else 'insuffisante'})"
+def _baremes_actifs() -> dict:
+    """Barèmes actifs indexés par code, sans lever.
 
-
-def _score_behavioral(client) -> tuple[float, str]:
-    """
-    Historique comportemental : base sur les transactions du wallet et l'épargne.
-    Score maximal par défaut (50/100) si pas d'historique négatif détecté.
+    `analyse.charger_baremes()` REFUSE d'analyser quand un barème manque : c'est
+    juste pour une analyse qui décide. Ici, un barème manquant ne doit pas rendre
+    le parcours client indisponible : le critère concerné devient non calculable
+    et sort de la pondération, ce que le module sait déjà faire et dire.
     """
     try:
-        from caisses.models import WalletTransaction
-        wallet = getattr(client, "wallets", None)
-        if not wallet:
-            return 50.0, "Aucun historique AGRICAP détecté — score neutre."
-        # Nombre de transactions réussies vs en retard
-        transactions = WalletTransaction.objects.filter(
-            wallet__owner=client, status__in=["COMPLETED", "FAILED"]
-        )
-        total = transactions.count()
-        failed = transactions.filter(status="FAILED").count()
-        if total == 0:
-            return 50.0, "Nouveau client — score d'historique neutre (50/100)."
-        ratio_ok = (total - failed) / total
-        score = round(min(100, ratio_ok * 100), 1)
-        return score, f"{total - failed}/{total} transactions réussies."
-    except Exception:
-        return 50.0, "Historique comportemental non disponible."
+        from credits.models import BaremeScore
+        return {b.code: b for b in BaremeScore.objects.filter(actif=True)}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Barèmes illisibles pour la simulation : %s", exc)
+        return {}
 
 
-def _score_guarantees(guarantees_data: dict | None, amount: float) -> tuple[float, str]:
-    """Garanties : couverture de l'encours."""
-    if not guarantees_data or not amount:
-        return 60.0, "Garanties non encore constituées — score indicatif."
-    items = guarantees_data.get("items", []) if isinstance(guarantees_data, dict) else []
-    total_coverage = sum(
-        float(g.get("holdAmount") or g.get("valeur_estimee") or 0) for g in items
-    )
-    if total_coverage == 0:
-        return 60.0, "Garanties non encore constituées — score indicatif."
-    ratio = total_coverage / amount
-    if ratio >= 1.5:
-        score, note = 100.0, f"Couverture {ratio:.1f}× (excellente)"
-    elif ratio >= 1.0:
-        score, note = 80.0, f"Couverture {ratio:.1f}× (satisfaisante)"
-    elif ratio >= 0.75:
-        score, note = 55.0, f"Couverture {ratio:.1f}× (partielle)"
+def _score_technique(referentiel, ns_totals: dict[str, float], quantite,
+                     unite_dossier: str | None, bareme, poids):
+    """Fiabilité technique — délègue à `analyse.scorer_technique`, sans exception.
+
+    C'est LE même calcul que celui de l'instruction : écart relatif par module,
+    moyenne des écarts absolus, courbe `ECART_TECHNIQUE`. L'ancienne règle locale
+    (« part des modules à ±30 % ») donnait un autre score au même dossier.
+
+    Retourne `(bloc, note, calculable)`. Non calculable — et donc EXCLU de la
+    pondération, jamais noté à un milieu arbitraire — dans trois cas explicites :
+    aucun référentiel pour la filière, barème absent, ou dimension du dossier
+    exprimée dans une autre unité que celle du référentiel.
+    """
+    from credits.analyse import scorer_technique
+
+    if referentiel is None:
+        return None, (
+            "Fiabilité technique non calculable : aucun référentiel de coûts n'est "
+            "actif pour cette filière. Le réalisme des coûts ne peut être établi "
+            "sans référence — le critère est exclu du score plutôt que noté à un "
+            "milieu arbitraire."
+        ), False
+    if bareme is None:
+        return None, ("Fiabilité technique non calculable : le barème "
+                      "« ECART_TECHNIQUE » n'est pas configuré en base."), False
+    if not ns_totals:
+        return None, ("Fiabilité technique non calculable : la feuille de besoins "
+                      "ne porte aucun montant par module à comparer au "
+                      "référentiel."), False
+
+    unite_ref = (referentiel.unite_reference or "ha").strip().lower()
+    unite_dossier = (unite_dossier or "ha").strip().lower()
+    if unite_dossier != unite_ref:
+        return None, (
+            f"Fiabilité technique non calculable : la filière se mesure en "
+            f"« {unite_ref} » et la simulation est dimensionnée en "
+            f"« {unite_dossier} ». Aucune conversion n'existe entre ces unités — "
+            f"renseignez la quantité dans l'unité de la filière."
+        ), False
+    if not quantite or Decimal(str(quantite)) <= 0:
+        return None, (
+            f"Fiabilité technique non calculable : la dimension du projet "
+            f"(en « {unite_ref} ») n'est pas renseignée, les coûts de référence ne "
+            f"peuvent pas être ramenés au projet."
+        ), False
+
+    # Frontière de type : les totaux arrivent en `float` (payload de vue) et
+    # repassent en `Decimal` par leur représentation décimale — le calcul lui-même
+    # est intégralement en `Decimal` dans `scorer_technique`.
+    totaux = {k: Decimal(str(v)) for k, v in ns_totals.items()}
+    bloc = scorer_technique(totaux, referentiel, Decimal(str(quantite)),
+                            bareme, Decimal(str(poids)), unite_ref)
+    details = bloc["details"]
+    ecarts = details.get("ecartsHorsPlage") or []
+    if ecarts:
+        note = ", ".join(e["message"] for e in ecarts[:4])
     else:
-        score, note = 30.0, f"Couverture {ratio:.1f}× (insuffisante)"
-    return score, note
+        note = (f"Écart moyen de {details.get('ecartMoyenPct')} % au référentiel "
+                f"{details.get('referentiel')}.")
+    if details.get("commentaire"):
+        note = f"{note} {details['commentaire']}".strip()
+    return bloc, note, True
+
+
+def _score_dscr(dscr, bareme, libelle: str = "Capacité financière"):
+    """DSCR → score, par la courbe `DSCR` en base. Aucun palier codé ici."""
+    if bareme is None:
+        return None, (f"{libelle} non calculable : le barème « DSCR » n'est pas "
+                      f"configuré en base."), False
+    if dscr is None:
+        return None, (f"{libelle} non calculable : aucun DSCR n'a pu être estimé "
+                      f"(ni EBE de référence, ni trésorerie déclarée)."), False
+    valeur = Decimal(str(dscr))
+    score = bareme.evaluer(valeur)
+    qualif = ("solide" if valeur >= Decimal("1.3")
+              else "acceptable" if valeur >= Decimal("1.0")
+              else "insuffisante")
+    return score, f"DSCR = {valeur:.2f} ({qualif})", True
+
+
+def _score_comportemental(client, poids):
+    """Historique comportemental — délègue à `analyse.scorer_comportemental`.
+
+    Ce module lisait les transactions du wallet, le moteur lit `portfolio.Loan` :
+    deux histoires différentes pour le même client. Celle du moteur fait foi (elle
+    porte le remboursement, pas le débit), et son score neutre de 50 est annoncé
+    comme tel plutôt que déguisé en performance.
+    """
+    from credits.analyse import scorer_comportemental
+
+    bloc = scorer_comportemental(client, None, Decimal(str(poids)))
+    return bloc, bloc["details"].get("commentaire", ""), True
+
+
+def _score_garanties(guarantees_data: dict | None, amount, bareme, poids):
+    """Couverture des garanties → courbe `COUVERTURE_GARANTIES`, plafond compris.
+
+    Le plafond « garanties non constituées » vit dans les paramètres du barème,
+    comme dans `analyse.scorer_garanties` : c'est la même règle, lue au même
+    endroit. En simulation, les garanties ne sont par construction jamais
+    constituées — le plafond s'applique donc toujours, et c'est dit.
+    """
+    if bareme is None:
+        return None, ("Garanties non calculables : le barème "
+                      "« COUVERTURE_GARANTIES » n'est pas configuré en base."), False
+
+    montant = Decimal(str(amount or 0))
+    items = (guarantees_data or {}).get("items", []) if isinstance(guarantees_data, dict) else []
+    couverture = Decimal("0")
+    for g in items:
+        brut = g.get("holdAmount") or g.get("valeur_estimee") or 0
+        try:
+            couverture += Decimal(str(brut))
+        except Exception:  # noqa: BLE001
+            continue
+
+    ratio = (couverture / montant).quantize(Decimal("0.001")) if montant else Decimal("0")
+    score = bareme.evaluer(ratio)
+    plafond = Decimal(str((bareme.parametres or {}).get("plafond_non_constituees", "60")))
+    score = min(score, plafond)
+    if couverture <= 0:
+        note = ("Aucune garantie déclarée — score indicatif plafonné en attente de "
+                "constitution.")
+    else:
+        note = (f"Couverture déclarée {ratio}× — score indicatif plafonné tant que "
+                f"les garanties ne sont pas constituées et vérifiées.")
+    return score, note, True
 
 
 # ── Tableau d'amortissement ───────────────────────────────────────────────────
 
-def _build_schedule(amount: float, rate_annual: float, duration_months: int, deferred: int = 0) -> list[dict]:
-    """Amortissement linéaire avec différé (intérêts seuls pendant le différé)."""
-    if amount <= 0 or duration_months <= 0:
+def _build_schedule(amount, rate_annual, duration_months: int,
+                    deferred: int = 0) -> list[dict]:
+    """Échéancier au format legacy, calculé par `credits.echeancier` en `Decimal`.
+
+    Ce module portait sa propre boucle d'amortissement en `float`, dont la
+    dernière tranche n'était pas ajustée : le CRD final ne tombait pas exactement
+    à zéro et le total différait de celui de l'analyse pour le même prêt. La seule
+    formule d'amortissement du module crédit est désormais
+    `construire_echeancier` — les centimes du simulateur et ceux de l'instruction
+    sont les mêmes.
+
+    `rate_annual` est un TAUX ANNUEL EN FRACTION (0,18) pour rester compatible avec
+    les appelants ; `construire_echeancier` le veut en points (18).
+    """
+    from credits.echeancier import EcheancierError, construire_echeancier
+
+    try:
+        lignes = construire_echeancier(
+            Decimal(str(amount)), Decimal(str(rate_annual)) * Decimal(100),
+            int(duration_months), int(deferred or 0))
+    except EcheancierError as exc:
+        logger.info("Échéancier de simulation non constructible : %s", exc.message)
         return []
-    repay = max(1, duration_months - deferred)
-    monthly_rate = rate_annual / 12
-    principal_pm = amount / repay
-    balance = amount
-    schedule = []
-    for m in range(1, duration_months + 1):
-        interest = round(balance * monthly_rate, 2)
-        if m <= deferred:
-            schedule.append({
-                "month": m, "principal": 0.0, "interest": interest,
-                "payment": interest, "balance": round(balance, 2),
-            })
-        else:
-            principal = round(principal_pm, 2)
-            balance = max(0.0, balance - principal)
-            schedule.append({
-                "month": m, "principal": round(principal, 2), "interest": interest,
-                "payment": round(principal + interest, 2), "balance": round(balance, 2),
-            })
-    return schedule
 
-
-def _valuation_note(score: float, eligible: bool) -> str:
-    if score >= 85:
-        return "Excellent dossier — accord favorable recommandé."
-    if score >= 70:
-        return "Bon dossier — accord favorable sous conditions standard."
-    if score >= 55:
-        return "Dossier à instruire — conditions supplémentaires probables."
-    return "Dossier à risque élevé — analyse approfondie requise."
+    return [
+        {
+            "month": l["mois"],
+            "principal": float(l["capital"]),
+            "interest": float(l["interets"]),
+            "payment": float(l["echeance"]),
+            "balance": float(l["crd"]),
+        }
+        for l in lignes
+    ]
 
 
 # ── Point d'entrée principal ─────────────────────────────────────────────────
@@ -488,6 +554,8 @@ def dataio_simulate(
     currency: str = "USD",
     guarantees_data: dict | None = None,
     module_financing: dict | None = None,
+    quantite_reference: float | None = None,
+    unite_reference: str | None = None,
 ) -> dict:
     """
     Simulation complète à partir des données de référence (dataio).
@@ -497,7 +565,7 @@ def dataio_simulate(
       value_chain_code : code filière (ex. 'CAFE_ARABICA')
       needs_sheet      : NeedsSheet ORM (optionnel)
       ns_totals        : dict {module: montant} si déjà calculé côté frontend
-      area_ha          : superficie
+      area_ha          : superficie en hectares (filières mesurées en hectares)
       amount_requested : montant demandé
       currency         : 'USD' | 'CDF'
       guarantees_data  : dict avec 'items' (liste de garanties)
@@ -505,21 +573,22 @@ def dataio_simulate(
                          module (contrat §1). Absent = 100 %. Les COÛTS restent
                          lus de `ns_totals` (DataRecord), jamais du payload
                          (principe 1) ; seul le POURCENTAGE demandé vient d'ici.
+      quantite_reference / unite_reference :
+                         dimension du projet pour les filières qui ne se mesurent
+                         PAS en hectares (30 ruches, 1 000 sujets, 100 m²,
+                         2 000 sacs, 300 t usinées). À défaut, `area_ha` est
+                         retenue avec l'unité « ha ». Si l'unité ne correspond pas
+                         à celle du référentiel de la filière, la fiabilité
+                         technique est déclarée NON CALCULABLE — jamais convertie.
 
     Retourne un dict compatible avec CreditSimulateResult (TypeScript).
     """
 
     # ── Frontière de type ────────────────────────────────────────────────────
-    # Ce module calcule en `float` de bout en bout ; les vues, elles, portent
-    # désormais des `Decimal` (principe 4 : aucun `float` n'entre dans un champ
-    # financier). Sans cette coercition, `Decimal / float` lève un TypeError et
-    # la simulation répond 500 — c'est ce qui est arrivé après la correction des
-    # vues, le défaut étant simplement déplacé plutôt que résolu.
-    #
-    # Dette assumée et bornée : ce simulateur est INDICATIF. Le scoring qui fait
-    # foi est `credits/analyse.py`, en `Decimal` du premier au dernier calcul.
-    # Migrer ce module entier en `Decimal` est le correctif propre ; le faire en
-    # urgence sur un chemin non couvert par des tests de vue le serait moins.
+    # Les grandeurs d'ENTRÉE arrivent en `float` (payload de vue) et les
+    # grandeurs de SORTIE partent en `float` (JSON). Entre les deux, tout ce qui
+    # note ou tarife passe par les fonctions `Decimal` du moteur : barèmes,
+    # échéancier, grille de taux. Le `float` ne traverse plus un calcul de score.
     def _f(x):
         return float(x) if x is not None else None
 
@@ -549,14 +618,12 @@ def dataio_simulate(
     grand_total_ns = sum(ns_totals.values()) if ns_totals else (amount_requested or 0)
 
     # ── Données de référence depuis le simulateur ──────────────────────────────
-    scoring_criteria: list[dict] = []
     ref_totals_sim: dict[str, float] = {}
     loan_params: dict = {}
 
     if source:
-        scoring_criteria = _read_scoring_criteria(source)
-        ref_totals_sim   = _read_reference_totals(source)
-        loan_params      = _read_loan_params(source)
+        ref_totals_sim = _read_reference_totals(source)
+        loan_params    = _read_loan_params(source)
 
     # ── Totaux de référence par filière ───────────────────────────────────────
     # Priorité : simulateur par filière > référentiel ValueChain (module_weights × superficie)
@@ -567,16 +634,35 @@ def dataio_simulate(
         vc_tokens  = _normalize(value_chain_code)
         source_matches_chain = bool(vc_tokens & src_tokens)
 
+    # ── Dimension du projet, dans l'unité de la filière ───────────────────────
+    # `area_ha` reste la valeur par défaut (les 9 filières mesurées en hectares) ;
+    # les autres passent `quantite_reference` + `unite_reference`. Aucune
+    # conversion : une unité qui ne correspond pas au référentiel rend la
+    # fiabilité technique non calculable, elle ne la fausse pas.
+    referentiel = _referentiel_filiere(value_chain)
+    if quantite_reference is not None:
+        quantite = _f(quantite_reference)
+        unite = (unite_reference or "").strip().lower() or (
+            (referentiel.unite_reference or "ha").strip().lower()
+            if referentiel is not None else "ha")
+    else:
+        quantite = area_ha
+        unite = (unite_reference or "ha").strip().lower()
+
     # Référentiel filière autoritatif (`ReferentielFiliere`, principe 1) — la même
-    # source que le moteur `analyse.py`. Le simulateur indicatif s'y aligne pour
-    # que la fiabilité technique se calcule dès qu'un référentiel existe (§1).
-    ref_filiere_totals, ref_filiere_code = _referentiel_filiere_totals(value_chain, area_ha)
+    # source que le moteur `analyse.py`, résolue par les mêmes clés.
+    ref_filiere_code = referentiel.code if referentiel is not None else None
+    unite_referentiel = ((referentiel.unite_reference or "ha").strip().lower()
+                         if referentiel is not None else None)
+    ref_filiere_totals = (
+        _referentiel_filiere_totals(referentiel, quantite)
+        if unite_referentiel == unite else {})
 
     if source_matches_chain and ref_totals_sim:
         ref_totals = ref_totals_sim
     elif ref_filiere_totals:
         ref_totals = ref_filiere_totals
-    elif value_chain and area_ha and getattr(value_chain, "module_weights", None):
+    elif value_chain and area_ha and unite == "ha" and getattr(value_chain, "module_weights", None):
         # Calcul des références depuis le référentiel filière (coût/ha × superficie)
         cost_per_ha = float(
             value_chain.cost_per_hectare_usd if currency == "USD"
@@ -698,120 +784,109 @@ def dataio_simulate(
         else:
             estimated_dscr = ref_dscr
 
-    # ── Calcul des scores par critère ─────────────────────────────────────────
-    # La fiabilité technique porte un 3e terme `calculable` : elle est exclue du
-    # score global (et non notée 50) quand aucun référentiel n'existe (§1). Les
-    # autres critères gardent leur repli neutre habituel (2-uplet).
-    fiab_score, fiab_detail, fiab_calculable = _score_fiabilite(ns_totals, ref_totals)
+    # ── Calcul des scores par critère — MÊMES règles que l'instruction ────────
+    # Chaque critère renvoie `(score, note, calculable)`. Un critère non
+    # calculable est EXCLU de la pondération (« pas de moyenne sans effectif »),
+    # jamais noté à un milieu arbitraire qui tirerait la note vers un faux centre.
+    from credits.analyse import CRITERES, poids_effectifs, recommander, regles_decision
+    from credits.scoring import LABELS_CRITERES, NOTES_RECOMMANDATION, taux_pour_score
 
-    scores_map: dict[str, tuple[float, str]] = {}
-    for crit in scoring_criteria:
-        label_low = crit["label"].lower()
-        if "capacit" in label_low or "dscr" in label_low or "financière" in label_low:
-            scores_map["dscr"] = _score_dscr(estimated_dscr)
-        elif "stress" in label_low or "résilience" in label_low:
-            # Score résilience basé sur marge par rapport au seuil DSCR minimum
-            dscr_stress = (estimated_dscr or 1.0) * 0.75  # stress -25 %
-            scores_map["stress"] = _score_dscr(dscr_stress)
-        elif "historique" in label_low or "comport" in label_low:
-            scores_map["behavioral"] = _score_behavioral(client)
-        elif "garantie" in label_low or "domiciliation" in label_low:
-            scores_map["guarantees"] = _score_guarantees(guarantees_data, sim_amount)
+    baremes = _baremes_actifs()
+    poids = poids_effectifs()          # InstitutionConfig — la pondération unique
 
-    # Fallback si le référentiel est incomplet
-    if "dscr"       not in scores_map: scores_map["dscr"]       = _score_dscr(estimated_dscr)
-    if "stress"     not in scores_map: scores_map["stress"]      = (_score_dscr((estimated_dscr or 1.0) * 0.75)[0], "Stress test -25%")
-    if "behavioral" not in scores_map: scores_map["behavioral"]  = _score_behavioral(client)
-    if "guarantees" not in scores_map: scores_map["guarantees"]  = _score_guarantees(guarantees_data, sim_amount)
+    bloc_tech, note_tech, ok_tech = _score_technique(
+        referentiel, ns_totals, quantite, unite,
+        baremes.get("ECART_TECHNIQUE"), poids["technique"])
 
-    # ── Pondération finale ────────────────────────────────────────────────────
-    # Utiliser les poids du référentiel si disponibles, sinon les poids par défaut
-    DEFAULT_WEIGHTS = {
-        "fiabilite":  0.25,
-        "dscr":       0.20,
-        "stress":     0.10,
-        "behavioral": 0.30,
-        "guarantees": 0.15,
+    dscr_stress = (Decimal(str(estimated_dscr)) * (Decimal(1) - _choc_stress(baremes))
+                   if estimated_dscr is not None else None)
+    bloc_compo, note_compo, ok_compo = _score_comportemental(
+        client, poids["comportemental"])
+
+    scores_map: dict[str, tuple] = {
+        "technique": ((bloc_tech["score"] if ok_tech else None), note_tech, ok_tech),
+        "dscr": _score_dscr(estimated_dscr, baremes.get("DSCR")),
+        "stress": _score_dscr(dscr_stress, baremes.get("DSCR"),
+                              libelle="Résilience au stress"),
+        "comportemental": (bloc_compo["score"], note_compo, ok_compo),
+        "garanties": _score_garanties(guarantees_data, sim_amount,
+                                      baremes.get("COUVERTURE_GARANTIES"),
+                                      poids["garanties"]),
     }
-    crit_keys = ["fiabilite", "dscr", "stress", "behavioral", "guarantees"]
 
-    # Récupérer les poids depuis le référentiel
-    weights = dict(DEFAULT_WEIGHTS)
-    if len(scoring_criteria) >= 5:
-        for i, key in enumerate(crit_keys):
-            if i < len(scoring_criteria):
-                weights[key] = scoring_criteria[i]["weight"]
-
+    # ── Pondération — `points = score × poids / 100`, comme à l'instruction ───
+    # L'ancien format servait `points = score /100` et `maxPoints = 100` : la
+    # somme des lignes affichées ne faisait pas le score global, et l'analyste ne
+    # pouvait pas vérifier le total de tête. Ici la colonne se lit « 8,5 / 25 » et
+    # sa somme tombe exactement sur la note (invariant CLAUDE.md §5.2).
     breakdown = []
-    total_weighted = 0.0
-    weight_calculable = 0.0
+    total_points = Decimal("0")
+    poids_calculable = Decimal("0")
     n_non_calculable = 0
-    labels_fr = {
-        "fiabilite":  "Fiabilité technique",
-        "dscr":       "Capacité financière (DSCR)",
-        "stress":     "Résilience au stress",
-        "behavioral": "Historique comportemental",
-        "guarantees": "Garanties & domiciliation",
-    }
-    for key in crit_keys:
-        w = weights[key]
-        if key == "fiabilite" and not fiab_calculable:
-            # Non calculable : exclu du score, jamais un 50 muet (§1). Le poids
-            # sort de la base de pondération (« pas de moyenne sans effectif »).
+
+    for cle in CRITERES:
+        score, detail, calculable = scores_map[cle]
+        p = Decimal(str(poids[cle]))
+        if not calculable or score is None:
             n_non_calculable += 1
             breakdown.append({
-                "code": key,
-                "label": labels_fr[key],
+                "code": cle,
+                "label": LABELS_CRITERES[cle],
                 "points": None,
-                "maxPoints": 100,
-                "weight": w,
+                "maxPoints": float(p),
+                "weight": float(p),
                 "weightedScore": None,
+                "score": None,
                 "calculable": False,
-                "detail": fiab_detail,
+                "detail": detail,
             })
             continue
-        if key == "fiabilite":
-            s, detail = fiab_score, fiab_detail
-        else:
-            s, detail = scores_map[key]
-        weighted = round(s * w, 2)
-        total_weighted += weighted
-        weight_calculable += w
+        score = Decimal(str(score))
+        points = _points_ponderes(score, p)
+        total_points += points
+        poids_calculable += p
         breakdown.append({
-            "code": key,
-            "label": labels_fr[key],
-            "points": round(s, 1),
-            "maxPoints": 100,
-            "weight": w,
-            "weightedScore": weighted,
+            "code": cle,
+            "label": LABELS_CRITERES[cle],
+            "points": float(points),
+            "maxPoints": float(p),
+            "weight": float(p),
+            "weightedScore": float(points),
+            "score": float(score),
             "calculable": True,
             "detail": detail,
         })
 
-    # Sans critère exclu, le score global est la somme pondérée (comportement
-    # inchangé). Avec un critère exclu, on renormalise sur les poids restants pour
-    # que la note reste sur 0–100 sans le combler par une valeur inventée.
-    if n_non_calculable and weight_calculable > 0:
-        final_score = round(total_weighted / weight_calculable, 1)
+    # Avec un critère exclu, on renormalise sur les poids restants : la note reste
+    # sur 0–100 sans qu'aucune valeur ne soit inventée pour combler le trou.
+    if poids_calculable <= 0:
+        final_score = None
+    elif n_non_calculable:
+        final_score = float(_q1(total_points * Decimal(100) / poids_calculable))
     else:
-        final_score = round(total_weighted, 1)
+        final_score = float(_q1(total_points))
 
-    # ── Taux proposé ──────────────────────────────────────────────────────────
-    # Taux de base depuis le référentiel + ajustement selon score
+    # ── Taux proposé — grille UNIQUE (`BaremeScore` « TAUX ») ─────────────────
+    # Ce module appliquait +2,0 sur la bande [55, 70[ quand `credits.scoring`
+    # appliquait +2,5 : le client simulait à 20 % et était instruit à 20,5 %.
+    # Il n'existe plus qu'un seul chemin vers un taux, et il est en base.
     base_rate = rate_annual * 100
-    if final_score >= 85:
-        proposed_rate = round(base_rate - 2.0, 2)
-    elif final_score >= 70:
-        proposed_rate = round(base_rate, 2)
-    elif final_score >= 55:
-        proposed_rate = round(base_rate + 2.0, 2)
-    else:
-        proposed_rate = round(base_rate + 5.0, 2)
+    tarification = taux_pour_score(final_score if final_score is not None else 0,
+                                   base_rate)
+    proposed_rate = tarification["taux"]
 
     # ── Score minimal requis (depuis ValueChain ou défaut 60) ────────────────
     min_score = int(value_chain.min_score_required) if value_chain else 60
 
-    eligible = final_score >= min_score
+    # Recommandation par le MÊME barème de décision que l'instruction : le
+    # simulateur n'a plus sa propre échelle de verdicts. `hors_plage` reste vide —
+    # une simulation ne porte pas de justification d'analyste.
+    regles = regles_decision(baremes.get("DECISION"))
+    recommandation = (
+        recommander(Decimal(str(final_score)), Decimal(str(estimated_dscr or 0)),
+                    [], regles)
+        if final_score is not None else None)
+    eligible = (final_score is not None and final_score >= min_score)
 
     # ── Tableau d'amortissement ───────────────────────────────────────────────
     schedule = _build_schedule(
@@ -823,12 +898,14 @@ def dataio_simulate(
     # Totaux de l'échéancier servis PAR LE SERVEUR : le front affiche un
     # échéancier complet (toutes les lignes) et sa synthèse, mais ne somme
     # jamais lui-même (règle §5 « zéro chiffre métier calculé côté client »).
-    # Ce module est indicatif et calcule en float de bout en bout ; on arrondit
-    # pour ne pas exposer le bruit binaire.
+    # Les lignes viennent de `construire_echeancier` (Decimal) : la somme se fait
+    # en Decimal puis sort en `float`, sans accumuler de bruit binaire.
+    _somme = lambda cle: float(  # noqa: E731
+        sum((Decimal(str(r[cle])) for r in schedule), Decimal("0")))
     schedule_totals = {
-        "totalPrincipal": round(sum(r["principal"] for r in schedule), 2),
-        "totalInterest":  round(sum(r["interest"] for r in schedule), 2),
-        "totalPayments":  round(sum(r["payment"] for r in schedule), 2),
+        "totalPrincipal": _somme("principal"),
+        "totalInterest":  _somme("interest"),
+        "totalPayments":  _somme("payment"),
         "count":          len(schedule),
     }
 
@@ -838,7 +915,7 @@ def dataio_simulate(
         else (source.original_name if source else "N/A")
     )
 
-    return {
+    resultat = {
         "score":            final_score,
         "breakdown":        breakdown,
         "eligible":         eligible,
@@ -846,16 +923,42 @@ def dataio_simulate(
         "proposedRate":     proposed_rate,
         "scheduleDraft":    schedule,
         "scheduleTotals":   schedule_totals,
-        "valuationNote":    _valuation_note(final_score, eligible),
+        # La note suit la RECOMMANDATION du barème de décision, comme à
+        # l'instruction : le simulateur n'a plus ses propres bandes de verdict.
+        "valuationNote":    NOTES_RECOMMANDATION.get(
+            recommandation,
+            "Score non calculable en l'état : voir le détail par critère."),
+        "recommandation":   recommandation,
+        # Couverture de la note : sur quelle part du barème elle a été calculée.
+        # Sans cela, une simulation renormalisée sur 3 critères (70 % des poids)
+        # s'affiche comme une note sur 100 et paraît MEILLEURE que l'instruction,
+        # qui, elle, aura pu calculer le DSCR. « Pas de moyenne sans effectif »
+        # (CLAUDE.md §4.6) : la base de calcul se dit.
+        "scoreCouverture": {
+            "poidsCalculable": float(poids_calculable),
+            "poidsTotal": float(sum(Decimal(str(poids[c])) for c in CRITERES)),
+            "nbCriteresExclus": n_non_calculable,
+            "renormalise": bool(n_non_calculable and poids_calculable > 0),
+        },
         # Financement par module (contrat §1) — parts demandées et montant scoré.
         "moduleFinancing":     module_financing_rows,
         "montantDemandeAjuste": montant_demande_ajuste,
+        # Tarification : le taux ET la bande qui l'explique. Servi au STAFF
+        # uniquement par la vue (la grille ne descend jamais au client — principe
+        # 7) ; c'est la vue qui filtre, ce module ne connaît pas le rôle appelant.
+        "tarification": {k: v for k, v in tarification.items()
+                         if not k.startswith("_")},
         "refData": {
             "source":          source_label,
             "sourceFile":      source.original_name if source else None,
             "sourceMatchesChain": source_matches_chain,
             "referentielFiliere": ref_filiere_code,
+            "uniteReference":  unite_referentiel,
+            "quantiteReference": quantite,
+            "uniteDossier":    unite,
             "dscr":            round(estimated_dscr, 3) if estimated_dscr else None,
+            "dscrStress":      float(_q1(dscr_stress) if dscr_stress is not None else 0)
+                               if dscr_stress is not None else None,
             "durationMonths":  duration_months,
             "deferredMonths":  deferred_months,
             "rateAnnual":      rate_annual,
@@ -863,3 +966,13 @@ def dataio_simulate(
             "grandTotalNS":    round(grand_total_ns, 2),
         },
     }
+    if final_score is None:
+        # Aucun critère calculable : on ne sert pas un 0 qui passerait pour une
+        # note. Le motif est déjà dans chaque ligne du `breakdown`.
+        resultat["unavailable"] = {
+            "code": "SCORE_NON_CALCULABLE",
+            "message": ("Aucun critère n'est calculable en l'état : barèmes non "
+                        "configurés, ou données de référence absentes. Le détail "
+                        "par critère en donne la raison."),
+        }
+    return resultat

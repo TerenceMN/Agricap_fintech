@@ -1,478 +1,299 @@
 """
-Moteur de scoring paramétrique Crédits Agricoles (Étape 3).
+Projection du moteur unifié vers l'ancien format `score_result` — ADAPTATEUR.
 
-Les barèmes sont lus depuis `ScoringCriterion` en base (pas dans le code).
-Chaque méthode de calcul reçoit l'application et le config du critère.
+Ce module ne score plus rien. Il ne contient plus un seul seuil, plus une seule
+courbe, plus une seule grille de taux.
 
-Usage :
-    engine = CreditScoringEngine(application)
-    result = engine.compute()
-    # result = {score, breakdown, eligible, proposedRate, scheduleDraft, ...}
+POURQUOI
+--------
+Deux systèmes de scoring coexistaient sur le même dossier :
+
+  - ce module, avec CINQ critères (historique de remboursement, cohérence de la
+    feuille de besoins, ratio d'endettement, ancienneté KYC, risque filière),
+    calculés en `float`, dont le résultat écrasait `CreditApplication.score_result` ;
+  - `credits.analyse`, avec CINQ AUTRES critères (technique, DSCR, stress,
+    comportemental, garanties), en `Decimal`, barèmes en base, résultat persisté
+    en `AnalyseCredit` immuable et journalisé.
+
+Un analyste voyait les critères du premier à l'écran et lisait la recommandation
+du second : personne ne pouvait dire lequel faisait foi. Pire, les deux
+proposaient un TAUX, et pas le même (+2,5 ici, +2,0 dans le simulateur, sur la
+même bande de score) — deux prix pour un même client selon l'écran consulté.
+
+L'AUTORITÉ EST `credits.analyse`, pour des raisons vérifiables et non d'ancienneté :
+  1. `Decimal` de bout en bout (principe 4) ; ce module calculait en `float` ;
+  2. barèmes, poids et seuils en base, éditables par le comité en maker-checker
+     avec prévisualisation sur le golden set (principe 8) ; ici, la grille de taux
+     était en dur dans une fonction ;
+  3. résultat APPEND-ONLY, horodaté, tracé (`needs_source` + révision + SHA-256),
+     journalisé en audit (principes 1 et 3) ; ici, un `UPDATE` écrasait le score
+     précédent — l'écart entre deux scorings, qui est une donnée, était perdu ;
+  4. le contrat front (`CreditAnalyse` dans `src/types/api.ts`) est typé dessus.
+
+CE QUE FAIT CE MODULE
+---------------------
+Il PROJETTE la dernière `AnalyseCredit` du dossier dans la forme `score_result`
+attendue par des consommateurs qui vivent hors du moteur : `credits.disbursement`
+(taux du prêt créé), `credits.workflow` (lettre de rejet), `portfolio.services`
+et `portfolio.serializers` (score et décision du prêt), `credits.view_context`
+(filtre client). Le supprimer aurait cassé ces quatre modules ; le laisser scorer
+aurait laissé deux vérités.
+
+Il n'INVENTE jamais de score : sans analyse exécutée, il le dit
+(`analyseDisponible: False`) et n'émet ni `score` ni `proposedRate`, pour que les
+consommateurs retombent sur leurs valeurs par défaut explicites plutôt que sur un
+chiffre fabriqué par une porte dérobée.
+
+Il n'exécute PAS le moteur non plus : `POST /score/` ne porte ni durée, ni
+différé, ni mode de différé, et les deviner produirait une analyse aux paramètres
+inventés — qui deviendrait de surcroît la dernière analyse du dossier, donc celle
+du golden set de calibrage des barèmes. L'analyse s'exécute par
+`POST /applications/<code>/reanalyser/`, avec ses paramètres, par un analyste.
 """
 from __future__ import annotations
 
-import decimal
-import math
+import logging
+from decimal import Decimal
 from typing import Any
 
+from credits.analyse import CRITERES, proposer_taux, regles_taux, score_lettre
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
-def _threshold_points(value: float, thresholds: list[list]) -> int:
+#: Libellés des cinq critères du moteur unifié — nomenclature UNIQUE (principe 6).
+#: Ce sont les mêmes clés que `credits.analyse.CRITERES` et que le contrat front ;
+#: les anciens codes de ce module (`repayment_history`, `kyc_seniority`…) et ceux
+#: du simulateur (`fiabilite`, `behavioral`, `guarantees`) ont disparu.
+LABELS_CRITERES = {
+    "technique": "Fiabilité technique",
+    "dscr": "Capacité financière (DSCR)",
+    "stress": "Résilience au stress",
+    "comportemental": "Historique comportemental",
+    "garanties": "Garanties & domiciliation",
+}
+
+#: Note de valorisation par recommandation du moteur. Elle suit la RECOMMANDATION
+#: et non une bande de score parallèle : une deuxième grille de bandes serait une
+#: deuxième vérité, exactement ce que ce lot supprime.
+NOTES_RECOMMANDATION = {
+    "approbation": "Dossier solide — approbation recommandée par le moteur.",
+    "approbation_cond": ("Dossier recevable — approbation sous conditions "
+                         "recommandée par le moteur."),
+    "revue": "Dossier à revoir — examen approfondi requis avant décision.",
+    "refus": "Refus recommandé par le moteur en l'état du dossier.",
+}
+
+#: Recommandations qui valent « éligible » pour les consommateurs aval.
+#: L'éligibilité n'est plus un `score >= seuil` recalculé ici : c'est le verdict
+#: du moteur, seul endroit où DSCR plancher, hors-plage et score sont croisés.
+RECOMMANDATIONS_ELIGIBLES = ("approbation", "approbation_cond")
+
+
+def _f(value) -> float | None:
+    return float(value) if value is not None else None
+
+
+def derniere_analyse(application):
+    """Dernière `AnalyseCredit` du dossier, ou `None`.
+
+    `AnalyseCredit.Meta.ordering` trie déjà par `-execute_le, -id` : la première
+    ligne est la plus récente, et c'est celle qui fait foi (les précédentes sont
+    conservées — on ré-analyse, on ne corrige pas).
     """
-    Retourne les points associés au premier seuil franchi.
-    Format : [[seuil_max, points], ...] trié par seuil décroissant.
-    Ex : [[30, 20], [50, 12], [70, 5], [100, 0]] — si value ≤ 30 → 20 pts
+    try:
+        return application.analyses.select_related("referentiel").first()
+    except Exception:  # noqa: BLE001 — un dossier non persisté n'a pas d'analyses
+        return None
+
+
+def _breakdown(analyse) -> list[dict]:
+    """Détail par critère, dans l'ordre canonique.
+
+    `points` = points PONDÉRÉS (score × poids / 100) et `maxPoints` = le poids du
+    critère : la colonne se lit « 8,5 / 25 » et sa somme tombe exactement sur le
+    score global. C'est l'invariant que l'analyste vérifie de tête à l'écran
+    (CLAUDE.md §5.2) — l'ancien format (score /100 par critère) ne le respectait
+    pas, la somme des lignes ne faisait pas le total affiché.
     """
-    for threshold, points in thresholds:
-        if value <= threshold:
-            return points
-    return 0
+    criteres = analyse.criteres or {}
+    lignes = []
+    for cle in CRITERES:
+        bloc = criteres.get(cle)
+        if not bloc:
+            continue
+        poids = Decimal(str(bloc.get("poids", 0)))
+        points = Decimal(str(bloc.get("points", 0)))
+        details = bloc.get("details") or {}
+        lignes.append({
+            "code": cle,
+            "label": LABELS_CRITERES.get(cle, cle),
+            "points": float(points),
+            "maxPoints": float(poids),
+            "weight": float(poids),
+            "weightedScore": float(points),
+            "score": float(Decimal(str(bloc.get("score", 0)))),
+            "detail": details.get("commentaire", ""),
+        })
+    return lignes
 
 
-def _threshold_points_desc(value: float, thresholds: list[list]) -> int:
+def _schedule(analyse) -> list[dict]:
+    """Échéancier au format legacy `{month, payment, principal, interest, balance}`.
+
+    Les montants sont ceux calculés en `Decimal` par `credits.echeancier` et
+    stockés en chaînes : ils sont convertis ici, à la frontière HTTP, et jamais
+    recalculés. Aucune formule d'amortissement ne subsiste dans ce module —
+    il en portait une troisième (annuité constante) là où le moteur amortit à
+    capital constant, ce qui donnait un échéancier différent de celui de l'analyse
+    pour le même dossier.
     """
-    Comme _threshold_points mais seuil dans l'ordre décroissant (≥ N → points).
-    Ex : [[90, 30], [75, 20], [60, 10], [0, 0]] — si value ≥ 90 → 30 pts
+    out = []
+    for ligne in (analyse.echeancier or []):
+        out.append({
+            "month": ligne.get("mois"),
+            "principal": float(Decimal(str(ligne.get("capital", 0)))),
+            "interest": float(Decimal(str(ligne.get("interets", 0)))),
+            "payment": float(Decimal(str(ligne.get("echeance", 0)))),
+            "balance": float(Decimal(str(ligne.get("crd", 0)))),
+        })
+    return out
+
+
+def _schedule_totals(schedule: list[dict]) -> dict:
+    """Totaux servis par le serveur — le front ne somme jamais une colonne."""
+    somme = lambda cle: float(  # noqa: E731
+        sum((Decimal(str(r[cle])) for r in schedule), Decimal("0")))
+    return {
+        "totalPrincipal": round(somme("principal"), 2),
+        "totalInterest": round(somme("interest"), 2),
+        "totalPayments": round(somme("payment"), 2),
+        "count": len(schedule),
+    }
+
+
+def _taux_propose(analyse, application) -> float | None:
+    """Taux figé par l'analyse. `None` si elle est antérieure à la grille unique.
+
+    On ne re-tarifie pas une analyse passée avec la grille d'aujourd'hui : le taux
+    lu par un analyste ne se réécrit pas rétroactivement (principe 3). L'absence
+    de clé fait retomber `credits.disbursement` sur le taux de base de la filière,
+    valeur explicite et sans surcote — jamais sur une surcote devinée.
     """
-    for threshold, points in thresholds:
-        if value >= threshold:
-            return points
-    return 0
+    if analyse.taux_propose is not None:
+        return float(analyse.taux_propose)
+    logger.warning(
+        "Dossier %s : analyse #%s antérieure à la grille de tarification unique — "
+        "aucun taux proposé n'est servi (le décaissement retombera sur le taux de "
+        "base de la filière). Ré-analysez pour tarifer.",
+        getattr(application, "code", "?"), analyse.pk)
+    return None
 
-
-# ── Moteur principal ───────────────────────────────────────────────────────────
 
 class CreditScoringEngine:
-    """
-    Moteur de scoring paramétrique.
-    Instancié avec un CreditApplication ; appeler .compute() pour obtenir le résultat.
+    """Adaptateur `AnalyseCredit` → `score_result`. Ne calcule aucun score.
+
+    Le nom est conservé parce que `credits.views.score_application` l'importe et
+    que les vues ne sont pas dans le périmètre de ce lot ; son contenu, lui, est
+    entièrement remplacé.
     """
 
     def __init__(self, application, needs_totals: dict[str, float] | None = None) -> None:
         self.app = application
-        self.client = application.client
-        self.value_chain = application.value_chain
-        self.needs_sheet = application.needs_sheet
-        #: Totaux par module LUS EN BASE (DataRecord de `application.needs_source`).
-        #: Quand ils sont fournis, ils font foi : le scoring ne dépend plus des
-        #: totaux figés au parse ni d'un payload client (principe 1).
+        self.client = getattr(application, "client", None)
+        self.value_chain = getattr(application, "value_chain", None)
+        #: Accepté pour compatibilité d'appel (`views.score_application` le passe).
+        #: Inutilisé : les totaux par module sont relus par le moteur lui-même dans
+        #: les `DataRecord` de la révision courante (principe 1). Les recevoir ici
+        #: laisserait croire qu'un appelant peut influencer le score.
         self.needs_totals = needs_totals
 
+    # ── API publique ──────────────────────────────────────────────────────────
+
     def compute(self) -> dict[str, Any]:
-        from credits.models import ScoringCriterion
+        analyse = derniere_analyse(self.app)
+        if analyse is None:
+            return self._sans_analyse()
+        return self.projeter(analyse)
 
-        criteria = list(ScoringCriterion.objects.filter(active=True).order_by("order"))
+    def projeter(self, analyse) -> dict[str, Any]:
+        schedule = _schedule(analyse)
+        taux = _taux_propose(analyse, self.app)
+        min_required = (int(self.value_chain.min_score_required)
+                        if self.value_chain is not None else 50)
 
-        breakdown: list[dict] = []
-        total_weighted = 0.0
-        max_weighted = 0.0
-
-        for criterion in criteria:
-            points, detail = self._dispatch(criterion)
-            points = max(0, min(points, criterion.max_points))  # clamp [0, max]
-            w = float(criterion.weight)
-            total_weighted += points * w
-            max_weighted += criterion.max_points * w
-            breakdown.append({
-                "code": criterion.code,
-                "label": criterion.label,
-                "points": points,
-                "maxPoints": criterion.max_points,
-                "weight": w,
-                "weightedScore": round(points * w, 2),
-                "detail": detail,
-            })
-
-        score = round(total_weighted / max_weighted * 100, 1) if max_weighted > 0 else 0.0
-
-        min_required = self.value_chain.min_score_required if self.value_chain else 50
-        eligible = score >= min_required
-
-        proposed_rate = self._propose_rate(score)
-        schedule = self._draft_schedule(proposed_rate)
-
-        return {
-            "score": score,
-            "breakdown": breakdown,
-            "eligible": eligible,
+        resultat: dict[str, Any] = {
+            "score": float(analyse.score_global),
+            "eligible": analyse.recommandation in RECOMMANDATIONS_ELIGIBLES,
             "minScoreRequired": min_required,
-            "proposedRate": proposed_rate,
+            "breakdown": _breakdown(analyse),
             "scheduleDraft": schedule,
-            "valuationNote": self._valuation_note(score, eligible),
+            "scheduleTotals": _schedule_totals(schedule),
+            "valuationNote": NOTES_RECOMMANDATION.get(
+                analyse.recommandation, "Analyse disponible."),
+            "analyseDisponible": True,
+            # Provenance : quel moteur, quelle analyse, quelle feuille de besoins.
+            # Sans elle, `score_result` serait un chiffre sans auteur.
+            "analyse": {
+                "id": analyse.pk,
+                "recommandation": analyse.recommandation,
+                "scoreLettre": score_lettre(
+                    analyse.score_global,
+                    (analyse.baremes_appliques or {}).get("_regles")),
+                "dscr": _f(analyse.dscr),
+                "dscrStress": _f(analyse.dscr_stress),
+                "executeLe": (analyse.execute_le.isoformat()
+                              if analyse.execute_le else None),
+                "versionMoteur": analyse.version_moteur,
+                "needsSourceId": analyse.needs_source_id,
+                "needsSourceRevision": analyse.needs_source_revision,
+                "needsSourceSha256": analyse.needs_source_sha256,
+            },
         }
+        if taux is not None:
+            resultat["proposedRate"] = taux
+        return resultat
 
-    def _dispatch(self, criterion) -> tuple[int, dict]:
-        method = criterion.compute_method
-        config = criterion.config or {}
-        try:
-            if method == "repayment_history":
-                return self._repayment_history(criterion.max_points, config)
-            if method == "needs_coherence":
-                return self._needs_coherence(criterion.max_points, config)
-            if method == "debt_ratio":
-                return self._debt_ratio(criterion.max_points, config)
-            if method == "kyc_seniority":
-                return self._kyc_seniority(criterion.max_points, config)
-            if method == "sector_risk":
-                return self._sector_risk(criterion.max_points, config)
-        except Exception as exc:
-            return 0, {"error": str(exc)}
-        return 0, {"note": f"Méthode inconnue : {method}"}
+    # ── Absence d'analyse — dit, jamais comblé ────────────────────────────────
 
-    # ── Méthodes de calcul ────────────────────────────────────────────────────
+    def _sans_analyse(self) -> dict[str, Any]:
+        """Aucune analyse exécutée : ni score ni taux, et la raison en clair.
 
-    def _repayment_history(self, max_points: int, config: dict) -> tuple[int, dict]:
+        Les clés `score` et `proposedRate` sont ABSENTES (et non nulles) :
+        `credits.disbursement` fait `int(score_result.get("score", 0))`, qu'un
+        `None` ferait échouer, et retombe sur le taux de base de la filière quand
+        `proposedRate` manque. Une clé absente est un contrat ; une clé nulle est
+        un piège.
         """
-        Historique de remboursement.
-        Cherche les prêts CLÔTURÉS du client dans portfolio.Loan et credits.CreditApplication.
-        """
-        thresholds = config.get("on_time_pct_thresholds", [[90, max_points], [0, 0]])
-        no_history = config.get("no_history_points", max_points // 2)
-
-        closed_count = 0
-        on_time_count = 0
-
-        # Source 1 : credits.CreditApplication CLOSED
-        try:
-            from credits.models import CreditApplication
-            past = CreditApplication.objects.filter(
-                client=self.client, status=CreditApplication.Status.CLOSED
-            ).exclude(pk=self.app.pk)
-            closed_count += past.count()
-            # Heuristique : pas de rejet = remboursé normalement
-            on_time_count += past.filter(rejection_reason_code="").count()
-        except Exception:
-            pass
-
-        # Source 2 : portfolio.Loan (ancien parcours)
-        try:
-            from portfolio.models import Loan
-            loans = Loan.objects.filter(borrower_sub=self.client.sub, status="CLOSED")
-            closed_count += loans.count()
-            on_time_count += loans.count()  # si CLOSED sans incident on considère OK
-        except Exception:
-            pass
-
-        if closed_count == 0:
-            points = no_history
-            detail = {
-                "note": "Aucun historique de remboursement — points partiels accordés.",
-                "closedLoans": 0,
-                "onTimePct": None,
-            }
-        else:
-            pct = on_time_count / closed_count * 100
-            points = _threshold_points_desc(pct, thresholds)
-            detail = {
-                "closedLoans": closed_count,
-                "onTimePct": round(pct, 1),
-                "onTimeCount": on_time_count,
-            }
-        return points, detail
-
-    def _needs_coherence(self, max_points: int, config: dict) -> tuple[int, dict]:
-        """
-        Cohérence de la Feuille de Besoins vs le référentiel filière.
-        """
-        ns = self.needs_sheet
-        vc = self.value_chain
-        from_tables = self.needs_totals is not None
-
-        if not from_tables and (ns is None or not ns.parsed_ok):
-            pts = config.get("no_needs_sheet", max_points // 2)
-            return pts, {"note": "Feuille de Besoins absente ou non parsée."}
-
-        if vc is None:
-            pts = config.get("no_needs_sheet", max_points // 2)
-            return pts, {"note": "Filière non renseignée — comparaison impossible."}
-
-        area = float(self.app.area_ha or (ns.area_ha if ns else 0) or 0)
-        if area <= 0:
-            pts = config.get("no_needs_sheet", max_points // 2)
-            return pts, {"note": "Superficie non renseignée."}
-
-        currency = (self.app.currency or (ns.currency if ns else "USD") or "USD").upper()
-        ref_per_ha = float(
-            vc.cost_per_hectare_usd if currency == "USD" else vc.cost_per_hectare_cdf
-        )
-        ref_total = ref_per_ha * area
-        declared = (sum(self.needs_totals.values()) if from_tables
-                    else float(ns.grand_total))
-
-        if ref_total == 0:
-            return max_points // 2, {"note": "Coût référentiel = 0, comparaison ignorée."}
-
-        ratio = abs(declared - ref_total) / ref_total * 100  # % d'écart
-
-        if ratio <= 10:
-            pts = config.get("within_10pct", max_points)
-        elif ratio <= 20:
-            pts = config.get("within_20pct", int(max_points * 0.72))
-        elif ratio <= 30:
-            pts = config.get("within_30pct", int(max_points * 0.4))
-        else:
-            pts = config.get("beyond_30pct", 0)
-
-        detail = {
-            "declaredTotal": declared,
-            "referentialTotal": round(ref_total, 2),
-            "deviationPct": round(ratio, 1),
-            "currency": currency,
-        }
-        return pts, detail
-
-    def _debt_ratio(self, max_points: int, config: dict) -> tuple[int, dict]:
-        """
-        Ratio d'endettement actif / capacité de remboursement mensuelle × 6 mois.
-        """
-        thresholds = config.get("thresholds", [[30, max_points], [50, 12], [70, 5], [100, 0]])
-
-        kyc = getattr(self.client, "kyc_profile", None)
-        monthly_capacity = float(kyc.monthly_limit) if kyc and kyc.monthly_limit else 0
-
-        try:
-            from credits.models import CreditApplication
-            active_statuses = [
-                CreditApplication.Status.ACTIVE,
-                CreditApplication.Status.PENDING_DISBURSEMENT,
-                CreditApplication.Status.IN_ANALYSIS,
-                CreditApplication.Status.APPROVED,
-            ]
-            encours = sum(
-                float(a.amount_approved or a.amount_requested or 0)
-                for a in CreditApplication.objects.filter(
-                    client=self.client, status__in=active_statuses, currency="USD"
-                ).exclude(pk=self.app.pk)
-            )
-        except Exception:
-            encours = 0
-
-        if monthly_capacity <= 0:
-            detail = {
-                "note": "Limite mensuelle KYC non renseignée — ratio non calculable.",
-                "encours": encours,
-            }
-            # Neutre : moitié des points
-            return max_points // 2, detail
-
-        capacity_6m = monthly_capacity * 6
-        ratio = encours / capacity_6m * 100 if capacity_6m > 0 else 100.0
-        pts = _threshold_points(ratio, thresholds)
-
-        detail = {
-            "encoursUsd": round(encours, 2),
-            "monthlyCapacityUsd": round(monthly_capacity, 2),
-            "capacity6mUsd": round(capacity_6m, 2),
-            "debtRatioPct": round(ratio, 1),
-        }
-        return pts, detail
-
-    def _kyc_seniority(self, max_points: int, config: dict) -> tuple[int, dict]:
-        """
-        Niveau KYC + ancienneté du compte client.
-        """
-        kyc_points_map: dict = config.get("kyc_points", {"T4": 10, "T3": 7, "T2": 4, "T1": 2, "T0": 0})
-        seniority_thresholds = config.get(
-            "seniority_months_thresholds", [[24, 5], [12, 3], [6, 1], [0, 0]]
-        )
-
-        kyc = getattr(self.client, "kyc_profile", None)
-        kyc_level = kyc.kyc_level if kyc else "T0"
-        kyc_pts = kyc_points_map.get(kyc_level, 0)
-
-        # Ancienneté en mois depuis la création du compte
-        from django.utils import timezone
-        created = self.client.created_at if hasattr(self.client, "created_at") else None
-        if created:
-            delta_months = (timezone.now() - created).days / 30.44
-        else:
-            delta_months = 0
-
-        seniority_pts = _threshold_points_desc(delta_months, seniority_thresholds)
-        pts = kyc_pts + seniority_pts
-
-        detail = {
-            "kycLevel": kyc_level,
-            "kycPoints": kyc_pts,
-            "seniorityMonths": round(delta_months, 1),
-            "seniorityPoints": seniority_pts,
-        }
-        return pts, detail
-
-    def _sector_risk(self, max_points: int, config: dict) -> tuple[int, dict]:
-        """
-        Risque filière : risk_factor du référentiel.
-        Plus le risk_factor est bas, plus la filière est sûre → plus de points.
-        """
-        thresholds = config.get("risk_factor_thresholds", [[0.15, max_points], [1.0, 0]])
-
-        if self.value_chain is None:
-            return max_points // 2, {"note": "Filière non renseignée."}
-
-        rf = float(self.value_chain.risk_factor)
-        pts = _threshold_points(rf, thresholds)
-        detail = {
-            "riskFactor": rf,
-            "valueChain": self.value_chain.code,
-            "label": self.value_chain.label,
-        }
-        return pts, detail
-
-    # ── Taux proposé ─────────────────────────────────────────────────────────
-
-    def _propose_rate(self, score: float) -> float:
-        """
-        Calcule le taux proposé à partir du score.
-        Base : value_chain.base_rate
-        Ajustement : score élevé → taux réduit, score faible → surcote.
-        """
-        base = float(self.value_chain.base_rate) if self.value_chain else 18.0
-
-        if score >= 85:
-            adjustment = -2.0
-        elif score >= 70:
-            adjustment = 0.0
-        elif score >= 55:
-            adjustment = +2.5
-        else:
-            adjustment = +5.0  # score très bas — taux maximum
-
-        return round(max(base + adjustment, base * 0.7), 2)
-
-    # ── Planning indicatif ────────────────────────────────────────────────────
-
-    def _draft_schedule(self, annual_rate: float) -> dict:
-        """
-        Génère un plan de remboursement indicatif (amortissement constant).
-        Basé sur amount_requested et cycle_months de la filière.
-        """
-        amount = float(self.app.amount_requested or 0)
-        n = int(self.value_chain.cycle_months) if self.value_chain else 12
-
-        if amount <= 0 or n <= 0 or annual_rate <= 0:
-            return {"note": "Données insuffisantes pour simuler le plan."}
-
-        monthly_rate = annual_rate / 100 / 12
-
-        if monthly_rate == 0:
-            monthly_payment = amount / n
-        else:
-            monthly_payment = amount * monthly_rate / (1 - (1 + monthly_rate) ** (-n))
-
-        monthly_payment = round(monthly_payment, 2)
-        total_repayment = round(monthly_payment * n, 2)
-        total_interest = round(total_repayment - amount, 2)
-
-        # Premières et dernières échéances
-        installments = []
-        balance = amount
-        for i in range(1, n + 1):
-            interest = round(balance * monthly_rate, 2)
-            principal = round(monthly_payment - interest, 2)
-            balance = round(balance - principal, 2)
-            if i <= 3 or i >= n - 1:
-                installments.append({
-                    "month": i,
-                    "payment": monthly_payment,
-                    "principal": principal,
-                    "interest": interest,
-                    "balance": max(balance, 0),
-                })
-
         return {
-            "principalAmount": amount,
-            "annualRatePct": annual_rate,
-            "termMonths": n,
-            "monthlyPayment": monthly_payment,
-            "totalRepayment": total_repayment,
-            "totalInterest": total_interest,
-            "currency": self.app.currency or "USD",
-            "installmentsSample": installments,
+            "eligible": False,
+            "breakdown": [],
+            "minScoreRequired": (int(self.value_chain.min_score_required)
+                                 if self.value_chain is not None else 50),
+            "valuationNote": ("Aucune analyse exécutée sur ce dossier : le score "
+                              "est produit par le moteur d'analyse, à partir de la "
+                              "feuille de besoins ingérée et des paramètres de "
+                              "crédit choisis par l'analyste."),
+            "analyseDisponible": False,
+            "unavailable": {
+                "code": "ANALYSE_REQUISE",
+                "message": ("Lancez l'analyse du dossier "
+                            "(POST /api/credits/applications/<code>/reanalyser/) "
+                            "pour obtenir un score, une recommandation et un taux."),
+            },
         }
 
-    # ── Note de valorisation ──────────────────────────────────────────────────
 
-    def _valuation_note(self, score: float, eligible: bool) -> str:
-        if score >= 85:
-            return "Dossier excellent — traitement prioritaire recommandé."
-        if score >= 70:
-            return "Dossier solide — aucune réserve majeure."
-        if score >= 55:
-            return "Dossier recevable — quelques points d'attention à lever."
-        if eligible:
-            return "Dossier limite — examen approfondi requis avant approbation."
-        return "Score insuffisant — dossier non éligible en l'état."
+# ── Tarification hors analyse (simulation indicative) ─────────────────────────
 
+def taux_pour_score(score_global, taux_base) -> dict:
+    """Taux proposé par la grille UNIQUE, pour un appelant sans `AnalyseCredit`.
 
-# ── Simulation sans dossier persisté ─────────────────────────────────────────
-
-class SimulationContext:
+    Point d'entrée unique du simulateur indicatif (`credits.dataio_simulator`) :
+    il n'a pas d'analyse persistée, mais il doit annoncer le MÊME taux que celui
+    que le dossier obtiendra à l'instruction pour le même score. C'est cette
+    fonction qui l'y oblige — il n'existe plus d'autre chemin vers un taux.
     """
-    Objet léger imitant CreditApplication pour la simulation /simulate/.
-    Permet de scorer sans créer de dossier en base.
-    """
+    from credits.models import BaremeScore
 
-    def __init__(
-        self,
-        client,
-        value_chain=None,
-        needs_sheet=None,
-        area_ha=None,
-        amount_requested=None,
-        currency: str = "USD",
-    ) -> None:
-        self.client = client
-        self.value_chain = value_chain
-        self.needs_sheet = needs_sheet
-        self.area_ha = decimal.Decimal(str(area_ha)) if area_ha else None
-        self.amount_requested = decimal.Decimal(str(amount_requested)) if amount_requested else None
-        self.currency = currency
-        self.pk = None  # pas de PK → les requêtes `.exclude(pk=self.app.pk)` fonctionnent
-
-
-def simulate(
-    client_sub: str,
-    value_chain_code: str | None = None,
-    needs_sheet_id: int | None = None,
-    area_ha: float | None = None,
-    amount_requested: float | None = None,
-    currency: str = "USD",
-) -> dict:
-    """
-    Simule le scoring sans créer de dossier en base.
-    Utilisé par POST /api/credits/simulate/.
-    """
-    from accounts.models import FintechUser
-    from reference_data.models import ValueChain
-    from credits.models import NeedsSheet
-
-    try:
-        client = FintechUser.objects.select_related("kyc_profile").get(sub=client_sub)
-    except FintechUser.DoesNotExist:
-        return {"error": "client_not_found"}
-
-    value_chain = None
-    if value_chain_code:
-        try:
-            value_chain = ValueChain.objects.get(code=value_chain_code, active=True)
-        except ValueChain.DoesNotExist:
-            return {"error": f"Filière '{value_chain_code}' inconnue."}
-
-    needs_sheet = None
-    if needs_sheet_id:
-        try:
-            needs_sheet = NeedsSheet.objects.get(pk=needs_sheet_id, uploaded_by=client_sub)
-        except NeedsSheet.DoesNotExist:
-            pass
-
-    ctx = SimulationContext(
-        client=client,
-        value_chain=value_chain,
-        needs_sheet=needs_sheet,
-        area_ha=area_ha,
-        amount_requested=amount_requested,
-        currency=currency,
-    )
-    engine = CreditScoringEngine(ctx)
-    return engine.compute()
+    bareme = BaremeScore.objects.filter(code="TAUX", actif=True).first()
+    return proposer_taux(score_global, taux_base, regles_taux(bareme))

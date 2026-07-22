@@ -1,5 +1,26 @@
 """
-Moteur d'analyse technico-économique — étape 2bis du pipeline (SPEC Moteur §4).
+Moteur d'analyse technico-économique — **LE moteur de scoring du module crédit**.
+
+AUTORITÉ (lot d'unification, juillet 2026)
+------------------------------------------
+Trois systèmes notaient un même dossier : ce module, `credits.scoring` (cinq
+AUTRES critères, en `float`, écrasant `score_result`) et `credits.dataio_simulator`
+(cinq critères aux codes encore différents, courbes et grille de taux en dur).
+Un analyste ne pouvait pas dire lequel faisait foi, et les deux derniers
+proposaient un taux différent pour la même bande de score.
+
+Ce module fait foi, pour des raisons vérifiables : `Decimal` de bout en bout
+(principe 4), barèmes / poids / seuils en base et recalibrables par le comité
+(principe 8), résultat append-only tracé jusqu'à la révision et au SHA-256 de la
+feuille de besoins (principes 1 et 3), journalisation d'audit, et contrat front
+typé dessus. Les deux autres modules sont devenus ses clients :
+
+  - `credits.scoring` PROJETTE la dernière `AnalyseCredit` en `score_result` ;
+  - `credits.dataio_simulator` SIMULE avec les mêmes barèmes, les mêmes poids,
+    la même grille de taux et le même échéancier.
+
+Il n'existe donc plus qu'un chemin vers un score (`executer_analyse`) et qu'un
+chemin vers un taux (`proposer_taux`).
 
 Cinq critères pondérés produisent un score global et une **recommandation**.
 Le moteur ne décide rien : `recommander()` renvoie une chaîne que l'analyste lit,
@@ -86,7 +107,51 @@ REGLES_DECISION_DEFAUT = {
 #: score. Règle de sûreté, pas un seuil de barème : elle ne se recalibre pas.
 DSCR_PLANCHER_APPROBATION = Decimal("1.0")
 
+#: Grille de TARIFICATION de secours — la seule du module (principe 6).
+#:
+#: Elle vivait en double et en dur : `scoring.py._propose_rate` appliquait +2,5 sur
+#: la bande [55, 70[ quand `dataio_simulator` appliquait +2,0 sur la même bande.
+#: Le même client recevait donc deux taux selon l'écran consulté — 20,5 % à
+#: l'instruction après 20,0 % annoncés à la simulation, sur un taux de base de
+#: 18 %. Arbitrage retenu : **+2,0**, pour trois raisons cumulées :
+#:
+#:   1. c'est la valeur DÉJÀ ANNONCÉE au client par le simulateur ; entre deux
+#:      chiffres, celui sur lequel le client a fondé sa demande engage l'institution
+#:      (un taux revu à la hausse après coup se plaide mal et se justifie encore
+#:      moins par « deux moteurs coexistaient ») ;
+#:   2. elle rend la grille symétrique (−2,0 en haut de barème, +2,0 au milieu) :
+#:      une surcote explicable est une surcote défendable devant un comité comme
+#:      devant un régulateur ; +2,5 n'a de trace ni dans une SPEC ni en base ;
+#:   3. elle est désormais en base : le comité qui veut 2,5 le décide par révision
+#:      de barème (maker ≠ checker, impact prévisualisé sur le golden set), sans
+#:      redéploiement — l'arbitrage est réversible sans toucher au code.
+#:
+#: Les bandes de tarification (85 / 70 / 55) ne sont volontairement PAS celles de
+#: la décision (75 / 60 / 45) ni celles de la lettre (85 / 70 / 50) : tarifer,
+#: décider et noter sont trois actes distincts. Les confondre reviendrait à faire
+#: bouger le prix d'un crédit en recalibrant une lettre affichée au client.
+GRILLE_TAUX_DEFAUT = {
+    "grille": [
+        {"score_min": "85", "ajustement": "-2.0"},
+        {"score_min": "70", "ajustement": "0.0"},
+        {"score_min": "55", "ajustement": "2.0"},
+        {"score_min": "0", "ajustement": "5.0"},
+    ],
+    #: Plancher de sécurité : la bonification ne peut pas descendre le taux sous
+    #: 70 % du taux de base de la filière (hérité de `scoring._propose_rate`, seul
+    #: garde-fou de l'ancienne grille qui méritait d'être conservé).
+    "plancher_ratio_base": "0.7",
+}
+
+#: Barèmes indispensables : sans eux, un score serait fabriqué par l'outil.
 CODES_BAREMES = ("ECART_TECHNIQUE", "DSCR", "COUVERTURE_GARANTIES", "DECISION")
+
+#: Barèmes FACULTATIFS : leur absence n'empêche pas de scorer, elle fait retomber
+#: sur la valeur de secours documentée, avec warning loggé (principe 8, exception).
+#: `TAUX` en fait partie : une grille de tarification manquante ne doit pas
+#: bloquer l'instruction d'un dossier, contrairement à une courbe de score
+#: manquante qui, elle, fabriquerait un 0.
+CODES_BAREMES_FACULTATIFS = ("TAUX",)
 
 
 # ── Exceptions (convention `credits.workflow`) ───────────────────────────────
@@ -139,6 +204,18 @@ class ParametresInvalides(AnalyseError):
     code = "PARAMETRES_INVALIDES"
 
 
+class DimensionIncoherente(AnalyseError):
+    """Le dossier et le référentiel ne parlent pas de la même unité.
+
+    Un référentiel apicole donne des USD PAR RUCHE ; un dossier qui ne porte
+    qu'une superficie en hectares n'est pas comparable à lui. Multiplier l'un par
+    l'autre produirait un coût de référence faux d'un facteur arbitraire — et un
+    score technique (25 % de la note) tout aussi faux. On refuse.
+    """
+
+    code = "DIMENSION_INCOHERENTE"
+
+
 # ── Quantize ─────────────────────────────────────────────────────────────────
 
 def q2(value) -> Decimal:
@@ -168,7 +245,7 @@ def _points(score: Decimal, poids: Decimal) -> Decimal:
 # ── Chargement des règles (principe 8) ───────────────────────────────────────
 
 def charger_baremes() -> dict[str, BaremeScore]:
-    """Barèmes actifs indexés par code. Lève `BaremeAbsent` si l'un manque."""
+    """Barèmes actifs indexés par code. Lève `BaremeAbsent` si un OBLIGATOIRE manque."""
     baremes = {b.code: b for b in BaremeScore.objects.filter(actif=True)}
     manquants = [c for c in CODES_BAREMES if c not in baremes]
     if manquants:
@@ -225,6 +302,76 @@ def regles_decision(bareme: BaremeScore | None) -> dict:
     return params
 
 
+def regles_taux(bareme: BaremeScore | None) -> dict:
+    """Grille de tarification active, avec repli loggé sur `GRILLE_TAUX_DEFAUT`."""
+    params = (bareme.parametres if bareme else None) or {}
+    if not params.get("grille"):
+        logger.warning(
+            "Barème TAUX absent ou vide — repli sur la grille de tarification par "
+            "défaut %s. Exécutez « manage.py seed_analyse » pour la faire vivre en "
+            "base (principe 8).", GRILLE_TAUX_DEFAUT["grille"])
+        return dict(GRILLE_TAUX_DEFAUT)
+    return params
+
+
+def proposer_taux(score_global, taux_base, regles: dict | None = None) -> dict:
+    """Taux proposé = taux de base de la filière + ajustement de la bande de score.
+
+    **Unique point de tarification du module** : `credits.scoring` (dossier
+    instruit) et `credits.dataio_simulator` (simulation indicative) appellent tous
+    deux cette fonction. C'est ce qui garantit qu'un client simule et instruit au
+    même taux — la divergence +2,5 / +2,0 venait de deux implémentations parallèles,
+    pas d'un désaccord métier.
+
+    Retourne le détail complet, pas seulement le nombre : la bande retenue,
+    l'ajustement appliqué, le plancher et son déclenchement. Un taux servi sans
+    sa justification n'est pas auditable (CLAUDE.md §4.6).
+
+    Args:
+        score_global: score 0–100 du moteur.
+        taux_base: taux annuel de base de la filière, en POINTS (18 = 18 %/an).
+        regles: `BaremeScore.TAUX.parametres`, ou `None` pour la grille de secours.
+    """
+    regles = regles or GRILLE_TAUX_DEFAUT
+    score = Decimal(str(score_global or 0))
+    base = Decimal(str(taux_base or 0))
+
+    grille = regles.get("grille") or GRILLE_TAUX_DEFAUT["grille"]
+    paliers = sorted(grille, key=lambda p: Decimal(str(p.get("score_min", 0))),
+                     reverse=True)
+
+    ajustement = ZERO
+    bande = None
+    for palier in paliers:
+        seuil = Decimal(str(palier.get("score_min", 0)))
+        if score >= seuil:
+            ajustement = Decimal(str(palier.get("ajustement", 0)))
+            bande = seuil
+            break
+    if bande is None:  # grille sans palier atteignable — jamais silencieux
+        logger.warning(
+            "Grille de tarification sans palier applicable au score %s : aucun "
+            "ajustement appliqué.", score)
+
+    brut = q2(base + ajustement)
+    ratio = Decimal(str(regles.get("plancher_ratio_base",
+                                   GRILLE_TAUX_DEFAUT["plancher_ratio_base"])))
+    plancher = q2(base * ratio)
+    taux = max(brut, plancher)
+
+    return {
+        "tauxBase": float(q2(base)),
+        "bandeScoreMin": float(bande) if bande is not None else None,
+        "ajustement": float(q2(ajustement)),
+        "tauxAvantPlancher": float(brut),
+        "plancher": float(plancher),
+        "plancherApplique": taux != brut,
+        "taux": float(taux),
+        "_taux": taux,          # Decimal — le seul chiffre qui entre en base
+        "origine": "bareme" if regles is not GRILLE_TAUX_DEFAUT else "defaut",
+    }
+
+
 def choc_stress(regles: dict) -> Decimal:
     """Amplitude du choc de revenus du stress test, en fraction (0,25 = −25 %)."""
     brut = regles.get("choc_revenus", REGLES_DECISION_DEFAUT["choc_revenus"])
@@ -238,12 +385,75 @@ def choc_stress(regles: dict) -> Decimal:
     return choc
 
 
+# ── Dimension de référence du dossier (modèle « hectare » généralisé) ────────
+
+def resoudre_quantite_reference(application, referentiel) -> tuple[Decimal | None, str]:
+    """`(quantité, unité)` du dossier, dans l'unité EXIGÉE par le référentiel.
+
+    Le référentiel d'une filière donne des coûts par unité de référence : par
+    hectare pour le maïs, par ruche pour l'apiculture, par sujet pour l'élevage,
+    par m² pour la bioconversion, par sac pour la myciculture, par tonne usinée
+    pour la transformation. Le dossier doit fournir sa quantité DANS CETTE UNITÉ.
+
+    Trois cas, et un seul refus :
+      - `quantite_reference` renseignée → elle fait foi ; son unité doit être celle
+        du référentiel (unité vide = celle du référentiel, avec warning : le champ
+        n'a de sens que rapporté à la filière du dossier) ;
+      - sinon `area_ha` → l'ancienne dimension, valable UNIQUEMENT si le
+        référentiel se mesure en hectares ;
+      - dimension absente → `(None, unité)` : le critère technique le dira, il ne
+        sera pas inventé.
+
+    Lève `DimensionIncoherente` quand les deux unités diffèrent — jamais de
+    conversion implicite, il n'en existe aucune entre une ruche et un hectare.
+    """
+    unite_ref = (getattr(referentiel, "unite_reference", "") or "ha").strip().lower()
+    quantite = getattr(application, "quantite_reference", None)
+    unite_dossier = (getattr(application, "unite_reference", "") or "").strip().lower()
+
+    if quantite is not None:
+        quantite = Decimal(str(quantite))
+        if not unite_dossier:
+            logger.warning(
+                "Dossier %s : quantité de référence %s sans unité — l'unité du "
+                "référentiel « %s » (%s) est retenue.",
+                getattr(application, "code", "?"), quantite, referentiel.code, unite_ref)
+            unite_dossier = unite_ref
+        if unite_dossier != unite_ref:
+            raise DimensionIncoherente(
+                f"Le dossier est dimensionné en « {unite_dossier} » alors que le "
+                f"référentiel « {referentiel.code} » de la filière donne ses coûts "
+                f"par « {unite_ref} ». Aucune conversion n'existe entre ces deux "
+                f"unités : l'analyse est refusée plutôt que faite sur une "
+                f"multiplication qui n'a pas de sens.",
+                errors=[{"code": DimensionIncoherente.code,
+                         "message": f"Unité du dossier « {unite_dossier} » ≠ unité du "
+                                    f"référentiel « {unite_ref} »."}],
+            )
+        return quantite, unite_ref
+
+    surface = getattr(application, "area_ha", None)
+    if surface is not None and unite_ref != "ha":
+        raise DimensionIncoherente(
+            f"Le dossier ne porte qu'une superficie en hectares alors que la "
+            f"filière se mesure en « {unite_ref} » (référentiel "
+            f"« {referentiel.code} »). Renseignez « quantite_reference » dans cette "
+            f"unité : un plan de {surface} ne se compare pas à un coût par "
+            f"{unite_ref}.",
+            errors=[{"code": DimensionIncoherente.code,
+                     "message": f"Dossier en hectares, référentiel en « {unite_ref} »."}],
+        )
+    if surface is None:
+        return None, unite_ref
+    return Decimal(str(surface)), unite_ref
+
+
 # ── C1 — Fiabilité technique (25 %) ──────────────────────────────────────────
 
 def scorer_technique(totaux_modules: dict, referentiel: ReferentielFiliere,
-                     superficie: Decimal, bareme: BaremeScore,
-                     poids: Decimal) -> dict:
-    """Compare chaque module du plan au référentiel filière, à l'unité de surface.
+                     quantite: Decimal, bareme: BaremeScore,
+                     poids: Decimal, unite: str | None = None) -> dict:
+    """Compare chaque module du plan au référentiel filière, à l'unité de référence.
 
     Le score dépend de l'écart absolu MOYEN ; les écarts hors tolérance
     alimentent le canal de justification. Deux précisions par rapport à la SPEC :
@@ -251,19 +461,30 @@ def scorer_technique(totaux_modules: dict, referentiel: ReferentielFiliere,
       - un module absent du plan compte comme un écart de −100 %, pas comme une
         donnée manquante : ne rien prévoir pour la main-d'œuvre sur 5 ha est une
         information, pas un trou (CLAUDE.md §4.4, « l'absence est une donnée ») ;
-      - une superficie nulle ou absente rend la comparaison impossible ; on le dit
-        au lieu de comparer un plan à un référentiel de 0.
+      - une quantité de référence nulle ou absente rend la comparaison impossible ;
+        on le dit au lieu de comparer un plan à un référentiel de 0.
+
+    `quantite` s'exprime dans l'unité du référentiel (`unite`) : 25 ha de maïs,
+    30 ruches, 1 000 sujets, 100 m² de bioconversion, 2 000 sacs, 300 t usinées.
+    La cohérence des deux unités est établie en amont par
+    `resoudre_quantite_reference`, qui refuse plutôt que de convertir.
     """
     couts = referentiel.couts_modules or {}
-    superficie = Decimal(str(superficie or 0))
+    unite = (unite or getattr(referentiel, "unite_reference", "") or "ha").strip().lower()
+    quantite = Decimal(str(quantite or 0))
 
-    if superficie <= 0:
+    if quantite <= 0:
         return {
             "score": Decimal("0.0"), "poids": poids, "points": Decimal("0.0"),
             "details": {
-                "commentaire": ("Superficie absente du dossier : la comparaison au "
-                                "référentiel n'est pas calculable."),
+                "commentaire": (f"Dimension de référence absente du dossier : la "
+                                f"comparaison au référentiel, qui donne ses coûts par "
+                                f"« {unite} », n'est pas calculable."),
                 "referentiel": referentiel.code,
+                "quantiteReference": None,
+                "uniteReference": unite,
+                # Conservé pour le contrat front existant (`superficieHa`), et nul
+                # dès que la filière ne se mesure pas en hectares.
                 "superficieHa": None,
                 "ecartsHorsPlage": [],
             },
@@ -277,7 +498,7 @@ def scorer_technique(totaux_modules: dict, referentiel: ReferentielFiliere,
     par_module: list[dict] = []
 
     for module, cfg in couts.items():
-        ref = q2(Decimal(str(cfg.get("ref", 0))) * superficie)
+        ref = q2(Decimal(str(cfg.get("ref", 0))) * quantite)
         val = q2(totaux_modules.get(module, ZERO))
         total_plan += val
         total_ref += ref
@@ -332,8 +553,13 @@ def scorer_technique(totaux_modules: dict, referentiel: ReferentielFiliere,
             "ecartMoyenPct": float(q1(ecart_moyen * Decimal(100))),
             "referentiel": referentiel.code,
             "referentielSource": referentiel.source,
-            "superficieHa": float(superficie),
-            "uniteReference": referentiel.unite_reference,
+            # Dimension du dossier, dans l'unité du référentiel. `superficieHa`
+            # reste servi pour le contrat front existant, mais UNIQUEMENT quand la
+            # filière se mesure en hectares : le remplir avec 30 ruches ferait
+            # afficher « 30 ha » à l'écran d'un analyste.
+            "quantiteReference": float(quantite),
+            "uniteReference": unite,
+            "superficieHa": float(quantite) if unite == "ha" else None,
             "parModule": par_module,
             "modulesNonReferences": non_references,
             "ecartsHorsPlage": hors_plage,
@@ -617,18 +843,23 @@ def scorer_garanties(application, bareme: BaremeScore, poids: Decimal) -> dict:
 
 # ── Cash-flows prévisionnels ─────────────────────────────────────────────────
 
-def projeter_cash_flows(referentiel: ReferentielFiliere, superficie: Decimal,
+def projeter_cash_flows(referentiel: ReferentielFiliere, quantite: Decimal,
                         total_plan: Decimal, duree_mois: int,
-                        differe_mois: int) -> tuple[list[Decimal], dict]:
+                        differe_mois: int, unite: str | None = None,
+                        ) -> tuple[list[Decimal], dict]:
     """Cash-flows mensuels disponibles pour le service de la dette.
 
     ⚠ HYPOTHÈSE EXPLICITE — la SPEC lit ces flux dans une feuille « Tresorerie »
     du template qui n'existe pas : le classeur ingéré ne porte que les feuilles 4
     et 5. Faute de trésorerie prévisionnelle déclarée, on la PROJETTE :
 
-        revenu brut = rendement_ref.qte_unite × prix_unitaire × superficie
+        revenu brut = rendement_ref.qte_unite × prix_unitaire × quantité
         marge nette du cycle = revenu brut − coûts du plan
         disponible mensuel = marge ÷ nombre de mois d'amortissement
+
+    `qte_unite` est la production attendue PAR UNITÉ DE RÉFÉRENCE (par hectare,
+    par ruche, par sujet…) et `quantite` la dimension du dossier dans cette même
+    unité — le produit est homogène quelle que soit la filière.
 
     La marge est portée sur les mois d'AMORTISSEMENT et non sur toute la durée :
     le produit de la vente arrive après la récolte, c'est précisément la raison
@@ -641,9 +872,10 @@ def projeter_cash_flows(referentiel: ReferentielFiliere, superficie: Decimal,
     rendement = referentiel.rendement_ref or {}
     qte = Decimal(str(rendement.get("qte_unite", 0) or 0))
     prix = Decimal(str(rendement.get("prix_unitaire", 0) or 0))
-    superficie = Decimal(str(superficie or 0))
+    quantite = Decimal(str(quantite or 0))
+    unite = (unite or getattr(referentiel, "unite_reference", "") or "ha").strip().lower()
 
-    revenu_brut = q2(qte * prix * superficie)
+    revenu_brut = q2(qte * prix * quantite)
     marge = q2(revenu_brut - Decimal(str(total_plan or 0)))
     n_amort = max(duree_mois - differe_mois, 1)
 
@@ -654,7 +886,9 @@ def projeter_cash_flows(referentiel: ReferentielFiliere, superficie: Decimal,
         "rendementUnitaire": float(qte),
         "prixUnitaire": float(prix),
         "uniteRendement": rendement.get("unite", ""),
-        "superficieHa": float(superficie),
+        "quantiteReference": float(quantite),
+        "uniteReference": unite,
+        "superficieHa": float(quantite) if unite == "ha" else None,
         "revenuBrut": float(revenu_brut),
         "chargesPlan": float(q2(total_plan or 0)),
         "margeNetteCycle": float(marge),
@@ -796,6 +1030,10 @@ def executer_analyse(application, *, duree_mois: int, differe_mois: int = 0,
     baremes = charger_baremes()
     poids = poids_effectifs()
     regles = regles_decision(baremes.get("DECISION"))
+    tarifs = regles_taux(baremes.get("TAUX"))
+    # Lève `DimensionIncoherente` AVANT tout calcul : mieux vaut refuser tôt que
+    # produire un échéancier pour un dossier qu'on ne saura pas scorer.
+    quantite, unite_reference = resoudre_quantite_reference(application, referentiel)
 
     capital = Decimal(str(application.amount_approved or application.amount_requested or 0))
     if capital <= 0:
@@ -822,14 +1060,15 @@ def executer_analyse(application, *, duree_mois: int, differe_mois: int = 0,
     # ── Données scorées : DataRecord de la révision courante (principe 1) ─────
     totaux = extract_module_totals(source)
     total_plan = q2(sum(totaux.values(), ZERO))
-    superficie = application.area_ha
 
-    c1 = scorer_technique(totaux, referentiel, superficie,
-                          baremes["ECART_TECHNIQUE"], poids["technique"])
+    c1 = scorer_technique(totaux, referentiel, quantite,
+                          baremes["ECART_TECHNIQUE"], poids["technique"],
+                          unite_reference)
 
     if cash_flows is None:
         cash_flows, hypothese_cf = projeter_cash_flows(
-            referentiel, superficie, total_plan, int(duree_mois), int(differe_mois))
+            referentiel, quantite, total_plan, int(duree_mois), int(differe_mois),
+            unite_reference)
     else:
         cash_flows = [Decimal(str(cf)) for cf in cash_flows]
         hypothese_cf = {"origine": "fourni",
@@ -871,6 +1110,16 @@ def executer_analyse(application, *, duree_mois: int, differe_mois: int = 0,
     hors_plage = c1.get("hors_plage", [])
     reco = recommander(score_global, dscr, hors_plage, regles)
 
+    # ── Tarification — grille UNIQUE, figée avec l'analyse ────────────────────
+    # Le taux de base est celui de la filière, pas `taux_annuel` : ce dernier est
+    # le taux auquel l'échéancier a été construit (paramètre d'instruction), le
+    # premier est l'assiette de la grille. Les confondre ferait dériver le taux à
+    # chaque ré-analyse (18 → 20 → 22…), le taux proposé devenant sa propre base.
+    chain = application.value_chain
+    taux_base = (Decimal(str(chain.base_rate))
+                 if chain is not None and chain.base_rate else taux_annuel)
+    tarification = proposer_taux(score_global, taux_base, tarifs)
+
     analyse = AnalyseCredit.objects.create(
         application=application,
         needs_source=source,
@@ -883,6 +1132,7 @@ def executer_analyse(application, *, duree_mois: int, differe_mois: int = 0,
         criteres=_jsonifier(criteres),
         dscr=dscr, dscr_stress=c3["dscr_stress"],
         score_global=score_global, recommandation=reco,
+        taux_propose=tarification["_taux"],
         indicateurs_hors_plage=_jsonifier(hors_plage),
         echeancier=serialiser_echeancier(lignes),
         poids_appliques={k: str(v) for k, v in poids.items()},
@@ -892,6 +1142,11 @@ def executer_analyse(application, *, duree_mois: int, differe_mois: int = 0,
         baremes_appliques={
             **{c: {"id": b.pk, "version": b.version} for c, b in baremes.items()},
             "_regles": regles,
+            # Grille de tarification appliquée, figée elle aussi : sans elle, on
+            # ne saurait pas dire deux ans plus tard POURQUOI ce dossier a été
+            # tarifé à 20 % — la grille aura pu changer entre-temps.
+            "_tarification": {k: v for k, v in tarification.items()
+                              if not k.startswith("_")},
         },
         execute_par=execute_par or "",
         version_moteur=VERSION_MOTEUR,
@@ -905,6 +1160,7 @@ def executer_analyse(application, *, duree_mois: int, differe_mois: int = 0,
             "applicationCode": application.code,
             "scoreGlobal": str(score_global),
             "recommandation": reco,
+            "tauxPropose": str(tarification["_taux"]),
             "dscr": str(dscr),
             "dscrStress": str(c3["dscr_stress"]),
             "needsSourceId": source.pk,
@@ -1048,6 +1304,29 @@ def _totaux_api(lignes: list[dict]) -> dict:
     }
 
 
+def _tarification_api(analyse: AnalyseCredit) -> dict | None:
+    """Bloc de tarification d'une analyse, tel qu'il a été figé à l'exécution.
+
+    `None` pour les analyses antérieures à la grille unique : on ne recalcule pas
+    un taux a posteriori avec la grille d'aujourd'hui, ce serait réécrire ce qu'un
+    analyste a lu (principe 3). L'écran affiche « non tarifée », l'analyste
+    ré-analyse s'il veut un taux.
+    """
+    if analyse.taux_propose is None:
+        return None
+    fige = (analyse.baremes_appliques or {}).get("_tarification") or {}
+    return {
+        "tauxPropose": float(analyse.taux_propose),
+        "tauxBase": fige.get("tauxBase"),
+        "bandeScoreMin": fige.get("bandeScoreMin"),
+        "ajustement": fige.get("ajustement"),
+        "plancher": fige.get("plancher"),
+        "plancherApplique": fige.get("plancherApplique"),
+        "origineGrille": fige.get("origine"),
+        "devise": analyse.devise,
+    }
+
+
 def serialiser_analyse_staff(analyse: AnalyseCredit) -> dict:
     """Vue ANALYSTE — expose barèmes, plages et tolérances. Jamais servie au client."""
     return {
@@ -1068,6 +1347,10 @@ def serialiser_analyse_staff(analyse: AnalyseCredit) -> dict:
         "scoreLettre": score_lettre(analyse.score_global,
                                     (analyse.baremes_appliques or {}).get("_regles")),
         "recommandation": analyse.recommandation,
+        # Tarification : le taux figé à l'analyse et la bande qui l'explique.
+        # Staff UNIQUEMENT — la grille apprendrait au client qu'un point de score
+        # de plus lui fait gagner 2 points de taux (principe 7).
+        "tarification": _tarification_api(analyse),
         "dscr": float(analyse.dscr) if analyse.dscr is not None else None,
         "dscrStress": float(analyse.dscr_stress) if analyse.dscr_stress is not None else None,
         "criteres": {

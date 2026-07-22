@@ -134,6 +134,29 @@ class CreditApplication(models.Model):
 
     # Données de la demande
     area_ha = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+
+    # ── Dimension de référence du projet (modèle « hectare » généralisé) ───────
+    # Toutes les filières ne se mesurent pas en hectares : l'apiculture compte des
+    # ruches, l'élevage des sujets, la bioconversion des m², la myciculture des
+    # sacs de substrat, la transformation des tonnes usinées. Le référentiel
+    # (`ReferentielFiliere.unite_reference`) porte déjà l'unité ; le dossier doit
+    # porter la QUANTITÉ exprimée dans cette unité, sinon le moteur multiplierait
+    # un coût USD/ruche par une superficie en hectares.
+    #
+    # Principe 6 — une seule grandeur, pas un champ par unité : `quantite_reference`
+    # + `unite_reference` remplacent à terme `area_ha`, conservé tel quel pour les
+    # dossiers existants (les filières en hectares continuent de le renseigner, et
+    # `credits.analyse.resoudre_quantite_reference` retombe dessus).
+    quantite_reference = models.DecimalField(
+        max_digits=12, decimal_places=3, null=True, blank=True,
+        help_text="Quantité du projet dans l'unité du référentiel filière "
+                  "(ha, ruche, sujet, m2, sac, tonne…).",
+    )
+    unite_reference = models.CharField(
+        max_length=30, blank=True,
+        help_text="Unité de `quantite_reference` — doit être celle du référentiel "
+                  "de la filière, sinon l'analyse est refusée.",
+    )
     currency = models.CharField(max_length=3, choices=Currency.choices, default=Currency.USD)
     amount_requested = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     amount_approved = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
@@ -765,6 +788,14 @@ class AnalyseCredit(models.Model):
     dscr_stress = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
     score_global = models.DecimalField(max_digits=5, decimal_places=1)
     recommandation = models.CharField(max_length=20, choices=Recommandation.choices)
+
+    #: Taux proposé par la grille de tarification unique (`BaremeScore` « TAUX »),
+    #: figé à l'exécution comme le reste des règles appliquées : un recalibrage de
+    #: la grille ne doit pas réécrire rétroactivement le taux qu'un analyste a lu.
+    #: C'est la SEULE source du taux servi au dossier — `score_result.proposedRate`
+    #: n'en est qu'une projection (cf. `credits.scoring`).
+    taux_propose = models.DecimalField(max_digits=6, decimal_places=3,
+                                       null=True, blank=True)
 
     indicateurs_hors_plage = models.JSONField(default=list)
     #: [{indicateur, justification, agent, date}] — APPEND ONLY (cf. `save`).

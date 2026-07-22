@@ -6,15 +6,30 @@ Exigence de la mission (Volet 1) : les 14 filières sont ingérées, et chacune
 PRODUIT un référentiel LU depuis son classeur OU est refusée proprement — jamais
 complétée par une valeur inventée (principe 1).
 
-Constat de structure (documenté, pas contourné) : le loader construit un
-référentiel PAR HECTARE (il ramène les coûts à la superficie de référence). Neuf
-filières se mesurent en hectares (01–07, 11 « superficie en eau », 12) ; cinq ne
-s'y mesurent pas (08 ruches, 09 sujets, 10 m² de bioconversion, 13 sacs de
-substrat, 14 tonnes usinées). Pour ces cinq, le loader lève `ReferentielIntrouvable`
-au lieu d'inventer une superficie — comportement CORRECT que ces tests verrouillent.
-Étendre le modèle « par hectare » aux unités alternatives touche le moteur de
-scoring (`analyse.scorer_technique` multiplie `ref × superficie = area_ha`) : c'est
-un chantier moteur, signalé au coordinateur, hors de ce lot.
+RÈGLE MÉTIER CHANGÉE — modèle « hectare » généralisé (lot moteur unifié)
+-----------------------------------------------------------------------
+Ces tests verrouillaient le fait que le loader ne lisait QUE des hectares et
+REFUSAIT les cinq filières hors-sol (08 ruches, 09 sujets, 10 m² de bioconversion,
+13 sacs de substrat, 14 tonnes usinées). C'était le comportement correct tant que
+le modèle n'avait qu'une unité : inventer une superficie aurait fabriqué des
+coûts/ha faux, donc un score technique faux sur 25 % de la note.
+
+Le modèle porte désormais une unité de référence quelconque, lue dans le classeur
+lui-même. Les cinq filières refusées deviennent scorables, et 5 filières sur 14
+(36 % du référentiel institutionnel) sortent de l'angle mort. Les assertions qui
+décrivaient l'ANCIENNE règle sont donc réécrites pour décrire la NOUVELLE — pas
+supprimées, et en gagnant en exigence :
+
+  - l'ancien `test_split_lecture_conforme_au_modele_hectare` vérifiait QUELLES
+    filières sont lues ; il devient `test_chaque_filiere_produit_un_referentiel_
+    dans_son_unite`, qui vérifie en plus DANS QUELLE UNITÉ chacune est lue —
+    une filière en hectares étiquetée « ruche » (ou l'inverse) échoue ;
+  - le garde-fou anti-invention (`test_les_couts_lus_sont_derives_du_classeur_
+    pas_inventes`) est INCHANGÉ dans sa logique et s'applique maintenant aux 14
+    classeurs au lieu de 9 : chaque coût reste `total_rubrique ÷ quantité de
+    référence`, relu des `DataRecord` ;
+  - le refus reste testé (`test_refus_explicite_quand_la_dimension_est_illisible`),
+    sur le seul cas qui subsiste : un classeur sans dimension nommée.
 
 Ces tests lisent les classeurs réels du dépôt (`DOCUMENT_EXCEL_DIR/« Agricap FIN
 simulateur Par Chaine »`) : sans eux, ils sont sautés proprement.
@@ -23,6 +38,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
 import tempfile
 from decimal import Decimal
@@ -44,10 +60,25 @@ from dataio.models import KIND_SIMULATEUR, STATUS_COMMITTED, DataSource
 SIM_DIR = os.path.join(settings.DOCUMENT_EXCEL_DIR, "Agricap FIN simulateur Par Chaine")
 SIM_GLOB = os.path.join(SIM_DIR, "AGRICAP_FIN_SIM_*.xlsx")
 
-#: Numéros de filière dont la référence est une superficie en hectares : le loader
-#: DOIT les lire. Les autres (08, 09, 10, 13, 14) se mesurent en une autre unité :
-#: le loader DOIT les refuser sans inventer.
-NUMEROS_PAR_HECTARE = {"01", "02", "03", "04", "05", "06", "07", "11", "12"}
+#: Unité de référence ATTENDUE pour chaque filière, telle que son classeur la
+#: nomme en « 2_Identification_Projet ». C'est la table de vérité du modèle
+#: généralisé : le loader doit lire les 14, chacune dans SON unité.
+#:
+#:   01–07, 12 → « Superficie exploitée (ha) » / « Superficie totale … (ha) »
+#:   08        → « Nombre de ruches »
+#:   09        → « Effectif (nombre de sujets) »
+#:   10        → « Surface de bioconversion (m²) »
+#:   11        → « Superficie en eau (ha) » — pisciculture, bien en hectares
+#:   13        → « Nombre de sacs de substrat »
+#:   14        → « Volume usiné sur le cycle (t) »
+UNITE_ATTENDUE = {
+    "01": "ha", "02": "ha", "03": "ha", "04": "ha", "05": "ha", "06": "ha",
+    "07": "ha", "08": "ruche", "09": "sujet", "10": "m2", "11": "ha",
+    "12": "ha", "13": "sac", "14": "t",
+}
+
+#: Les cinq filières que l'ancien modèle refusait, et que le nouveau doit lire.
+#: Nommées explicitement : c'est le gain fonctionnel du lot, il mérite son test.
 NUMEROS_HORS_HECTARE = {"08", "09", "10", "13", "14"}
 
 
@@ -106,50 +137,103 @@ class IngestionSimulateursTests(TestCase):
             self.assertGreaterEqual(src.tables.count(), 3, f"{name} : trop peu de tables.")
 
     # ── Lecture du référentiel : lire OU refuser, jamais inventer ─────────────
-    def test_split_lecture_conforme_au_modele_hectare(self):
-        """Chaque simulateur courant est SOIT lu (filière par hectare), SOIT refusé
-        proprement (filière hors modèle hectare). Aucun cas intermédiaire — donc
-        aucune superficie inventée pour forcer une lecture."""
-        lus, refuses = set(), {}
+    def test_chaque_filiere_produit_un_referentiel_dans_son_unite(self):
+        """Les 14 filières sont lues, chacune dans l'unité que SON classeur nomme.
+
+        Remplace `test_split_lecture_conforme_au_modele_hectare`, qui verrouillait
+        l'ancienne règle (« 9 lues en hectares, 5 refusées »). L'assertion est plus
+        forte qu'avant : elle ne dit plus seulement QUELLES filières sont lisibles,
+        elle épingle l'UNITÉ de chacune. Une filière en hectares qui se mettrait à
+        sortir en « ruche » — le vrai risque d'une détection générique — échoue ici.
+        """
+        lues: dict[str, str] = {}
         for source in simulateurs_disponibles():
             num = _numero(source.original_name)
-            try:
-                spec = charger_depuis_simulateur(source)
-            except ReferentielIntrouvable as exc:
-                refuses[num] = str(exc)
-                continue
-            lus.add(num)
+            spec = charger_depuis_simulateur(source)   # ne doit plus lever
+            lues[num] = spec["unite_reference"]
             # Invariants de provenance sur ce qui EST lu.
             self.assertEqual(spec["source"], "indicatif", source.original_name)
             self.assertEqual(spec["n_cas_reels"], 0, source.original_name)
-            self.assertEqual(spec["unite_reference"], "ha", source.original_name)
             self.assertTrue(spec["couts_modules"], f"{source.original_name} sans coûts.")
             self.assertRegex(spec["value_chain_code"], r"^\d{2}$", source.original_name)
+            # La dimension lue est tracée : quantité, unité ET libellé source.
+            lignage = spec["_lignage"]
+            self.assertGreater(Decimal(lignage["quantiteReference"]), 0,
+                               source.original_name)
+            self.assertTrue(lignage["libelleDimension"], source.original_name)
 
         self.assertEqual(
-            lus, NUMEROS_PAR_HECTARE,
-            "Le jeu de filières lues par hectare a changé — vérifier qu'aucune "
-            "superficie n'est inventée et qu'aucune filière hectare n'a régressé.",
+            lues, UNITE_ATTENDUE,
+            "L'unité de référence lue ne correspond plus au classeur : une "
+            "détection générique qui se trompe d'unité fausserait tous les coûts "
+            "de la filière (ref × quantité).",
         )
-        self.assertEqual(
-            set(refuses), NUMEROS_HORS_HECTARE,
-            f"Filières refusées inattendues : {set(refuses)} vs {NUMEROS_HORS_HECTARE}.",
-        )
-        # Le refus est explicite sur la superficie manquante (message précis, pas
-        # générique) — c'est ce qui distingue « signalé » de « inventé ».
-        for num, message in refuses.items():
-            self.assertIn("uperficie", message, f"Refus non explicite pour {num} : {message}")
+
+    def test_les_cinq_filieres_hors_sol_sont_desormais_scorables(self):
+        """Le gain fonctionnel du lot, nommé : 5 filières sortent de l'angle mort.
+
+        Elles étaient refusées faute d'unité dans le modèle — 36 % du référentiel
+        institutionnel inscorable. Chacune doit maintenant produire des coûts par
+        unité STRICTEMENT positifs, sinon le référentiel existerait sans rien
+        pouvoir comparer.
+        """
+        vues = set()
+        for source in simulateurs_disponibles():
+            num = _numero(source.original_name)
+            if num not in NUMEROS_HORS_HECTARE:
+                continue
+            vues.add(num)
+            spec = charger_depuis_simulateur(source)
+            self.assertNotEqual(spec["unite_reference"], "ha", source.original_name)
+            self.assertIn(spec["unite_reference"], ("ruche", "sujet", "m2", "sac", "t"))
+            for module, cfg in spec["couts_modules"].items():
+                self.assertGreater(
+                    Decimal(cfg["ref"]), 0,
+                    f"{source.original_name}/{module} : coût unitaire nul.")
+        self.assertEqual(vues, NUMEROS_HORS_HECTARE)
+
+    def test_refus_explicite_quand_la_dimension_est_illisible(self):
+        """Le refus subsiste, mais seulement là où il est mérité.
+
+        Un classeur dont la feuille d'identification ne nomme aucune dimension
+        (ni unité entre parenthèses, ni « ruches / sujets / sacs ») n'est pas
+        complété par une valeur devinée : il est refusé, avec un message qui dit
+        quoi chercher. C'est le dernier cas de `ReferentielIntrouvable` — et il
+        doit le rester.
+        """
+        source = simulateurs_disponibles()[0]
+        table = source.tables.filter(name="2_Identification_Projet").first()
+        self.assertIsNotNone(table)
+        for rec in table.records.all():
+            valeurs = dict(rec.values)
+            if "Rubrique" in valeurs:
+                valeurs["Rubrique"] = "Ligne sans dimension nommée"
+                rec.values = valeurs
+                rec.save(update_fields=["values"])
+
+        with self.assertRaises(ReferentielIntrouvable) as ctx:
+            charger_depuis_simulateur(source)
+        message = str(ctx.exception)
+        self.assertIn("Dimension de référence", message)
+        # Le message nomme les unités attendues : l'admin sait quoi corriger.
+        self.assertIn("ruches", message)
 
     def test_les_couts_lus_sont_derives_du_classeur_pas_inventes(self):
-        """Cœur anti-invention : chaque coût/module = total_rubrique ÷ superficie,
-        relu DIRECTEMENT des DataRecord de la feuille 5 (la source que le loader lit)."""
+        """Cœur anti-invention : chaque coût/module = total_rubrique ÷ quantité de
+        référence, relu DIRECTEMENT des DataRecord de la feuille 5 (la source que le
+        loader lit).
+
+        Logique INCHANGÉE par la généralisation des unités — seul le diviseur
+        s'appelle désormais « quantité de référence » au lieu de « superficie ». La
+        couverture passe de 9 à 14 classeurs : le garde-fou s'applique maintenant
+        aussi aux filières hors-sol, qu'il ne protégeait pas puisqu'elles étaient
+        refusées.
+        """
         verifies = 0
         for source in simulateurs_disponibles():
-            try:
-                spec = charger_depuis_simulateur(source)
-            except ReferentielIntrouvable:
-                continue  # filière hors modèle hectare — testée ailleurs
-            superficie = Decimal(spec["_lignage"]["superficieReference"])
+            spec = charger_depuis_simulateur(source)
+            quantite = Decimal(spec["_lignage"]["quantiteReference"])
+            superficie = quantite
             self.assertGreater(superficie, 0, source.original_name)
 
             table = source.tables.filter(name="5_Synthese_Besoins").first()
@@ -178,8 +262,9 @@ class IngestionSimulateursTests(TestCase):
                 )
             verifies += 1
         self.assertEqual(
-            verifies, len(NUMEROS_PAR_HECTARE),
-            "Toutes les filières par hectare doivent passer le contrôle de dérivation.",
+            verifies, len(UNITE_ATTENDUE),
+            "Les 14 filières doivent passer le contrôle de dérivation — aucune ne "
+            "doit sortir du garde-fou anti-invention.",
         )
 
     def test_le_mais_ne_reproduit_pas_la_fiction_historique_des_semences(self):
@@ -198,15 +283,21 @@ class IngestionSimulateursTests(TestCase):
             "La valeur inventée 850 USD/ha de semences est réapparue.",
         )
 
-    def test_le_rapport_de_commande_signale_les_filieres_non_couvertes(self):
-        """La commande DIT quelles filières sont hors modèle hectare, sans les
-        présenter comme corrompues."""
+    def test_le_rapport_de_commande_dit_l_unite_de_chaque_filiere(self):
+        """Le rapport d'ingestion rend la dimension VISIBLE, filière par filière.
+
+        Il annonçait « N filière(s) hors modèle hectare » — un aveu de couverture
+        manquante. Il annonce désormais l'unité retenue pour chacune : c'est ce que
+        l'admin doit pouvoir vérifier d'un coup d'œil, parce qu'une unité mal lue
+        se voit dans le rapport avant de se voir dans un score.
+        """
         sortie = self._out.getvalue()
-        self.assertIn("hors modèle hectare", sortie)
-        for num in NUMEROS_HORS_HECTARE:
+        self.assertIn("par unité de référence", sortie)
+        self.assertIn("0 sans dimension de reference lisible", sortie)
+        for num, unite in UNITE_ATTENDUE.items():
             self.assertRegex(
-                sortie, rf"SIM_{num}_.*uperficie",
-                f"La filière {num} n'est pas signalée dans le rapport.",
+                sortie, rf"SIM_{num}_[^\n]*\s{re.escape(unite)}\s",
+                f"La filière {num} n'est pas rapportée avec son unité « {unite} ».",
             )
 
     # ── Idempotence ───────────────────────────────────────────────────────────

@@ -205,3 +205,60 @@ class GoldenSetImpactTest(TestCase):
         resume = preview["resume"]
         self.assertEqual(resume["nbRecommandationFlip"], 1)
         self.assertEqual(resume["deltaScoreMax"], 15.0)
+
+    def test_impact_de_la_grille_de_taux_est_chiffre_en_points_de_taux(self):
+        """Une grille de taux se prévisualise en TAUX, pas en score.
+
+        Rejouée telle quelle, une révision de grille afficherait « 0 changement »
+        si on la mesurait comme une courbe de score — le comité activerait une
+        modification de PRIX en croyant qu'elle ne change rien.
+
+        Cas chiffré : le dossier du golden set est noté 44/100, tarifé sur une base
+        de 18 % → bande [0, 55[ → +5,0 → 23,00 %. Une grille qui ramène cette
+        surcote à +3,0 le tarifie à 21,00 % : −2 points de taux.
+        """
+        analyse = self._golden_analyse()
+        analyse.taux_propose = Decimal("23.000")
+        analyse.baremes_appliques = {"_tarification": {"tauxBase": 18.0}}
+        AnalyseCredit.objects.filter(pk=analyse.pk).update(
+            taux_propose=analyse.taux_propose,
+            baremes_appliques=analyse.baremes_appliques)
+
+        bareme, _ = BaremeScore.objects.update_or_create(
+            code="TAUX",
+            defaults={"points": [], "actif": True, "parametres": {
+                "grille": [{"score_min": "55", "ajustement": "2.0"},
+                           {"score_min": "0", "ajustement": "5.0"}],
+                "plancher_ratio_base": "0.7"}},
+        )
+        nouvelle = {
+            "grille": [{"score_min": "55", "ajustement": "2.0"},
+                       {"score_min": "0", "ajustement": "3.0"}],
+            "plancher_ratio_base": "0.7",
+        }
+        preview = bs.previsualiser_impact(bareme, parametres=nouvelle)
+
+        self.assertEqual(preview["type"], "regles")
+        self.assertEqual(preview["unite"], "points de taux annuel")
+        self.assertEqual(preview["goldenSet"]["nbEvalues"], 1)
+        impact = preview["impacts"][0]
+        self.assertEqual(impact["tauxAvant"], 23.0)
+        self.assertEqual(impact["tauxApres"], 21.0)
+        self.assertEqual(impact["deltaTaux"], -2.0)
+        self.assertEqual(preview["resume"]["deltaScoreMax"], 2.0)
+
+    def test_une_grille_de_taux_invalide_est_refusee(self):
+        """Un PRIX se règle ici : une grille mal formée ne doit pas être activable."""
+        with self.assertRaises(bs.BaremeContenuInvalide):
+            bs.valider_contenu("TAUX", [], {"grille": []})
+        with self.assertRaises(bs.BaremeContenuInvalide):
+            # Aucune bande basse : un dossier faible ne serait tarifé par personne.
+            bs.valider_contenu("TAUX", [], {
+                "grille": [{"score_min": "70", "ajustement": "1.0"}]})
+        with self.assertRaises(bs.BaremeContenuInvalide):
+            # 200 points de taux : faute de frappe, pas décision de comité.
+            bs.valider_contenu("TAUX", [], {
+                "grille": [{"score_min": "0", "ajustement": "200"}]})
+        bs.valider_contenu("TAUX", [], {
+            "grille": [{"score_min": "0", "ajustement": "5.0"}],
+            "plancher_ratio_base": "0.7"})

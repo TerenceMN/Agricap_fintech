@@ -62,6 +62,36 @@
 | `AGRICAP_FIN_SIM_14_Transformation_MoulinMais.xlsx` | Transformation |
 | `AGRICAP_FIN_Simulateur_Credit_Cycle_Production_v4.xlsx` | Générique (fallback) |
 
+#### Unité de référence par filière — ✅ modèle « hectare » généralisé (juillet 2026)
+
+Le référentiel était construit **par hectare** : `referentiel_loader` cherchait une
+ligne « Superficie … (ha) » et refusait les cinq filières qui ne s'y mesurent pas.
+**5 filières sur 14 (36 % du référentiel) étaient inscorables.**
+
+L'unité est désormais lue dans le classeur (`2_Identification_Projet`), et
+`ReferentielFiliere.unite_reference` la porte. Les coûts par module sont
+`total rubrique ÷ quantité de référence`, dans cette unité.
+
+| Filières | Dimension lue | Unité |
+|---|---|---|
+| 01–07, 12 | « Superficie exploitée (ha) » | `ha` |
+| 08 Apiculture | « Nombre de ruches » (30) | `ruche` |
+| 09 Élevage | « Effectif (nombre de sujets) » (1 000) | `sujet` |
+| 10 Élevages non conv. | « Surface de bioconversion (m²) » (100) | `m2` |
+| 11 Aquaculture | « Superficie en eau (ha) » (0,4) | `ha` |
+| 13 Champignons | « Nombre de sacs de substrat » (2 000) | `sac` |
+| 14 Transformation | « Volume usiné sur le cycle (t) » (300) | `t` |
+
+Côté dossier : `CreditApplication.quantite_reference` + `unite_reference`
+(migration `credits.0012`). `area_ha` reste valable pour les filières en hectares.
+**Aucune conversion implicite** : si l'unité du dossier ne correspond pas à celle
+du référentiel, l'analyse est refusée (`DIMENSION_INCOHERENTE`, 422) plutôt que
+faite en multipliant des ruches par des hectares.
+
+⚠️ Reste à faire (hors périmètre du lot moteur) : exposer `quantite_reference` /
+`unite_reference` à la création de dossier (vues + formulaire client), sinon un
+dossier hors-sol ne peut être dimensionné que par l'API ou l'admin.
+
 ### 3.2 Tables utilisées par filière (structure commune)
 
 | Table | Contenu | Utilisation |
@@ -91,24 +121,63 @@ Le moteur cherche d'abord un simulateur dont le nom contient les mots-clés du c
 - Durée : `ValueChain.cycle_months` (ex. 9 mois pour CAFE_ARABICA)
 - DSCR : proxy depuis le simulateur le plus proche (scalé par ratio montant)
 
-### 4.2 Critères de scoring (pondérations depuis `12_Analyse_Credit`)
+### 4.2 Critères de scoring — ✅ unifiés (juillet 2026)
 
-| Critère | Poids | Calcul |
-|---------|-------|--------|
-| Fiabilité technique | 25% | Cohérence feuille de besoins vs référentiel (plage ±30% par module) |
-| Capacité financière (DSCR) | 20% | DSCR ≥ 1.8 → 100pts, ≥ 1.5 → 80pts, ≥ 1.25 → 60pts, ≥ 1.0 → 30pts |
-| Résilience au stress | 10% | DSCR × 0.75 (stress test −25%) |
-| Historique comportemental | 30% | Transactions wallet AGRICAP (défaut 50/100 si nouveau client) |
-| Garanties & domiciliation | 15% | Couverture garanties vs montant demandé |
+**Un seul moteur fait foi : [`credits/analyse.py`](backend/credits/analyse.py).**
+Le simulateur ne porte plus ni courbe, ni poids, ni grille de taux : il appelle le
+moteur. Les codes de critères sont ceux du moteur et du contrat front (principe 6).
 
-### 4.3 Taux proposé (ajustement par score)
+| Critère (code canonique) | Poids | Source de la règle |
+|---|---|---|
+| `technique` — Fiabilité technique | 25 % | `analyse.scorer_technique` + barème `ECART_TECHNIQUE` |
+| `dscr` — Capacité financière | 20 % | barème `DSCR` (courbe en base) |
+| `stress` — Résilience au stress | 10 % | barème `DSCR` sur DSCR choqué ; choc lu dans `DECISION` |
+| `comportemental` — Historique | 30 % | `analyse.scorer_comportemental` (`portfolio.Loan`) |
+| `garanties` — Garanties & domiciliation | 15 % | barème `COUVERTURE_GARANTIES` + plafond non constituées |
 
-| Score | Taux proposé |
-|-------|-------------|
-| ≥ 85 | Taux de base − 2 points |
-| ≥ 70 | Taux de base (standard) |
-| ≥ 55 | Taux de base + 2 points |
-| < 55 | Taux de base + 5 points |
+Pondération : `referentiel.InstitutionConfig` (et non plus la feuille
+`12_Analyse_Credit` du classeur — deux sources de poids donnaient deux scores).
+`points = score × poids / 100` : la somme des points affichés fait le score global.
+
+Critère non calculable ⇒ **exclu** de la pondération avec son motif (jamais noté
+50), et la note est renormalisée sur les poids restants.
+
+### 4.3 Taux proposé — grille UNIQUE, en base (`BaremeScore` code `TAUX`)
+
+Deux grilles codées en dur coexistaient : `scoring.py` appliquait **+2,5** sur la
+bande [55, 70[ là où `dataio_simulator.py` appliquait **+2,0** — le même client
+était simulé à 20,0 % puis instruit à 20,5 % sur une base de 18 %.
+
+**Arbitrage retenu : +2,0** (valeur déjà annoncée au client, grille symétrique du
+bonus de −2,0). Chiffrage sur le cas de référence (1 330 USD, 8 mois, différé 5) :
+155,19 USD d'intérêts à 20,0 % contre 159,04 à 20,5 % (**+3,85 USD**) ; sur un
+dossier de 5 000 USD / 12 mois / différé 3 : **+16,68 USD**.
+
+| Bande de score | Ajustement | Taux si base = 18 % |
+|---|---|---|
+| ≥ 85 | − 2,0 point | 16,00 % |
+| ≥ 70 | 0 | 18,00 % |
+| ≥ 55 | + 2,0 points | 20,00 % |
+| < 55 | + 5,0 points | 23,00 % |
+
+Plancher : le taux bonifié ne descend pas sous 70 % du taux de base.
+La grille est **éditable par le comité** (maker ≠ checker, impact prévisualisé en
+points de taux sur le golden set) — repasser à +2,5 ne demande aucun déploiement.
+Le taux est **figé dans `AnalyseCredit.taux_propose`** avec la grille appliquée :
+un recalibrage ne réécrit jamais le taux d'une analyse déjà lue.
+
+### 4.4 `score_result` — projection, plus une seconde vérité
+
+`credits/scoring.py` ne score plus : il projette la dernière `AnalyseCredit` dans
+la forme `score_result` attendue par `disbursement`, `workflow`, `portfolio` et
+`view_context`. **Sans analyse exécutée, il n'émet ni `score` ni `proposedRate`**
+(`analyseDisponible: false`, `unavailable.code = ANALYSE_REQUISE`) — les
+consommateurs retombent sur leurs valeurs par défaut explicites (taux de base de
+la filière au décaissement) plutôt que sur un chiffre fabriqué.
+
+⚠️ Conséquence opérationnelle : `POST /applications/<code>/score/` ne produit plus
+de score par lui-même. Le score vient de `POST /applications/<code>/reanalyser/`,
+avec ses paramètres (durée, différé, mode, taux) choisis par l'analyste.
 
 ---
 
@@ -462,9 +531,11 @@ Route `/admin/data`, `PrivateRoute roles={['admin']}`. Gère **exclusivement `da
 ## 10. Points d'Attention & Limites Actuelles
 
 ### À surveiller
-- **Filières sans simulateur dédié** (CAFE_ARABICA, HARICOT, MANIOC, RIZ) : le scoring utilise `ValueChain.module_weights` pour la fiabilité technique. Ces données doivent être correctement renseignées dans le référentiel filière.
-- **Historique comportemental** : si le client n'a pas de transactions wallet AGRICAP, le score est 50/100 (neutre). À améliorer avec les données des caisses.
-- **DSCR pour filières sans simulateur** : proxy basé sur le simulateur générique v4 → score DSCR peut être imprécis.
+- **Filières sans simulateur dédié** (CAFE_ARABICA, MANIOC, RIZ) : sans `ReferentielFiliere`, la fiabilité technique est déclarée **non calculable** et exclue de la note (avec son motif) — elle n'est plus notée à un milieu arbitraire.
+- **Historique comportemental** : sans crédit antérieur au nom du client, le score est 50/100 **neutre et annoncé comme tel** (`historiqueDisponible: false`). Ce critère pèse 30 % : c'est la principale zone d'incertitude d'un dossier de primo-emprunteur.
+- **DSCR pour filières sans simulateur** : proxy basé sur le simulateur générique v4 → score DSCR imprécis ; à défaut d'EBE de référence, le critère est non calculable en simulation.
+- **Le DSCR est calculé au taux de BASE, pas au taux proposé.** Un dossier surcoté de +5 points paie un service de la dette plus lourd que celui sur lequel il a été noté. Traiter proprement demande une passe de re-tarification (score → taux → échéancier → DSCR → score), donc une règle d'arrêt : **décision fondateur attendue**.
+- **`ScoringCriterion` est une table morte** depuis l'unification (ses 5 critères legacy ne notent plus rien). À supprimer par migration, ou à recycler pour porter en base les signaux KYC / ancienneté / risque filière que le moteur unifié n'exploite pas encore.
 
 ### Simulateurs manquants pour les filières actives
 | Filière | Simulateur dédié | Fallback utilisé |
