@@ -163,15 +163,6 @@ IDP = {
     "USERINFO_CACHE_TTL": int(os.environ.get("IDP_USERINFO_CACHE_TTL", "300")),
 }
 
-AI = {
-    "PROVIDER": os.environ.get("AI_PROVIDER", "anthropic"),
-    "API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
-    "MODEL": os.environ.get("AI_MODEL", "claude-sonnet-5"),
-    "BASE_URL": os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages"),
-    "ENABLED": os.environ.get("AI_ANALYSIS_ENABLED", "true").lower() == "true",
-    "TIMEOUT": int(os.environ.get("AI_TIMEOUT", "45")),
-}
-
 # --- CORS (SPA FINTECH) -----------------------------------------------------
 CORS_ALLOWED_ORIGINS = _env_list(
     "CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000"
@@ -191,6 +182,31 @@ SMS = {
 
 if "test" in sys.argv:
     SMS = {**SMS, "API_URL": "", "API_ID": "", "API_PASSWORD": ""}
+
+# --- Plateforme de paiement Makuta (Wolf Technologies) ----------------------
+# Authentification par signature RSA de nos requêtes ; cf. `common/makuta.py`,
+# qui documente les trois écarts relevés dans la spécification fournisseur.
+#
+# La clé privée ne vit JAMAIS dans le dépôt : on passe le PEM par variable
+# d'environnement, ou un chemin vers un fichier hors webroot. `SIGNATURE_HEADER`
+# est configurable parce que la documentation se contredit sur son nom
+# (`X-Makuta-Signature` dans le tableau normatif, `X-Signature` dans l'exemple).
+MAKUTA = {
+    "BASE_URL": os.environ.get("MAKUTA_BASE_URL", ""),
+    "PRIVATE_KEY_PEM": os.environ.get("MAKUTA_PRIVATE_KEY_PEM", ""),
+    "PRIVATE_KEY_PATH": os.environ.get("MAKUTA_PRIVATE_KEY_PATH", ""),
+    "PRIVATE_KEY_PASSPHRASE": os.environ.get("MAKUTA_PRIVATE_KEY_PASSPHRASE", ""),
+    #: Clé PUBLIQUE de Makuta, pour authentifier un éventuel rappel entrant.
+    #: Non fournie à ce jour : la documentation ne couvre que partenaire → Makuta.
+    "CALLBACK_PUBLIC_KEY_PEM": os.environ.get("MAKUTA_CALLBACK_PUBLIC_KEY_PEM", ""),
+    "SIGNATURE_HEADER": os.environ.get("MAKUTA_SIGNATURE_HEADER", "X-Makuta-Signature"),
+}
+
+if "test" in sys.argv:
+    # Même raison que pour le SMS : `.env` porte de vrais identifiants et la
+    # suite ne doit atteindre aucun réseau. Les tests de signature fabriquent
+    # leur propre paire de clés en mémoire.
+    MAKUTA = {**MAKUTA, "BASE_URL": "", "PRIVATE_KEY_PEM": "", "PRIVATE_KEY_PATH": ""}
 
 CREDIT_DELEGATION_USD: dict[str, float | None] = {
     "gest_credit":        25_000,   # Gestionnaire Crédits
