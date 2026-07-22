@@ -124,6 +124,12 @@ export interface ApplicationSummary {
   created_at: string;
 }
 
+/** Une version d'un classeur ingéré (`dataio._source_dict`).
+ *
+ *  `sha256` et `credit_application` sont servis par le backend sur TOUTES les
+ *  routes `dataio` : ils étaient absents de ce contrat, donc invisibles du
+ *  compilateur — et c'est précisément l'empreinte qui rend une révision
+ *  comparable à une autre (principe 3, comparaison des SHA-256 entre analyses). */
 export interface DataSource {
   id: number;
   original_name: string;
@@ -136,6 +142,14 @@ export interface DataSource {
   committed_at: string | null;
   supersedes: number | null;
   n_tables: number;
+  /** Empreinte du fichier déposé. Chaîne vide tant que l'inspection n'a pas eu
+   *  lieu : une source sans empreinte n'est pas rejouable, à signaler plutôt
+   *  qu'à interpréter. */
+  sha256: string;
+  /** Code du dossier de crédit rattaché (`fb__<code>`), `null` pour les sources
+   *  administratives (simulateurs, référentiels) qui n'appartiennent à aucun
+   *  dossier. */
+  credit_application: string | null;
   preview?: DataPreview;
 }
 
@@ -1214,11 +1228,41 @@ export interface CreditAnalyseCritere {
     }>;
     dscr?: number;
     dscrStress?: number;
-    /** Le §4.6 exige qu'un DSCR soit livré avec son facteur dominant, pas seul. */
+    /** Le §4.6 exige qu'un DSCR soit livré avec son facteur dominant, pas seul.
+     *  Remontés à la RACINE des détails par `analyse.py` (`diagnostic.pop`) —
+     *  tout le reste du diagnostic vit dans `diagnostic` ci-dessous. */
     facteurDominant?: string;
     levier?: string;
-    /** Courbe « différé N mois → DSCR X » : le levier chiffré, pas une phrase. */
-    alternativesDiffere?: Array<{ differeMois: number; dscr: number; serviceDette: number }>;
+    /** Diagnostic complet du critère DSCR, tel que sérialisé par le moteur.
+     *  `alternativesDiffere` était déclaré ici à la racine des détails alors que
+     *  le serveur l'imbrique : le contrat décrivait une réponse qui n'existe
+     *  pas, et seul le fait que `DscrPanel` soit en `.jsx` a masqué l'écart. */
+    diagnostic?: {
+      /** Provenance du numérateur du DSCR. `projection_referentiel` = les
+       *  cash-flows sont une hypothèse du référentiel, pas une donnée déclarée :
+       *  l'écran doit le dire (§4.6, incertitude assumée). */
+      hypotheseCashFlows?: {
+        origine: 'projection_referentiel' | 'fourni';
+        commentaire?: string;
+        revenuBrut?: number;
+        chargesPlan?: number;
+        margeNetteCycle?: number;
+        rendementUnitaire?: number;
+        uniteRendement?: string;
+        superficieHa?: number | null;
+      };
+      /** Le mois le plus tendu : un DSCR global sain peut cacher un mois à 0,2.
+       *  Objet vide quand aucune échéance n'est exigible. */
+      moisLePlusTendu?: {
+        mois?: number; dscr?: number; echeance?: number; cashFlow?: number;
+      };
+      serviceDette?: number;
+      cashFlowTotal?: number;
+      /** Courbe « différé N mois → DSCR X » : le levier chiffré, pas une phrase.
+       *  Présente seulement si le dossier porte un différé. */
+      alternativesDiffere?: Array<{ differeMois: number; dscr: number; serviceDette: number }>;
+      [k: string]: unknown;
+    };
     ratioCouverture?: number;
     constituees?: boolean;
     [k: string]: unknown;
@@ -1311,8 +1355,22 @@ export interface CreditAnalyse {
   scoreLettre: 'A' | 'B' | 'C' | 'D';
 
   /** Traçabilité : identifie la révision exacte de la feuille de besoins scorée.
-   *  Deux analyses successives sont comparables par ces trois champs (principe 3). */
-  lignage: { needsSourceId: number | null; revision: number | null; sha256: string };
+   *  Deux analyses successives sont comparables par ces trois champs (principe 3).
+   *
+   *  `datasetKey` est OPTIONNEL parce que `analyse.py::serialiser` ne l'émet pas
+   *  encore — alors que `needs_sheet.py::needs_source_lineage` l'émet, lui, sur
+   *  la même notion de lignage. Deux formes de lignage coexistent donc côté
+   *  serveur, et le front doit reconstruire `fb__<code>` pour retrouver la
+   *  lignée des révisions : la convention de nommage est dupliquée hors du
+   *  backend, ce qui viole le principe 6. Correctif attendu côté serveur
+   *  (ajouter `datasetKey` au lignage de l'analyse) ; le front le consomme dès
+   *  qu'il arrive et cesse alors de deviner (`useNeedsRevisions`). */
+  lignage: {
+    needsSourceId: number | null;
+    revision: number | null;
+    sha256: string;
+    datasetKey?: string | null;
+  };
 
   /** Poids effectivement appliqués, tels que lus en base au moment du calcul. */
   poidsAppliques: Record<string, number>;

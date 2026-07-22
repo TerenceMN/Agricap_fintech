@@ -11,18 +11,7 @@ import JustifyIndicatorDialog from './JustifyIndicatorDialog';
 import RevisionSelector from './RevisionSelector';
 
 /**
- * Onglet « Analyse » du dossier de crédit (SPEC Moteur §8b, CLAUDE.md §7.1.3).
- *
- * ⚠ **Staff uniquement.** Cet écran expose les barèmes, les tolérances par
- * module, les plages du référentiel et désormais la lignée complète des dépôts
- * de la feuille de besoins : servi à un client, il lui apprendrait à fabriquer
- * un dossier qui passe (principe 7, anti-gaming). Aucun composant de ce dossier
- * ne doit être monté dans un écran client — la vue prévue pour lui est
- * `analyse-resume`, volontairement pauvre, et sans surface à ce jour.
- *
- * L'écran ne recalcule rien : score, DSCR, points, montants de l'échéancier et
- * empreintes SHA-256 viennent du serveur et sont affichés tels quels. La devise
- * affichée est celle de l'analyse (`devise`), jamais celle d'un autre agrégat.
+
  *
  * @param {{
  *   code: string,

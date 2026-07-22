@@ -9,43 +9,26 @@ import { formatDateTimeFr, NULL_DISPLAY } from './analyseFormat';
 import { useNeedsRevisions } from './useNeedsRevisions';
 
 /**
- * Sélecteur de révision de la feuille de besoins + comparaison des SHA-256
- * (CLAUDE.md §7.1 point 3, principe 3, §4.3).
- *
- * Ce que ce panneau montre, et pourquoi :
- *  - **la trajectoire** des dépôts, tentatives refusées comprises : trois
- *    re-dépôts rapprochés ne se lisent pas dossier par dossier, ils se lisent
- *    en série (§4.3 — « la TRAJECTOIRE est le signal ») ;
- *  - **l'empreinte** de chaque dépôt, et sa comparaison avec celle de la
- *    révision sur laquelle l'analyse affichée a été exécutée. Deux empreintes
- *    identiques = même fichier bit à bit ; deux empreintes différentes = le
- *    contenu a changé. C'est une comparaison de chaînes servies par le serveur,
- *    pas un diff calculé côté client ;
- *  - **le décalage** éventuel entre la révision analysée et la révision
- *    courante : décider sur une analyse périmée est le vrai risque opérationnel.
- *
- * Ce panneau n'énonce jamais de jugement (« le client triche ») : il livre des
- * faits datés et laisse la lecture à l'analyste (§4.5).
- *
- * Écran **staff** : `GET /api/dataio/history` et `/dataio/sources/<id>/tables`
- * sont derrière `IsStaff` côté serveur ; un 403 s'affiche tel quel.
- *
+
  * @param {{
  *   code: string,
- *   lignage?: {needsSourceId?: number|null, revision?: number|null, sha256?: string|null}|null,
+ *   lignage?: {needsSourceId?: number|null, revision?: number|null, sha256?: string|null,
+ *              datasetKey?: string|null}|null,
  * }} props
  */
 const RevisionSelector = ({ code, lignage }) => {
-  const { revisions, loading, error, loaded, forbidden, reload } = useNeedsRevisions(code);
+  // `lignage.datasetKey` est prioritaire quand le serveur le sert : le front
+  // cesse alors de reconstruire `fb__<code>` de son côté (cf. `useNeedsRevisions`).
+  const { revisions, loading, error, loaded, forbidden, reload } = useNeedsRevisions(
+    code, true, lignage?.datasetKey,
+  );
   const [selectionId, setSelectionId] = useState(null);
   const [contenuOuvert, setContenuOuvert] = useState(false);
 
   const idAnalysee = lignage?.needsSourceId ?? null;
   const shaAnalysee = lignage?.sha256 ? String(lignage.sha256) : '';
 
-  // Sélection par défaut : la révision sur laquelle l'analyse a tourné — c'est
-  // celle que l'analyste lit dans le reste de l'onglet. À défaut, la courante,
-  // puis le dépôt le plus récent.
+
   useEffect(() => {
     if (!loaded || revisions.length === 0) return;
     setSelectionId((actuel) => {
@@ -240,14 +223,7 @@ function empreinteCourte(sha) {
   return `${String(sha).slice(0, 12)}…`;
 }
 
-/**
- * L'analyse affichée porte-t-elle sur la feuille courante ?
- *
- * C'est la question la plus opérationnelle du panneau : approuver sur une
- * analyse exécutée sur une version périmée du fichier, c'est décider sur des
- * chiffres que le client a déjà remplacés. Le front ne relance rien tout seul
- * (principe 2) — il le signale.
- */
+
 const AlerteDecalage = ({ analysee, courante, lignage }) => {
   const idAnalysee = lignage?.needsSourceId ?? null;
 
@@ -303,13 +279,7 @@ const AlerteDecalage = ({ analysee, courante, lignage }) => {
   );
 };
 
-/**
- * Comparaison des SHA-256 : révision sélectionnée vs révision analysée.
- *
- * Trois issues, jamais fondues en une : identiques (même fichier bit à bit),
- * différentes (le contenu a changé), indéterminable (une empreinte manque —
- * « inconnu » n'est pas « différent »).
- */
+
 const ComparaisonEmpreintes = ({ selection, analysee, idAnalysee, shaAnalysee }) => {
   const memeSource = selection.id === idAnalysee;
   const shaRef = analysee?.sha256 || shaAnalysee || '';

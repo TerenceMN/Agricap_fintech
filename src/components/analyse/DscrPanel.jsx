@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, TrendingDown, AlertTriangle } from 'lucide-react';
+import { Activity, AlertTriangle, CalendarClock, TrendingDown } from 'lucide-react';
 import { formatDscr, formatTaux, formatMontant, NULL_DISPLAY } from './analyseFormat';
 
 /**
@@ -44,6 +44,16 @@ const Stat = ({ label, value, tone = 'text-white', hint }) => (
  * répartition des phases de l'échéancier à côté du ratio, pour que l'analyste
  * fasse le lien lui-même — on n'invente jamais le diagnostic à sa place.
  *
+ * Le **mois le plus tendu** (`details.diagnostic.moisLePlusTendu`) est affiché à
+ * côté du ratio global : un DSCR annuel sain peut cacher un mois à 0,2, et c'est
+ * là que le dossier casse (SPEC §9.3). Le moteur le calcule ; ne pas le montrer
+ * revenait à laisser conclure sur une moyenne.
+ *
+ * Attention à la forme du payload : `facteurDominant` et `levier` sont remontés
+ * à la RACINE de `details` par `analyse.py` (`diagnostic.pop`), tout le reste du
+ * diagnostic reste imbriqué dans `details.diagnostic`. Lire au mauvais niveau
+ * n'échoue pas — ça affiche moins, en silence.
+ *
  * Le nombre d'échéances d'amortissement est un **comptage des lignes renvoyées
  * par le serveur**, pas un recalcul de l'échéancier.
  *
@@ -77,6 +87,13 @@ const DscrPanel = ({ analyse, currency = '' }) => {
   // réellement fournis discrédite le bandeau, et l'analyste cesse de le lire.
   const hypothese = diag && typeof diag === 'object' ? diag.hypotheseCashFlows : undefined;
   const estProjection = String(hypothese?.origine || '') === 'projection_referentiel';
+
+  // Le mois le plus tendu (`dscr_mensuel_minimum`, SPEC §9.3) : un DSCR global
+  // sain peut cacher un mois à 0,2, et c'est là que le dossier casse. Le moteur
+  // le calcule et le sert ; ne pas l'afficher revenait à laisser l'analyste
+  // conclure sur la moyenne — exactement l'angle mort que le différé creuse.
+  const pire = diag && typeof diag === 'object' ? diag.moisLePlusTendu : undefined;
+  const pireMois = pire && typeof pire === 'object' && pire.mois !== undefined ? pire : null;
 
   const lignes = Array.isArray(analyse?.echeancier) ? analyse.echeancier : [];
   const nbAmort = lignes.filter((l) => l?.phase === 'amortissement').length;
@@ -156,6 +173,49 @@ const DscrPanel = ({ analyse, currency = '' }) => {
           hint={MODE_DIFFERE_LIBELLE[params.modeDiffere] || undefined}
         />
       </div>
+
+      {pireMois && (
+        <div className="bg-slate-900/50 border border-slate-700 rounded-lg p-3">
+          <p className="text-[11px] uppercase tracking-wide text-slate-500 flex items-center gap-1.5">
+            <CalendarClock className="w-3.5 h-3.5" aria-hidden="true" />
+            Mois le plus tendu — DSCR mensuel, pas la moyenne
+          </p>
+          <dl className="mt-1.5 flex flex-wrap items-baseline gap-x-5 gap-y-1 tabular-nums">
+            <div>
+              <dt className="text-[11px] text-slate-500">Mois</dt>
+              <dd className="text-sm font-semibold text-slate-100">{pireMois.mois}</dd>
+            </div>
+            <div>
+              <dt className="text-[11px] text-slate-500">DSCR du mois</dt>
+              <dd className={`text-lg font-bold ${
+                Number(pireMois.dscr) < 1 ? 'text-red-300' : 'text-emerald-300'
+              }`}>
+                {formatDscr(pireMois.dscr)}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-[11px] text-slate-500">Cash-flow du mois</dt>
+              <dd className="text-sm text-slate-200">{formatMontant(pireMois.cashFlow, currency)}</dd>
+            </div>
+            <div>
+              <dt className="text-[11px] text-slate-500">Échéance exigible</dt>
+              <dd className="text-sm text-slate-200">{formatMontant(pireMois.echeance, currency)}</dd>
+            </div>
+          </dl>
+          {Number(pireMois.dscr) < 1 && (
+            <p className="text-xs text-red-200/90 mt-2 flex items-start gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" aria-hidden="true" />
+              <span>
+                Ce mois-là, la trésorerie attendue ne couvre pas l'échéance — même si le DSCR
+                global tient. Question à poser au client : d'où viendra la différence au mois{' '}
+                {pireMois.mois} ? À confronter au calendrier de récolte : un remboursement
+                exigible avant la vente est un défaut de calibrage du différé, pas un défaut
+                du client.
+              </span>
+            </p>
+          )}
+        </div>
+      )}
 
       {facteurDominant ? (
         <div className="bg-slate-900/50 border border-slate-700 rounded-lg p-3">
