@@ -92,6 +92,34 @@ def role_detail(request, role_id):
     current = existing_override or base
     data = request.data or {}
     permissions = data.get("permissions") or {}
+
+    # On ne modifie pas les pouvoirs de SON PROPRE rôle.
+    #
+    # La capacité `config` suffisait à s'attribuer `disburse` — le pouvoir de
+    # sortir de l'argent — et le changement prenait effet immédiatement. Vérifié :
+    # `admin_it.disburse` False → True en un PATCH, par son propre titulaire.
+    # C'est l'escalade de privilège la plus directe qui soit : celui qui garde
+    # les clés se sert lui-même.
+    #
+    # Le §7.2 exige maker ≠ checker « partout où il y a de l'argent ». Modifier
+    # une matrice de capacités, c'est décider qui touchera l'argent : la règle
+    # s'y applique. On refuse donc l'auto-modification, sans interdire la
+    # modification — un collègue porteur de `config` le fera, et le journal
+    # gardera qui a demandé quoi à qui.
+    #
+    # Les autres champs (libellé, niveau, type) restent modifiables : ils ne
+    # confèrent aucun pouvoir.
+    role_appelant = getattr(request.user, "role", "") or ""
+    if permissions and role_appelant == role_id:
+        return Response(
+            {"detail": (
+                "Vous ne pouvez pas modifier les permissions de votre propre rôle "
+                f"« {current.label} ». Un autre administrateur doit le faire — c'est "
+                "ce qui empêche quelqu'un de s'attribuer seul des pouvoirs, "
+                "notamment celui de décaisser."
+            ), "code": "AUTO_ESCALADE_INTERDITE"},
+            status=403,
+        )
     override, _ = RoleOverride.objects.update_or_create(id=role_id, defaults={
         "label": data.get("label", current.label),
         "level": int(data.get("level", current.level)),
