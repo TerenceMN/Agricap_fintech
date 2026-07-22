@@ -307,8 +307,32 @@ def portfolio_allocation(*, investor: Investor) -> dict:
     obligations_total = ObligationPosition.objects.filter(investor=investor).aggregate(
         total=Sum("invested_amount"))["total"] or Decimal("0")
     cash_total = ClientWallet.objects.filter(user=investor.user).aggregate(total=Sum("balance"))["total"] or Decimal("0")
+    positions_obligataires = ObligationPosition.objects.filter(investor=investor).count()
     return {
         "bonds": float(bonds_total + obligations_total),
+        # `bonds` additionne DEUX grandeurs qui ne se valent pas, et le total seul le
+        # cachait. À gauche, de l'argent reçu et comptabilisé (B10), rapprochable d'une
+        # pièce. À droite, des positions obligataires dont le montant est saisi libre,
+        # dont le coupon, le taux et la maturité viennent des défauts du modèle
+        # (250 / 9 % / 24 mois) et qui ne sont rattachées à aucune offre — elles
+        # n'ont jamais transité par un encaissement.
+        #
+        # Conséquence mesurable : `GET /metrics/mine` ne compte QUE les souscriptions
+        # encaissées, donc le même investisseur lit deux « investi » différents sur
+        # deux écrans — l'incident de données du principe 11. Tant que le produit
+        # obligataire n'est pas raccroché au cycle des offres, la ventilation est le
+        # minimum honnête : le total reste servi tel quel pour ne rien casser, mais
+        # sa composition est désormais lisible.
+        "bondsFromSubscriptions": float(bonds_total),
+        "bondsFromObligationPositions": float(obligations_total),
+        "obligationPositionsCount": positions_obligataires,
+        "reconciliationWarning": (
+            "Les positions obligataires sont incluses dans « bonds » mais absentes de "
+            "`metrics/mine.totalInvested`, qui ne compte que les souscriptions "
+            "encaissées : les deux écrans afficheront des montants différents pour cet "
+            "investisseur tant que ce produit n'est pas rattaché au cycle des offres."
+            if obligations_total else None
+        ),
         "cash": float(cash_total),
         # Aucun produit actions n'existe encore dans le système — trou produit assumé,
         # pas inventé silencieusement (voir le plan).

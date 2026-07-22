@@ -1807,6 +1807,40 @@ class PerformanceReportTests(AuthedAPITestCase):
         self.assertFalse(AnalystObservation.objects.filter(project=project).exists())
 
 
+class PortfolioAllocationTests(AuthedAPITestCase):
+    """L'allocation additionne deux grandeurs de nature différente — elle le dit."""
+
+    def test_composition_de_bonds_est_ventilee(self):
+        from .models import ObligationPosition
+        inv = make_investor("alloc-1")
+        funded_project("ALLOC-1", inv)                      # 8 000 encaissés
+        ObligationPosition.objects.create(investor=inv, invested_amount="1000")
+        res = services.portfolio_allocation(investor=inv)
+        self.assertEqual(res["bonds"], 9000.0)              # total inchangé
+        self.assertEqual(res["bondsFromSubscriptions"], 8000.0)
+        self.assertEqual(res["bondsFromObligationPositions"], 1000.0)
+        self.assertEqual(res["obligationPositionsCount"], 1)
+
+    def test_lecart_avec_les_metriques_est_signale_et_non_masque(self):
+        from .models import ObligationPosition
+        inv = make_investor("alloc-2")
+        funded_project("ALLOC-2", inv)
+        ObligationPosition.objects.create(investor=inv, invested_amount="1000")
+        allocation = services.portfolio_allocation(investor=inv)
+        metriques = metrics.investor_metrics(inv)
+        # Deux chiffres différents pour « investi » sur deux écrans : l'incident de
+        # données du principe 11. Il est signalé, pas lissé.
+        self.assertNotEqual(allocation["bonds"], metriques["totalInvested"])
+        self.assertIsNotNone(allocation["reconciliationWarning"])
+
+    def test_sans_position_obligataire_aucun_avertissement(self):
+        inv = make_investor("alloc-3")
+        funded_project("ALLOC-3", inv)
+        res = services.portfolio_allocation(investor=inv)
+        self.assertEqual(res["bonds"], res["bondsFromSubscriptions"])
+        self.assertIsNone(res["reconciliationWarning"])
+
+
 class InvestorActionTests(AuthedAPITestCase):
     def setUp(self):
         self.investor = make_investor("inv-action-1")
