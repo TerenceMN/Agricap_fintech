@@ -47,18 +47,21 @@ BASE_CURRENCY = "USD"
 
 #: Unité de CHAQUE taux servi par ce module — déclarée, pas devinée.
 #:
-#: Deux unités cohabitent aujourd'hui dans la même réponse : les taux CALCULÉS (XIRR,
-#: défaut, concentration, retard) sont des fractions (0,12 = 12 %), tandis que
-#: `expectedCouponRate` est la moyenne de `Offer.coupon_rate`, stocké en points de
-#: pourcentage (9,000 = 9 %). C'est une dette de nomenclature (principe 6) : deux
-#: unités pour deux taux voisins est un piège à conversion côté écran. Tant qu'elle
-#: n'est pas tranchée — l'harmoniser change des valeurs déjà consommées, donc c'est
-#: une décision, pas un refactor — la réponse PORTE l'unité de chaque champ pour que
-#: le piège soit visible plutôt que subi.
+#: **Une seule convention : la fraction** (0,09 = 9 %). Le module servait jusqu'ici
+#: deux unités dans la MÊME réponse — les taux calculés (XIRR, défaut, concentration,
+#: retard) en fraction, `expectedCouponRate` en points de pourcentage parce que
+#: `Offer.coupon_rate` est stocké ainsi (9,000). Deux conventions pour deux taux
+#: voisins dans un même payload est un piège à conversion : l'écran en convertit un et
+#: oublie l'autre, et l'erreur ne se voit que sur la copie d'écran d'un investisseur.
+#: Principe 6 — une seule nomenclature par concept : la conversion se fait ici, une
+#: fois, à la frontière de sortie, et non dans chaque consommateur.
+#:
+#: `RATE_UNITS` accompagne la réponse pour que la convention soit LISIBLE et non
+#: supposée : un consommateur n'a jamais à deviner l'unité d'un taux financier.
 RATE_UNITS = {
     "realizedReturn": "fraction",
     "weightedIrr": "fraction",
-    "expectedCouponRate": "percent",
+    "expectedCouponRate": "fraction",
     "defaultRates.byValue": "fraction",
     "defaultRates.byCount": "fraction",
     "defaultRates.alertThreshold": "fraction",
@@ -769,10 +772,12 @@ def investor_metrics(investor: Investor) -> dict:
                     late=retard["share"])
     attendu = Decimal("0")
     if encaisse:
+        # `coupon_rate_snapshot` est stocké en points de pourcentage (9,000) ; il sort
+        # en FRACTION comme tous les autres taux du payload (cf. `RATE_UNITS`).
         attendu = _q(
             sum((Decimal(s.settled_amount) * Decimal(s.coupon_rate_snapshot) for s in subs),
-                Decimal("0")) / encaisse,
-            Decimal("0.001"),
+                Decimal("0")) / encaisse / Decimal("100"),
+            Decimal("0.00001"),
         )
     paiement = _next_payment(subs)
     devise = currency_note(

@@ -1247,8 +1247,10 @@ class KpiContextTests(AuthedAPITestCase):
         # Aucune distribution : le rendement réalisé n'existe pas encore et le dit.
         self.assertIsNone(res["realizedReturn"])
         self.assertTrue(res["realizedReturnUnavailableReason"])
-        # Le taux contractuel n'est PAS un rendement : grandeur séparée.
-        self.assertEqual(res["expectedCouponRate"], 9.0)
+        # Le taux contractuel n'est PAS un rendement : grandeur séparée. Servi en
+        # FRACTION comme tous les taux du payload — 0,09 pour un coupon de 9 %.
+        self.assertEqual(res["expectedCouponRate"], 0.09)
+        self.assertEqual(res["units"]["expectedCouponRate"], "fraction")
 
     def test_devise_etrangere_est_signalee_jamais_additionnee_en_silence(self):
         p = to_p10(self.project, self.offer)
@@ -1273,8 +1275,25 @@ class KpiContextTests(AuthedAPITestCase):
     def test_chaque_taux_declare_son_unite(self):
         res = metrics.investor_metrics(self.inv)
         self.assertEqual(res["units"]["realizedReturn"], "fraction")
-        self.assertEqual(res["units"]["expectedCouponRate"], "percent")
+        self.assertEqual(res["units"]["expectedCouponRate"], "fraction")
         self.assertEqual(res["units"]["health.score"], "points_sur_100")
+
+    def test_une_seule_convention_de_taux_dans_tout_le_payload(self):
+        """Aucun taux servi en points de pourcentage : tout est fraction.
+
+        Le score de santé est la seule exception, et elle est explicite : il est en
+        points sur 100, ce qui est son unité naturelle et non un taux déguisé.
+        """
+        taux = {k: v for k, v in metrics.RATE_UNITS.items() if not k.startswith("health.")}
+        self.assertTrue(taux)
+        self.assertEqual(set(taux.values()), {"fraction"})
+        # Et la valeur suit la déclaration : coupon de 9 % → 0,09, pas 9,0.
+        res = metrics.investor_metrics(self.inv)
+        for champ in ("realizedReturn", "expectedCouponRate"):
+            valeur = res[champ]
+            if valeur is not None:
+                self.assertLess(abs(valeur), 1.0,
+                                 f"{champ} semble servi en pourcents et non en fraction.")
 
     def test_detail_par_position_seulement_cote_investisseur(self):
         res = metrics.investor_metrics(self.inv)
@@ -1481,6 +1500,32 @@ class InformationAsymmetryTests(AuthedAPITestCase):
         self.assertNotIn("OFR-DD", {o["code"] for o in res.data})
         cible = self.client.get(f"/api/investments/offers?project={self.due_diligence.code}")
         self.assertEqual(cible.data, [])
+
+    def test_aucune_offre_dun_projet_non_visible_ne_sort_dans_la_reponse(self):
+        """Balayage exhaustif : une offre par statut du cycle, pour toutes les valeurs.
+
+        Le test précédent vérifie un dossier P03 nommé ; celui-ci échoue dès qu'un
+        statut NON public réapparaît dans la réponse — y compris un statut ajouté au
+        cycle après ce lot. C'est le filet qui survit à la prochaine évolution.
+        """
+        from .views import PUBLIC_PROJECT_STATUSES
+        for i, statut in enumerate(Project.Status.values):
+            projet = Project.objects.create(code=f"SWEEP-{statut}", title=f"Balayage {statut}",
+                                             status=statut)
+            Offer.objects.create(project=projet, code=f"OFR-SWEEP-{statut}",
+                                 status=Offer.Status.OUVERT, funding_goal=Decimal("1000") * (i + 1))
+        self.login(role="invest", sub="inv-sweep")
+        res = self.client.get("/api/investments/offers")
+        self.assertEqual(res.status_code, 200)
+        rendus = {o["projectId"] for o in res.data}
+        interdits = Project.objects.exclude(status__in=PUBLIC_PROJECT_STATUSES)
+        self.assertFalse(rendus & set(interdits.values_list("pk", flat=True)),
+                          "Une offre d'un projet non visible a été servie à un investisseur.")
+        # Contrôle positif : le filtre ne rend pas la vue vide pour autant.
+        self.assertTrue(rendus)
+        for statut in ("P01", "P02", "P03", "P04", "P05"):
+            cible = self.client.get(f"/api/investments/offers?project=SWEEP-{statut}")
+            self.assertEqual(cible.data, [], f"Offre du dossier {statut} exposée par ?project=.")
 
     def test_personnel_voit_les_offres_des_dossiers_en_instruction(self):
         Offer.objects.create(project=self.due_diligence, code="OFR-DD2", funding_goal=Decimal("50000"))
