@@ -14,9 +14,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { api } from '@/services/api';
 import { buildCommitments, formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
-import { formatPercent } from '@/lib/investorSpaceWire';
-
-const TYPE_LABEL = { OBLIGATION: 'Obligation', ACTION: 'Action', PART_SOCIALE: 'Part sociale' };
+import { formatPercent, titleTypeLabel } from '@/lib/investorSpaceWire';
 
 const DetailsDialog = ({ open, onOpenChange, holding }) => (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -43,7 +41,7 @@ const DetailsDialog = ({ open, onOpenChange, holding }) => (
                 <div className="space-y-4">
                     <div className="bg-white/5 p-3 rounded-lg">
                         <Label className="text-gray-400 text-xs uppercase">Type d'instrument</Label>
-                        <p className="font-semibold">{TYPE_LABEL[holding?.typeOfTitle] || holding?.typeOfTitle || '-'}</p>
+                        <p className="font-semibold">{titleTypeLabel(holding?.typeOfTitle)}</p>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
                         <div className="bg-white/5 p-3 rounded-lg">
@@ -292,7 +290,7 @@ const Holdings = () => {
                             <div className="font-medium text-white">{h.projectName}</div>
                             <div className="text-xs text-gray-500 font-mono">{h.id}</div>
                         </TableCell>
-                        <TableCell><Badge variant="outline" className="border-white/20 text-gray-300">{TYPE_LABEL[h.typeOfTitle] || h.typeOfTitle || '-'}</Badge></TableCell>
+                        <TableCell><Badge variant="outline" className="border-white/20 text-gray-300">{titleTypeLabel(h.typeOfTitle)}</Badge></TableCell>
                         <TableCell className="text-right font-mono text-emerald-400 font-bold">{h.amount.toLocaleString()}</TableCell>
                         <TableCell className="text-right">{formatPercent(h.couponRatePercent)}</TableCell>
                         <TableCell>{formatDate(h.expectedMaturity)}</TableCell>

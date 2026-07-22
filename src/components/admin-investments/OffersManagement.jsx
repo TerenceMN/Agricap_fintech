@@ -12,8 +12,13 @@ import { Eye, Download, Plus } from 'lucide-react';
 import { useToast } from '@/components/ui/use-toast';
 import { useExport } from '@/lib/agricapHooks';
 import { api } from '@/services/api';
+import {
+  TITLE_TYPE_LABELS, UNIT_PERCENT, formatPercent, rowRateToPercent, titleTypeLabel,
+} from '@/lib/investorSpaceWire';
 
-const TYPE_LABELS = { OBLIGATION: 'Obligation', ACTION: 'Action', PART_SOCIALE: 'Part sociale' };
+// Les libellés des types de titre viennent du référentiel front unique
+// (`investorSpaceWire`), pas d'un second dictionnaire local : trois codes
+// recopiés à deux endroits finissent par diverger sur le troisième (principe 6).
 const STATUS_LABELS = { DRAFT: 'Brouillon', PREPARATION: 'Préparation', OUVERT: 'Ouvert', SUSPENDU: 'Suspendu', CLOTURE: 'Clôturé' };
 const STATUS_COLORS = {
   DRAFT: 'bg-slate-500/20 text-slate-400 border-slate-500/30',
@@ -23,7 +28,10 @@ const STATUS_COLORS = {
   CLOTURE: 'bg-slate-500/20 text-slate-500 border-slate-500/30',
 };
 
-const emptyForm = { projectCode: '', code: '', couponRate: '', maturityMonths: 24, minTicket: '', availableBonds: '', fundingGoal: '' };
+const emptyForm = {
+  projectCode: '', code: '', typeOfTitle: 'OBLIGATION', couponRate: '',
+  maturityMonths: 24, minTicket: '', availableBonds: '', fundingGoal: '',
+};
 
 const OffersManagement = ({ offers, projects, refreshData }) => {
   const { toast } = useToast();
@@ -50,6 +58,13 @@ const OffersManagement = ({ offers, projects, refreshData }) => {
       await api.investments.offers.create({
         projectCode: formData.projectCode,
         code: formData.code,
+        // Le type de titre gouverne la MÉTHODE DE VALORISATION de toutes les
+        // positions issues de cette offre : une obligation se valorise au pair
+        // avec ses intérêts courus, une action ou une part sociale par expertise
+        // datée. Le champ n'existait pas dans ce formulaire : aucune offre en
+        // titres de capital ne pouvait naître depuis l'application, et la branche
+        // « expertise » de la valorisation était inatteignable en production.
+        typeOfTitle: formData.typeOfTitle,
         couponRate: Number(formData.couponRate) || 0,
         maturityMonths: Number(formData.maturityMonths) || 0,
         minTicket: Number(formData.minTicket) || 0,
@@ -101,22 +116,29 @@ const OffersManagement = ({ offers, projects, refreshData }) => {
             </TableHeader>
             <TableBody>
               {offers.map((offer) => {
-                const percent = offer.fundingGoal > 0 ? (offer.fundedAmount / offer.fundingGoal) * 100 : 0;
+                // Largeur de barre — représentation graphique des deux montants
+                // affichés dans les colonnes voisines. Le pourcentage n'est plus
+                // écrit : aucune projection d'offre ne le sert, et un chiffre
+                // recomposé ici pourrait diverger de celui du back-office.
+                const percent = offer.fundingGoal > 0
+                  ? Math.min(100, (offer.fundedAmount / offer.fundingGoal) * 100)
+                  : 0;
                 const project = projectFor(offer);
                 return (
                   <TableRow key={offer.id} className="border-slate-800 hover:bg-slate-800/30">
                     <TableCell className="font-mono text-xs text-slate-400">{offer.code}</TableCell>
                     <TableCell className="text-white text-sm">{project ? `${project.code} — ${project.title}` : `#${offer.projectId}`}</TableCell>
-                    <TableCell className="text-slate-300 text-xs">{TYPE_LABELS[offer.typeOfTitle] || offer.typeOfTitle}</TableCell>
+                    <TableCell className="text-slate-300 text-xs">{titleTypeLabel(offer.typeOfTitle)}</TableCell>
                     <TableCell className="font-mono text-white">{offer.fundingGoal.toLocaleString()} $</TableCell>
                     <TableCell className="font-mono text-emerald-400">{offer.fundedAmount.toLocaleString()} $</TableCell>
                     <TableCell className="w-[150px]">
                       <div className="flex items-center gap-2">
                          <Progress value={percent} className="h-2" />
-                         <span className="text-xs text-slate-400">{percent.toFixed(0)}%</span>
                       </div>
                     </TableCell>
-                    <TableCell className="text-blue-400 font-bold">{offer.couponRate}%</TableCell>
+                    <TableCell className="text-blue-400 font-bold">
+                      {formatPercent(rowRateToPercent(offer, 'couponRate', offer.couponRate, UNIT_PERCENT))}
+                    </TableCell>
                     <TableCell className="text-slate-300">{offer.maturityMonths} mois</TableCell>
                     <TableCell className="text-slate-300">{offer.minTicket.toLocaleString()} $</TableCell>
                     <TableCell>{getStatusBadge(offer.status)}</TableCell>
@@ -160,6 +182,22 @@ const OffersManagement = ({ offers, projects, refreshData }) => {
                 <Input className="bg-slate-800 border-slate-700" value={formData.code} onChange={e => setFormData({...formData, code: e.target.value})} />
              </div>
              <div className="space-y-2">
+                <Label>Type de titre</Label>
+                <Select value={formData.typeOfTitle} onValueChange={v => setFormData({...formData, typeOfTitle: v})}>
+                   <SelectTrigger className="bg-slate-800 border-slate-700"><SelectValue /></SelectTrigger>
+                   <SelectContent>
+                      {Object.keys(TITLE_TYPE_LABELS).map(code => (
+                        <SelectItem key={code} value={code}>{titleTypeLabel(code)}</SelectItem>
+                      ))}
+                   </SelectContent>
+                </Select>
+                <p className="text-xs text-slate-500">
+                  Détermine la valorisation des positions : au pair avec intérêts courus pour une
+                  obligation, par expertise datée pour un titre de capital. Sans expertise valide,
+                  ces derniers restent au pair et l’écran investisseur le dit.
+                </p>
+             </div>
+             <div className="space-y-2">
                 <Label>Objectif de financement ($)</Label>
                 <Input type="number" className="bg-slate-800 border-slate-700" value={formData.fundingGoal} onChange={e => setFormData({...formData, fundingGoal: e.target.value})} />
              </div>
@@ -197,13 +235,14 @@ const OffersManagement = ({ offers, projects, refreshData }) => {
           {selectedOffer && (
             <div className="grid grid-cols-2 gap-3 text-sm">
               <span className="text-slate-500">Projet</span><span>{projectFor(selectedOffer)?.title || `#${selectedOffer.projectId}`}</span>
-              <span className="text-slate-500">Type de titre</span><span>{TYPE_LABELS[selectedOffer.typeOfTitle] || selectedOffer.typeOfTitle}</span>
+              <span className="text-slate-500">Type de titre</span><span>{titleTypeLabel(selectedOffer.typeOfTitle)}</span>
               <span className="text-slate-500">Valeur unitaire</span><span>{selectedOffer.bondUnitValue?.toLocaleString()} $</span>
               <span className="text-slate-500">Obligations min/max</span><span>{selectedOffer.minBonds} / {selectedOffer.maxBonds}</span>
               <span className="text-slate-500">Obligations disponibles</span><span>{selectedOffer.availableBonds}</span>
               <span className="text-slate-500">Objectif</span><span>{selectedOffer.fundingGoal?.toLocaleString()} $</span>
               <span className="text-slate-500">Collecté</span><span>{selectedOffer.fundedAmount?.toLocaleString()} $</span>
-              <span className="text-slate-500">Coupon</span><span>{selectedOffer.couponRate}%</span>
+              <span className="text-slate-500">Coupon</span>
+              <span>{formatPercent(rowRateToPercent(selectedOffer, 'couponRate', selectedOffer.couponRate, UNIT_PERCENT))}</span>
               <span className="text-slate-500">Échéance</span><span>{selectedOffer.maturityMonths} mois</span>
               <span className="text-slate-500">Ticket minimum</span><span>{selectedOffer.minTicket?.toLocaleString()} $</span>
               <span className="text-slate-500">Statut</span><span>{STATUS_LABELS[selectedOffer.status] || selectedOffer.status}</span>

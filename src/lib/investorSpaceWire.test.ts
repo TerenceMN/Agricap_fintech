@@ -33,6 +33,7 @@ import type {
 import {
   UNIT_FRACTION,
   UNIT_PERCENT,
+  TITLE_TYPE_LABELS,
   buildAllocationView,
   buildExposureBars,
   buildOpenOfferCards,
@@ -942,5 +943,28 @@ describe('buildAllocationView — additionner de l’encaissé et du déclaré e
     expect(buildAllocationView(null)).toEqual({
       slices: [], total: 0, reconciliationWarning: null,
     });
+  });
+});
+
+// ── Nomenclature des types de titre : une seule, et complète ─────────────────
+
+describe('TITLE_TYPE_LABELS — le référentiel qui alimente le formulaire d’offre', () => {
+  it('couvre exactement les trois codes de `Offer.TypeOfTitle`', () => {
+    // Ce dictionnaire ne fait pas que traduire : ses CLÉS peuplent le sélecteur
+    // de type de titre à la création d'une offre. Une clé de trop et le serveur
+    // refuse la création (`create_offer` valide contre les choix du modèle) ;
+    // une clé manquante et le type correspondant devient impossible à créer
+    // depuis l'application — c'est ce qui rendait la valorisation par expertise
+    // inatteignable en production.
+    expect(Object.keys(TITLE_TYPE_LABELS).sort())
+      .toEqual(['ACTION', 'OBLIGATION', 'PART_SOCIALE']);
+  });
+
+  it('distingue la dette du capital dans le libellé lui-même', () => {
+    // La nature du titre change la lecture du rendement : un coupon obligataire
+    // est contractuel, un rendement d'action ne l'est pas.
+    expect(titleTypeLabel('OBLIGATION')).toContain('Dette');
+    expect(titleTypeLabel('ACTION')).toContain('Capital');
+    expect(titleTypeLabel('PART_SOCIALE')).toContain('Capital');
   });
 });
