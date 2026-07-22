@@ -26,6 +26,9 @@ urlpatterns = [
     path("api/agencies/", include("agencies.urls")),
     path("api/caisses/", include("caisses.urls")),
     path("api/ledger/", include("ledger.urls")),
+    # Socle comptable bi-monnaie natif (devise portée par la LIGNE, annexes A/B/E) —
+    # distinct de `ledger` (SYSCOHADA, devise portée par la pièce), qui reste branché.
+    path("api/accounting/", include("accounting.urls")),
     path("api/fx/", include("fx.urls")),
     path("api/transactions/", include("transactions.urls")),
     path("api/investments/", include("investments.urls")),

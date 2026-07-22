@@ -10,11 +10,14 @@ Le rechargement ne DÉTRUIT jamais : un compte retiré des définitions est dés
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from accounting.definitions import CATALOGUE, PLAN_COMPTABLE
+from accounting.definitions import CATALOGUE, CLASSES_RISQUE, PLAN_COMPTABLE
 from accounting.models import (
+    ClasseRisque,
     CompteComptable,
     EventEntryTemplate,
     EventEntryTemplateLine,
@@ -35,6 +38,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         crees, majs = self._charger_plan_comptable()
         templates, lignes = self._charger_catalogue()
+        classes = self._charger_classes_risque()
         desactives = self._desactiver_comptes_obsoletes()
         supprimes = 0
         if options["purge_comptes_vierges"]:
@@ -44,7 +48,9 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(
                 f"Plan comptable : {crees} compte(s) créé(s), {majs} mis à jour, "
                 f"{desactives} désactivé(s), {supprimes} supprimé(s).\n"
-                f"Catalogue : {templates} schéma(s), {lignes} ligne(s) de schéma."
+                f"Catalogue : {templates} schéma(s), {lignes} ligne(s) de schéma.\n"
+                f"Classes de risque : {classes} amorcée(s) (créées uniquement si absentes — "
+                f"un taux ajusté par le comité n'est JAMAIS écrasé par un rechargement)."
             ))
 
     # ------------------------------------------------------------------ PLAN COMPTABLE
@@ -106,6 +112,30 @@ class Command(BaseCommand):
         for compte in candidats:
             compte.delete()  # la garde du modèle refuse tout compte mouvementé
             compteur += 1
+        return compteur
+
+    # ------------------------------------------------------------- CLASSES DE RISQUE
+    def _charger_classes_risque(self) -> int:
+        """`get_or_create`, PAS `update_or_create` : la grille PAR est un paramètre du
+        comité (principe 8). Une fois la première amorce posée, un rechargement du
+        référentiel ne doit surtout pas remettre les taux d'usine — ce serait une
+        modification de provision silencieuse."""
+        compteur = 0
+        for code, libelle, jmin, jmax, taux, souffrance, ordre in CLASSES_RISQUE:
+            _, cree = ClasseRisque.objects.get_or_create(
+                code=code,
+                defaults={
+                    "libelle": libelle,
+                    "jours_min": jmin,
+                    "jours_max": jmax,
+                    "taux_provision": Decimal(taux),
+                    "en_souffrance": souffrance,
+                    "ordre": ordre,
+                    "actif": True,
+                    "modifie_par": "seed_accounting",
+                },
+            )
+            compteur += int(cree)
         return compteur
 
     # ---------------------------------------------------------------------- CATALOGUE

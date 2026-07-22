@@ -24,22 +24,44 @@ from .models import (
 JOUR = date(2026, 7, 21)
 
 
+def publier_taux_fx(*, jour=None, usage="OPERATIONNEL", pivot="2800", version=1):
+    """Publie un taux GOUVERNÉ dans l'app `fx` (source de vérité unique du taux de change).
+
+    `fx` cote en achat/vente autour d'un cours pivot ; la comptabilité applique le pivot
+    `(achat + vente) / 2` — ici 2 799 / 2 801 → 2 800,000000 exactement, la valeur de
+    l'annexe E.
+    """
+    from fx.models import ExchangeRate
+
+    pivot = Decimal(pivot)
+    return ExchangeRate.objects.create(
+        tier=ExchangeRate.Tier.BCC,
+        currency=ExchangeRate.Currency.USD,
+        usage=usage,
+        buy_rate=pivot - Decimal("1"),
+        sell_rate=pivot + Decimal("1"),
+        effective_date=jour or JOUR,
+        version=version,
+        source=ExchangeRate.Source.BCC,
+        source_reference="BCC — cours indicatif du jour",
+        status=ExchangeRate.Status.ACTIF,
+        created_by="tresorier", validated_by="chef_compta",
+    )
+
+
 class SocleTestCase(TestCase):
     """Base commune : le référentiel est chargé par la commande idempotente, jamais à la main
-    dans les tests — on teste ainsi le chemin réel d'installation."""
+    dans les tests — on teste ainsi le chemin réel d'installation.
+
+    Le taux vient de `fx` et transite par `accounting.fx.taux_du_jour` : la délégation est
+    donc exercée par TOUTE la suite, pas seulement par les tests qui la ciblent.
+    """
 
     @classmethod
     def setUpTestData(cls):
         call_command("seed_accounting", verbosity=0)
-        cls.taux = TauxChange.objects.create(
-            date_taux=JOUR,
-            usage=TauxChange.Usage.OPERATIONNEL,
-            devise_base="USD", devise_contre="FC",
-            taux=Decimal("2800.000000"),
-            source=TauxChange.Source.BCC,
-            source_reference="BCC — cours indicatif du jour",
-            saisi_par="tresorier", valide_par="chef_compta",
-        )
+        cls.rate_fx = publier_taux_fx()
+        cls.taux = fx.taux_du_jour(date_taux=JOUR)
 
 
 # ---------------------------------------------------------------- PLAN COMPTABLE
@@ -362,6 +384,9 @@ class CatalogueTests(SocleTestCase):
 # ------------------------------------------------------- TAUX DE CHANGE GOUVERNÉ
 
 class TauxChangeTests(SocleTestCase):
+    """Le taux est gouverné par `fx` ; `accounting` le CONSOMME (délégation) et le projette
+    en `TauxChange` pour que chaque pièce reste auto-portante."""
+
     def test_un_seul_taux_par_jour_et_par_usage(self):
         from django.db import IntegrityError
         with self.assertRaises(IntegrityError):
@@ -371,20 +396,47 @@ class TauxChangeTests(SocleTestCase):
             )
 
     def test_usages_distincts_coexistent(self):
-        cloture = TauxChange.objects.create(
-            date_taux=JOUR, usage=TauxChange.Usage.CLOTURE,
-            devise_base="USD", devise_contre="FC", taux=Decimal("2810"),
-            source=TauxChange.Source.BCC,
-        )
+        publier_taux_fx(usage="CLOTURE", pivot="2810")
+        cloture = fx.taux_du_jour(date_taux=JOUR, usage=TauxChange.Usage.CLOTURE)
         self.assertNotEqual(cloture.pk, self.taux.pk)
-        self.assertEqual(
-            fx.taux_du_jour(date_taux=JOUR, usage=TauxChange.Usage.CLOTURE).taux,
-            Decimal("2810.000000"),
-        )
+        self.assertEqual(cloture.taux, Decimal("2810.000000"))
 
     def test_absence_de_taux_bloque_sans_retombee_sur_la_veille(self):
         with self.assertRaises(NotFoundError):
             fx.taux_du_jour(date_taux=date(2026, 7, 22))
+
+    def test_le_taux_projete_porte_lidentite_du_taux_fx(self):
+        """Sans cette trace, la projection serait un second chiffre orphelin — exactement
+        l'incident de données que la bascule vers `fx` supprime."""
+        self.assertIn(f"fx.ExchangeRate#{self.rate_fx.pk}", self.taux.source_reference)
+        self.assertEqual(self.taux.taux, Decimal("2800.000000"))
+        provenance = fx.provenance(self.taux)
+        self.assertIsNotNone(provenance["origineFx"])
+        self.assertEqual(provenance["origineFx"]["rateId"], self.rate_fx.pk)
+        self.assertFalse(provenance["origineFx"]["stale"])
+
+    def test_projection_idempotente(self):
+        self.assertEqual(fx.taux_du_jour(date_taux=JOUR).pk, self.taux.pk)
+        self.assertEqual(TauxChange.objects.filter(date_taux=JOUR).count(), 1)
+
+    def test_taux_fx_reversionne_apres_usage_est_un_conflit_signale(self):
+        """`fx` republie une version corrective d'un taux déjà appliqué à des écritures :
+        réécrire la projection changerait rétroactivement le taux de pièces validées. On
+        refuse — la correction d'une écriture passée au mauvais taux est une
+        CONTREPASSATION, pas une mise à jour de référentiel."""
+        from common.exceptions import ConflictError
+        from fx.models import ExchangeRate
+
+        self.rate_fx.status = ExchangeRate.Status.REMPLACE
+        self.rate_fx.save(update_fields=["status"])
+        publier_taux_fx(pivot="2900", version=2)
+        with self.assertRaises(ConflictError) as ctx:
+            fx.taux_du_jour(date_taux=JOUR)
+        self.assertIn("contrepassez", str(ctx.exception).lower())
+
+    def test_couple_de_devises_non_cote_par_fx_refuse(self):
+        with self.assertRaises(ValidationFailed):
+            fx.taux_du_jour(date_taux=JOUR, devise_base="FC", devise_contre="USD")
 
     def test_conversion_dans_les_deux_sens(self):
         self.assertEqual(fx.convertir(100, de="USD", vers="FC", taux=self.taux),

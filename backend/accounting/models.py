@@ -128,6 +128,12 @@ class PieceComptable(models.Model):
         max_length=16, blank=True, db_index=True,
         help_text="Code du schéma du catalogue (B1…B16). Vide = opération diverse (OD).",
     )
+    saisie_manuelle = models.BooleanField(
+        default=False,
+        help_text="OD saisie à la main : la validation exige un checker DIFFÉRENT du maker. "
+                  "Les pièces produites par le catalogue (événements métier) ne sont pas "
+                  "concernées — elles n'ont pas d'auteur humain à opposer.",
+    )
 
     # --- Traçabilité de la correction (les trois pièces liées) ------------------------
     piece_contrepassee = models.ForeignKey(
@@ -244,10 +250,26 @@ class LigneEcriture(models.Model):
 
 
 class TauxChange(models.Model):
-    """Taux de change gouverné : un taux par jour ET par usage, historisé, source tracée.
+    """PROJECTION LOCALE, EN LECTURE SEULE, d'un taux gouverné par l'app `fx`.
+
+    ⚠️ Ce modèle n'est PLUS un point de saisie. La source de vérité du taux de change est
+    `fx.ExchangeRate`, qui porte le versionnement append-only, le maker-checker au-delà du
+    seuil d'`InstitutionConfig`, la source tracée et le refus de retomber sur la veille.
+    Deux modèles pour la même grandeur violaient le principe 6 et faisaient un incident de
+    données en puissance (principe 11).
+
+    Ce qui subsiste ici, et pourquoi : `PieceComptable.taux_change` pointe sur cette table,
+    de sorte qu'une pièce reste AUTO-PORTANTE — le taux appliqué se lit sur la pièce, sans
+    dépendre d'une jointure inter-app ni d'une re-lecture d'un référentiel qui aura bougé.
+    Chaque ligne est fabriquée par `accounting.fx._projeter` depuis un taux `fx` ACTIF et
+    porte son identité dans `source_reference` (« fx.ExchangeRate#42 v2 (BCC/USD) »).
+
+    Cible : remplacer la clé étrangère par un pointeur direct vers `fx.ExchangeRate` — une
+    migration qui touche deux apps et se coordonne, cf. rapport de livraison.
 
     Convention : `taux` = nombre d'unités de `devise_contre` pour 1 unité de `devise_base`
-    (ex. base=USD, contre=FC, taux=2800 → 1 USD = 2 800 FC).
+    (ex. base=USD, contre=FC, taux=2800 → 1 USD = 2 800 FC), valeur = cours PIVOT
+    `(achat + vente) / 2` du taux `fx` d'origine.
     """
 
     class Usage(models.TextChoices):
@@ -366,3 +388,270 @@ class EventEntryTemplateLine(models.Model):
 
     def __str__(self) -> str:
         return f"{self.template_id} {self.ordre} {self.sens} {self.compte_racine}"
+
+
+# ===========================================================================
+#  MAKER-CHECKER SUR LE PLAN COMPTABLE
+# ===========================================================================
+
+class DemandeCompteComptable(models.Model):
+    """Ajout d'un compte au plan comptable — JAMAIS en un seul geste (annexe A :
+    « extension maker-checker »).
+
+    Le maker décrit le compte, un checker DIFFÉRENT l'approuve, et c'est l'approbation
+    qui crée le `CompteComptable`. Un compte refusé laisse une trace : le plan comptable
+    d'AGRICAP doit pouvoir s'expliquer compte par compte, y compris ce qu'on a refusé
+    d'y mettre.
+
+    La suppression n'existe pas dans l'autre sens : un compte mouvementé est protégé par
+    `CompteComptable.delete`, et un compte devenu inutile se désactive.
+    """
+
+    class Statut(models.TextChoices):
+        EN_ATTENTE = "EN_ATTENTE", "En attente de validation"
+        APPROUVEE = "APPROUVEE", "Approuvée"
+        REJETEE = "REJETEE", "Rejetée"
+
+    code = models.CharField(max_length=32, db_index=True)
+    racine = models.CharField(max_length=24)
+    intitule = models.CharField(max_length=200)
+    classe = models.PositiveSmallIntegerField()
+    nature = models.CharField(max_length=8, choices=Nature.choices)
+    devise = models.CharField(max_length=3, choices=Devise.choices, blank=True)
+    est_transitoire = models.BooleanField(default=False)
+    cantonnement = models.CharField(max_length=64, blank=True)
+    parent_code = models.CharField(max_length=32, blank=True)
+    justification = models.TextField()
+
+    statut = models.CharField(max_length=12, choices=Statut.choices, default=Statut.EN_ATTENTE)
+    demande_par = models.CharField(max_length=255)
+    demande_le = models.DateTimeField(auto_now_add=True)
+    decide_par = models.CharField(max_length=255, blank=True)
+    decide_le = models.DateTimeField(null=True, blank=True)
+    motif_decision = models.TextField(blank=True)
+
+    compte = models.ForeignKey(
+        CompteComptable, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="demandes",
+        help_text="Renseigné à l'approbation : le compte réellement créé.",
+    )
+
+    class Meta:
+        ordering = ["-demande_le"]
+        verbose_name = "demande d'ouverture de compte"
+        verbose_name_plural = "demandes d'ouverture de compte"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["code"], condition=Q(statut="EN_ATTENTE"),
+                name="acc_une_seule_demande_en_attente_par_code",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"Demande {self.code} ({self.statut})"
+
+    def delete(self, *args, **kwargs):
+        raise ValidationFailed(
+            "Une demande d'ouverture de compte ne se supprime pas : elle se rejette "
+            "(la trace du refus fait partie de la gouvernance du plan comptable)."
+        )
+
+
+# ===========================================================================
+#  PROVISIONNEMENT DU RISQUE DE CRÉDIT (principe 6)
+# ===========================================================================
+
+class ClasseRisque(models.Model):
+    """Grille de classification PAR — EN BASE, jamais en dur (principe 8 de MKOPO).
+
+    Les bornes sont exprimées en jours de retard de la plus ancienne échéance non
+    intégralement réglée. Elles doivent couvrir [0, ∞[ sans trou ni recouvrement :
+    `provisions.verifier_couverture` le vérifie et le test le verrouille.
+    """
+
+    code = models.CharField(max_length=16, unique=True, db_index=True)
+    libelle = models.CharField(max_length=200)
+    jours_min = models.PositiveIntegerField(
+        help_text="Borne INCLUSE, en jours de retard.",
+    )
+    jours_max = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Borne INCLUSE. NULL = classe terminale (pas de borne supérieure).",
+    )
+    taux_provision = models.DecimalField(
+        max_digits=6, decimal_places=4,
+        help_text="Fraction de l'encours à provisionner (0.2500 = 25 %).",
+    )
+    en_souffrance = models.BooleanField(
+        default=False,
+        help_text="Classe qui déclenche le déclassement automatique 413 → 416 (schéma B5).",
+    )
+    ordre = models.PositiveSmallIntegerField(default=0)
+    actif = models.BooleanField(default=True)
+    modifie_par = models.CharField(max_length=255, blank=True)
+    modifie_le = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["ordre", "jours_min"]
+        verbose_name = "classe de risque (PAR)"
+        verbose_name_plural = "classes de risque (PAR)"
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(taux_provision__gte=0) & Q(taux_provision__lte=1),
+                name="acc_classe_taux_entre_0_et_1",
+            ),
+            models.CheckConstraint(
+                condition=Q(jours_max__isnull=True) | Q(jours_max__gte=models.F("jours_min")),
+                name="acc_classe_bornes_ordonnees",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        borne = "∞" if self.jours_max is None else str(self.jours_max)
+        return f"{self.code} [{self.jours_min}–{borne} j] {self.taux_provision}"
+
+    def contient(self, jours_retard: int) -> bool:
+        if jours_retard < self.jours_min:
+            return False
+        return self.jours_max is None or jours_retard <= self.jours_max
+
+
+class ClassementCredit(models.Model):
+    """Photo, à une date d'arrêté, de la classification d'UN crédit — append-only.
+
+    C'est la pièce justificative de la provision : deux ans plus tard, un auditeur doit
+    pouvoir rejouer pourquoi tel crédit était en PAR90 le 31/12 et combien il pesait.
+    """
+
+    date_arrete = models.DateField(db_index=True)
+    loan_id = models.PositiveIntegerField(db_index=True)
+    loan_reference = models.CharField(max_length=64, db_index=True)
+    classe = models.ForeignKey(ClasseRisque, on_delete=models.PROTECT, related_name="classements")
+    jours_retard = models.PositiveIntegerField(default=0)
+    encours = models.DecimalField(max_digits=20, decimal_places=2)
+    devise = models.CharField(max_length=3, choices=Devise.choices)
+    en_souffrance = models.BooleanField(default=False)
+    piece_declassement = models.ForeignKey(
+        PieceComptable, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="declassements",
+        help_text="Pièce B5 (413 → 416) produite par CET arrêté, le cas échéant.",
+    )
+    cree_par = models.CharField(max_length=255, blank=True)
+    cree_le = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date_arrete", "loan_reference"]
+        verbose_name = "classement de crédit"
+        verbose_name_plural = "classements de crédit"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["date_arrete", "loan_id"], name="acc_un_classement_par_credit_et_arrete",
+            ),
+            models.CheckConstraint(condition=Q(encours__gte=0), name="acc_classement_encours_positif"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.date_arrete} {self.loan_reference} → {self.classe_id}"
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationFailed(
+                "Un classement est une photo datée : il ne se modifie pas, on en produit "
+                "un nouveau à l'arrêté suivant."
+            )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationFailed("Un classement de crédit ne se supprime pas (append-only).")
+
+
+class ArreteProvision(models.Model):
+    """Résultat d'une clôture de provisionnement, POUR UNE DEVISE.
+
+    Le stock cible (`provision_requise`) est comparé au solde réel de 137 en base
+    (`provision_anterieure`) : l'écart devient une dotation B6 ou une reprise B7 —
+    jamais les deux, jamais une écriture « de confort ».
+    """
+
+    date_arrete = models.DateField(db_index=True)
+    devise = models.CharField(max_length=3, choices=Devise.choices)
+    provision_requise = models.DecimalField(max_digits=20, decimal_places=2)
+    provision_anterieure = models.DecimalField(max_digits=20, decimal_places=2)
+    dotation = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
+    reprise = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
+    encours_portefeuille = models.DecimalField(
+        max_digits=20, decimal_places=2, default=Decimal("0.00"),
+        help_text="Base de calcul : encours classé, issu de `portfolio`.",
+    )
+    encours_comptable = models.DecimalField(
+        max_digits=20, decimal_places=2, default=Decimal("0.00"),
+        help_text="Solde 413 + 416 au grand livre à la même date — l'écart est un signal, "
+                  "pas une correction automatique.",
+    )
+    nombre_credits = models.PositiveIntegerField(default=0)
+    piece = models.ForeignKey(
+        PieceComptable, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="arretes_provision",
+    )
+    cree_par = models.CharField(max_length=255, blank=True)
+    cree_le = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date_arrete", "devise"]
+        verbose_name = "arrêté de provision"
+        verbose_name_plural = "arrêtés de provision"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["date_arrete", "devise"], name="acc_un_arrete_par_date_et_devise",
+            ),
+            models.CheckConstraint(
+                condition=~(Q(dotation__gt=0) & Q(reprise__gt=0)),
+                name="acc_arrete_dotation_ou_reprise",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"Arrêté {self.date_arrete} {self.devise} → {self.provision_requise}"
+
+    def save(self, *args, **kwargs):
+        if self.pk and ArreteProvision.objects.filter(pk=self.pk).exists():
+            # Seul le rattachement de la pièce est autorisé après création (même
+            # transaction) ; tout le reste est figé.
+            autorise = {"piece", "piece_id"}
+            champs = set(kwargs.get("update_fields") or [])
+            if not champs or not champs.issubset(autorise):
+                raise ValidationFailed(
+                    "Un arrêté de provision est figé : reprenez un nouvel arrêté à une "
+                    "date postérieure."
+                )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationFailed("Un arrêté de provision ne se supprime pas (append-only).")
+
+
+class LigneArreteProvision(models.Model):
+    """Détail par classe de risque d'un arrêté — c'est ce qui rend la provision explicable."""
+
+    arrete = models.ForeignKey(ArreteProvision, on_delete=models.PROTECT, related_name="lignes")
+    classe = models.ForeignKey(ClasseRisque, on_delete=models.PROTECT, related_name="lignes_arrete")
+    nombre_credits = models.PositiveIntegerField(default=0)
+    encours = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
+    taux_applique = models.DecimalField(max_digits=6, decimal_places=4)
+    provision = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
+
+    class Meta:
+        ordering = ["arrete_id", "classe__ordre"]
+        verbose_name = "ligne d'arrêté de provision"
+        verbose_name_plural = "lignes d'arrêté de provision"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["arrete", "classe"], name="acc_une_ligne_par_classe_et_arrete",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.arrete_id} {self.classe_id} {self.encours} × {self.taux_applique}"
+
+    def delete(self, *args, **kwargs):
+        raise ValidationFailed("Le détail d'un arrêté ne se supprime pas (append-only).")

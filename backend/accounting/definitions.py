@@ -68,6 +68,25 @@ PLACEHOLDER_CANTONNEMENT = "$CANTONNEMENT"
 CONDITION_GAIN = "GAIN"
 CONDITION_PERTE = "PERTE"
 
+# ------------------------------------------------- GRILLE DE CLASSIFICATION PAR
+# (code, libellé, jours_min, jours_max, taux_provision, en_souffrance, ordre)
+#
+# VALEURS PAR DÉFAUT DE SECOURS uniquement (principe 8 : « le code ne contient que des
+# mécanismes, jamais des seuils métier en dur »). Elles reprennent la gradation usuelle du
+# provisionnement IMF (instruction BCC n° 1 sur le classement des crédits) mais N'ONT PAS
+# ÉTÉ VALIDÉES par le fondateur : elles servent d'amorce au premier chargement, et se
+# modifient ensuite en base (`ClasseRisque`, endpoint `provisions/classes`) sans
+# redéploiement. Le rapport de livraison signale explicitement ce point d'arbitrage.
+#
+# Les bornes doivent couvrir [0, ∞[ sans trou ni recouvrement (contrôlé par
+# `provisions.verifier_couverture`, verrouillé par un test).
+CLASSES_RISQUE: list[tuple[str, str, int, int | None, str, bool, int]] = [
+    ("SAIN",    "Crédits sains (retard < 30 j)",              0,   29,   "0.0100", False, 1),
+    ("PAR30",   "Portefeuille à risque 30 j (30–89 j)",       30,  89,   "0.2500", False, 2),
+    ("PAR90",   "Portefeuille à risque 90 j (90–179 j)",      90,  179,  "0.5000", True,  3),
+    ("DOUTEUX", "Créances douteuses (≥ 180 j)",               180, None, "1.0000", True,  4),
+]
+
 # --------------------------------------------------------------------------- ANNEXE B
 # code → {libelle, journal, description, lignes: [(ordre, sens, compte_racine,
 #                                                   devise_regle, montant_ref, condition)]}

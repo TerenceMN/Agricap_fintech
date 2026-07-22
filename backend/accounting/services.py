@@ -14,6 +14,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import date as date_cls
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from common.exceptions import NotFoundError, ValidationFailed
@@ -182,12 +183,27 @@ def enregistrer_piece(
     piece_contrepassee: PieceComptable | None = None,
     piece_rectifiee: PieceComptable | None = None,
     motif: str = "",
+    saisie_manuelle: bool = False,
 ) -> PieceComptable:
     """Crée UNE pièce et ses n lignes, de façon indivisible.
 
     L'équilibre par devise est vérifié AVANT toute persistance ; l'ensemble est dans un
     `transaction.atomic`, donc toute erreur annule la pièce entière.
+
+    `saisie_manuelle=True` marque une OD : elle naît OBLIGATOIREMENT en brouillon et sa
+    validation exigera un checker distinct du maker.
     """
+    if saisie_manuelle:
+        if valider:
+            raise ValidationFailed(
+                "Une OD ne s'auto-valide pas : elle naît en brouillon et un checker "
+                "distinct du maker la valide (services.valider_piece)."
+            )
+        if not par:
+            raise ValidationFailed(
+                "Une OD sans auteur identifié est ingérable : le maker doit être connu "
+                "pour qu'un checker puisse lui être opposé."
+            )
     normalisees = _normaliser_lignes(lignes)
     totaux = verifier_equilibre(normalisees)
 
@@ -214,6 +230,7 @@ def enregistrer_piece(
         piece_contrepassee=piece_contrepassee,
         piece_rectifiee=piece_rectifiee,
         motif=motif,
+        saisie_manuelle=saisie_manuelle,
         statut=PieceComptable.Statut.BROUILLON,
     )
     LigneEcriture.objects.bulk_create([
@@ -238,9 +255,26 @@ def enregistrer_piece(
 
 @transaction.atomic
 def valider_piece(piece: PieceComptable, *, par: str = "") -> PieceComptable:
-    """`BROUILLON → VALIDEE`. Re-vérifie l'équilibre sur les lignes RÉELLEMENT en base."""
+    """`BROUILLON → VALIDEE`. Re-vérifie l'équilibre sur les lignes RÉELLEMENT en base.
+
+    Sur une OD (`saisie_manuelle`), le checker doit être DIFFÉRENT du maker : c'est le
+    seul contrôle qui empêche une écriture manuelle d'entrer au grand livre par la seule
+    volonté de son auteur.
+    """
     if piece.statut == PieceComptable.Statut.VALIDEE:
         raise ValidationFailed(f"La pièce {piece.reference} est déjà validée.")
+
+    if piece.saisie_manuelle:
+        if not par:
+            raise ValidationFailed(
+                "Validation anonyme refusée : une OD se valide sous une identité "
+                "opposable au maker."
+            )
+        if par == piece.cree_par:
+            raise ValidationFailed(
+                f"Maker ≠ checker : « {par} » a saisi la pièce {piece.reference}, "
+                "il ne peut pas la valider lui-même."
+            )
 
     lignes = [
         {"devise": l.devise, "debit": l.debit, "credit": l.credit}
@@ -372,6 +406,158 @@ def balance_par_devise(*, devise: str, as_of: date_cls | None = None) -> list[di
         row["solde"] = q2(row["debit"] - row["credit"])
         rows.append(row)
     return rows
+
+
+def grand_livre(
+    *,
+    reference_compte: str,
+    devise: str,
+    debut: date_cls | None = None,
+    fin: date_cls | None = None,
+) -> dict:
+    """Grand livre d'un compte dans UNE devise, avec report à nouveau et solde progressif.
+
+    Le « report » n'est pas décoratif : sans lui, un extrait de période ne se rapproche
+    d'aucun solde et n'a aucune valeur probante.
+    """
+    if devise not in Devise.values:
+        raise ValidationFailed(f"Devise « {devise} » inconnue.")
+    codes = [f"{reference_compte}{devise}", reference_compte]
+    compte = CompteComptable.objects.filter(code__in=codes).order_by("-code").first()
+    if compte is None:
+        raise NotFoundError(f"Compte « {reference_compte} » introuvable en {devise}.")
+
+    report = Decimal("0.00")
+    if debut:
+        for ligne in _lignes_validees().filter(
+            compte=compte, devise=devise, piece__date_operation__lt=debut
+        ):
+            report += ligne.debit - ligne.credit
+    report = q2(report)
+
+    qs = _lignes_validees(as_of=fin).filter(compte=compte, devise=devise)
+    if debut:
+        qs = qs.filter(piece__date_operation__gte=debut)
+    qs = qs.order_by("piece__date_operation", "piece_id", "ordre", "id")
+
+    solde = report
+    mouvements = []
+    total_debit = total_credit = Decimal("0.00")
+    for ligne in qs:
+        solde += ligne.debit - ligne.credit
+        total_debit += ligne.debit
+        total_credit += ligne.credit
+        mouvements.append({
+            "date": ligne.piece.date_operation,
+            "reference": ligne.piece.reference,
+            "journal": ligne.piece.journal,
+            "evenement": ligne.piece.evenement,
+            "libelle": ligne.libelle or ligne.piece.libelle,
+            "debit": ligne.debit,
+            "credit": ligne.credit,
+            "solde": q2(solde),
+        })
+    return {
+        "compte": {"code": compte.code, "intitule": compte.intitule,
+                   "nature": compte.nature, "racine": compte.racine},
+        "devise": devise,
+        "debut": debut,
+        "fin": fin,
+        "report": report,
+        "mouvements": mouvements,
+        "total_rows": len(mouvements),
+        "total_debit": q2(total_debit),
+        "total_credit": q2(total_credit),
+        "solde": q2(solde),
+    }
+
+
+def journaux_auxiliaires(
+    *, debut: date_cls | None = None, fin: date_cls | None = None,
+) -> list[dict]:
+    """Un journal auxiliaire par code, avec ses totaux PAR DEVISE.
+
+    Invariant vérifiable : Σ des journaux auxiliaires = grand livre (test dédié).
+    """
+    from .models import Journal
+
+    totaux: dict[str, dict] = {
+        code: {
+            "journal": code,
+            "libelle": libelle,
+            "nombre_pieces": 0,
+            "devises": {},
+        }
+        for code, libelle in Journal.choices
+    }
+    qs = _lignes_validees(as_of=fin)
+    if debut:
+        qs = qs.filter(piece__date_operation__gte=debut)
+
+    pieces_vues: dict[str, set] = {}
+    for ligne in qs:
+        journal = ligne.piece.journal
+        bucket = totaux.setdefault(
+            journal, {"journal": journal, "libelle": journal, "nombre_pieces": 0, "devises": {}},
+        )
+        pieces_vues.setdefault(journal, set()).add(ligne.piece_id)
+        devise = bucket["devises"].setdefault(
+            ligne.devise, {"devise": ligne.devise,
+                           "debit": Decimal("0.00"), "credit": Decimal("0.00")},
+        )
+        devise["debit"] += ligne.debit
+        devise["credit"] += ligne.credit
+
+    resultat = []
+    for code, bucket in totaux.items():
+        bucket["nombre_pieces"] = len(pieces_vues.get(code, ()))
+        bucket["devises"] = [
+            {**d, "debit": q2(d["debit"]), "credit": q2(d["credit"]),
+             "equilibre": q2(d["debit"]) == q2(d["credit"])}
+            for d in sorted(bucket["devises"].values(), key=lambda d: d["devise"])
+        ]
+        resultat.append(bucket)
+    return sorted(resultat, key=lambda b: b["journal"])
+
+
+def rechercher_pieces(
+    *,
+    debut: date_cls | None = None,
+    fin: date_cls | None = None,
+    journal: str = "",
+    statut: str = "",
+    evenement: str = "",
+    reference: str = "",
+    compte: str = "",
+    devise: str = "",
+    origine_type: str = "",
+    origine_id: str = "",
+):
+    """Requête filtrée sur les pièces. Retourne un queryset (la vue pagine et compte)."""
+    qs = PieceComptable.objects.all()
+    if debut:
+        qs = qs.filter(date_operation__gte=debut)
+    if fin:
+        qs = qs.filter(date_operation__lte=fin)
+    if journal:
+        qs = qs.filter(journal=journal)
+    if statut:
+        qs = qs.filter(statut=statut)
+    if evenement:
+        qs = qs.filter(evenement__icontains=evenement)
+    if reference:
+        qs = qs.filter(reference__icontains=reference)
+    if compte:
+        # « 413 » (racine) ou « 413USD » (code exact) doivent tous deux fonctionner :
+        # l'utilisateur qui cherche « 413 » veut les deux devises.
+        qs = qs.filter(Q(lignes__compte__code=compte) | Q(lignes__compte__racine=compte))
+    if devise:
+        qs = qs.filter(lignes__devise=devise)
+    if origine_type:
+        qs = qs.filter(origine_type=origine_type)
+    if origine_id:
+        qs = qs.filter(origine_id=origine_id)
+    return qs.distinct()
 
 
 def controler_integrite(*, as_of: date_cls | None = None) -> list[dict]:

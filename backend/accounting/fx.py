@@ -1,8 +1,31 @@
-"""Mécanisme 588FX et gouvernance du taux de change (annexe E, principes 4 et 5).
+"""Mécanisme 588FX et rattachement au taux de change gouverné (annexe E, principes 4 et 5).
 
 « La dollarisation se trace, ne se subit pas. » Toute opération mixte FC↔USD transite par le
 transitoire 588FX en deux jambes, et l'écart se constate explicitement en 712FX (gain) ou
 613FX (perte) — jamais noyé dans un compte de résultat générique.
+
+Source de vérité du taux : l'app `fx`
+-------------------------------------
+`accounting` ne gouverne PLUS le taux de change. `fx.ExchangeRate` porte ce que
+`accounting.TauxChange` n'a jamais porté : versionnement append-only (une correction publie
+une version, elle n'écrase pas un taux probant), maker-checker déclenché au-delà d'un écart
+lu dans `InstitutionConfig`, source tracée, et refus explicite de retomber en silence sur la
+veille. Deux modèles pour la même grandeur, c'était une violation du principe 6 et un
+incident de données en puissance (principe 11) : deux écrans auraient affiché deux taux de
+clôture pour la même date.
+
+`accounting.TauxChange` survit en **projection locale, en lecture seule** : c'est la ligne
+que `PieceComptable.taux_change` référence, pour qu'une pièce reste auto-portante (le taux
+appliqué est lisible sur la pièce, sans jointure inter-app). Elle n'est plus alimentée par
+aucune saisie humaine — seul `_projeter` la fabrique, à partir d'un taux `fx` ACTIF, et elle
+porte l'identité de ce taux dans `source_reference`. Cible à terme : remplacer la clé
+étrangère par un pointeur direct vers `fx.ExchangeRate` (migration à coordonner, cf. rapport).
+
+Le cours retenu par la comptabilité est le **cours pivot** `(achat + vente) / 2` de `fx`,
+et non l'une des deux jambes : les livres se tiennent à un cours de référence unique ; l'écart
+entre ce cours et le prix réellement pratiqué au guichet EST le gain ou la perte de change,
+et il doit apparaître en 712FX/613FX — c'est précisément le mécanisme de l'annexe E, pas
+quelque chose à dissoudre dans le choix d'une jambe.
 
 Contrôle de dénouement
 ----------------------
@@ -17,12 +40,12 @@ la formulation de l'annexe mérite d'être corrigée.)
 from __future__ import annotations
 
 from datetime import date as date_cls, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.db import transaction
 from django.utils import timezone
 
-from common.exceptions import NotFoundError, ValidationFailed
+from common.exceptions import ConflictError, ValidationFailed
 
 from . import catalogue, services
 from .definitions import CONDITION_GAIN, CONDITION_PERTE, RACINE_TRANSITOIRE_FX
@@ -30,8 +53,59 @@ from .models import Devise, PieceComptable, TauxChange
 
 DEVISE_PIVOT = Devise.FC
 
+#: `fx` nomme le franc congolais « CDF » (pivot implicite), l'annexe A le nomme « FC ».
+DEVISE_FX = {Devise.FC: "CDF", Devise.USD: "USD"}
+
+#: Correspondance des nomenclatures de source (principe 6 : une seule nomenclature, mais
+#: deux tables historiques à réconcilier le temps de la bascule).
+SOURCE_FX_VERS_COMPTA = {
+    "BCC": TauxChange.Source.BCC,
+    "MANUELLE": TauxChange.Source.INTERNE,
+    "AGREGATEUR": TauxChange.Source.MARCHE,
+}
+
+#: Précision de stockage du taux projeté (`TauxChange.taux` : 6 décimales).
+PRECISION_TAUX = Decimal("0.000001")
+
 
 # --------------------------------------------------------------- GOUVERNANCE DU TAUX
+
+def _projeter(rate) -> TauxChange:
+    """Projette un `fx.ExchangeRate` ACTIF en ligne `accounting.TauxChange`.
+
+    Idempotent, et **jamais destructif** : si une projection existe déjà pour cette date et
+    cet usage avec une AUTRE valeur, c'est que `fx` a re-versionné un taux déjà utilisé par
+    des écritures. On refuse — bruyamment. Réécrire la projection changerait rétroactivement
+    le taux de pièces déjà validées ; la correction d'une écriture passée au mauvais taux
+    est une CONTREPASSATION, pas une mise à jour de référentiel.
+    """
+    valeur = Decimal(rate.mid_rate).quantize(PRECISION_TAUX, rounding=ROUND_HALF_UP)
+    identite = f"fx.ExchangeRate#{rate.pk} v{rate.version} ({rate.tier}/{rate.currency})"
+    projection = TauxChange.objects.filter(
+        date_taux=rate.effective_date, usage=rate.usage,
+        devise_base=Devise.USD, devise_contre=Devise.FC,
+    ).first()
+    if projection is not None:
+        if projection.taux != valeur:
+            raise ConflictError(
+                f"Le taux {rate.usage} du {rate.effective_date} vaut {valeur} dans `fx` "
+                f"({identite}) mais {projection.taux} dans la projection comptable déjà "
+                "utilisée par des écritures. Un taux appliqué ne se réécrit pas : "
+                "contrepassez les pièces concernées, puis republiez-les au taux corrigé."
+            )
+        return projection
+    return TauxChange.objects.create(
+        date_taux=rate.effective_date,
+        usage=rate.usage,
+        devise_base=Devise.USD,
+        devise_contre=Devise.FC,
+        taux=valeur,
+        source=SOURCE_FX_VERS_COMPTA.get(rate.source, TauxChange.Source.INTERNE),
+        source_reference=" — ".join(filter(None, [identite, rate.source_reference])),
+        saisi_par=rate.created_by,
+        valide_par=rate.validated_by,
+    )
+
 
 def taux_du_jour(
     *,
@@ -40,19 +114,57 @@ def taux_du_jour(
     devise_base: str = Devise.USD,
     devise_contre: str = Devise.FC,
 ) -> TauxChange:
-    """Un taux par jour ET par usage. Aucune retombée silencieuse sur la veille : si le taux
-    du jour n'est pas saisi, l'opération est refusée (le taux est une donnée gouvernée, pas
-    une valeur par défaut)."""
-    taux = TauxChange.objects.filter(
-        date_taux=date_taux, usage=usage,
-        devise_base=devise_base, devise_contre=devise_contre,
-    ).first()
-    if taux is None:
-        raise NotFoundError(
-            f"Aucun taux {usage} {devise_base}/{devise_contre} saisi pour le {date_taux}. "
-            "Saisissez et validez le taux du jour avant toute opération de change."
+    """Taux applicable à une date et à un usage — DÉLÉGUÉ à `fx.services.taux_du_jour`.
+
+    Sémantique inchangée et volontairement stricte : aucune retombée sur la veille. `fx`
+    applique la même règle (et signale en plus qu'un taux existe mais reste EN ATTENTE de
+    son second acteur — un message qu'`accounting` ne savait pas produire).
+    """
+    from fx.services import taux_du_jour as taux_fx
+
+    if devise_contre != Devise.FC or devise_base != Devise.USD:
+        raise ValidationFailed(
+            f"`fx` cote les devises étrangères CONTRE le CDF (pivot implicite) : le couple "
+            f"{devise_base}/{devise_contre} n'y est pas représentable."
         )
-    return taux
+    rate = taux_fx(date_taux=date_taux, usage=usage, currency=DEVISE_FX[devise_base])
+    return _projeter(rate)
+
+
+def taux_de_cloture(*, date_arrete: date_cls) -> TauxChange:
+    """Taux de CLÔTURE d'une date — celui que tout état consolidé doit référencer."""
+    return taux_du_jour(date_taux=date_arrete, usage=TauxChange.Usage.CLOTURE)
+
+
+def provenance(taux: TauxChange) -> dict:
+    """Provenance journalisable du taux appliqué (principe 4 : « toute conversion journalise
+    le taux utilisé et sa date »). Remonte jusqu'au taux `fx` d'origine quand la projection
+    en porte l'identité."""
+    origine = None
+    reference = taux.source_reference or ""
+    if reference.startswith("fx.ExchangeRate#"):
+        try:
+            identifiant = int(reference.split("#", 1)[1].split(" ", 1)[0])
+        except (IndexError, ValueError):  # pragma: no cover - référence malformée
+            identifiant = None
+        if identifiant is not None:
+            from fx.models import ExchangeRate
+            from fx.services import rate_provenance
+
+            rate = ExchangeRate.objects.filter(pk=identifiant).first()
+            if rate is not None:
+                origine = rate_provenance(rate, asked_for=taux.date_taux)
+    return {
+        "tauxId": taux.pk,
+        "dateTaux": taux.date_taux.isoformat(),
+        "usage": taux.usage,
+        "deviseBase": taux.devise_base,
+        "deviseContre": taux.devise_contre,
+        "taux": str(taux.taux),
+        "source": taux.source,
+        "sourceReference": taux.source_reference,
+        "origineFx": origine,
+    }
 
 
 def convertir(montant, *, de: str, vers: str, taux: TauxChange) -> Decimal:
