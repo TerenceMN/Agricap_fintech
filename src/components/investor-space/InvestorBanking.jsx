@@ -4,16 +4,11 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
-} from '@/components/ui/dialog';
-import { useToast } from '@/components/ui/use-toast';
 import { ArrowRightLeft, Plus, History } from 'lucide-react';
 import { api } from '@/services/api';
 import { formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
 import { describeHistoryCoverage, movementTypeLabel } from '@/lib/investorSpaceWire';
+import WalletDepositDialog from '@/components/treasury/WalletDepositDialog';
 
 /**
  * Trésorerie de l'investisseur et historique RÉEL de ses mouvements.
@@ -27,17 +22,21 @@ import { describeHistoryCoverage, movementTypeLabel } from '@/lib/investorSpaceW
  *
  * Aucun cumul, aucune moyenne : les montants affichés sont ceux du serveur,
  * ligne par ligne.
+ *
+ * LE DÉPÔT N'EST PLUS ÉCRIT ICI. Cet écran en portait une copie appauvrie du
+ * formulaire de « Ma Trésorerie » : montant seul, aucune étape de confirmation,
+ * et surtout la devise passée en dur (`'USD'`) à `wallets.deposit`. Un
+ * investisseur qui déposait des francs voyait donc son versement enregistré en
+ * dollars — un écart de montant, pas un détail d'affichage. Le formulaire
+ * partagé rend ce défaut impossible : la devise y est saisie puis reconfirmée.
  */
 const InvestorBanking = ({ movements, onRefresh }) => {
-  const { toast } = useToast();
   const navigate = useNavigate();
   const [wallets, setWallets] = useState([]);
   const [walletMovements, setWalletMovements] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isDepositOpen, setDepositOpen] = useState(false);
-  const [depositAmount, setDepositAmount] = useState('');
-  const [depositing, setDepositing] = useState(false);
 
   const loadWallets = async () => {
     setLoading(true);
@@ -62,26 +61,9 @@ const InvestorBanking = ({ movements, onRefresh }) => {
   const cdfWallet = wallets.find((w) => w.currency === 'CDF');
   const coverage = describeHistoryCoverage(movements);
 
-  const handleDeposit = async () => {
-    const amount = Number(depositAmount);
-    if (!amount || amount <= 0) return;
-    setDepositing(true);
-    try {
-      await api.caisses.wallets.deposit(amount, 'USD');
-      toast({ title: 'Dépôt initié', description: 'Votre dépôt est en cours de traitement.' });
-      setDepositOpen(false);
-      setDepositAmount('');
-      await loadWallets();
-      if (onRefresh) onRefresh();
-    } catch (err) {
-      toast({
-        title: 'Erreur',
-        description: err.errors?.length ? err.errors.map((e) => e.message).join(' · ') : (err.message || 'Dépôt impossible.'),
-        variant: 'destructive',
-      });
-    } finally {
-      setDepositing(false);
-    }
+  const handleDepositCompleted = async () => {
+    await loadWallets();
+    if (onRefresh) onRefresh();
   };
 
   return (
@@ -222,32 +204,11 @@ const InvestorBanking = ({ movements, onRefresh }) => {
         </div>
       </div>
 
-      <Dialog open={isDepositOpen} onOpenChange={setDepositOpen}>
-        <DialogContent className="bg-slate-900 border-slate-700 text-white">
-          <DialogHeader>
-            <DialogTitle>Nouveau dépôt</DialogTitle>
-            <DialogDescription>Alimentez votre portefeuille AGRICAP (USD).</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div>
-              <Label>Montant (USD)</Label>
-              <Input
-                type="number"
-                value={depositAmount}
-                onChange={(e) => setDepositAmount(e.target.value)}
-                placeholder="5000"
-                className="bg-slate-800 border-slate-700 mt-2"
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setDepositOpen(false)}>Annuler</Button>
-            <Button onClick={handleDeposit} disabled={depositing || !depositAmount} className="bg-emerald-600">
-              Valider
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <WalletDepositDialog
+        open={isDepositOpen}
+        onOpenChange={setDepositOpen}
+        onCompleted={handleDepositCompleted}
+      />
     </div>
   );
 };
