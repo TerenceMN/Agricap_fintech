@@ -9,7 +9,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Filter, Search, TrendingUp } from 'lucide-react';
 import { formatCurrency, formatDate } from '@/lib/investorSpaceUtils';
-import { subscriptionStatusClass, projectStatusClass } from '@/lib/investorSpaceWire';
+import {
+  subscriptionStatusClass, projectStatusClass, valuationMethodLabel,
+} from '@/lib/investorSpaceWire';
 import PerformanceReports from './PerformanceReports';
 
 const TYPE_FILTERS = [
@@ -135,9 +137,12 @@ const MyInvestments = ({ positions }) => {
                   <TableHead className="text-slate-300 text-right">Réservé</TableHead>
                   <TableHead className="text-slate-300 text-right">Encaissé</TableHead>
                   <TableHead className="text-slate-300 text-right">Reçu</TableHead>
+                  <TableHead className="text-slate-300 text-right">Capital restant dû</TableHead>
+                  <TableHead className="text-slate-300 text-right">Gain latent</TableHead>
+                  <TableHead className="text-slate-300 text-right">Perte estimée</TableHead>
+                  <TableHead className="text-slate-300">Valorisation</TableHead>
                   <TableHead className="text-slate-300 text-right">Coupon</TableHead>
                   <TableHead className="text-slate-300">Souscrit le</TableHead>
-                  <TableHead className="text-slate-300">Prochain paiement</TableHead>
                   <TableHead className="text-slate-300">Statut</TableHead>
                   <TableHead className="text-slate-300">Projet</TableHead>
                   <TableHead className="text-right text-slate-300">Actions</TableHead>
@@ -146,7 +151,7 @@ const MyInvestments = ({ positions }) => {
               <TableBody>
                 {visible.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={12} className="text-center py-12 text-slate-400">
+                    <TableCell colSpan={15} className="text-center py-12 text-slate-400">
                       {positions.length === 0
                         ? 'Vous n’avez encore aucune souscription.'
                         : 'Aucune position ne correspond à ces filtres.'}
@@ -173,9 +178,26 @@ const MyInvestments = ({ positions }) => {
                       <TableCell className="text-right font-mono text-blue-400">
                         {formatCurrency(p.totalReceived)}
                       </TableCell>
+                      {/* Valorisation SERVEUR, position par position. Un tiret
+                          quand elle n'existe pas : une réservation n'est pas
+                          valorisée, et l'inventer serait pire que le vide. */}
+                      <TableCell className="text-right font-mono text-white">
+                        {p.valuation ? formatCurrency(p.valuation.capitalOutstanding) : '—'}
+                      </TableCell>
+                      <TableCell className={`text-right font-mono ${
+                        (p.valuation?.latentGain ?? 0) < 0 ? 'text-red-400' : 'text-amber-400'}`}>
+                        {p.valuation ? formatCurrency(p.valuation.latentGain) : '—'}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-red-300">
+                        {p.valuation
+                          ? (p.valuation.impairment > 0 ? formatCurrency(p.valuation.impairment) : '—')
+                          : '—'}
+                      </TableCell>
+                      <TableCell className="text-xs text-slate-400" title={p.valuation?.valuationNote || ''}>
+                        {p.valuation ? valuationMethodLabel(p.valuation.valuationMethod) : 'Non valorisée'}
+                      </TableCell>
                       <TableCell className="text-right font-bold text-purple-400">{p.couponRate} %</TableCell>
                       <TableCell className="text-slate-300">{formatDate(p.subscriptionDate)}</TableCell>
-                      <TableCell className="text-slate-300">{formatDate(p.nextPaymentDate)}</TableCell>
                       <TableCell>
                         <Badge variant="outline" className={subscriptionStatusClass(p.status)}>
                           {p.statusLabel}

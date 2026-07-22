@@ -18,7 +18,15 @@ import ReturnColumns from '@/components/investor-space/ReturnColumns';
 import { buildReturnColumns } from '@/lib/investorSpaceWire';
 import type { InvestorMetrics } from '@/types/api';
 
-function metrics(over: Partial<InvestorMetrics> = {}): InvestorMetrics {
+/**
+ * Fixture PARTIELLE et assumée : `ReturnColumns` ne lit que ce que
+ * `buildReturnColumns` projette — les taux, leurs unités déclarées, la
+ * valorisation et l'effectif du coupon. Recopier les trente autres champs de
+ * `InvestorMetrics` (défaut, concentration, santé, période, devise) noierait le
+ * cas testé sans rien prouver de plus, d'où le cast plutôt qu'un `Partial<>`
+ * qui mentirait au composant sur ce qu'il reçoit en production.
+ */
+function metrics(over: Record<string, unknown> = {}): InvestorMetrics {
   return {
     totalInvested: 5000,
     totalSettled: 5000,
@@ -27,18 +35,26 @@ function metrics(over: Partial<InvestorMetrics> = {}): InvestorMetrics {
     positionsCount: 1,
     realizedReturn: 0.0925,
     realizedReturnUnavailableReason: null,
-    expectedCouponRate: 12.5,
+    // FRACTION, comme tous les taux du module — et `units` le déclare.
+    expectedCouponRate: 0.125,
+    expectedCouponBasis: 5000,
+    expectedCouponPositions: 1,
     valuation: {
       capitalOutstanding: 4843.75,
       latentGain: 210,
       latentGainIsLatent: true,
+      totalValue: 5053.75,
+      positionsCount: 1,
+      byMethod: {},
+      methodNotes: [],
       method: 'Dette saine valorisée au pair ; intérêts courus prorata temporis.',
     },
+    units: { realizedReturn: 'fraction', expectedCouponRate: 'fraction' },
     nextPaymentDate: '2026-04-20',
     currency: 'USD',
     asOf: '2026-07-22',
     ...over,
-  };
+  } as unknown as InvestorMetrics;
 }
 
 describe('ReturnColumns', () => {

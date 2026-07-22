@@ -16,10 +16,14 @@
  *    méthode) et attendu (promesse contractuelle) sont trois grandeurs de nature
  *    différente. Les additionner ou n'en montrer qu'une est l'anti-modèle.
  *
- * 2. **Les unités diffèrent selon le champ servi.** `realizedReturn` est un XIRR,
- *    donc une fraction (0,12) ; `expectedCouponRate` est déjà en pourcents (12,5).
- *    La conversion faite ici est une conversion d'UNITÉ, explicite et testée, pas
- *    un calcul.
+ * 2. **L'unité d'un taux se LIT, elle ne se devine pas.** Le serveur a servi un
+ *    temps deux conventions dans la même réponse (XIRR en fraction,
+ *    `expectedCouponRate` en points de pourcentage) ; il n'en sert plus qu'une et
+ *    la déclare champ par champ dans `metrics.units`. On lit ce dictionnaire —
+ *    coder « fraction » en dur reviendrait à réintroduire le pari qui vient
+ *    d'être supprimé, et à afficher « 0,09 % » ou « 1 250 % » au premier
+ *    changement. Attention : `GET /investments/offers/open` reste, lui, en points
+ *    de pourcentage et ne porte pas de `units` — deux endpoints, deux conventions.
  *
  * 3. **Asymétrie d'information.** Un investisseur voit SON argent et les offres
  *    OUVERTES. `buildPositions` refuse toute souscription qui n'est pas la sienne
@@ -28,6 +32,7 @@
  *    régression serveur en fuite. Le pipeline P01→P05 ne sort qu'en compteurs.
  */
 import type {
+  ExposureLine,
   InvestmentMovement,
   InvestmentOffer,
   InvestmentPipeline,
@@ -36,6 +41,7 @@ import type {
   InvestmentSubscription,
   InvestorMetrics,
   OpenOfferSummary,
+  ValuationPosition,
 } from '@/types/api';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +88,7 @@ export const PROJECT_STATUS_CLASSES: Record<string, string> = {
 export const TITLE_TYPE_LABELS: Record<string, string> = {
   OBLIGATION: 'Dette — obligation',
   ACTION: 'Capital — action',
+  PART_SOCIALE: 'Capital — part sociale',
 };
 
 /** `investments.Subscription.Status` — les dix états servis, libellés à
@@ -113,6 +120,17 @@ export const SUBSCRIPTION_STATUS_CLASSES: Record<string, string> = {
   REFUNDED: 'bg-slate-500/20 text-slate-400 border-slate-500/30',
 };
 
+/** Méthodes de valorisation servies par `metrics._valuation` (annexe D). Une
+ *  position en porte toujours exactement une, et elle est affichée : « au pair »
+ *  et « faute d'expertise » ne se lisent pas pareil, la seconde dit qu'on ne
+ *  sait pas ce que le titre vaut. */
+export const VALUATION_METHOD_LABELS: Record<string, string> = {
+  PAIR: 'Au pair',
+  PROVISION_P12: 'Décote de défaut',
+  EXPERTISE_DATEE: 'Expertise datée',
+  PAIR_FAUTE_D_EXPERTISE: 'Au pair, faute d’expertise',
+};
+
 /** Traduit un code en s'abstenant d'inventer : un code absent du dictionnaire
  *  ressort inchangé, visible, plutôt que rangé dans la case la plus proche. */
 function label(dictionary: Record<string, string>, code: string | null | undefined): string {
@@ -120,6 +138,8 @@ function label(dictionary: Record<string, string>, code: string | null | undefin
   return dictionary[code] ?? code;
 }
 
+export const valuationMethodLabel = (code: string | null | undefined) =>
+  label(VALUATION_METHOD_LABELS, code);
 export const projectStatusLabel = (code: string | null | undefined) =>
   label(PROJECT_STATUS_LABELS, code);
 export const titleTypeLabel = (code: string | null | undefined) =>
@@ -168,6 +188,11 @@ export interface InvestorPosition {
   isInDefault: boolean;
   /** L'argent est-il réellement parti ? Une réservation n'est pas un placement. */
   isSettled: boolean;
+  /** Valorisation SERVEUR de la position (`valuation.positions`), jointe par
+   *  `subscriptionId`. `null` sur une souscription seulement réservée : le
+   *  serveur ne valorise que ce qui est encaissé, et c'est correct — une
+   *  intention n'a pas de valeur de marché. */
+  valuation: ValuationPosition | null;
 }
 
 export interface PositionsResult {
@@ -190,9 +215,13 @@ export function buildPositions(
   offers: Array<Pick<InvestmentOffer, 'id' | 'code' | 'projectId' | 'typeOfTitle'>>,
   projects: InvestmentProject[],
   investorId: number,
+  valuationPositions: ValuationPosition[] = [],
 ): PositionsResult {
   const offerById = new Map(offers.map((o) => [o.id, o]));
   const projectById = new Map(projects.map((p) => [p.id, p]));
+  // Valorisation servie par l'annexe D, indexée par souscription : capital restant
+  // dû, gain latent, perte estimée et méthode viennent de là, pas d'un calcul local.
+  const valuationBySubscription = new Map(valuationPositions.map((v) => [v.subscriptionId, v]));
 
   let foreignRowsRejected = 0;
   const positions: InvestorPosition[] = [];
@@ -234,6 +263,7 @@ export function buildPositions(
       nextPaymentDate: s.nextPaymentDate,
       isInDefault: project?.status === DEFAULT_PROJECT_STATUS,
       isSettled: Boolean(s.settledAt),
+      valuation: valuationBySubscription.get(s.id) ?? null,
     });
   }
   return { positions, foreignRowsRejected };
@@ -268,11 +298,29 @@ export interface ReturnColumn {
   isLatent: boolean;
 }
 
-/** Fraction serveur → pourcentage d'affichage. Conversion d'UNITÉ : le taux
- *  reste celui du XIRR serveur, seule sa présentation change. */
-export function fractionToPercent(fraction: number | null | undefined): number | null {
-  if (fraction === null || fraction === undefined) return null;
-  return fraction * 100;
+/** Unité déclarée pour un taux, lue dans `metrics.units` (chemin pointé, ex.
+ *  `defaultRates.byValue`). Repli sur `fraction`, convention unique du module —
+ *  et repli LOGGÉ nulle part exprès : un champ absent du dictionnaire est un
+ *  champ que le serveur n'a pas déclaré, pas un champ dans une autre unité. */
+export function rateUnit(metrics: Pick<InvestorMetrics, 'units'>, path: string): string {
+  return metrics.units?.[path] ?? 'fraction';
+}
+
+/**
+ * Taux serveur → pourcentage d'affichage, selon l'unité DÉCLARÉE.
+ *
+ * Conversion d'unité, pas calcul métier : la valeur reste celle du serveur, seule
+ * sa présentation change. `fraction` est multipliée par 100 ; toute autre unité
+ * (`percent`, `points_sur_100`…) est affichée telle quelle — mieux vaut un
+ * chiffre non converti, visiblement faux d'un facteur 100, qu'une conversion
+ * appliquée à l'aveugle sur une unité qu'on n'a pas comprise.
+ */
+export function rateToPercent(
+  value: number | null | undefined,
+  unit: string = 'fraction',
+): number | null {
+  if (value === null || value === undefined) return null;
+  return unit === 'fraction' ? value * 100 : value;
 }
 
 /**
@@ -288,7 +336,7 @@ export function buildReturnColumns(metrics: InvestorMetrics): ReturnColumn[] {
     {
       key: 'realized',
       label: 'Rendement réalisé',
-      rate: fractionToPercent(metrics.realizedReturn),
+      rate: rateToPercent(metrics.realizedReturn, rateUnit(metrics, 'realizedReturn')),
       amount: null,
       unit: 'percent',
       caption: 'Distributions réellement encaissées',
@@ -315,19 +363,60 @@ export function buildReturnColumns(metrics: InvestorMetrics): ReturnColumn[] {
     {
       key: 'expected',
       label: 'Rendement attendu',
-      // Déjà en pourcents côté serveur : aucune conversion ici, contrairement au
-      // réalisé. C'est la dissymétrie la plus facile à casser par mégarde.
-      rate: metrics.expectedCouponRate,
+      // Même traitement que le réalisé, et pour la même raison : l'unité est LUE.
+      // Ce champ a changé de convention côté serveur (points de pourcentage →
+      // fraction) ; la lire plutôt que la supposer est ce qui a fait que le
+      // changement n'a rien cassé d'invisible.
+      rate: rateToPercent(metrics.expectedCouponRate, rateUnit(metrics, 'expectedCouponRate')),
       amount: null,
       unit: 'percent',
-      caption: 'Promesse contractuelle des projets souscrits',
+      caption: `Promesse contractuelle · ${metrics.expectedCouponPositions} position(s) financée(s)`,
       detail:
         'Moyenne des taux de coupon figés à la souscription, pondérée par les '
         + 'montants encaissés. Ce que les projets ont promis, pas ce qu’ils ont versé.',
-      unavailableReason: null,
+      unavailableReason: metrics.expectedCouponPositions === 0
+        ? 'Aucune position encaissée : il n’y a pas encore de promesse contractuelle à afficher.'
+        : null,
       isLatent: false,
     },
   ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Risque — tout vient du serveur, y compris les bases et les avertissements
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RateReading {
+  /** Taux en pourcents d'affichage, converti selon l'unité déclarée. */
+  percent: number;
+  /** Base de la mesure — un pourcentage sans base n'est pas une information. */
+  basis: string;
+}
+
+/** Lit un taux du payload et l'accompagne de sa base, telle que servie. */
+export function readRate(
+  metrics: InvestorMetrics,
+  path: string,
+  value: number,
+  basis: string,
+): RateReading {
+  return { percent: rateToPercent(value, rateUnit(metrics, path)) ?? 0, basis };
+}
+
+export interface ExposureBar extends ExposureLine {
+  /** Part en pourcents d'affichage — `share` est servi en fraction. */
+  sharePercent: number;
+}
+
+/**
+ * Ventilation d'exposition prête à tracer.
+ *
+ * Le serveur sert `{key, amount, share}` triés du plus exposé au moins exposé :
+ * il n'y a plus rien à agréger côté navigateur. La seule opération faite ici est
+ * la mise en pourcents de la part — une unité, pas un calcul.
+ */
+export function buildExposureBars(lines: ExposureLine[] = []): ExposureBar[] {
+  return lines.map((l) => ({ ...l, sharePercent: l.share * 100 }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -364,62 +453,60 @@ export interface OpenOfferCard {
   location: string;
   offerId: number;
   offerCode: string;
-  /** Score de risque du projet (0–10), servi par `GET /investments/projects`. */
+  /** Score de risque du projet (0–10), servi par la projection de l'offre. */
   riskScore: number | null;
   globalScore: number | null;
-  /** Avancement SERVEUR (`Project.progress_percent`) — jamais recalculé ici. */
-  progressPercent: number | null;
+  riskCategory: string | null;
   raisedAmount: number;
   reservedAmount: number;
   targetAmount: number;
   minFundingAmount: number;
   minimumTicket: number;
+  /** Coupon promis, en POINTS DE POURCENTAGE — `offers/open` ne convertit pas. */
   expectedReturn: number;
   maturityMonths: number;
+  paymentFrequency: string;
   bondUnitValue: number;
   availableBonds: number;
-  /** Bornes de souscription. `offers/open` ne les sert PAS : à défaut, on borne
-   *  sur ce qui est structurellement vrai (au moins 1 titre, au plus le stock
-   *  disponible) et le serveur re-valide `min_bonds` à la réservation. */
+  /** Bornes de souscription servies par l'offre. Le repli (au moins 1 titre, au
+   *  plus le stock disponible) ne joue que sur un serveur antérieur à leur ajout :
+   *  sans lui, le sélecteur partait sur `NaN` et la borne haute ne bloquait rien.
+   *  `funding.reserve` re-valide `min_bonds` de toute façon. */
   minBonds: number;
   maxBonds: number;
   bondLimitsFromServer: boolean;
   subscriptionDeadline: string | null;
   oversubscriptionPolicy: string;
-  /** Typologie dette / capital — absente de `offers/open`, jointe si connue. */
   titleType: string | null;
   titleTypeLabel: string;
 }
 
 /**
- * Cartes des offres ouvertes, enrichies du score du projet.
+ * Cartes des offres ouvertes.
  *
- * La jointure se fait sur `projectCode` : `open_offers_summary()` sert le code du
- * projet mais pas son score, et le score est précisément ce qu'un investisseur
- * doit voir avant d'engager son argent (« un risque honnête ou rien »).
+ * `open_offers_summary()` sert désormais le score de risque du projet, sa
+ * catégorie, la typologie du titre et les bornes de souscription : la jointure
+ * qu'il fallait faire ici sur `GET /investments/projects` a disparu, et avec elle
+ * un appel réseau et une occasion de désaccorder deux sources.
+ *
+ * Aucun pourcentage d'avancement n'est produit : cette projection n'en sert pas,
+ * et le calculer ici ferait un chiffre métier de plus dans le navigateur. La
+ * carte affiche les deux montants servis.
  */
-export function buildOpenOfferCards(
-  offers: OpenOfferSummary[],
-  projects: InvestmentProject[],
-  offerDetails: Array<Pick<InvestmentOffer, 'id' | 'typeOfTitle' | 'minBonds' | 'maxBonds'>> = [],
-): OpenOfferCard[] {
-  const projectByCode = new Map(projects.map((p) => [p.code, p]));
-  const detailById = new Map(offerDetails.map((o) => [o.id, o]));
+export function buildOpenOfferCards(offers: OpenOfferSummary[]): OpenOfferCard[] {
   return offers.map((o) => {
-    const project = projectByCode.get(o.projectCode) ?? null;
-    const detail = detailById.get(o.offerId) ?? null;
-    const hasLimits = detail?.minBonds !== undefined && detail?.maxBonds !== undefined;
+    const hasLimits = o.minBonds !== undefined && o.maxBonds !== undefined;
     return {
-      id: project?.id ?? o.offerId,
+      id: o.offerId,
       code: o.projectCode,
       name: o.title,
       sector: o.sector,
       location: o.location,
       offerId: o.offerId,
       offerCode: o.offerCode,
-      riskScore: project?.riskScore ?? null,
-      globalScore: project?.globalScore ?? null,
-      progressPercent: project?.progressPercent ?? null,
+      riskScore: o.riskScore ?? null,
+      globalScore: o.globalScore ?? null,
+      riskCategory: o.riskCategory || null,
       raisedAmount: o.fundedAmount,
       reservedAmount: o.reservedAmount,
       targetAmount: o.fundingGoal,
@@ -427,15 +514,16 @@ export function buildOpenOfferCards(
       minimumTicket: o.minTicket,
       expectedReturn: o.couponRate,
       maturityMonths: o.maturityMonths,
+      paymentFrequency: o.paymentFrequency,
       bondUnitValue: o.bondUnitValue,
       availableBonds: o.availableBonds,
-      minBonds: detail?.minBonds ?? 1,
-      maxBonds: detail?.maxBonds ?? o.availableBonds,
+      minBonds: o.minBonds ?? 1,
+      maxBonds: o.maxBonds ?? o.availableBonds,
       bondLimitsFromServer: Boolean(hasLimits),
       subscriptionDeadline: o.subscriptionDeadline,
       oversubscriptionPolicy: o.oversubscriptionPolicy,
-      titleType: detail?.typeOfTitle ?? null,
-      titleTypeLabel: titleTypeLabel(detail?.typeOfTitle),
+      titleType: o.typeOfTitle ?? null,
+      titleTypeLabel: titleTypeLabel(o.typeOfTitle),
     };
   });
 }
@@ -517,7 +605,7 @@ export const movementTypeLabel = (code: string | null | undefined) =>
   label(MOVEMENT_TYPE_LABELS, code);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Métriques absentes du serveur — nommées, pas simulées
+// Ce qui reste non mesurable — et le reste pour une raison de DONNÉES
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface MissingMetric {
@@ -528,38 +616,45 @@ export interface MissingMetric {
 }
 
 /**
- * Ce que l'espace investisseur NE PEUT PAS afficher aujourd'hui, faute d'un
- * chiffre serveur — et qu'il refuse de calculer dans le navigateur.
+ * Les trous restants ne viennent plus d'un calcul absent mais d'une donnée
+ * absente — ce n'est pas la même chose, et l'écran doit dire laquelle.
  *
- * `metrics.py` sait déjà mesurer la concentration (Herfindahl), le taux de
- * défaut et le score de santé, mais uniquement au niveau INSTITUTION
- * (`GET /investments/metrics/portfolio`, réservé au personnel : servir cet
- * agrégat à un investisseur reviendrait à lui montrer le portefeuille des
- * autres). Le même calcul restreint à SES souscriptions n'existe pas encore
- * dans `investor_metrics()`.
+ * Défaut, concentration, retard et score de santé sont désormais calculés par
+ * `investor_metrics()` sur le seul portefeuille du demandeur : ils sont affichés.
+ * Ce qui manque encore se déduit du payload lui-même, pas d'une liste figée —
+ * d'où une fonction plutôt qu'une constante : une couverture d'échéanciers nulle
+ * ou une expertise manquante sont des états, pas des dettes permanentes.
  */
-export const MISSING_INVESTOR_METRICS: MissingMetric[] = [
-  {
-    key: 'defaultRate',
-    label: 'Votre taux de défaut (valeur et nombre)',
-    reason:
-      'Mesuré côté serveur pour l’institution entière, pas encore pour un portefeuille '
-      + 'individuel. Les projets de votre portefeuille passés en défaut sont listés '
-      + 'nommément ci-dessus : c’est l’information brute, sans le ratio.',
-  },
-  {
-    key: 'concentration',
-    label: 'Concentration de votre portefeuille (Herfindahl)',
-    reason:
-      'L’indice de concentration par secteur et par zone n’est servi que pour '
-      + 'l’institution. Le recomposer ici donnerait un chiffre invérifiable, différent '
-      + 'de celui du back-office.',
-  },
-  {
-    key: 'health',
-    label: 'Score de santé de votre portefeuille /100',
-    reason:
-      'La formule et ses paramètres vivent en base côté serveur. Tant qu’ils ne sont pas '
-      + 'appliqués à votre seul portefeuille, aucun score n’est affiché.',
-  },
-];
+export function unmeasurableFrom(metrics: InvestorMetrics): MissingMetric[] {
+  const trous: MissingMetric[] = [];
+
+  if (metrics.nextPayment.unavailableReason) {
+    trous.push({
+      key: 'nextPayment',
+      label: 'Date du prochain paiement',
+      reason: metrics.nextPayment.unavailableReason,
+    });
+  }
+  if (metrics.lateProjects.scheduleCoverageWarning) {
+    trous.push({
+      key: 'lateProjects',
+      label: 'Part de projets en retard — mesure partielle',
+      reason: metrics.lateProjects.scheduleCoverageWarning,
+    });
+  }
+  // Une position valorisée « au pair faute d'expertise » n'a pas de valeur de
+  // marché connue : le dire vaut mieux que laisser lire le pair comme une valeur.
+  const sansExpertise = (metrics.valuation.positions ?? [])
+    .filter((p) => p.valuationMethod === 'PAIR_FAUTE_D_EXPERTISE');
+  if (sansExpertise.length > 0) {
+    trous.push({
+      key: 'expertValuation',
+      label: `Valeur de marché de ${sansExpertise.length} titre(s) de capital`,
+      reason:
+        'Aucune valorisation d’expert datée et valide n’est enregistrée sur ces projets : '
+        + 'ils sont retenus au pair, c’est-à-dire à leur prix de souscription. Ce n’est pas '
+        + 'une estimation de ce qu’ils valent aujourd’hui.',
+    });
+  }
+  return trous;
+}

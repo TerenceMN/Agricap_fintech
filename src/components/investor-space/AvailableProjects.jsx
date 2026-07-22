@@ -19,11 +19,13 @@ import ProjectDetailsModal from './ProjectDetailsModal';
  * Les offres OUVERTES — le seul détail projet auquel un investisseur a droit
  * avant d'engager son argent.
  *
- * La liste vient de `GET /investments/offers/open`, jointe aux projets visibles
- * pour récupérer le SCORE : afficher une opportunité sans son score de risque,
- * c'est vendre la promesse en taisant le risque. Les montants (encaissé,
- * réservé, avancement) sont ceux du serveur ; aucun pourcentage n'est recalculé
- * ici.
+ * Tout vient de `GET /investments/offers/open`, y compris le SCORE de risque du
+ * projet et les bornes de souscription : afficher une opportunité sans son score,
+ * c'est vendre la promesse en taisant le risque. La jointure qu'il fallait faire
+ * ici sur `GET /investments/projects` a disparu avec l'enrichissement de la
+ * projection serveur — un appel de moins, et une source unique.
+ *
+ * Les montants (encaissé, réservé, objectif) sont ceux du serveur.
  */
 const AvailableProjects = ({ onInvest }) => {
   const { toast } = useToast();
@@ -50,11 +52,7 @@ const AvailableProjects = ({ onInvest }) => {
     setLoading(true);
     setError(null);
     try {
-      const [openOffers, allProjects] = await Promise.all([
-        api.investments.offers.open(),
-        api.investments.projects.list(),
-      ]);
-      setProjects(buildOpenOfferCards(openOffers, allProjects));
+      setProjects(buildOpenOfferCards(await api.investments.offers.open()));
     } catch (err) {
       const detail = err.errors?.length
         ? err.errors.map((e) => e.message).join(' · ')
@@ -200,8 +198,6 @@ const AvailableProjects = ({ onInvest }) => {
           </div>
         ) : (
           filteredProjects.map((project, index) => {
-            // Avancement SERVEUR (`Project.progress_percent`) — jamais redivisé ici.
-            const fundingProgress = project.progressPercent;
             const riskInfo = project.riskScore === null ? null : getRiskLabel(project.riskScore);
 
             return (
@@ -214,10 +210,18 @@ const AvailableProjects = ({ onInvest }) => {
                 <Card className="bg-slate-900 border-slate-800 hover:border-slate-600 transition-all hover:-translate-y-1 group h-full flex flex-col">
                   <div className="relative h-32 overflow-hidden rounded-t-lg bg-gradient-to-br from-emerald-900/60 to-slate-900 flex items-center justify-center">
                     <Leaf className="w-12 h-12 text-emerald-500/30" />
-                    <div className="absolute top-3 left-3 flex gap-2">
+                    <div className="absolute top-3 left-3 flex flex-wrap gap-2">
                       <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/30">
                         Disponible
                       </Badge>
+                      {/* Dette ou capital : la nature du titre change la lecture
+                          du rendement affiché — un coupon obligataire est
+                          contractuel, un rendement d'action ne l'est pas. */}
+                      {project.titleType && (
+                        <Badge className="bg-slate-800/80 text-slate-200 border-slate-600">
+                          {project.titleTypeLabel}
+                        </Badge>
+                      )}
                     </div>
                     <div className="absolute top-3 right-3">
                       {riskInfo ? (
@@ -256,11 +260,19 @@ const AvailableProjects = ({ onInvest }) => {
                     <div className="space-y-2">
                       <div className="flex justify-between text-xs text-slate-400">
                         <span>Financement encaissé</span>
-                        <span className="font-bold text-white">
-                          {fundingProgress === null ? '—' : `${fundingProgress} %`}
-                        </span>
+                        <span className="text-slate-500">objectif {formatCurrency(project.targetAmount)}</span>
                       </div>
-                      <Progress value={fundingProgress ?? 0} className="h-2" />
+                      {/* La barre est une REPRÉSENTATION GRAPHIQUE des deux
+                          montants servis, affichés en clair juste dessous. Aucun
+                          pourcentage d'avancement n'est écrit : cette projection
+                          n'en sert pas, et un chiffre calculé ici pourrait
+                          diverger de celui du back-office. */}
+                      <Progress
+                        value={project.targetAmount > 0
+                          ? Math.min(100, (project.raisedAmount / project.targetAmount) * 100)
+                          : 0}
+                        className="h-2"
+                      />
                       <div className="flex justify-between text-xs">
                         <span className="text-emerald-400">{formatCurrency(project.raisedAmount)}</span>
                         <span className="text-slate-500">/ {formatCurrency(project.targetAmount)}</span>
@@ -287,7 +299,8 @@ const AvailableProjects = ({ onInvest }) => {
                     </div>
 
                     <div className="text-xs text-slate-500 space-y-1">
-                      <p>Maturité : {project.maturityMonths} mois</p>
+                      <p>Maturité : {project.maturityMonths} mois · coupon {project.paymentFrequency}</p>
+                      {project.riskCategory && <p>Catégorie de risque : {project.riskCategory}</p>}
                       <p>
                         Clôture des souscriptions :{' '}
                         {project.subscriptionDeadline ? formatDate(project.subscriptionDeadline) : 'non fixée'}

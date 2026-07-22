@@ -402,37 +402,175 @@ export interface PortfolioAllocation {
 // HAZINA). Ces chiffres sont CALCULÉS PAR LE SERVEUR sur flux datés réels : le front
 // les affiche, il ne les recompose pas.
 //
-// ATTENTION AUX UNITÉS, elles diffèrent d'un champ à l'autre côté serveur :
-//   - `realizedReturn` est un XIRR, donc une FRACTION (0.12 = 12 %) ;
-//   - `expectedCouponRate` est une moyenne de `coupon_rate_snapshot`, donc déjà en
-//     POURCENTS (12.5 = 12,5 %).
-// Les confondre affiche « 0,12 % » là où le serveur dit 12 %.
+// UNITÉS : le module servait deux conventions dans la même réponse (XIRR en fraction,
+// coupon en points de pourcentage). Il n'en sert plus qu'une — la FRACTION — et il la
+// DÉCLARE, champ par champ, dans `units`. Un consommateur ne devine jamais l'unité
+// d'un taux financier : il lit `units`. Voir `investorSpaceWire.rateToPercent`.
+
+/** Contexte obligatoire de tout agrégat monétaire : la devise est VÉRIFIÉE sur les
+ *  flux, jamais postulée. `mixedCurrency` vrai = l'agrégat additionne des devises
+ *  sans taux journalisé, donc il n'est pas exploitable : afficher l'avertissement. */
+export interface CurrencyNote {
+  currency: string;
+  currenciesObserved: string[];
+  conversionRate: number | null;
+  mixedCurrency: boolean;
+  mixedCurrencyWarning: string | null;
+}
+
+/** Période RÉELLEMENT couverte par les flux — pas une période déclarée. */
+export interface MetricsPeriod {
+  from: string | null;
+  to: string;
+  flowsCount: number;
+  basis: string;
+}
+
+/** Une position valorisée, servie uniquement à son titulaire (`valuation.positions`,
+ *  absent de la vue institution). C'est ce détail qui rend une alerte de défaut
+ *  exploitable : un agrégat ne dit jamais QUELLE ligne a décroché. */
+export interface ValuationPosition {
+  subscriptionId: number;
+  offerCode: string;
+  projectCode: string;
+  projectStatus: string;
+  typeOfTitle: string;
+  sector: string;
+  location: string;
+  settledAmount: number;
+  /** Remboursements de CAPITAL reçus — distincts des coupons. */
+  capitalRepaid: number;
+  couponsReceived: number;
+  principalAtPar: number;
+  capitalOutstanding: number;
+  /** Peut être NÉGATIF : une moins-value latente est une information. */
+  latentGain: number;
+  /** PAIR | PROVISION_P12 | EXPERTISE_DATEE | PAIR_FAUTE_D_EXPERTISE */
+  valuationMethod: string;
+  /** Taux de recouvrement retenu sur un P12, en fraction. `null` hors défaut. */
+  recoveryRate: number | null;
+  /** Perte ESTIMÉE sur cette position (0 hors dépréciation). */
+  impairment: number;
+  valuationNote: string;
+}
 
 export interface InvestorValuation {
   capitalOutstanding: number;
+  /** Détail par position — présent côté investisseur, absent côté institution. */
+  positions?: ValuationPosition[];
   /** Gain LATENT — non encaissé. Ne jamais l'additionner au réalisé. */
   latentGain: number;
   latentGainIsLatent: boolean;
+  /** Capital restant dû + gain latent, borné à zéro. */
+  totalValue: number;
+  positionsCount: number;
+  byMethod: Record<string, { positionsCount: number; amount: number }>;
+  methodNotes: string[];
   /** Méthode de valorisation, à afficher avec le chiffre (annexe D). */
   method: string;
 }
 
-export interface InvestorMetrics {
+/** Taux de défaut en valeur ET en nombre — les deux, toujours, avec leurs bases. */
+export interface DefaultRates {
+  byValue: number;
+  byCount: number;
+  defaultedValue: number;
+  defaultedProjects: number;
+  totalProjects: number;
+  totalValue: number;
+  alertThreshold: number;
+  alert: boolean;
+}
+
+/** Une ligne de ventilation : montant ET part, servis par le serveur. */
+export interface ExposureLine {
+  key: string;
+  amount: number;
+  share: number;
+}
+
+export interface ConcentrationMetrics {
+  exposureBySector: ExposureLine[];
+  exposureByLocation: ExposureLine[];
+  herfindahlSector: number;
+  herfindahlGeography: number;
+  /** Axe le plus concentré des deux — celui qui pénalise le score de santé. */
+  herfindahlRetained: number;
+  retainedAxis: string;
+  threshold: number;
+  highConcentration: boolean;
+  largestExposureShare: number;
+  largestExposureProject: string | null;
+  largestSector: string | null;
+  largestSectorShare: number;
+  largestLocation: string | null;
+  largestLocationShare: number;
+  projectsCount: number;
+  sectorsCount: number;
+  locationsCount: number;
+  basisAmount: number;
+}
+
+export interface LateProjects {
+  share: number;
+  lateProjects: number;
+  totalProjects: number;
+  projectsWithSchedule: number;
+  /** Avertissement de couverture : sans échéancier, le retard est un plancher. */
+  scheduleCoverageWarning: string | null;
+}
+
+/** Score de santé publiable tel quel : formule, paramètres réellement appliqués,
+ *  entrées et pénalités — de quoi refaire le calcul à la main. */
+export interface HealthScore {
+  score: number;
+  rawScore: number;
+  clamped: boolean;
+  formula: string;
+  parameters: { a: number; b: number; c: number; h0: number };
+  inputs: { defaultRate: number; herfindahl: number; lateShare: number };
+  penalties: { default: number; concentration: number; late: number };
+}
+
+export interface NextPayment {
+  nextPaymentDate: string | null;
+  /** `repayment_schedule` | `subscription.next_payment_date` | `null`. */
+  nextPaymentSource: string | null;
+  upcomingCount: number;
+  offersWithSchedule: number;
+  offersCount: number;
+  /** Motif écrit pour être AFFICHÉ quand aucune date n'est établissable. */
+  unavailableReason: string | null;
+}
+
+export interface InvestorMetrics extends CurrencyNote {
   totalInvested: number;
   totalSettled: number;
   totalRefunded: number;
   totalDistributed: number;
+  /** Capital restant dû + gain latent — grandeur DISTINCTE du total investi. */
+  totalValue: number;
   positionsCount: number;
   /** XIRR sur flux réels, en FRACTION. `null` = n'existe pas encore. */
   realizedReturn: number | null;
   /** Motif d'indisponibilité, destiné à être AFFICHÉ tel quel. */
   realizedReturnUnavailableReason: string | null;
-  /** Coupon contractuel pondéré, en POURCENTS. */
+  /** Coupon contractuel pondéré. Unité déclarée par `units.expectedCouponRate`. */
   expectedCouponRate: number;
+  expectedCouponBasis: number;
+  expectedCouponPositions: number;
   valuation: InvestorValuation;
+  defaultRates: DefaultRates;
+  concentration: ConcentrationMetrics;
+  lateProjects: LateProjects;
+  health: HealthScore;
+  nextPayment: NextPayment;
   nextPaymentDate: string | null;
-  currency: string;
+  period: MetricsPeriod;
+  /** Unité de chaque taux, chemin pointé → `fraction` | `points_sur_100`. */
+  units: Record<string, string>;
   asOf: string;
+  scope: string;
 }
 
 export interface InvestmentPipelineStage {
@@ -450,8 +588,13 @@ export interface InvestmentPipeline {
 }
 
 /** `GET /investments/offers/open` — `metrics.open_offers_summary()`. Forme DISTINCTE
- *  de `InvestmentOffer` : c'est une projection restreinte, et elle ne porte ni
- *  `minBonds`/`maxBonds`, ni `typeOfTitle`, ni le score du projet. */
+ *  de `InvestmentOffer` : projection restreinte, mais désormais complète pour
+ *  souscrire (bornes, typologie) et pour juger (score de risque du projet).
+ *
+ *  `couponRate` est ici en POINTS DE POURCENTAGE (9.0 = 9 %), tel que stocké sur
+ *  `Offer.coupon_rate` — la conversion en fraction n'a lieu que dans
+ *  `investments/metrics/mine`, qui déclare ses unités. Deux endpoints, deux
+ *  conventions : ne pas transposer l'une sur l'autre. */
 export interface OpenOfferSummary {
   offerId: number;
   offerCode: string;
@@ -459,12 +602,19 @@ export interface OpenOfferSummary {
   title: string;
   sector: string;
   location: string;
+  typeOfTitle: string;
+  paymentFrequency: string;
   couponRate: number;
   maturityMonths: number;
   minTicket: number;
   bondUnitValue: number;
+  minBonds: number;
+  maxBonds: number;
   availableBonds: number;
   fundingGoal: number;
+  riskScore: number;
+  globalScore: number;
+  riskCategory: string;
   reservedAmount: number;
   fundedAmount: number;
   minFundingAmount: number;

@@ -1,9 +1,9 @@
 import React from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Info, EyeOff, Layers } from 'lucide-react';
+import { Info, EyeOff, Layers, Ruler } from 'lucide-react';
 import { formatCurrency } from '@/lib/investorSpaceUtils';
-import { MISSING_INVESTOR_METRICS } from '@/lib/investorSpaceWire';
+import { unmeasurableFrom, valuationMethodLabel } from '@/lib/investorSpaceWire';
 
 /**
  * Ce que l'espace investisseur sait, et ce qu'il ne sait pas.
@@ -11,14 +11,21 @@ import { MISSING_INVESTOR_METRICS } from '@/lib/investorSpaceWire';
  * Trois blocs, dans cet ordre d'importance :
  *
  * - la **méthode de valorisation** servie par l'annexe D, affichée en toutes
- *   lettres à côté du gain latent qu'elle produit ;
+ *   lettres à côté du gain latent qu'elle produit, avec la ventilation des
+ *   positions par méthode : « au pair » et « décote de défaut » ne se lisent pas
+ *   pareil, et savoir combien de lignes relèvent de chacune change la lecture ;
  * - le **pipeline anonymisé** : un investisseur a le droit de savoir qu'il y a du
  *   flux dans le tuyau, pas de lire les dossiers en instruction ;
- * - les **métriques absentes**, nommées une par une avec leur motif. Un écran
- *   d'investissement qui tait ce qu'il ne mesure pas laisse croire qu'il a tout
- *   mesuré ; c'est la forme la plus discrète du chiffre flatteur.
+ * - ce qui reste **non mesurable**, déduit du payload lui-même (`unmeasurableFrom`)
+ *   plutôt que d'une liste figée. Un écran d'investissement qui tait ce qu'il ne
+ *   mesure pas laisse croire qu'il a tout mesuré ; c'est la forme la plus
+ *   discrète du chiffre flatteur.
  */
-const InvestorTransparency = ({ metrics, pipelineStages, currency = 'USD' }) => (
+const InvestorTransparency = ({ metrics, pipelineStages, currency = 'USD' }) => {
+  const unmeasurable = unmeasurableFrom(metrics);
+  const methods = Object.entries(metrics.valuation.byMethod ?? {});
+
+  return (
   <div className="space-y-6">
     <Card className="bg-slate-900 border-slate-800">
       <CardHeader>
@@ -52,6 +59,69 @@ const InvestorTransparency = ({ metrics, pipelineStages, currency = 'USD' }) => 
               {formatCurrency(metrics.totalDistributed, currency)}
             </p>
           </div>
+        </div>
+
+        {/* Combien de lignes relèvent de chaque méthode. Un portefeuille valorisé
+            « au pair faute d'expertise » sur la moitié de ses positions ne se lit
+            pas comme un portefeuille de dette saine intégralement au pair. */}
+        {methods.length > 0 && (
+          <div className="pt-4 border-t border-slate-800 space-y-2">
+            <p className="text-xs text-slate-400">Répartition par méthode de valorisation</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {methods.map(([code, entry]) => (
+                <div key={code} className="p-3 rounded-lg bg-slate-800/40 border border-slate-700">
+                  <p className="text-sm text-slate-200">{valuationMethodLabel(code)}</p>
+                  <p className="text-xs text-slate-400">
+                    {entry.positionsCount} position(s) · {formatCurrency(entry.amount, currency)}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {metrics.valuation.methodNotes?.length > 0 && (
+          <ul className="pt-4 border-t border-slate-800 space-y-1">
+            {metrics.valuation.methodNotes.map((note, index) => (
+              <li key={`${note}-${index}`} className="text-xs text-slate-400">• {note}</li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+
+    <Card className="bg-slate-900 border-slate-800">
+      <CardHeader>
+        <CardTitle className="text-white flex items-center gap-2">
+          <Ruler className="w-5 h-5 text-blue-400" />
+          Périmètre, période et unités
+        </CardTitle>
+        <CardDescription>
+          Le contexte sans lequel un chiffre financier ne veut rien dire.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-sm">
+        <div>
+          <p className="text-xs text-slate-400 mb-1">Période couverte</p>
+          <p className="text-white">
+            {metrics.period.from ? `${metrics.period.from} → ${metrics.period.to}` : 'Aucun flux'}
+          </p>
+          <p className="text-xs text-slate-500 mt-1">{metrics.period.flowsCount} flux réels</p>
+        </div>
+        <div>
+          <p className="text-xs text-slate-400 mb-1">Devise</p>
+          <p className="text-white">{metrics.currency}</p>
+          <p className="text-xs text-slate-500 mt-1">
+            Observées : {metrics.currenciesObserved.join(', ')}
+          </p>
+        </div>
+        <div>
+          <p className="text-xs text-slate-400 mb-1">Périmètre</p>
+          <p className="text-white">{metrics.scope}</p>
+        </div>
+        <div>
+          <p className="text-xs text-slate-400 mb-1">Base de calcul</p>
+          <p className="text-white text-xs leading-relaxed">{metrics.period.basis}</p>
         </div>
       </CardContent>
     </Card>
@@ -90,29 +160,31 @@ const InvestorTransparency = ({ metrics, pipelineStages, currency = 'USD' }) => 
       </CardContent>
     </Card>
 
-    <Card className="bg-slate-900 border-slate-800">
-      <CardHeader>
-        <CardTitle className="text-white flex items-center gap-2">
-          <Info className="w-5 h-5 text-blue-400" />
-          Ce que cet écran ne mesure pas encore
-        </CardTitle>
-        <CardDescription>
-          Ces indicateurs existent côté institution mais ne sont pas encore calculés pour un
-          portefeuille individuel. Ils ne sont pas estimés dans le navigateur : un chiffre
-          approché ici différerait de celui du back-office, et deux chiffres pour la même
-          grandeur valent moins que pas de chiffre du tout.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {MISSING_INVESTOR_METRICS.map((item) => (
-          <div key={item.key} className="p-4 rounded-lg bg-slate-800/40 border border-slate-700">
-            <p className="text-sm font-semibold text-slate-200 mb-1">{item.label}</p>
-            <p className="text-xs text-slate-400 leading-relaxed">{item.reason}</p>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
+    {unmeasurable.length > 0 && (
+      <Card className="bg-slate-900 border-slate-800">
+        <CardHeader>
+          <CardTitle className="text-white flex items-center gap-2">
+            <Info className="w-5 h-5 text-blue-400" />
+            Ce que cet écran ne peut pas établir
+          </CardTitle>
+          <CardDescription>
+            Ces points ne manquent pas d’un calcul mais d’une donnée. Rien n’est estimé pour
+            combler le vide : une valeur approchée ici différerait de celle du back-office, et
+            deux chiffres pour la même grandeur valent moins que pas de chiffre du tout.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {unmeasurable.map((item) => (
+            <div key={item.key} className="p-4 rounded-lg bg-slate-800/40 border border-slate-700">
+              <p className="text-sm font-semibold text-slate-200 mb-1">{item.label}</p>
+              <p className="text-xs text-slate-400 leading-relaxed">{item.reason}</p>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+    )}
   </div>
-);
+  );
+};
 
 export default InvestorTransparency;

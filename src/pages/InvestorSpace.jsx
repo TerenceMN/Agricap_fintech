@@ -17,6 +17,7 @@ import {
   positionsInDefault,
 } from '@/lib/investorSpaceWire';
 import ReturnColumns from '@/components/investor-space/ReturnColumns';
+import InvestorRiskPanel from '@/components/investor-space/InvestorRiskPanel';
 import InvestorTransparency from '@/components/investor-space/InvestorTransparency';
 import InvestorBanking from '@/components/investor-space/InvestorBanking';
 import InvestorAccount from '@/components/investor-space/InvestorAccount';
@@ -77,14 +78,19 @@ const InvestorSpace = () => {
           api.investments.offers.open().catch(() => []),
         ]);
 
-      const built = buildPositions(subscriptions, offers, projects, profile.id);
+      // La valorisation par position (`valuation.positions`) est jointe aux
+      // souscriptions par `subscriptionId` : capital restant dû, gain latent et
+      // perte estimée viennent du serveur, position par position.
+      const built = buildPositions(
+        subscriptions, offers, projects, profile.id, serverMetrics.valuation.positions ?? [],
+      );
       setInvestor(profile);
       setMetrics(serverMetrics);
       setPositions(built.positions);
       setForeignRowsRejected(built.foreignRowsRejected);
       setPipelineStages(buildPipelineStages(pipeline));
       setMovements(myMovements);
-      setOpenOffersCount(buildOpenOfferCards(openOffers, projects).length);
+      setOpenOffersCount(buildOpenOfferCards(openOffers).length);
     } catch (err) {
       // 422 structurée : chaque erreur est affichée, pas résumée en un message.
       setError({
@@ -174,6 +180,17 @@ const InvestorSpace = () => {
           </Card>
         )}
 
+        {/* Agrégat multi-devises sans taux journalisé : le serveur le signale, on
+            l'affiche AVANT les chiffres qu'il rend inexploitables (principe 4). */}
+        {metrics.mixedCurrency && (
+          <Card className="bg-amber-500/10 border-amber-500/40">
+            <CardContent className="p-4 flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-amber-400 mt-0.5 shrink-0" />
+              <p className="text-sm text-amber-200">{metrics.mixedCurrencyWarning}</p>
+            </CardContent>
+          </Card>
+        )}
+
         {/* Le risque se montre quand il naît (§5.2) : un projet en P12 apparaît
             ici le jour même, pas au prochain rapport. */}
         {defaults.length > 0 && (
@@ -186,25 +203,30 @@ const InvestorSpace = () => {
                 </CardTitle>
                 <CardDescription className="text-red-200/80">
                   Le passage en défaut (P12) déclenche un plan de recouvrement conduit par
-                  l’institution. Les montants ci-dessous sont ceux du serveur : le capital que
-                  vous avez encaissé sur la position, et ce que vous avez déjà reçu.
-                  La perte définitive n’est connue qu’au terme du recouvrement — aucun montant
-                  de perte n’est estimé ici.
+                  l’institution. La perte estimée ci-dessous est calculée par le serveur sur le
+                  taux de recouvrement RÉELLEMENT constaté (retours encaissés ÷ décaissé) ;
+                  à défaut de recouvrement observé, sur la décote de provision paramétrée. Elle
+                  bougera avec le recouvrement — ce n’est pas une perte définitive.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
                 {defaults.map((p) => (
                   <div
                     key={p.key}
-                    className="p-4 rounded-lg bg-slate-900/60 border border-red-500/20 flex flex-col md:flex-row md:items-center justify-between gap-3"
+                    className="p-4 rounded-lg bg-slate-900/60 border border-red-500/20 space-y-3"
                   >
-                    <div>
-                      <p className="font-semibold text-white">{p.projectTitle}</p>
-                      <p className="text-xs text-slate-400">
-                        {p.projectCode || p.offerCode} · {p.titleTypeLabel} · souscrit le {formatDate(p.subscriptionDate)}
-                      </p>
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                      <div>
+                        <p className="font-semibold text-white">{p.projectTitle}</p>
+                        <p className="text-xs text-slate-400">
+                          {p.projectCode || p.offerCode} · {p.titleTypeLabel} · souscrit le {formatDate(p.subscriptionDate)}
+                        </p>
+                      </div>
+                      <Badge variant="outline" className="border-red-500/40 text-red-300 self-start md:self-center">
+                        {p.projectStatusLabel}
+                      </Badge>
                     </div>
-                    <div className="flex flex-wrap gap-6 text-sm">
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 text-sm">
                       <div>
                         <p className="text-xs text-slate-400">Encaissé</p>
                         <p className="font-mono text-white">{formatCurrency(p.settledAmount)}</p>
@@ -213,16 +235,43 @@ const InvestorSpace = () => {
                         <p className="text-xs text-slate-400">Déjà reçu</p>
                         <p className="font-mono text-emerald-400">{formatCurrency(p.totalReceived)}</p>
                       </div>
-                      <Badge variant="outline" className="border-red-500/40 text-red-300 self-center">
-                        {p.projectStatusLabel}
-                      </Badge>
+                      {p.valuation ? (
+                        <>
+                          <div>
+                            <p className="text-xs text-slate-400">Taux de recouvrement</p>
+                            <p className="font-mono text-white">
+                              {p.valuation.recoveryRate === null
+                                ? '—'
+                                : `${(p.valuation.recoveryRate * 100).toFixed(2).replace('.', ',')} %`}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs text-slate-400">Valeur retenue</p>
+                            <p className="font-mono text-white">
+                              {formatCurrency(p.valuation.capitalOutstanding)}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs text-slate-400">Perte estimée</p>
+                            <p className="font-mono text-red-300 font-bold">
+                              {formatCurrency(p.valuation.impairment)}
+                            </p>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="col-span-2 lg:col-span-3">
+                          <p className="text-xs text-slate-400">
+                            Position non encaissée : elle n’est pas valorisée, et aucune perte n’est
+                            estimée dessus.
+                          </p>
+                        </div>
+                      )}
                     </div>
+                    {p.valuation?.valuationNote && (
+                      <p className="text-xs text-slate-400">{p.valuation.valuationNote}</p>
+                    )}
                   </div>
                 ))}
-                <p className="text-xs text-slate-400">
-                  La valorisation de ces positions est déjà dépréciée dans le gain latent affiché
-                  ci-dessous, au taux de recouvrement constaté par le serveur.
-                </p>
               </CardContent>
             </Card>
           </motion.div>
@@ -240,6 +289,12 @@ const InvestorSpace = () => {
               <Target className="w-4 h-4 mr-2" /> Projets ouverts
               {openOffersCount ? (
                 <Badge className="ml-2 bg-emerald-500/20 text-emerald-300 border-0">{openOffersCount}</Badge>
+              ) : null}
+            </TabsTrigger>
+            <TabsTrigger value="risk" className="data-[state=active]:bg-slate-800">
+              <ShieldAlert className="w-4 h-4 mr-2" /> Risque
+              {metrics.defaultRates.alert || metrics.concentration.highConcentration ? (
+                <Badge className="ml-2 bg-red-500/20 text-red-300 border-0">!</Badge>
               ) : null}
             </TabsTrigger>
             <TabsTrigger value="banking" className="data-[state=active]:bg-slate-800">
@@ -283,12 +338,16 @@ const InvestorSpace = () => {
                   <div className="p-3 bg-blue-500/20 rounded-lg w-fit mb-4">
                     <Wallet className="w-6 h-6 text-blue-400" />
                   </div>
-                  <h3 className="text-sm text-slate-400 mb-1">Capital restant dû</h3>
+                  {/* Valeur totale = capital restant dû + gain latent. Grandeur
+                      DISTINCTE du capital investi et du rendement réalisé : les
+                      trois sont affichées séparément, jamais résumées en une. */}
+                  <h3 className="text-sm text-slate-400 mb-1">Valeur totale</h3>
                   <p className="text-3xl font-bold text-white">
-                    {formatCurrency(metrics.valuation.capitalOutstanding, metrics.currency)}
+                    {formatCurrency(metrics.totalValue, metrics.currency)}
                   </p>
                   <p className="text-xs text-slate-500 mt-2">
-                    Sur {metrics.positionsCount} position(s) financée(s)
+                    Capital restant dû {formatCurrency(metrics.valuation.capitalOutstanding, metrics.currency)}
+                    {' '}+ latent · {metrics.positionsCount} position(s) financée(s)
                   </p>
                 </CardContent>
               </Card>
@@ -313,10 +372,18 @@ const InvestorSpace = () => {
                   </div>
                   <h3 className="text-sm text-slate-400 mb-1">Prochain paiement attendu</h3>
                   <p className="text-2xl font-bold text-white">
-                    {metrics.nextPaymentDate ? formatDate(metrics.nextPaymentDate) : 'Aucun programmé'}
+                    {metrics.nextPaymentDate ? formatDate(metrics.nextPaymentDate) : 'Non établie'}
                   </p>
+                  {/* Le motif d'indisponibilité est écrit côté serveur pour être
+                      LU : « aucun échéancier enregistré » n'est pas « aucun
+                      paiement à venir ». */}
                   <p className="text-xs text-slate-500 mt-2">
-                    Date d’échéance la plus proche ; le montant est arrêté à la distribution.
+                    {metrics.nextPayment.unavailableReason
+                      ?? (metrics.nextPaymentDate
+                        ? `${metrics.nextPayment.upcomingCount} échéance(s) à venir sur `
+                          + `${metrics.nextPayment.offersWithSchedule}/${metrics.nextPayment.offersCount} offre(s) `
+                          + 'dotée(s) d’un échéancier ; le montant est arrêté à la distribution.'
+                        : 'Aucune échéance à venir sur vos offres.')}
                   </p>
                 </CardContent>
               </Card>
@@ -353,6 +420,10 @@ const InvestorSpace = () => {
 
           <TabsContent value="offers" className="mt-8">
             <AvailableProjects onInvest={load} />
+          </TabsContent>
+
+          <TabsContent value="risk" className="mt-8">
+            <InvestorRiskPanel metrics={metrics} />
           </TabsContent>
 
           <TabsContent value="banking" className="mt-8">
