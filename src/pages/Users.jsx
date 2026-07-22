@@ -20,6 +20,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { exportToExcel } from '@/lib/export.js';
 import { formatAuditAction, formatAuditDetails } from '@/lib/auditLabels.js';
 import { api, ApiError } from '@/services/api';
+import RoleFormModal from '@/components/rbac/RoleFormModal';
 
 // Couleur par niveau hiérarchique (pure présentation — les libellés/capacités viennent
 // de l'API /api/rbac/roles, source de vérité unique côté backend).
@@ -145,6 +146,8 @@ const Users = () => {
     const { toast } = useToast();
     const [users, setUsers] = useState([]);
     const [roles, setRoles] = useState([]);
+    const [roleModalOpen, setRoleModalOpen] = useState(false);
+    const [editingRole, setEditingRole] = useState(null);
     const [auditEntries, setAuditEntries] = useState([]);
     const [activeTab, setActiveTab] = useState('users');
     const [searchTerm, setSearchTerm] = useState('');
@@ -161,6 +164,34 @@ const Users = () => {
         loadUsers();
         loadAudit();
     }, []);
+
+    // Création ET modification d'un rôle, depuis l'onglet qui porte leur nom.
+    // Le serveur refuse qu'on modifie les permissions de SON PROPRE rôle
+    // (AUTO_ESCALADE_INTERDITE) : on relaie son message tel quel plutôt que de
+    // pré-juger le droit côté écran.
+    const handleSaveRole = async (formData) => {
+        try {
+            if (editingRole) {
+                await api.rbac.updateRole(editingRole.id, {
+                    label: formData.label, level: formData.level,
+                    type: formData.type, permissions: formData.permissions,
+                });
+                toast({ title: 'Rôle mis à jour', description: `${formData.label} — permissions enregistrées.` });
+            } else {
+                await api.rbac.createRole({
+                    id: formData.id, label: formData.label || formData.id,
+                    level: formData.level, type: formData.type,
+                    permissions: formData.permissions,
+                });
+                toast({ title: 'Rôle créé', description: `${formData.label || formData.id} est disponible pour affectation.` });
+            }
+            setRoleModalOpen(false); setEditingRole(null);
+            api.rbac.roles().then(setRoles).catch(() => {});
+        } catch (e) {
+            toast({ variant: 'destructive', title: 'Échec',
+                    description: e instanceof ApiError ? e.message : String(e) });
+        }
+    };
 
     const handleSaveUser = async (formData) => {
         try {
@@ -367,6 +398,29 @@ const Users = () => {
                     </TabsContent>
 
                     <TabsContent value="roles">
+                        {/* Cette matrice est en LECTURE SEULE, et rien ne le disait.
+                            Deux écrans parlent des rôles : celui-ci montre la matrice
+                            effective, « Rôles & Accès » (/roles) la modifie. Un
+                            utilisateur qui cherchait à cocher une case ici n'avait
+                            aucun moyen de savoir où aller — un écran sans issue.
+                            On ne duplique pas l'éditeur : un seul endroit modifie
+                            les pouvoirs, sinon deux formulaires divergent
+                            (principe 6). On indique le chemin. */}
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                            <p className="text-xs text-slate-400">
+                                Matrice effective des capacités. Vous ne pouvez pas modifier
+                                les permissions de <strong>votre propre rôle</strong> : un autre
+                                administrateur doit le faire.
+                            </p>
+                            <Button
+                                size="sm"
+                                className="bg-emerald-600 hover:bg-emerald-500"
+                                onClick={() => { setEditingRole(null); setRoleModalOpen(true); }}
+                            >
+                                <Shield className="w-3.5 h-3.5 mr-1.5" aria-hidden="true" />
+                                Créer un rôle
+                            </Button>
+                        </div>
                         <div className="rounded-md border border-slate-800 bg-slate-900/30 overflow-hidden">
                             <Table>
                                 <TableHeader>
@@ -378,6 +432,7 @@ const Users = () => {
                                         <TableHead className="text-center w-24">Décaissement</TableHead>
                                         <TableHead className="text-center w-24">Audit</TableHead>
                                         <TableHead className="text-center w-24">Paramétrage</TableHead>
+                                        <TableHead className="text-right w-28">Actions</TableHead>
                                     </TableRow>
                                 </TableHeader>
                                 <TableBody>
@@ -392,6 +447,12 @@ const Users = () => {
                                             <TableCell className="text-center"><PermissionCheck active={role.permissions.disburse} /></TableCell>
                                             <TableCell className="text-center"><PermissionCheck active={role.permissions.audit} /></TableCell>
                                             <TableCell className="text-center"><PermissionCheck active={role.permissions.config} /></TableCell>
+                                            <TableCell className="text-right">
+                                                <Button variant="ghost" size="sm"
+                                                    onClick={() => { setEditingRole(role); setRoleModalOpen(true); }}>
+                                                    Modifier
+                                                </Button>
+                                            </TableCell>
                                         </TableRow>
                                     ))}
                                 </TableBody>
@@ -487,6 +548,17 @@ const Users = () => {
                 user={editingUser}
                 roles={roles}
                 onSave={handleSaveUser}
+            />
+
+            {/* Même éditeur que l'écran « Rôles & Accès » — importé, jamais recopié :
+                deux formulaires qui décident des mêmes pouvoirs divergent tôt ou
+                tard, et c'est la matrice « qui approuve, qui décaisse » qu'on ne
+                peut pas se permettre de voir diverger (principe 6). */}
+            <RoleFormModal
+                isOpen={roleModalOpen}
+                onClose={() => { setRoleModalOpen(false); setEditingRole(null); }}
+                role={editingRole}
+                onSave={handleSaveRole}
             />
         </Layout>
     );
