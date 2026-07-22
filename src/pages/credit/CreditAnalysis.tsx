@@ -40,6 +40,12 @@ const CreditAnalysis: React.FC = () => {
   // Step 0 state
   const [prefill, setPrefill] = useState<CreditPrefillResult | null>(null);
   const [clientSub, setClientSub] = useState('');
+  // Bénéficiaires possibles. Le personnel est exclu : le serveur refuse
+  // (BENEFICIAIRE_INTERNE), donc le proposer serait offrir un choix voué à
+  // l'échec. `isStaffRole` n'étant pas servi par `/rbac/users`, on s'appuie sur
+  // le niveau hiérarchique — 0 = niveau client dans le registre RBAC.
+  const [clients, setClients] = useState<Array<{ sub: string; name: string; email: string; roleLabel: string }>>([]);
+  const [clientsErreur, setClientsErreur] = useState('');
   const [vcCode, setVcCode] = useState('');
   const [areaHa, setAreaHa] = useState('');
   const [amountRequested, setAmountRequested] = useState('');
@@ -67,6 +73,26 @@ const CreditAnalysis: React.FC = () => {
         if (data.defaults.currency) setCurrency(data.defaults.currency);
       })
       .catch(() => {}); // prefill optionnel
+
+    // Liste des bénéficiaires possibles. `level === 0` = niveau client au
+    // registre RBAC ; le personnel (niveaux 1 à 5) est écarté.
+    api.rbac.users.list()
+      .then((users) => {
+        const eligibles = (users || []).filter((u) => u.level === 0 && u.status !== 'Suspendu');
+        setClients(eligibles.map((u) => ({
+          sub: u.sub, name: u.name, email: u.email, roleLabel: u.roleLabel,
+        })));
+        if (!eligibles.length) {
+          setClientsErreur(
+            "Aucun client enregistré pour l'instant. Un crédit doit être au nom "
+            + "d'un client : créez-en un depuis « Utilisateurs » avant de continuer."
+          );
+        }
+      })
+      .catch(() => setClientsErreur(
+        "La liste des clients n'a pas pu être chargée. Sans bénéficiaire, la "
+        + "demande sera refusée : réessayez avant de poursuivre."
+      ));
   }, []);
 
   // ── Step 0 → 1: validate form ──
@@ -191,6 +217,41 @@ const CreditAnalysis: React.FC = () => {
                 </p>
               </div>
             )}
+
+            {/* Bénéficiaire du crédit.
+                Le champ `clientSub` existait dans l'état du composant et partait
+                dans `api.credits.create`, mais AUCUNE interface ne le remplissait :
+                il restait vide, la demande retombait donc sur l'agent connecté,
+                et le serveur la refuse désormais (BENEFICIAIRE_INTERNE) — un
+                membre du personnel ne peut pas être bénéficiaire de son propre
+                crédit. Sans ce sélecteur, le parcours était sans issue.
+                Les internes sont exclus de la liste : on ne propose pas un choix
+                que le serveur rejettera. */}
+            <div className="mb-4">
+              <label className="text-xs text-slate-400 block mb-1">
+                Bénéficiaire du crédit
+              </label>
+              <select
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white [&>option]:bg-slate-800 [&>option]:text-white"
+                value={clientSub}
+                onChange={(e) => setClientSub(e.target.value)}
+              >
+                <option value="">— Choisir le client —</option>
+                {clients.map((c) => (
+                  <option key={c.sub} value={c.sub}>
+                    {c.name || c.email || c.sub}{c.roleLabel ? ` · ${c.roleLabel}` : ''}
+                  </option>
+                ))}
+              </select>
+              {clientsErreur ? (
+                <p className="text-xs text-amber-300/90 mt-1">{clientsErreur}</p>
+              ) : (
+                <p className="text-xs text-slate-500 mt-1">
+                  Un crédit est toujours au nom d'un client. Le personnel AGRICAP
+                  n'apparaît pas dans cette liste : il ne peut pas être bénéficiaire.
+                </p>
+              )}
+            </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
