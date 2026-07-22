@@ -3,17 +3,19 @@
  * assume encore (saisie assistée de la feuille de besoins).
  *
  * Ils existent pour donner un total au fil de la frappe ; le SERVEUR reste seul
- * juge des montants scorés. Deux choses les rendent fragiles et méritent d'être
- * figées :
+ * juge des montants scorés. Trois choses les rendaient fragiles, corrigées et
+ * désormais figées ici :
  *   - la normalisation de saisie francophone (« 3,5 » et non « 3.5 »), qui casse
  *     silencieusement en `NaN` si elle disparaît ;
- *   - l'arithmétique en `float`, alors que le backend calcule en `Decimal`
- *     (principe 4). Les écarts sont documentés plus bas — ce ne sont pas des
- *     détails de présentation, ce sont deux moteurs de calcul différents sur la
- *     même ligne.
+ *   - l'arithmétique en `float` là où le backend calcule en `Decimal`
+ *     (principe 4) : `Math.round(x * 100) / 100` n'est pas `ROUND_HALF_UP`.
+ *     Le calcul passe maintenant par des décimaux exacts (`BigInt`), donc les
+ *     deux moteurs tombent sur le même centime ;
+ *   - l'absence de bornes sur `taux_perte`, qui produisait des recettes
+ *     négatives à partir d'une saisie en pourcents.
  */
 import { describe, expect, it } from 'vitest';
-import { montantLigne, recetteVente } from '@/services/api';
+import { diagnostiquerTauxPerte, montantLigne, recetteVente } from '@/services/api';
 
 describe('montantLigne', () => {
   it('multiplie quantité × coût unitaire × fréquence', () => {
@@ -67,30 +69,65 @@ describe('montantLigne', () => {
     })).toBe(6);
   });
 
-  it('DÉFAUT CONSTATÉ : une fréquence explicitement à 0 est comptée comme 1', () => {
-    // `(n(b.frequence) || 1)` ne distingue pas « pas de fréquence saisie » de
-    // « zéro occurrence ». Un client qui met 0 pour neutraliser une ligne voit
-    // le montant plein s'afficher — et il est repris dans le total du poste.
-    // Correctif hors périmètre (`api.ts` en lecture seule) : ne remplacer par 1
-    // que si le champ est vide/absent, pas s'il vaut 0.
-    expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5, frequence: 0 })).toBe(50);
-  });
-
-  it.skip('ATTENDU (échoue aujourd’hui) : fréquence 0 → montant 0', () => {
+  it('une fréquence explicitement à 0 donne un montant nul', () => {
+    // CORRIGÉ. `(n(b.frequence) || 1)` ne distinguait pas « pas de fréquence
+    // saisie » de « zéro occurrence » : un client qui met 0 pour neutraliser une
+    // ligne voyait le montant plein, repris dans le total du poste.
+    // Une donnée absente et un zéro explicite ne se traitent jamais pareil
+    // (CLAUDE.md §4.5).
     expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5, frequence: 0 })).toBe(0);
+    expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5, frequence: '0' })).toBe(0);
+    expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5, frequence: '0,0' })).toBe(0);
   });
 
-  it('DÉFAUT CONSTATÉ : l’arrondi `float` n’est pas le ROUND_HALF_UP du backend', () => {
-    // 1,005 × 1 × 1 = 1,005 → attendu 1,01 en ROUND_HALF_UP (principe 4).
-    // `Math.round(1.005 * 100) / 100` donne 1 : `1.005 * 100` vaut
-    // 100.49999999999999 en binaire. La ligne affichée peut donc différer d'un
-    // centime du total que le serveur retiendra. Écart borné, mais réel, et il
-    // remonte dans les contrôles de cohérence (Σ feuille 4 = feuille 5, ±0,01).
-    expect(montantLigne({ rubrique: 'X', quantite: 1.005, cout_unitaire: 1 })).toBe(1);
+  it('une fréquence vide ou absente reste 1 — c’est l’oubli, pas le zéro', () => {
+    expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5 })).toBe(50);
+    expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5, frequence: '' })).toBe(50);
+    expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5, frequence: '  ' })).toBe(50);
   });
 
-  it.skip('ATTENDU (échoue aujourd’hui) : arrondi demi-supérieur comme le serveur', () => {
+  it('une fréquence saisie mais illisible n’est pas silencieusement 1', () => {
+    // « deux » est une saisie, pas un oubli : la lire comme 1 fabriquerait une
+    // occurrence que personne n'a demandée. Elle vaut 0, comme une quantité
+    // illisible, et le total tombe à 0 — visible, donc corrigeable.
+    expect(montantLigne({ rubrique: 'X', quantite: 10, cout_unitaire: 5, frequence: 'deux' })).toBe(0);
+  });
+
+  it('arrondit au demi-supérieur comme le backend (ROUND_HALF_UP)', () => {
+    // CORRIGÉ. 1,005 × 1 = 1,005 → 1,01 en ROUND_HALF_UP (principe 4).
+    // `Math.round(1.005 * 100) / 100` donnait 1 : `1.005 * 100` vaut
+    // 100.49999999999999 en binaire. L'écart d'un centime remontait dans les
+    // contrôles de cohérence (Σ feuille 4 = feuille 5, ±0,01).
     expect(montantLigne({ rubrique: 'X', quantite: 1.005, cout_unitaire: 1 })).toBe(1.01);
+    expect(montantLigne({ rubrique: 'X', quantite: '1,005', cout_unitaire: 1 })).toBe(1.01);
+  });
+
+  it('arrondit au demi-supérieur sur les cas que le binaire manque', () => {
+    // Chacun de ces produits tombe exactement sur un demi-centime : c'est là que
+    // `float` et `Decimal` divergent, et nulle part ailleurs.
+    expect(montantLigne({ rubrique: 'X', quantite: '0,005', cout_unitaire: 1 })).toBe(0.01);
+    expect(montantLigne({ rubrique: 'X', quantite: '2,675', cout_unitaire: 1 })).toBe(2.68);
+    expect(montantLigne({ rubrique: 'X', quantite: '8,165', cout_unitaire: 1 })).toBe(8.17);
+    expect(montantLigne({ rubrique: 'X', quantite: '1,015', cout_unitaire: 1 })).toBe(1.02);
+    // Trois facteurs : les échelles s'additionnent (3 + 2 + 1 = 6 décimales).
+    expect(montantLigne({
+      rubrique: 'X', quantite: '1,005', cout_unitaire: '1,00', frequence: '1,0',
+    })).toBe(1.01);
+  });
+
+  it('ne perd pas de précision sur un produit à beaucoup de décimales', () => {
+    // 0,1 + 0,2 ≠ 0,3 en binaire ; ici le produit est exact avant arrondi.
+    expect(montantLigne({ rubrique: 'X', quantite: '0,1', cout_unitaire: '0,2' })).toBe(0.02);
+    expect(montantLigne({
+      rubrique: 'X', quantite: '1234,567', cout_unitaire: '89,012', frequence: 3,
+    })).toBe(329673.83);
+  });
+
+  it('accepte un montant hors de portée du binaire sans dériver', () => {
+    // 12 345 678 901,23 × 3 : au-delà de ce que `x * 100` arrondit encore juste.
+    expect(montantLigne({
+      rubrique: 'X', quantite: '12345678901,23', cout_unitaire: 3,
+    })).toBe(37037036703.69);
   });
 });
 
@@ -123,29 +160,85 @@ describe('recetteVente', () => {
     })).toBe(343.76);
   });
 
-  it('DÉFAUT CONSTATÉ : un taux de perte saisi en POURCENTS rend la recette négative', () => {
-    // `taux_perte` est attendu en FRACTION (0,1 = 10 %). Rien ne le borne : un
-    // client qui saisit « 10 » en pensant « 10 % » obtient (1 − 10) = −9 et une
-    // recette négative de −1 800 au lieu de 180. Aucun garde-fou, aucun message.
-    // Correctif hors périmètre (`api.ts` en lecture seule) : borner le taux à
-    // [0, 1] et libeller l'unité au point de saisie.
-    expect(recetteVente({
-      produit: 'Maïs grain', quantite: 100, taux_perte: 10, prix_unitaire: 2,
-    })).toBe(-1800);
-  });
-
-  it.skip('ATTENDU (échoue aujourd’hui) : une perte hors [0,1] ne produit pas de recette négative', () => {
+  it('une perte hors [0,1] ne produit jamais de recette négative', () => {
+    // CORRIGÉ. `taux_perte` est une FRACTION (0,1 = 10 %). Rien ne le bornait :
+    // « 10 » saisi pour « 10 % » donnait (1 − 10) = −9, soit −1 800 au lieu de
+    // 180 — un montant négatif qui se propage dans un total de feuille 5.
     expect(recetteVente({
       produit: 'Maïs grain', quantite: 100, taux_perte: 10, prix_unitaire: 2,
     })).toBeGreaterThanOrEqual(0);
+    // Borné à une perte totale : au-delà de 100 %, il ne reste rien à vendre.
+    expect(recetteVente({
+      produit: 'Maïs grain', quantite: 100, taux_perte: 10, prix_unitaire: 2,
+    })).toBe(0);
   });
 
-  it('DÉFAUT CONSTATÉ : une perte totale (1) donne 0, mais une perte > 1 n’est pas signalée', () => {
+  it('borne aussi une perte négative, sans en faire un bonus de récolte', () => {
+    // −0,2 ne signifie pas « 20 % de plus » : la perte est comptée nulle.
+    expect(recetteVente({
+      produit: 'Maïs grain', quantite: 100, taux_perte: -0.2, prix_unitaire: 2,
+    })).toBe(200);
+  });
+
+  it('perte totale (1) et perte > 1 donnent toutes deux 0', () => {
     expect(recetteVente({
       produit: 'Maïs grain', quantite: 100, taux_perte: 1, prix_unitaire: 2,
     })).toBe(0);
     expect(recetteVente({
       produit: 'Maïs grain', quantite: 100, taux_perte: 1.5, prix_unitaire: 2,
-    })).toBe(-100);
+    })).toBe(0);
+    expect(recetteVente({
+      produit: 'Maïs grain', quantite: 100, taux_perte: '1,000', prix_unitaire: 2,
+    })).toBe(0);
+  });
+
+  it('une perte juste sous 1 reste calculée, elle n’est pas rabotée', () => {
+    // La borne ne doit pas manger les valeurs légitimes proches du bord.
+    expect(recetteVente({
+      produit: 'Maïs grain', quantite: 100, taux_perte: '0,999', prix_unitaire: 2,
+    })).toBe(0.2);
+  });
+
+  it('arrondit au demi-supérieur comme le backend', () => {
+    // 100 × (1 − 0,9) × 0,1005 = 1,005 → 1,01 en ROUND_HALF_UP.
+    expect(recetteVente({
+      produit: 'Riz', quantite: 100, taux_perte: '0,9', prix_unitaire: '0,1005',
+    })).toBe(1.01);
+  });
+});
+
+describe('diagnostiquerTauxPerte', () => {
+  it('ne signale rien sur un taux dans [0, 1]', () => {
+    expect(diagnostiquerTauxPerte('0,1')).toMatchObject({ saisi: 0.1, horsPlage: false, message: null });
+    expect(diagnostiquerTauxPerte(0)).toMatchObject({ horsPlage: false });
+    expect(diagnostiquerTauxPerte(1)).toMatchObject({ horsPlage: false });
+  });
+
+  it('ne signale rien sur un champ vide — l’absence n’est pas une erreur', () => {
+    expect(diagnostiquerTauxPerte('')).toEqual({
+      saisi: null, horsPlage: false, message: null, suggestion: null,
+    });
+    expect(diagnostiquerTauxPerte(undefined)).toMatchObject({ saisi: null, horsPlage: false });
+  });
+
+  it('signale une saisie en pourcents et SUGGÈRE la lecture probable', () => {
+    // §4.5 : on suggère la correction pressentie, on ne l'applique jamais d'office.
+    const d = diagnostiquerTauxPerte(10);
+    expect(d.horsPlage).toBe(true);
+    expect(d.saisi).toBe(10);
+    expect(d.message).toContain('fraction');
+    expect(d.suggestion).toBe('0,1 pour 10 % ?');
+  });
+
+  it('ne suggère rien quand la saisie ne se lit même pas en pourcents', () => {
+    const d = diagnostiquerTauxPerte(450);
+    expect(d.horsPlage).toBe(true);
+    expect(d.suggestion).toBeNull();
+  });
+
+  it('signale un taux négatif', () => {
+    const d = diagnostiquerTauxPerte('-0,2');
+    expect(d.horsPlage).toBe(true);
+    expect(d.message).toContain('négatif');
   });
 });

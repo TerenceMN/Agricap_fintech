@@ -166,16 +166,166 @@ function auditQuery(filters?: import('@/types/api').AuditFilters, extra?: Record
   return qs ? `?${qs}` : '';
 }
 
-/** Montant total d'une ligne = quantité × coût unitaire × fréquence (logique client). */
-export function montantLigne(b: BesoinInput): number {
-  const n = (v: unknown) => Number(String(v ?? '').replace(',', '.')) || 0;
-  return Math.round(n(b.quantite) * n(b.cout_unitaire) * (n(b.frequence) || 1) * 100) / 100;
+// ── Arithmétique décimale de saisie assistée ────────────────────────────────
+//
+// `montantLigne` et `recetteVente` sont les deux SEULS calculs métier que le
+// front assume : ils donnent un total au fil de la frappe pendant la saisie de
+// la feuille de besoins. Le serveur reste seul juge des montants scorés
+// (principe 1) — mais tant que ces deux totaux s'affichent, ils doivent tomber
+// sur le même centime que lui, sinon l'écran contredit le contrôle de cohérence
+// Σ feuille 4 = feuille 5 (±0,01) qu'il prépare.
+//
+// D'où l'abandon de `Math.round(x * 100) / 100`, qui n'est PAS le ROUND_HALF_UP
+// du backend : `1.005 * 100` vaut 100.49999999999999 en binaire, donc 1,00 au
+// lieu de 1,01 (principe 4 — `float` nulle part sur un calcul financier).
+// Ci-dessous, les saisies sont lues comme des décimaux exacts (mantisse entière
+// + échelle, en `BigInt`), multipliées exactement, et arrondies au centime au
+// demi-supérieur — la transposition littérale de `Decimal(str(v))` puis
+// `quantize(0.01, ROUND_HALF_UP)`. Aucun `float` n'intervient avant la dernière
+// division par 100, qui est exacte au double le plus proche.
+
+/** Un décimal exact : `units × 10^-scale`. */
+interface Decimale { units: bigint; scale: number }
+
+/** Décimal signé accepté à la saisie : virgule OU point, notation scientifique
+ *  tolérée (`String(1e-7)` vaut « 1e-7 » — la refuser ferait un zéro muet). */
+const SAISIE_DECIMALE = /^([+-]?)(\d*)(?:[.](\d*))?(?:[eE]([+-]?\d+))?$/;
+
+/**
+ * Lit une saisie comme un décimal exact, à l'identique de `Decimal(str(v))`.
+ * `null` = rien d'exploitable (champ vide, texte libre) — jamais `NaN`, et
+ * surtout jamais confondu avec un zéro saisi volontairement.
+ */
+function decimale(value: unknown): Decimale | null {
+  const brut = String(value ?? '').trim().replace(',', '.');
+  if (!brut) return null;
+  const m = SAISIE_DECIMALE.exec(brut);
+  if (!m) return null;
+  const [, signe, entiere = '', decimales = '', exposant] = m;
+  if (!entiere && !decimales) return null;          // « . », « + », « e3 »
+  let units = BigInt(`${signe === '-' ? '-' : ''}${entiere || '0'}${decimales}`);
+  let scale = decimales.length - (exposant ? Number(exposant) : 0);
+  if (scale < 0) {                                   // 1e3 → 1000, échelle 0
+    units *= 10n ** BigInt(-scale);
+    scale = 0;
+  }
+  return { units, scale };
 }
 
-/** Recette prévisionnelle d'une vente = quantité × (1 − perte) × prix (logique client). */
+/** Produit exact de plusieurs décimaux — aucune perte, les échelles s'ajoutent. */
+function produit(facteurs: Decimale[]): Decimale {
+  return facteurs.reduce(
+    (acc, f) => ({ units: acc.units * f.units, scale: acc.scale + f.scale }),
+    { units: 1n, scale: 0 },
+  );
+}
+
+/**
+ * Arrondi au centime au demi-supérieur (`ROUND_HALF_UP` : la moitié s'écarte
+ * de zéro, comme `decimal.ROUND_HALF_UP` de Python — pas comme `Math.round`,
+ * qui arrondit −0,005 vers 0).
+ */
+function auCentime({ units, scale }: Decimale): number {
+  if (scale <= 2) return Number(units * 10n ** BigInt(2 - scale)) / 100;
+  const diviseur = 10n ** BigInt(scale - 2);
+  const negatif = units < 0n;
+  const absolu = negatif ? -units : units;
+  const entier = absolu / diviseur;
+  const reste = absolu % diviseur;
+  const centimes = reste * 2n >= diviseur ? entier + 1n : entier;
+  return Number(negatif ? -centimes : centimes) / 100;
+}
+
+/**
+ * Montant total d'une ligne = quantité × coût unitaire × fréquence.
+ *
+ * `frequence` vaut 1 UNIQUEMENT quand le champ est vide ou absent. Une fréquence
+ * explicitement à 0 vaut 0 : c'est le geste par lequel un client neutralise une
+ * ligne sans l'effacer, et l'ancien `|| 1` le retournait en montant plein
+ * (CLAUDE.md §4.5 — « donnée absente » et « zéro explicite » ne se traitent
+ * jamais pareil). Une fréquence saisie mais illisible (« deux ») n'est pas non
+ * plus 1 : elle vaut 0, comme une quantité illisible, et le total tombe à 0
+ * plutôt que d'inventer une occurrence.
+ *
+ * `montant_total` porté par la ligne est volontairement ignoré : le total
+ * affiché se recalcule toujours à partir des facteurs voisins.
+ */
+export function montantLigne(b: BesoinInput): number {
+  const quantite = decimale(b.quantite);
+  const cout = decimale(b.cout_unitaire);
+  if (!quantite || !cout) return 0;
+  const frequenceSaisie = String(b.frequence ?? '').trim();
+  const frequence = frequenceSaisie
+    ? (decimale(frequenceSaisie) ?? { units: 0n, scale: 0 })
+    : { units: 1n, scale: 0 };
+  return auCentime(produit([quantite, cout, frequence]));
+}
+
+/**
+ * Diagnostic d'un taux de perte saisi, pour le point de saisie.
+ *
+ * `taux_perte` est une FRACTION (0,1 = 10 %) : c'est la convention du backend
+ * et elle ne se devine pas à l'écran. Un client qui tape « 10 » en pensant
+ * « 10 % » produisait (1 − 10) = −9, donc une recette NÉGATIVE, sans le moindre
+ * message. On ne corrige pas sa saisie en silence — interpréter 10 comme 0,10
+ * serait décider à sa place (CLAUDE.md §4.5 : on suggère la correction, on ne
+ * l'applique pas) : on borne le calcul et on rend l'anomalie visible.
+ *
+ * @returns `horsPlage` vrai si le taux sort de [0, 1] ; `suggestion` = la
+ *          lecture la plus probable, à proposer, jamais à appliquer d'office.
+ */
+export function diagnostiquerTauxPerte(value: unknown): {
+  saisi: number | null;
+  horsPlage: boolean;
+  message: string | null;
+  suggestion: string | null;
+} {
+  const d = decimale(value);
+  if (!d) return { saisi: null, horsPlage: false, message: null, suggestion: null };
+  const saisi = Number(d.units) / 10 ** d.scale;
+  if (saisi >= 0 && saisi <= 1) {
+    return { saisi, horsPlage: false, message: null, suggestion: null };
+  }
+  if (saisi < 0) {
+    return {
+      saisi,
+      horsPlage: true,
+      message: 'Un taux de perte négatif n’a pas de sens : la perte est comptée comme nulle.',
+      suggestion: null,
+    };
+  }
+  const enFraction = saisi <= 100 ? String(saisi / 100).replace('.', ',') : null;
+  return {
+    saisi,
+    horsPlage: true,
+    message: 'Le taux de perte s’exprime en fraction (0,1 = 10 %), pas en pourcents. '
+      + 'Au-delà de 1, la perte est comptée comme totale et la recette tombe à 0.',
+    suggestion: enFraction ? `${enFraction} pour ${saisi} % ?` : null,
+  };
+}
+
+/**
+ * Recette prévisionnelle d'une vente = quantité × (1 − perte) × prix.
+ *
+ * Le taux de perte est borné à [0, 1] : hors de cet intervalle il n'est pas
+ * interprétable, et une recette négative à l'écran est pire qu'un zéro — elle
+ * se propage dans un total de feuille 5 que rien ne signale.
+ * `diagnostiquerTauxPerte` porte le message à afficher au point de saisie.
+ */
 export function recetteVente(v: VenteInput): number {
-  const n = (x: unknown) => Number(String(x ?? '').replace(',', '.')) || 0;
-  return Math.round(n(v.quantite) * (1 - n(v.taux_perte)) * n(v.prix_unitaire) * 100) / 100;
+  const quantite = decimale(v.quantite);
+  const prix = decimale(v.prix_unitaire);
+  if (!quantite || !prix) return 0;
+
+  const perte = decimale(v.taux_perte) ?? { units: 0n, scale: 0 };
+  const un = 10n ** BigInt(perte.scale);
+  const restant: Decimale = perte.units <= 0n
+    ? { units: 1n, scale: 0 }                          // perte nulle ou négative → tout reste
+    : perte.units >= un
+      ? { units: 0n, scale: 0 }                        // perte ≥ 100 % → rien ne reste
+      : { units: un - perte.units, scale: perte.scale };
+
+  return auCentime(produit([quantite, restant, prix]));
 }
 
 export const api = {
@@ -1095,6 +1245,16 @@ export const api = {
     // ── Surface agent terrain ───────────────────────────────────────────────
     /** File de vérification : actifs déclarés en attente de contrôle. */
     pending: () => request<{ total_rows: number; items: AssetRow[] }>('/assets/pending'),
+    /** Historique post-déclaratif : tout ce que `pending` ne sert plus une fois
+     *  l'acte posé (`verifie`, `rejete`, `gage`, `libere`). Lecture seule, même
+     *  garde que la file (403 hors `CAN_VERIFY_ASSET`). Trié sur `verifieLe`
+     *  décroissant, les actifs sans horodatage en fin de liste.
+     *  `status` restreint à un statut ; un statut inconnu est refusé en 400
+     *  (`STATUT_INCONNU`) — le serveur ne devine pas. */
+    history: (status?: string) => {
+      const suffix = status ? `?status=${encodeURIComponent(status)}` : '';
+      return request<{ total_rows: number; items: AssetRow[] }>(`/assets/history${suffix}`);
+    },
     /** La valeur retenue est calculée par le serveur (valeur constatée − décote). */
     verify: (id: number, data: { valeur_verifiee: number | string; documents?: unknown[] }) =>
       request<AssetRow>(`/assets/${id}/verify`, { method: 'POST', body: data }),
