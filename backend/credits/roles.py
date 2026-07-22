@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from django.conf import settings
 
-from rbac.role_registry import get_role
+from rbac.role_registry import canonical_role_id, get_role
 
 
 # ── Groupes fonctionnels (identifiants canoniques du registre) ────────────────
@@ -126,7 +126,13 @@ def roles_of(request) -> list[str]:
         return []
 
     role_id = getattr(user, "role", "") or "client"
-    return [role_id]
+    # Les groupes fonctionnels ci-dessus comparent des CHAÎNES : un alias de
+    # nomenclature (« auditeur », « caissier » — des noms de vues confondus avec
+    # des rôles, cf. `rbac.role_registry.ROLE_ALIASES`) resterait hors de tout
+    # groupe, donc hors `STAFF_ROLES`, même si `get_role()` le résout
+    # correctement en capacités. On canonicalise ici pour que les deux chemins
+    # de décision — capacité et appartenance — voient le même rôle.
+    return [canonical_role_id(role_id) or role_id]
 
 
 def has_capability(request, capability: str) -> bool:

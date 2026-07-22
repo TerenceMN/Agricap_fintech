@@ -1,4 +1,3 @@
-
 from common.testing import AuthedAPITestCase
 
 
@@ -25,11 +24,13 @@ class BeneficiaireInterneTests(AuthedAPITestCase):
     def test_tous_les_roles_internes_sont_couverts_pas_seulement_admin(self):
         """`is_staff_role` dérive du registre RBAC : tout rôle non-Client est
         interne. La règle ne doit pas se limiter au rôle `admin` historique."""
-        # Rôles RÉELLEMENT présents au registre. « auditeur » et « caissier »
-        # n'y sont PAS : `get_role()` les fait retomber en silence sur
-        # « client », alors que la barre latérale leur sert un menu interne.
-        # Divergence signalée séparément — ne pas la masquer ici.
-        for role in ("gest_port", "agent_terrain", "aud_fin", "gest_caisse"):
+        # « auditeur » et « caissier » ne sont pas des rôles mais des noms de
+        # VUES (`rbac.models.DASHBOARD_VIEWS`). Reçus comme rôle, ils ne
+        # retombent plus en silence sur « client » : ils sont canonicalisés
+        # vers `aud_tech` / `agent_cash` (`rbac.role_registry.ROLE_ALIASES`),
+        # avec log d'avertissement. Ils sont donc testés ici comme internes.
+        for role in ("gest_port", "agent_terrain", "aud_fin", "gest_caisse",
+                     "auditeur", "caissier"):
             with self.subTest(role=role):
                 self.login(role=role, sub=f"{role}-x")
                 res = self.client.post(self.URL, self.PAYLOAD, format="json")
