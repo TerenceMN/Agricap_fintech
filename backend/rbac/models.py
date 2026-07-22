@@ -64,6 +64,8 @@ class RoleOverride(models.Model):
     disburse = models.BooleanField(default=False)
     audit = models.BooleanField(default=False)
     config = models.BooleanField(default=False)
+    #: Gestion des coopératives, groupes et équipes — voir `RoleDef.cooperatives`.
+    cooperatives = models.BooleanField(default=False)
     is_supervisor = models.BooleanField(default=False)
     mfa_step_up_required = models.BooleanField(default=False)
     is_custom = models.BooleanField(default=False)

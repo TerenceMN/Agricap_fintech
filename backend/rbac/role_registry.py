@@ -23,6 +23,11 @@ class RoleDef:
     disburse: bool = False
     audit: bool = False
     config: bool = False
+    #: Gestion des coopératives, groupes et équipes (créer, affecter des membres,
+    #: désigner un responsable). Distincte de `config` : administrer le
+    #: RÉFÉRENTIEL et animer le RÉSEAU MUTUALISTE ne sont pas le même métier —
+    #: un gestionnaire de zone anime des coopératives sans toucher aux barèmes.
+    cooperatives: bool = False
     is_supervisor: bool = False
     mfa_step_up_required: bool = False
 
@@ -30,10 +35,10 @@ class RoleDef:
 _ROLES = [
     RoleDef("dg", "Directeur Général", 1, "Direction",
             read=True, create=True, validate=True, disburse=True, audit=True, config=True,
-            is_supervisor=True, mfa_step_up_required=True),
+            is_supervisor=True, mfa_step_up_required=True, cooperatives=True),
     RoleDef("dir_ops", "Directeur Opérations", 1, "Direction",
             read=True, create=True, validate=True, disburse=True, audit=True,
-            is_supervisor=True, mfa_step_up_required=True),
+            is_supervisor=True, mfa_step_up_required=True, cooperatives=True),
     RoleDef("aud_tech", "Auditeur Technique", 2, "Audit",
             read=True, audit=True, is_supervisor=True, mfa_step_up_required=True),
     RoleDef("aud_fin", "Auditeur Financier", 2, "Audit",
@@ -43,9 +48,9 @@ _ROLES = [
     RoleDef("gest_port", "Gestionnaire Portefeuille", 3, "Gestion",
             read=True, create=True, validate=True),
     RoleDef("gest_agents", "Gestionnaire Agents", 4, "Opérations",
-            read=True, create=True),
+            read=True, create=True, cooperatives=True),
     RoleDef("gest_zone", "Gestionnaire Zones", 4, "Opérations",
-            read=True, create=True, validate=True),
+            read=True, create=True, validate=True, cooperatives=True),
     RoleDef("gest_caisse", "Gestionnaire Caisses", 4, "Opérations",
             read=True, create=True, validate=True, disburse=True),
     RoleDef("agent_terrain", "Agent Terrain", 5, "Terrain",
@@ -81,7 +86,7 @@ _ROLES = [
 
 ROLE_REGISTRY: dict[str, RoleDef] = {r.id: r for r in _ROLES}
 
-CAPABILITIES = ("read", "create", "validate", "disburse", "audit", "config")
+CAPABILITIES = ("read", "create", "validate", "disburse", "audit", "config", "cooperatives")
 
 
 def get_role(role_id: str) -> RoleDef:

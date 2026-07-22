@@ -23,11 +23,12 @@ export const CAPABILITIES = [
   { key: 'disburse', label: 'Décaissement' },
   { key: 'audit', label: 'Audit' },
   { key: 'config', label: 'Paramétrage' },
+  { key: 'cooperatives', label: 'Gestion coopératives' },
 ];
 
 export const emptyForm = {
   id: '', label: '', level: 0, type: 'Gestion',
-  permissions: { read: true, create: false, validate: false, disburse: false, audit: false, config: false },
+  permissions: { read: true, create: false, validate: false, disburse: false, audit: false, config: false, cooperatives: false },
 };
 
 const RoleFormModal = ({ isOpen, onClose, role, onSave }) => {

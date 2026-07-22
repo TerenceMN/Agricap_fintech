@@ -432,6 +432,7 @@ const Users = () => {
                                         <TableHead className="text-center w-24">Décaissement</TableHead>
                                         <TableHead className="text-center w-24">Audit</TableHead>
                                         <TableHead className="text-center w-24">Paramétrage</TableHead>
+                                        <TableHead className="text-center w-28">Coopératives</TableHead>
                                         <TableHead className="text-right w-28">Actions</TableHead>
                                     </TableRow>
                                 </TableHeader>
@@ -447,6 +448,7 @@ const Users = () => {
                                             <TableCell className="text-center"><PermissionCheck active={role.permissions.disburse} /></TableCell>
                                             <TableCell className="text-center"><PermissionCheck active={role.permissions.audit} /></TableCell>
                                             <TableCell className="text-center"><PermissionCheck active={role.permissions.config} /></TableCell>
+                                            <TableCell className="text-center"><PermissionCheck active={role.permissions.cooperatives} /></TableCell>
                                             <TableCell className="text-right">
                                                 <Button variant="ghost" size="sm"
                                                     onClick={() => { setEditingRole(role); setRoleModalOpen(true); }}>
