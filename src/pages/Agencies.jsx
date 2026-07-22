@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Helmet } from 'react-helmet';
 import Layout from '@/components/Layout';
 import { motion } from 'framer-motion';
 import {
     Store, Plus, Search, MapPin, Building2, AlertTriangle,
     MoreHorizontal, RefreshCcw, Download, History, Lock, ShieldCheck, ArrowLeftRight, Eye, ClipboardCheck,
-    Clock, CheckCircle2, XCircle, Send, UserCheck, Loader2
+    Clock, CheckCircle2, XCircle, Send, UserCheck, Loader2, Users, ShieldAlert
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -54,38 +54,198 @@ const StatusBadge = ({ status }) => {
 
 const EMPTY_FORM = { code: '', name: '', type: 'URBAINE', city: '', province: '', manager: '' };
 
-const AgencyFormModal = ({ isOpen, onClose, agency, onSave }) => {
+// Radix interdit `value=""` sur un SelectItem : sentinelle pour « pas de responsable ».
+const NO_MANAGER = '__none__';
+
+// Rend un échec serveur TEL QUEL, sans le réinterpréter côté client :
+//  · 403 → le refus de capacité renvoyé par `agencies/views.py::_require` ;
+//  · 400/422 portant `errors[]` → une ligne par erreur ;
+//  · sinon → le `detail` du serveur (ex. « Le code agence « X » existe déjà. »).
+const ServerErrorPanel = ({ error }) => {
+    if (!error) return null;
+    const isRefusal = error.status === 403;
+    const lines = error.errors?.length ? error.errors : null;
+    return (
+        <div
+            role="alert"
+            className={`rounded-lg border px-3 py-2 text-sm ${isRefusal
+                ? 'border-red-500/40 bg-red-500/10 text-red-300'
+                : 'border-amber-500/40 bg-amber-500/10 text-amber-300'}`}
+        >
+            <div className="flex items-center gap-2 font-medium">
+                {isRefusal ? <ShieldAlert className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+                {isRefusal ? 'Action refusée par le serveur' : `Erreur ${error.status}`}
+            </div>
+            {lines ? (
+                <ul className="mt-1 space-y-0.5 pl-6 list-disc">
+                    {lines.map((e, i) => <li key={e.code || i}>{e.message}</li>)}
+                </ul>
+            ) : (
+                <p className="mt-1 pl-6">{error.message}</p>
+            )}
+        </div>
+    );
+};
+
+// Le responsable d'agence est un `sub` OIDC opaque : personne ne le connaît par cœur, donc
+// il se CHOISIT dans le registre RBAC (`/rbac/users`) et ne se tape pas. Niveau 0 = client
+// externe au registre : exclu, un client ne dirige pas une agence.
+// `/rbac/users` exige la capacité `config`, alors que créer une agence exige `create` : un
+// utilisateur peut légitimement avoir le droit de créer sans pouvoir lister le personnel.
+// Dans ce cas on n'invente rien — on affiche le refus et on retombe sur la saisie du sub.
+const StaffPicker = ({
+    value, onChange, disabled, staff, loadError,
+    label = 'Responsable', emptyLabel = 'Aucun responsable', allowEmpty = true, required = false,
+}) => {
+    if (staff === undefined) {
+        return (
+            <div>
+                <Label>{label}</Label>
+                <div className="flex items-center gap-2 text-sm text-slate-500 h-10 px-3 rounded-md border border-slate-700 bg-slate-800/40">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Chargement du personnel…
+                </div>
+            </div>
+        );
+    }
+
+    if (loadError) {
+        return (
+            <div className="space-y-2">
+                <Label>{label} (identifiant OIDC)</Label>
+                <div className="flex items-start gap-2 text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    <span>
+                        Liste du personnel indisponible ({loadError.status === 403
+                            ? 'capacité « config » requise pour consulter le registre RBAC'
+                            : loadError.message}). Saisissez le <code>sub</code> à la main.
+                    </span>
+                </div>
+                <Input
+                    value={value}
+                    disabled={disabled}
+                    onChange={e => onChange(e.target.value)}
+                    placeholder="sub de l'utilisateur"
+                />
+            </div>
+        );
+    }
+
+    // Une personne déjà enregistrée mais absente du registre (compte désactivé, sub hérité)
+    // reste sélectionnable : on ne l'efface pas silencieusement du formulaire.
+    const known = staff.some(u => u.sub === value);
+    return (
+        <div>
+            <Label className="flex items-center gap-1.5">
+                <Users className="w-3.5 h-3.5 text-slate-400" /> {label}
+                {required && <span className="text-red-400">*</span>}
+            </Label>
+            <Select
+                value={value || NO_MANAGER}
+                disabled={disabled}
+                onValueChange={v => onChange(v === NO_MANAGER ? '' : v)}
+            >
+                <SelectTrigger><SelectValue placeholder="Choisir un membre du personnel" /></SelectTrigger>
+                <SelectContent className="max-h-72">
+                    {allowEmpty && <SelectItem value={NO_MANAGER}>{emptyLabel}</SelectItem>}
+                    {value && !known && (
+                        <SelectItem value={value}>{value} (hors registre)</SelectItem>
+                    )}
+                    {staff.map(u => (
+                        <SelectItem key={u.sub} value={u.sub}>
+                            {u.name || u.email || u.sub}
+                            {u.roleLabel ? ` — ${u.roleLabel}` : ''}
+                            {u.status && u.status !== 'Actif' ? ` (${u.status})` : ''}
+                        </SelectItem>
+                    ))}
+                </SelectContent>
+            </Select>
+            {staff.length === 0 && (
+                <p className="text-xs text-slate-500 mt-1">
+                    Aucun membre du personnel au registre RBAC — attribuez d'abord un rôle interne à un utilisateur.
+                </p>
+            )}
+        </div>
+    );
+};
+
+const AgencyFormModal = ({ isOpen, onClose, agency, onSave, staff, staffError }) => {
     const [form, setForm] = useState(EMPTY_FORM);
+    const [saving, setSaving] = useState(false);
+    const [error, setError] = useState(null);
+
     useEffect(() => {
         setForm(agency
-            ? { code: agency.code, name: agency.name, type: agency.type, city: agency.city, province: agency.province, manager: agency.manager }
+            ? { code: agency.code, name: agency.name, type: agency.type, city: agency.city, province: agency.province, manager: agency.manager || '' }
             : EMPTY_FORM);
+        setError(null);
+        setSaving(false);
     }, [agency, isOpen]);
 
+    // `create_agency` exige code + nom ; le reste est facultatif côté modèle.
+    const canSubmit = agency ? !!form.name.trim() : (!!form.code.trim() && !!form.name.trim());
+
+    const handleSubmit = async () => {
+        if (!canSubmit || saving) return;
+        setSaving(true);
+        setError(null);
+        try {
+            await onSave(form);
+        } catch (e) {
+            setError(e instanceof ApiError ? e : new ApiError(0, String(e)));
+        } finally {
+            setSaving(false);
+        }
+    };
+
     return (
-        <Dialog open={isOpen} onOpenChange={onClose}>
-            <DialogContent className="bg-slate-900 border-slate-700 text-white">
+        <Dialog open={isOpen} onOpenChange={() => { if (!saving) onClose(); }}>
+            <DialogContent className="bg-slate-900 border-slate-700 text-white max-h-[85vh] overflow-y-auto">
                 <DialogHeader>
                     <DialogTitle>{agency ? "Modifier l'agence" : 'Nouvelle Agence'}</DialogTitle>
                     <DialogDescription className="text-slate-400">
-                        {agency ? `Mise à jour de ${agency.code}` : "Crée un nouveau point d'agence dans le réseau."}
+                        {agency
+                            ? `Mise à jour de ${agency.code}. Le code et le type ne sont pas modifiables ici — le type évolue via le plan d'évolution.`
+                            : "Crée un nouveau point d'agence dans le réseau. Le droit de création est vérifié par le serveur à l'envoi."}
                     </DialogDescription>
                 </DialogHeader>
                 <div className="space-y-3 py-2">
-                    {!agency && (
+                    {agency ? (
+                        <div className="grid grid-cols-2 gap-3 rounded-lg bg-slate-800/60 border border-slate-700 px-3 py-2">
+                            <div>
+                                <p className="text-xs text-slate-500">Code agence</p>
+                                <p className="text-sm font-mono text-slate-200">{agency.code}</p>
+                            </div>
+                            <div>
+                                <p className="text-xs text-slate-500">Type</p>
+                                <p className="text-sm text-slate-200">{AGENCY_TYPES.find(t => t.value === agency.type)?.label || agency.type}</p>
+                            </div>
+                        </div>
+                    ) : (
                         <div>
-                            <Label>Code agence</Label>
-                            <Input value={form.code} onChange={e => setForm(f => ({ ...f, code: e.target.value }))} placeholder="AG-KIN-01" />
+                            <Label>Code agence <span className="text-red-400">*</span></Label>
+                            <Input
+                                value={form.code}
+                                disabled={saving}
+                                onChange={e => setForm(f => ({ ...f, code: e.target.value }))}
+                                placeholder="AG-KIN-01"
+                                autoFocus
+                            />
+                            <p className="text-xs text-slate-500 mt-1">Identifiant unique dans le réseau, définitif après création.</p>
                         </div>
                     )}
                     <div>
-                        <Label>Nom</Label>
-                        <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Agence Kinshasa Centre" />
+                        <Label>Nom <span className="text-red-400">*</span></Label>
+                        <Input
+                            value={form.name}
+                            disabled={saving}
+                            onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+                            placeholder="Agence Kinshasa Centre"
+                        />
                     </div>
                     {!agency && (
                         <div>
                             <Label>Type</Label>
-                            <Select value={form.type} onValueChange={v => setForm(f => ({ ...f, type: v }))}>
+                            <Select value={form.type} disabled={saving} onValueChange={v => setForm(f => ({ ...f, type: v }))}>
                                 <SelectTrigger><SelectValue /></SelectTrigger>
                                 <SelectContent>
                                     {AGENCY_TYPES.map(t => <SelectItem key={t.value} value={t.value}>{t.label}</SelectItem>)}
@@ -96,21 +256,27 @@ const AgencyFormModal = ({ isOpen, onClose, agency, onSave }) => {
                     <div className="grid grid-cols-2 gap-3">
                         <div>
                             <Label>Ville</Label>
-                            <Input value={form.city} onChange={e => setForm(f => ({ ...f, city: e.target.value }))} />
+                            <Input value={form.city} disabled={saving} onChange={e => setForm(f => ({ ...f, city: e.target.value }))} />
                         </div>
                         <div>
                             <Label>Province</Label>
-                            <Input value={form.province} onChange={e => setForm(f => ({ ...f, province: e.target.value }))} />
+                            <Input value={form.province} disabled={saving} onChange={e => setForm(f => ({ ...f, province: e.target.value }))} />
                         </div>
                     </div>
-                    <div>
-                        <Label>Responsable (identifiant)</Label>
-                        <Input value={form.manager} onChange={e => setForm(f => ({ ...f, manager: e.target.value }))} placeholder="sub de l'utilisateur responsable" />
-                    </div>
+                    <StaffPicker
+                        value={form.manager}
+                        disabled={saving}
+                        staff={staff}
+                        loadError={staffError}
+                        onChange={v => setForm(f => ({ ...f, manager: v }))}
+                    />
+
+                    <ServerErrorPanel error={error} />
                 </div>
                 <DialogFooter>
-                    <Button variant="outline" onClick={onClose}>Annuler</Button>
-                    <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={() => onSave(form)}>
+                    <Button variant="outline" onClick={onClose} disabled={saving}>Annuler</Button>
+                    <Button className="bg-emerald-600 hover:bg-emerald-700" disabled={!canSubmit || saving} onClick={handleSubmit}>
+                        {saving && <Loader2 className="w-4 h-4 animate-spin mr-2" />}
                         {agency ? 'Enregistrer' : 'Créer'}
                     </Button>
                 </DialogFooter>
@@ -743,7 +909,7 @@ const StatusHistoryDialog = ({ open, agencyCode, rows, onClose }) => (
 
 const RECONCILIATION_STATUS_LABELS = { PENDING: 'En attente', IN_PROGRESS: 'En cours', COMPLETED: 'Terminé' };
 
-const ReconciliationDialog = ({ agency, onClose, toast }) => {
+const ReconciliationDialog = ({ agency, onClose, toast, staff, staffError }) => {
     const [current, setCurrent] = useState(undefined); // undefined = chargement, null = aucun en cours
     const [periodStart, setPeriodStart] = useState('');
     const [periodEnd, setPeriodEnd] = useState('');
@@ -836,14 +1002,25 @@ const ReconciliationDialog = ({ agency, onClose, toast }) => {
                         </div>
                         {current.status === 'PENDING' && (
                             <div className="space-y-2">
-                                <Label>Assigner à (identifiant)</Label>
-                                <Input value={assigneeSub} onChange={e => setAssigneeSub(e.target.value)} placeholder="sub de l'agent responsable" />
+                                {/* Même règle que le responsable d'agence : un `sub` OIDC se choisit
+                                    dans le registre RBAC, il ne se tape pas. */}
+                                <StaffPicker
+                                    label="Assigner à"
+                                    required
+                                    allowEmpty={false}
+                                    value={assigneeSub}
+                                    staff={staff}
+                                    loadError={staffError}
+                                    onChange={setAssigneeSub}
+                                />
                                 <Button className="w-full" disabled={!assigneeSub} onClick={handleAssign}>Assigner</Button>
                             </div>
                         )}
                         {current.status === 'IN_PROGRESS' && (
                             <div className="space-y-2">
-                                <p className="text-xs text-slate-500">Assigné à {current.assignedTo}</p>
+                                <p className="text-xs text-slate-500">
+                                    Assigné à {(staff || []).find(u => u.sub === current.assignedTo)?.name || current.assignedTo}
+                                </p>
                                 <div className="grid grid-cols-2 gap-3">
                                     <div>
                                         <Label>Écart constaté</Label>
@@ -879,6 +1056,7 @@ const Agencies = () => {
     const { toast } = useToast();
     const [agencies, setAgencies] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState(null);
     const [searchTerm, setSearchTerm] = useState('');
     const [formAgency, setFormAgency] = useState(undefined); // undefined = fermé, null = création, objet = édition
     const [evolutionAgency, setEvolutionAgency] = useState(null);
@@ -891,10 +1069,21 @@ const Agencies = () => {
     const [makerRequest, setMakerRequest] = useState(null);   // { agency, actionType } | null
     const [checkerRequest, setCheckerRequest] = useState(null); // demande complète | null
     const [activeAgencyTab, setActiveAgencyTab] = useState('agencies');
+    // Registre du personnel interne (niveau ≠ 0 = non-client) : sert à CHOISIR un
+    // responsable au lieu de taper un `sub` OIDC, et à afficher un nom dans la colonne
+    // « Responsable » plutôt qu'un identifiant opaque. `/rbac/users` exige la capacité
+    // `config` — l'échec est toléré et rendu explicitement, jamais masqué.
+    const [staff, setStaff] = useState(undefined); // undefined = chargement
+    const [staffError, setStaffError] = useState(null);
 
     const load = useCallback(() => {
         setLoading(true);
-        api.agencies.list().then(setAgencies).catch((e) => {
+        setLoadError(null);
+        api.agencies.list().then(rows => { setAgencies(rows); }).catch((e) => {
+            // Un refus serveur ne doit pas se déguiser en « aucune agence » : on garde
+            // l'erreur pour la rendre dans le tableau, en plus du toast.
+            setAgencies([]);
+            setLoadError(e instanceof ApiError ? e : new ApiError(0, String(e)));
             toast({ variant: 'destructive', title: 'Erreur', description: e instanceof ApiError ? e.message : String(e) });
         }).finally(() => setLoading(false));
     }, [toast]);
@@ -905,20 +1094,41 @@ const Agencies = () => {
 
     useEffect(() => { load(); loadRequests(); }, [load, loadRequests]);
 
+    useEffect(() => {
+        let cancelled = false;
+        api.rbac.users.list()
+            .then(rows => { if (!cancelled) setStaff(rows.filter(u => u.level !== 0)); })
+            .catch(e => {
+                if (cancelled) return;
+                setStaff([]);
+                setStaffError(e instanceof ApiError ? e : new ApiError(0, String(e)));
+            });
+        return () => { cancelled = true; };
+    }, []);
+
+    const staffBySub = useMemo(
+        () => Object.fromEntries((staff || []).map(u => [u.sub, u])),
+        [staff],
+    );
+
+    // Laisse remonter l'erreur : le modal la rend telle quelle (403 de capacité, 422
+    // ligne par ligne, code d'agence déjà pris) au lieu d'un toast qui disparaît et
+    // referme la saisie. Seul le succès ferme le formulaire.
     const handleSave = async (form) => {
-        try {
-            if (formAgency) {
-                await api.agencies.update(formAgency.code, { name: form.name, city: form.city, province: form.province, manager: form.manager });
-                toast({ title: 'Agence mise à jour', description: `${formAgency.code} a été modifiée.` });
-            } else {
-                await api.agencies.create(form);
-                toast({ title: 'Agence créée', description: `${form.code} a été ajoutée au réseau.` });
-            }
-            setFormAgency(undefined);
-            load();
-        } catch (e) {
-            toast({ variant: 'destructive', title: 'Erreur', description: e instanceof ApiError ? e.message : String(e) });
+        if (formAgency) {
+            // PATCH /agencies/<code> n'accepte que name/city/province/manager (+complianceScore) :
+            // ni le code ni le type ne s'y modifient — inutile de les envoyer.
+            await api.agencies.update(formAgency.code, { name: form.name, city: form.city, province: form.province, manager: form.manager });
+            toast({ title: 'Agence mise à jour', description: `${formAgency.code} a été modifiée.` });
+        } else {
+            await api.agencies.create({
+                code: form.code.trim(), name: form.name.trim(), type: form.type,
+                city: form.city, province: form.province, manager: form.manager,
+            });
+            toast({ title: 'Agence créée', description: `${form.code} a été ajoutée au réseau.` });
         }
+        setFormAgency(undefined);
+        load();
     };
 
     const openReconciliation = async (agency) => {
@@ -1060,9 +1270,30 @@ const Agencies = () => {
                                 </TableHeader>
                                 <TableBody>
                                     {loading ? (
-                                        <TableRow><TableCell colSpan={8} className="text-center text-slate-500 py-8">Chargement...</TableCell></TableRow>
+                                        <TableRow><TableCell colSpan={8} className="text-center text-slate-500 py-8">
+                                            <span className="inline-flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Chargement...</span>
+                                        </TableCell></TableRow>
+                                    ) : loadError ? (
+                                        <TableRow><TableCell colSpan={8} className="py-8">
+                                            <div className="max-w-md mx-auto"><ServerErrorPanel error={loadError} /></div>
+                                            <div className="text-center mt-3">
+                                                <Button variant="outline" size="sm" className="border-slate-600" onClick={load}>
+                                                    <RefreshCcw className="w-3.5 h-3.5 mr-1.5" /> Réessayer
+                                                </Button>
+                                            </div>
+                                        </TableCell></TableRow>
+                                    ) : agencies.length === 0 ? (
+                                        <TableRow><TableCell colSpan={8} className="text-center text-slate-500 py-10">
+                                            <Store className="w-8 h-8 mx-auto mb-2 text-slate-600" />
+                                            <p className="text-slate-400">Aucune agence dans le réseau.</p>
+                                            <Button className="mt-3 bg-emerald-600 hover:bg-emerald-700" size="sm" onClick={() => setFormAgency(null)}>
+                                                <Plus className="w-4 h-4 mr-2" /> Créer la première agence
+                                            </Button>
+                                        </TableCell></TableRow>
                                     ) : filtered.length === 0 ? (
-                                        <TableRow><TableCell colSpan={8} className="text-center text-slate-500 py-8">Aucune agence.</TableCell></TableRow>
+                                        <TableRow><TableCell colSpan={8} className="text-center text-slate-500 py-8">
+                                            Aucune agence ne correspond à « {searchTerm} ».
+                                        </TableCell></TableRow>
                                     ) : filtered.map((agency) => (
                                         <TableRow key={agency.id} className="border-slate-800 hover:bg-slate-800/30">
                                             <TableCell>
@@ -1073,7 +1304,20 @@ const Agencies = () => {
                                                 <div className="flex items-center gap-1 text-xs mb-1"><Building2 className="w-3 h-3 text-blue-400"/> {AGENCY_TYPES.find(t => t.value === agency.type)?.label || agency.type}</div>
                                                 <div className="flex items-center gap-1 text-xs text-slate-400"><MapPin className="w-3 h-3"/> {agency.city}{agency.city && agency.province ? ', ' : ''}{agency.province}</div>
                                             </TableCell>
-                                            <TableCell className="text-sm">{agency.manager || '—'}</TableCell>
+                                            <TableCell className="text-sm">
+                                                {agency.manager ? (
+                                                    staffBySub[agency.manager] ? (
+                                                        <>
+                                                            <div className="text-white">{staffBySub[agency.manager].name || staffBySub[agency.manager].email || agency.manager}</div>
+                                                            {staffBySub[agency.manager].roleLabel && (
+                                                                <div className="text-xs text-slate-500">{staffBySub[agency.manager].roleLabel}</div>
+                                                            )}
+                                                        </>
+                                                    ) : (
+                                                        <span className="font-mono text-xs text-slate-400" title={agency.manager}>{agency.manager}</span>
+                                                    )
+                                                ) : <span className="text-slate-500">—</span>}
+                                            </TableCell>
                                             <TableCell className="text-center">
                                                 <Badge
                                                     variant="outline"
@@ -1261,7 +1505,14 @@ const Agencies = () => {
                 </Tabs>
             </div>
 
-            <AgencyFormModal isOpen={formAgency !== undefined} onClose={() => setFormAgency(undefined)} agency={formAgency} onSave={handleSave} />
+            <AgencyFormModal
+                isOpen={formAgency !== undefined}
+                onClose={() => setFormAgency(undefined)}
+                agency={formAgency}
+                onSave={handleSave}
+                staff={staff}
+                staffError={staffError}
+            />
             <ReportDialog open={!!report} title={report?.title || ''} rows={report?.rows ?? null} onClose={() => setReport(null)} />
             <EvolutionPlanDialog agency={evolutionAgency} onClose={() => setEvolutionAgency(null)} toast={toast} onChanged={load} />
             <AgencyComplianceDialog agency={complianceAgency} onClose={() => setComplianceAgency(null)} />
@@ -1271,7 +1522,13 @@ const Agencies = () => {
                 rows={statusHistory?.rows ?? null}
                 onClose={() => setStatusHistory(null)}
             />
-            <ReconciliationDialog agency={reconcilingAgency} onClose={() => setReconcilingAgency(null)} toast={toast} />
+            <ReconciliationDialog
+                agency={reconcilingAgency}
+                onClose={() => setReconcilingAgency(null)}
+                toast={toast}
+                staff={staff}
+                staffError={staffError}
+            />
             <MakerRequestDialog
                 agency={makerRequest?.agency || null}
                 actionType={makerRequest?.actionType || ''}
