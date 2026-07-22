@@ -4,6 +4,30 @@ from __future__ import annotations
 
 from .models import Investor, Movement, Offer, Project, Subscription
 
+#: Unité de CHAQUE taux servi par ces sérialiseurs — déclarée, jamais devinée.
+#:
+#: Le module stocke ses taux dans DEUX unités, et ce n'est pas un choix : c'est un
+#: héritage. `Offer.coupon_rate` et `ObligationPosition.rate` sont en points de
+#: pourcentage (9,000 = 9 %) ; `Offer.loan_to_value`, `BondWithdrawal.penalty_rate`,
+#: `SecondaryMarketListing.fee_rate`, `InvestmentConfig.default_rate_alert` et
+#: `concentration_threshold` sont des fractions (0,60 = 60 %). Deux conventions
+#: cohabitent donc jusque dans la MÊME table (`Offer.coupon_rate` à 9,000 à côté de
+#: `Offer.loan_to_value` à 0,600).
+#:
+#: Les uniformiser en sortie sans les uniformiser en base créerait une troisième
+#: convention et ferait afficher 1 250 % là où on attend 12,5 % — c'est une migration
+#: de données sur des montants réels, donc une décision, jamais un effet de bord de
+#: sérialisation. En attendant qu'elle soit tranchée, **aucun taux ne sort sans son
+#: unité** : le consommateur lit `units`, il ne parie plus.
+UNIT_PERCENT = "percent"      # 9,0 = 9 %
+UNIT_FRACTION = "fraction"    # 0,09 = 9 %
+
+OFFER_RATE_UNITS = {"couponRate": UNIT_PERCENT}
+COLLATERAL_RATE_UNITS = {"loanToValue": UNIT_FRACTION}
+SUBSCRIPTION_RATE_UNITS = {"couponRate": UNIT_PERCENT}
+OBLIGATION_RATE_UNITS = {"rate": UNIT_PERCENT}
+WITHDRAWAL_RATE_UNITS = {"penaltyRate": UNIT_FRACTION}
+
 
 def project_row(p: Project) -> dict:
     return {
@@ -44,6 +68,7 @@ def project_detail_row(p: Project) -> dict:
             "typeOfTitle": latest_offer.type_of_title, "couponRate": float(latest_offer.coupon_rate),
             "paymentFrequency": latest_offer.payment_frequency, "maturityMonths": latest_offer.maturity_months,
             "minTicket": float(latest_offer.min_ticket),
+            "units": OFFER_RATE_UNITS,
         })
     return row
 
@@ -62,6 +87,7 @@ def offer_row(o: Offer) -> dict:
         "subscriptionDeadline": o.subscription_deadline.isoformat() if o.subscription_deadline else None,
         "closedAt": o.closed_at.isoformat() if o.closed_at else None,
         "status": o.status,
+        "units": OFFER_RATE_UNITS,
     }
 
 
@@ -89,6 +115,7 @@ def subscription_row(s: Subscription) -> dict:
         "refundedAt": s.refunded_at.isoformat() if s.refunded_at else None,
         "nextPaymentDate": s.next_payment_date.isoformat() if s.next_payment_date else None,
         "totalReceived": float(s.total_received), "subPortfolioId": s.sub_portfolio_id,
+        "units": SUBSCRIPTION_RATE_UNITS,
     }
 
 
@@ -148,6 +175,7 @@ def collateral_row(c) -> dict:
     return {
         "offerId": c.offer_id, "debtType": c.debt_type, "guarantees": c.guarantees,
         "collateralValue": float(c.collateral_value), "loanToValue": float(c.loan_to_value),
+        "units": COLLATERAL_RATE_UNITS,
     }
 
 

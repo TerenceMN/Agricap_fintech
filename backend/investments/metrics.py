@@ -34,6 +34,10 @@ from .models import (
     Distribution, DistributionLine, InvestmentConfig, Investor, Offer, Project,
     RepaymentSchedule, Subscription,
 )
+#: `serializers` ne dépend que de `models` : l'import est sûr (aucun cycle) et évite de
+#: redéfinir ici une seconde table d'unités, ce qui serait exactement la faute que ces
+#: tables servent à empêcher.
+from .serializers import OFFER_RATE_UNITS
 
 getcontext().prec = 40
 
@@ -892,6 +896,11 @@ def open_offers_summary() -> list[dict]:
             "availableBonds": o.available_bonds, "fundingGoal": float(o.funding_goal),
             "riskScore": o.project.risk_score, "globalScore": o.project.global_score,
             "riskCategory": o.project.risk_category,
+            # `couponRate` est ici le taux CONTRACTUEL brut de `Offer.coupon_rate`, en
+            # points de pourcentage — pas le `fraction` des taux calculés de
+            # `RATE_UNITS`. Deux projections, deux unités, les deux DÉCLARÉES : c'est
+            # ce que cet endpoint devait à ses consommateurs et ne leur donnait pas.
+            "units": OFFER_RATE_UNITS,
             "reservedAmount": float(o.reserved_amount), "fundedAmount": float(o.funded_amount),
             "minFundingAmount": float(o.min_funding_amount),
             "oversubscriptionPolicy": o.oversubscription_policy,

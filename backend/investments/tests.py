@@ -1278,6 +1278,53 @@ class KpiContextTests(AuthedAPITestCase):
         self.assertEqual(res["units"]["expectedCouponRate"], "fraction")
         self.assertEqual(res["units"]["health.score"], "points_sur_100")
 
+    def test_aucun_taux_ne_sort_sans_son_unite(self):
+        """Balayage : tout champ dont le nom se termine par « Rate » porte son unité.
+
+        Le module stocke ses taux dans DEUX unités jusque dans la même table
+        (`Offer.coupon_rate` = 9,000 à côté de `Offer.loan_to_value` = 0,600). Tant
+        que ce n'est pas harmonisé en base, la seule protection est la déclaration —
+        et ce test échoue si un futur champ de taux part sans elle.
+        """
+        from . import serializers as ser
+
+        def _taux_non_declares(row: dict) -> set:
+            declares = set(row.get("units", {}))
+            return {c for c in row
+                    if c.endswith("Rate") or c in ("rate", "loanToValue")} - declares
+
+        offre = self.offer
+        Collateral.objects.create(offer=offre, debt_type="Nantissement",
+                                   collateral_value="5000", loan_to_value="0.6")
+        souscription = Subscription.objects.filter(offer=offre).first()
+        lignes = [
+            ser.offer_row(offre),
+            ser.subscription_row(souscription),
+            ser.collateral_row(offre.collateral),
+            ser.project_detail_row(self.project),
+            metrics.open_offers_summary()[0],
+        ]
+        for ligne in lignes:
+            self.assertFalse(_taux_non_declares(ligne),
+                              f"Taux servi sans unité déclarée : {_taux_non_declares(ligne)}")
+
+        # Et les unités déclarées disent la VÉRITÉ sur les valeurs servies.
+        self.assertEqual(ser.offer_row(offre)["units"]["couponRate"], "percent")
+        self.assertEqual(ser.offer_row(offre)["couponRate"], 9.0)
+        self.assertEqual(ser.collateral_row(offre.collateral)["units"]["loanToValue"], "fraction")
+        self.assertEqual(ser.collateral_row(offre.collateral)["loanToValue"], 0.6)
+
+    def test_les_obligations_declarent_aussi_leurs_taux(self):
+        from .models import ObligationPosition
+        position = ObligationPosition.objects.create(investor=self.inv, invested_amount="1000")
+        BondWithdrawal.objects.create(position=position, amount="100")
+        self.login(role="invest", sub="k-1")
+        obligations = self.client.get("/api/investments/obligations").data
+        self.assertEqual(obligations[0]["units"]["rate"], "percent")
+        retraits = self.client.get(
+            f"/api/investments/obligations/{position.pk}/withdrawals").data
+        self.assertEqual(retraits[0]["units"]["penaltyRate"], "fraction")
+
     def test_une_seule_convention_de_taux_dans_tout_le_payload(self):
         """Aucun taux servi en points de pourcentage : tout est fraction.
 

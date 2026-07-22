@@ -762,7 +762,8 @@ def obligations(request):
         return Response([
             {"id": p.pk, "name": p.name, "couponAmount": float(p.coupon_amount),
              "investedAmount": float(p.invested_amount), "rate": float(p.rate),
-             "termMonths": p.term_months, "status": p.status, "dateCreated": p.date_created.isoformat()}
+             "termMonths": p.term_months, "status": p.status, "dateCreated": p.date_created.isoformat(),
+             "units": serializers.OBLIGATION_RATE_UNITS}
             for p in investor.obligation_positions.all()
         ])
     data = request.data or {}
@@ -782,7 +783,7 @@ def obligation_withdrawals(request, position_id):
     return Response([
         {"id": w.pk, "positionId": w.position_id, "amount": float(w.amount),
          "penaltyRate": float(w.penalty_rate), "reason": w.reason, "status": w.status,
-         "date": w.date.isoformat()}
+         "date": w.date.isoformat(), "units": serializers.WITHDRAWAL_RATE_UNITS}
         for w in position.withdrawals.all()
     ])
 
