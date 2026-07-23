@@ -1,6 +1,7 @@
 """API épargne (Savings.jsx + admin/savings/*) — CRUD léger, toujours audité."""
 from __future__ import annotations
 
+import uuid
 from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
@@ -10,6 +11,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from audit.services import record as audit_record
+from common import idempotency
+from common.exceptions import InsufficientFundsError
 from common.parsing import to_decimal
 from rbac.permissions import HasCapability
 from rbac.role_registry import get_role
@@ -55,14 +58,22 @@ def all_plans(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def plan_deposit(request, plan_id):
-    """Dépôt sur un plan d'épargne.
+    """Dépôt sur un plan d'épargne — DÉBITE le portefeuille du client (flux interne).
 
-    Les contrôles ci-dessous ne sont PAS un doublon de la validation d'écran :
-    `to_decimal` est tolérant par construction (il rend `0` sur une saisie
-    illisible et accepte les négatifs), si bien qu'un `amount` de `-500` posté
-    directement débitait le plan — un retrait déguisé en dépôt, sans permission
-    ni confirmation. Le refus est structuré `{code, message}` (principe 5) pour
-    que l'écran puisse déplier chaque cause au lieu d'afficher « Erreur 422 ».
+    Décision du fondateur, « une seule porte » : le wallet est le seul point de contact
+    avec l'extérieur ; tout autre flux d'argent est interne et débite le WALLET du client.
+    Un dépôt d'épargne n'invente donc pas d'argent — il déplace du cash du portefeuille
+    vers le plan, via le SEUL service de débit du système (`caisses.services.withdraw`,
+    déjà employé par les obligations : pas de second chemin de débit, principe 6). Le
+    `channel` reste informatif (par où l'argent est entré dans le système à l'origine) ;
+    la source réelle du dépôt est toujours le portefeuille. Solde insuffisant ou
+    portefeuille absent → refus 422 structuré, sans inscription partielle.
+
+    Les contrôles d'amont ne sont PAS un doublon d'écran : `to_decimal` est tolérant (il
+    rend `0` sur une saisie illisible et accepte les négatifs), si bien qu'un `amount` de
+    `-500` débitait le plan — un retrait déguisé en dépôt. Ils sont collectés AVANT le
+    débit et le refus est structuré `{code, message}` (principe 5) pour que l'écran déplie
+    chaque cause au lieu d'afficher « Erreur 422 ».
     """
     plan = SavingsPlan.objects.filter(pk=plan_id, user=request.user).first()
     if not plan:
@@ -97,12 +108,54 @@ def plan_deposit(request, plan_id):
     if errors:
         return Response({"detail": errors[0]["message"], "errors": errors}, status=422)
 
-    with transaction.atomic():
-        SavingsDeposit.objects.create(plan=plan, amount=amount, channel=channel)
-        SavingsPlan.objects.filter(pk=plan.pk).update(balance=F("balance") + amount)
-        audit_record(actor=getattr(request.user, "sub", ""), action="savings.plan.deposit",
-                     entity_type="SavingsPlan", entity_id=str(plan.pk),
-                     details={"amount": str(amount), "channel": channel})
+    # Le dépôt débite le portefeuille du client dans la devise du plan. Aucune création
+    # de portefeuille implicite : sans wallet dans cette devise, il n'y a pas de cash à
+    # déplacer — on le dit plutôt que d'inventer une source.
+    from caisses.models import ClientWallet
+    from caisses.services import withdraw as caisses_withdraw
+
+    wallet = ClientWallet.objects.filter(user=request.user, currency=plan.currency).first()
+    if wallet is None:
+        return Response(
+            {"detail": f"Aucun portefeuille {plan.currency} : alimentez d'abord votre "
+                       "portefeuille avant d'épargner.",
+             "errors": [{"code": "WALLET_MISSING",
+                         "message": f"Aucun portefeuille {plan.currency} sur ce compte."}]},
+            status=422,
+        )
+
+    # Idempotence optionnelle : une clé fournie protège d'un double-clic (le débit et
+    # l'inscription ne se rejouent pas) ; sans clé, chaque requête est une opération
+    # distincte (comportement historique préservé). Le débit + l'inscription vivent dans
+    # UNE transaction : un échec après le débit annule tout, jamais de dépôt sans débit.
+    key = (data.get("idempotencyKey") or "").strip() or uuid.uuid4().hex
+    debit_key = f"savings-deposit:{plan.pk}:{key}"
+    try:
+        with transaction.atomic():
+            movement = caisses_withdraw(wallet_id=wallet.pk, amount=amount,
+                                         idempotency_key=debit_key,
+                                         by=getattr(request.user, "sub", ""))
+            SavingsDeposit.objects.create(plan=plan, amount=amount, channel=channel)
+            SavingsPlan.objects.filter(pk=plan.pk).update(balance=F("balance") + amount)
+            audit_record(actor=getattr(request.user, "sub", ""), action="savings.plan.deposit",
+                         entity_type="SavingsPlan", entity_id=str(plan.pk),
+                         details={"amount": str(amount), "channel": channel,
+                                  "walletMovementId": movement.pk,
+                                  "currency": plan.currency})
+    except idempotency.IdempotentReplay:
+        # Requête déjà traitée à l'identique : on rejoue l'état courant sans re-débiter
+        # ni ré-inscrire (le premier passage a tout committé, débit compris).
+        plan.refresh_from_db()
+        return Response(_plan_row(plan))
+    except InsufficientFundsError:
+        return Response(
+            {"detail": f"Solde insuffisant : {wallet.balance} {plan.currency} disponibles "
+                       f"pour un dépôt de {amount} {plan.currency}. Aucun dépôt effectué.",
+             "errors": [{"code": "WALLET_INSUFFICIENT_FUNDS",
+                         "message": f"Solde insuffisant ({wallet.balance} {plan.currency}) "
+                                    f"pour un dépôt de {amount} {plan.currency}."}]},
+            status=422,
+        )
     plan.refresh_from_db()
     return Response(_plan_row(plan))
 

@@ -759,6 +759,78 @@ class ReservationVsSettlementTests(AuthedAPITestCase):
                              idempotency_key="r9", by="inv-r1")
 
 
+# ── 5bis. L'encaissement d'une souscription DÉBITE le portefeuille ────────────
+
+class SettleFromWalletTests(AuthedAPITestCase):
+    """Décision du fondateur (« une seule porte ») : un encaissement de souscription tire
+    l'argent du WALLET du souscripteur, en interne. Le piège fermé ici : `funding.settle`
+    seul déplaçait `funded_amount`/`settled_amount` sans qu'aucune source réelle ne soit
+    débitée — de l'argent inscrit venu de nulle part. L'endpoint passe désormais par
+    `settle_from_wallet` : débit réel, ou refus sans inscription."""
+
+    def setUp(self):
+        self.project = advance_to(make_project("SW-1"), S.P06)
+        self.offer = self.project.offers.first()
+        self.investor = make_investor("inv-sw")
+
+    def _reserve(self, bonds: int = 3, key: str = "rsw") -> Subscription:
+        return funding.reserve(investor=self.investor, offer_id=self.offer.pk, bonds=bonds,
+                                idempotency_key=key, by="inv-sw")
+
+    def _settle_via_api(self, sub: Subscription, key: str = "sw-1"):
+        self.login(role="gest_port", sub="staff-sw")
+        return self.client.post(f"/api/investments/subscriptions/{sub.pk}/settle",
+                                 {"idempotencyKey": key}, format="json")
+
+    def test_encaissement_debite_le_wallet_du_meme_montant(self):
+        sub = self._reserve(bonds=3)          # 3 × 100 = 300
+        make_wallet(self.investor, amount="1000")
+        res = self._settle_via_api(sub)
+        self.assertEqual(res.status_code, 200)
+        sub.refresh_from_db()
+        self.project.refresh_from_db()
+        self.assertEqual(sub.status, Subscription.Status.SETTLED)
+        self.assertEqual(sub.settled_amount, Decimal("300.00"))
+        self.assertEqual(self.project.funded_amount, Decimal("300.00"))
+        # Le cash a réellement quitté le portefeuille, du même montant.
+        self.assertEqual(wallet_balance(self.investor), Decimal("700.00"))
+
+    def test_solde_insuffisant_refuse_sans_inscription(self):
+        sub = self._reserve(bonds=3)          # 300 dû
+        make_wallet(self.investor, amount="100")
+        res = self._settle_via_api(sub)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "WALLET_INSUFFICIENT_FUNDS")
+        sub.refresh_from_db()
+        self.project.refresh_from_db()
+        # Rien n'est inscrit : la souscription reste réservée, aucun encaissement.
+        self.assertEqual(sub.status, Subscription.Status.RESERVED)
+        self.assertEqual(sub.settled_amount, Decimal("0.00"))
+        self.assertEqual(self.project.funded_amount, Decimal("0.00"))
+        self.assertEqual(wallet_balance(self.investor), Decimal("100.00"))
+        self.assertFalse(Movement.objects.filter(type=Movement.Type.SETTLEMENT).exists())
+        self.assertFalse(InvestmentEvent.objects.filter(
+            event_type=InvestmentEvent.Type.SUBSCRIPTION_SETTLED).exists())
+
+    def test_sans_portefeuille_refuse(self):
+        sub = self._reserve(bonds=1)
+        res = self._settle_via_api(sub)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "WALLET_MISSING")
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, Subscription.Status.RESERVED)
+
+    def test_rejeu_idempotent_nencaisse_et_ne_debite_quune_fois(self):
+        sub = self._reserve(bonds=2)          # 200 dû
+        make_wallet(self.investor, amount="1000")
+        first = self._settle_via_api(sub, key="sw-idem")
+        second = self._settle_via_api(sub, key="sw-idem")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(wallet_balance(self.investor), Decimal("800.00"))
+        self.assertEqual(Movement.objects.filter(type=Movement.Type.SETTLEMENT).count(), 1)
+
+
 # ── 6. Sursouscription et min-funding ────────────────────────────────────────
 
 class OversubscriptionTests(AuthedAPITestCase):

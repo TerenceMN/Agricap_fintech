@@ -28,7 +28,8 @@ from django.utils import timezone
 
 from audit.services import record as audit_record
 from common import idempotency
-from common.exceptions import ConflictError, NotFoundError, ValidationFailed
+from common.exceptions import BusinessError, ConflictError, InsufficientFundsError, NotFoundError, \
+    ValidationFailed
 from common.parsing import to_decimal
 
 from . import workflow
@@ -52,6 +53,75 @@ def segregation_account(offer: Offer) -> str:
     la comptabilité doit ouvrir.
     """
     return f"419-OFF-{offer.code}"
+
+
+# ── Débit du portefeuille client : délégué à `caisses`, jamais réimplémenté ────
+#
+# Décision du fondateur — « une seule porte » : le wallet est le SEUL point de contact
+# avec l'extérieur ; tout autre flux d'argent est INTERNE et débite le WALLET du client.
+# Un encaissement de souscription n'est donc pas une entrée externe qu'on « constate » :
+# c'est du cash qui quitte réellement le portefeuille du souscripteur. Le débit passe par
+# l'UNIQUE service de débit du système (`caisses.services.withdraw`), le même qu'empruntent
+# déjà les obligations — pas de second chemin de débit (principe 6).
+
+#: Devise des flux monétaires du module (voir `Movement.currency`, `settle`).
+WALLET_CURRENCY = "USD"
+
+
+class WalletDebitError(BusinessError):
+    """Refus d'un débit de portefeuille dans un flux d'investissement.
+
+    Même contrat `{code, message}` que `credits.workflow.WorkflowError` /
+    `obligations.ObligationError` : le `code` est consommé par le front, le message
+    explique sans se parser. `as_errors()` produit la liste attendue par les écrans.
+    """
+
+    code = "WALLET_DEBIT_ERROR"
+    http_status = 422
+
+    def as_errors(self) -> list[dict]:
+        return [{"code": self.code, "message": self.message}]
+
+
+class WalletMissingError(WalletDebitError):
+    """Aucun portefeuille dans la devise du flux : il n'y a pas de cash à débiter."""
+
+    code = "WALLET_MISSING"
+
+
+class InsufficientWalletError(WalletDebitError):
+    """Solde de portefeuille insuffisant — refus AVANT toute écriture, jamais partiel."""
+
+    code = "WALLET_INSUFFICIENT_FUNDS"
+
+
+def debit_investor_wallet(*, investor: Investor, amount, idempotency_key: str, by: str = ""):
+    """Débite le portefeuille de l'investisseur via le SEUL service de débit du système.
+
+    `caisses.services.withdraw` pose le verrou de ligne (`select_for_update`), refuse un
+    solde insuffisant, journalise le `WalletMovement` et l'audit. Ce module n'écrit jamais
+    dans les modèles de `caisses` — il appelle son service. C'est l'unique chemin de débit
+    de l'app investissement : l'encaissement de souscription l'emprunte, exactement comme
+    les obligations (principe 6, pas de second chemin de débit)."""
+    from caisses.models import ClientWallet
+    from caisses.services import withdraw as caisses_withdraw
+
+    montant = _q(amount)
+    wallet = ClientWallet.objects.filter(user=investor.user, currency=WALLET_CURRENCY).first()
+    if wallet is None:
+        raise WalletMissingError(
+            f"Aucun portefeuille {WALLET_CURRENCY} sur ce compte : il n'y a pas de cash "
+            "à engager. Alimentez d'abord le portefeuille."
+        )
+    try:
+        return caisses_withdraw(wallet_id=wallet.pk, amount=montant,
+                                 idempotency_key=idempotency_key, by=by)
+    except InsufficientFundsError as exc:
+        raise InsufficientWalletError(
+            f"Solde insuffisant : {_q(wallet.balance)} {WALLET_CURRENCY} disponibles "
+            f"pour un encaissement de {montant} {WALLET_CURRENCY}. Aucun encaissement "
+            "n'a été effectué."
+        ) from exc
 
 
 def _emit(event_type: str, *, project: Project | None = None, offer: Offer | None = None,
@@ -265,6 +335,40 @@ def settle(*, subscription: Subscription, idempotency_key: str, by: str = "",
     idempotency.complete(rec, response=serializers.subscription_row(sub),
                           entity_type="Subscription", entity_id=str(sub.pk))
     project.refresh_from_db()
+    return sub
+
+
+@transaction.atomic
+def settle_from_wallet(*, subscription: Subscription, idempotency_key: str, by: str = "",
+                       amount=None, value_date=None) -> Subscription:
+    """Encaisse une souscription EN DÉBITANT le portefeuille du souscripteur (flux interne).
+
+    Décision du fondateur — « une seule porte » : l'argent d'une souscription vient du
+    WALLET du client, jamais d'une entrée externe. L'encaissement comptable (`settle`,
+    B10) et le débit réel du portefeuille vivent dans UNE transaction : si le solde est
+    insuffisant, `settle` est annulé et la souscription reste réservée. Il n'existe donc
+    jamais d'encaissement inscrit (ni de `funded_amount` qui bouge) sans un débit du même
+    montant — le piège de l'« argent créé de rien » est fermé.
+
+    `settle` porte déjà toutes les gardes de statut (souscription réservée, projet en
+    P06/P07, allocation connue) et calcule le montant encaissé : on débite exactement ce
+    qu'il a encaissé (`settled_amount`). Le débit passe par `debit_investor_wallet` — le
+    même chemin que les obligations (principe 6), qui empruntent `settle` de leur côté
+    après avoir débité eux-mêmes ; il n'y a jamais double débit.
+    """
+    rec = idempotency.begin(
+        scope="investments.settle_from_wallet", key=idempotency_key,
+        params={"subscription": subscription.pk,
+                "amount": str(amount) if amount is not None else ""}, by=by,
+    )
+    sub = settle(subscription=subscription, idempotency_key=f"settle-b10:{idempotency_key}",
+                 by=by, amount=amount, value_date=value_date)
+    debit_investor_wallet(investor=sub.investor, amount=sub.settled_amount,
+                          idempotency_key=f"settle-debit:{idempotency_key}", by=by)
+
+    from . import serializers
+    idempotency.complete(rec, response=serializers.subscription_row(sub),
+                          entity_type="Subscription", entity_id=str(sub.pk))
     return sub
 
 

@@ -601,8 +601,11 @@ def subscriptions(request):
 @api_view(["POST"])
 @permission_classes([HasCapability("validate")])
 def subscription_settle(request, subscription_id):
-    """Encaissement d'une souscription réservée (B10) — événement distinct de la
-    réservation, réservé au personnel qui constate l'arrivée des fonds."""
+    """Encaissement d'une souscription réservée (B10) par DÉBIT du portefeuille du
+    souscripteur — flux interne « une seule porte ». Réservé au personnel qui constate
+    l'encaissement ; le montant quitte réellement le wallet du client (`settle_from_wallet`),
+    il n'est jamais inscrit sans contrepartie. Solde insuffisant ou portefeuille absent →
+    422 structuré, la souscription reste réservée."""
     sub = Subscription.objects.filter(pk=subscription_id).first()
     if not sub:
         return Response({"detail": "Souscription introuvable."}, status=404)
@@ -611,11 +614,13 @@ def subscription_settle(request, subscription_id):
     if not key:
         return Response({"detail": "idempotencyKey requis."}, status=400)
     try:
-        sub = funding.settle(subscription=sub, idempotency_key=key,
-                              by=getattr(request.user, "sub", ""), amount=data.get("amount"),
-                              value_date=data.get("valueDate"))
+        sub = funding.settle_from_wallet(subscription=sub, idempotency_key=key,
+                                          by=getattr(request.user, "sub", ""), amount=data.get("amount"),
+                                          value_date=data.get("valueDate"))
     except idempotency.IdempotentReplay as exc:
         return idempotency.replay_response(exc)
+    except funding.WalletDebitError as exc:
+        return _structured_error(exc)
     return Response(serializers.subscription_row(sub))
 
 
