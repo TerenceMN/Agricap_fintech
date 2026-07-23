@@ -7,11 +7,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { STATUS_LABELS } from '@/lib/constants';
-import { Download, Upload, RefreshCw, History, Clock, ShieldCheck } from 'lucide-react';
+import { Download, Upload, RefreshCw, History, Clock, ShieldCheck, Send } from 'lucide-react';
 import { api } from '@/services/api';
 import DepositForm from '@/components/treasury/DepositForm';
 import WithdrawForm from '@/components/treasury/WithdrawForm';
 import FxForm from '@/components/treasury/FxForm';
+import PaymentOrdersTracker from '@/components/treasury/PaymentOrdersTracker';
 
 /**
  * « Ma Trésorerie » — l'écran de référence des mouvements de portefeuille.
@@ -31,6 +32,9 @@ const ClientWallet = () => {
   // retrait en attente disparaîtrait de la vue du client jusqu'à sa validation.
   const [pendingWithdrawals, setPendingWithdrawals] = useState([]);
   const [kyc, setKyc] = useState(null);
+  // Incrémenté après chaque mouvement : signale au suivi des ordres de paiement
+  // qu'il doit relire la liste (un dépôt externe vient d'y créer un ordre).
+  const [ordersRefresh, setOrdersRefresh] = useState(0);
 
   const loadWallets = () => api.caisses.wallets.mine().then(wallets => {
     const usd = wallets.find(w => w.currency === 'USD');
@@ -44,8 +48,15 @@ const ClientWallet = () => {
   const loadKyc = () => api.compliance.myKyc().then(setKyc).catch(() => {});
   useEffect(() => { loadWallets(); loadMovements(); loadPendingWithdrawals(); loadKyc(); }, []);
 
-  // Après tout mouvement : soldes, historique ET file d'attente de validation.
-  const refreshAll = () => { loadWallets(); loadMovements(); loadPendingWithdrawals(); };
+  // Après tout mouvement : soldes, historique, file d'attente ET suivi des
+  // ordres de paiement (un dépôt externe n'a PAS bougé le solde, mais a créé un
+  // ordre à suivre).
+  const refreshAll = () => {
+    loadWallets();
+    loadMovements();
+    loadPendingWithdrawals();
+    setOrdersRefresh((n) => n + 1);
+  };
 
   return (
     <Layout>
@@ -98,11 +109,14 @@ const ClientWallet = () => {
       </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <TabsList className="grid w-full grid-cols-4 bg-slate-800/60 mb-6">
+        <TabsList className="grid w-full grid-cols-5 bg-slate-800/60 mb-6">
           <TabsTrigger value="overview">Vue d'ensemble</TabsTrigger>
           <TabsTrigger value="deposit">Dépôt</TabsTrigger>
           <TabsTrigger value="withdraw">Retrait</TabsTrigger>
           <TabsTrigger value="fx">Change (FX)</TabsTrigger>
+          <TabsTrigger value="orders" className="flex items-center gap-1">
+            <Send className="w-3.5 h-3.5" /> Ordres
+          </TabsTrigger>
         </TabsList>
 
         {/* OVERVIEW TAB */}
@@ -195,6 +209,11 @@ const ClientWallet = () => {
                <FxForm balances={balance} onCompleted={refreshAll} />
              </CardContent>
            </Card>
+        </TabsContent>
+
+        {/* PAYMENT ORDERS TAB — suivi des dépôts/retraits externes en attente. */}
+        <TabsContent value="orders">
+          <PaymentOrdersTracker refreshSignal={ordersRefresh} />
         </TabsContent>
       </Tabs>
 

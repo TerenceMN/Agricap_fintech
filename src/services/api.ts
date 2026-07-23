@@ -9,9 +9,9 @@ import type {
   EvolutionPlanRow, FinancialAnalysis, InvestmentMovement,
   InvestmentOffer, InvestmentPipeline, InvestmentProject, InvestmentSubscription, InvestorMetrics,
   InvestorProfile, KycMine, LedgerAccount, LoanAlert,
-  LoanConfig, LoanRow, LoanTxn, Me, ObligationPosition, OpenOfferSummary, PerformanceReport, PortfolioAllocation,
+  LoanConfig, LoanRow, LoanTxn, Me, ObligationPosition, OpenOfferSummary, PaymentOrderRow, PerformanceReport, PortfolioAllocation,
   ProjectQuestion, RbacMe, RbacRole, RbacUser, ReferenceRange, RegularizationOrderRow, ScheduleRow, SourceTablesResponse,
-  SummaryCard, TechnicalAnalysis, TicketMessage, TicketRow, VenteInput, WithdrawalRequestRow,
+  SummaryCard, TechnicalAnalysis, TicketMessage, TicketRow, VenteInput, WalletDepositResult, WithdrawalRequestRow,
 } from '@/types/api';
 
 interface RequestOpts {
@@ -1006,8 +1006,12 @@ export const api = {
     },
     wallets: {
       mine: () => request<unknown[]>('/caisses/wallets/mine'),
+      // Réponse DISCRIMINÉE : `kind: "movement"` (dépôt interne réglé) ou
+      // `kind: "payment_order"` (dépôt externe confié à Makuta, encore en
+      // attente). Le site d'appel ne décide pas « effectué » lui-même : il passe
+      // la réponse à `classifyDepositOutcome`.
       deposit: (amount: number, currency = 'USD', channel = 'agent') =>
-        request<unknown>('/caisses/wallets/mine/deposit', {
+        request<WalletDepositResult>('/caisses/wallets/mine/deposit', {
           method: 'POST', body: { amount, currency, channel, idempotencyKey: crypto.randomUUID() },
         }),
       withdraw: (amount: number, currency = 'USD') =>
@@ -1020,6 +1024,10 @@ export const api = {
           { method: 'POST', body: { from, to, amount, idempotencyKey: crypto.randomUUID() } }),
       movements: () => request<unknown[]>('/caisses/wallets/mine/movements'),
       myWithdrawalRequests: () => request<WithdrawalRequestRow[]>('/caisses/wallets/mine/withdrawal-requests'),
+      // Suivi des ordres de paiement du client (dépôts/retraits externes confiés
+      // à Makuta). LECTURE SEULE : un ordre ne se « relance » pas depuis l'écran
+      // — un rejeu à l'aveugle d'un ordre indéterminé paie deux fois.
+      paymentOrders: () => request<PaymentOrderRow[]>('/caisses/wallets/mine/payment-orders/list'),
       // Résout/crée le portefeuille d'un client par son sub IdP (Support.jsx « Crédit
       // forcé ») — un agent connaît le client via son ticket, pas l'id interne du wallet.
       forUser: (sub: string, currency = 'USD') =>

@@ -98,6 +98,40 @@ describe('DepositForm', () => {
     await waitFor(() => expect(onCompleted).toHaveBeenCalled());
   });
 
+  it('un dépôt externe (payment_order) non confirmé affiche « en attente », JAMAIS « effectué »', async () => {
+    // Réponse discriminée : ordre de paiement transmis, encore en attente.
+    deposit.mockResolvedValueOnce({
+      kind: 'payment_order',
+      status: 'SENT',
+      reference: 'PO-2026-0007',
+      awaitingReconciliation: true,
+      detail: 'Ordre transmis au fournisseur — réponse en attente.',
+    });
+    const { container } = render(<DepositForm />);
+    fill(container, { amount: '150', phone: '+243900000000' });
+    submit(container);
+    fireEvent.click(await screen.findByText('Confirmer et Exécuter'));
+
+    // Le récapitulatif honnête s'affiche, persistant, sous le formulaire.
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent?.toLowerCase()).toContain('attente');
+    // Le pire mensonge est explicitement interdit : pas de « effectué / crédité ».
+    expect(notice.textContent?.toLowerCase()).not.toMatch(/effectu|crédit/);
+    // La référence de l'ordre remonte pour le suivi.
+    expect(notice.textContent).toContain('PO-2026-0007');
+  });
+
+  it('un dépôt interne (movement) affiche « effectué »', async () => {
+    deposit.mockResolvedValueOnce({ kind: 'movement', detail: 'Dépôt effectué.', movementId: 5, amount: 150 });
+    const { container } = render(<DepositForm />);
+    fill(container, { amount: '150', phone: '+243900000000' });
+    submit(container);
+    fireEvent.click(await screen.findByText('Confirmer et Exécuter'));
+
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toContain('Dépôt effectué');
+  });
+
   it('déplie les causes d’un refus 422 et garde l’opération à l’écran', async () => {
     const { ApiError } = await import('@/services/api') as unknown as {
       ApiError: new (

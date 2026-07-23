@@ -921,6 +921,56 @@ export interface WithdrawalRequestRow {
   movementId: number | null;
 }
 
+/**
+ * Réponse discriminée de POST /caisses/wallets/mine/deposit.
+ *
+ * `kind: "movement"` → dépôt interne réglé ; `kind: "payment_order"` → dépôt
+ * externe confié à Makuta, crédité seulement à `status: "CONFIRMED"`. La
+ * discrimination vit dans `@/components/treasury/depositOutcome` — ce type reste
+ * volontairement permissif (champs optionnels) pour ne pas mentir sur une forme
+ * que seul le serveur arrête.
+ */
+export interface WalletDepositResult {
+  kind?: 'movement' | 'payment_order';
+  detail?: string;
+  movementId?: number | null;
+  amount?: number | string;
+  reference?: string;
+  status?: string;
+  currency?: string;
+  direction?: string;
+  awaitingReconciliation?: boolean;
+  failureDetail?: string | null;
+}
+
+/**
+ * Ordre de paiement (fournisseur Makuta) tel que servi au client — montants en
+ * CHAÎNES (`str(Decimal)`), jamais en float : c'est la pièce comparée au relevé
+ * de l'opérateur. `awaitingReconciliation` empêche le front de proposer un
+ * rejeu (un ordre indéterminé peut avoir abouti chez le fournisseur).
+ */
+export interface PaymentOrderRow {
+  reference: string;
+  status: string; // PaymentOrder.Status : PENDING | SENT | AWAITING_CONFIRMATION | INDETERMINATE | CONFIRMED | REFUSED | CANCELLED
+  detail: string;
+  direction: string; // 'COLLECTION' (dépôt) | 'PAYOUT' (retrait)
+  operation: string;
+  amount: string;
+  currency: string;
+  counterparty: string;
+  walletId: number;
+  treasuryAccountCode: string | null;
+  providerReference: string | null;
+  movementId: number | null;
+  reversalMovementId: number | null;
+  awaitingReconciliation: boolean;
+  failureDetail: string | null;
+  createdAt: string | null;
+  sentAt: string | null;
+  settledAt: string | null;
+  createdBy: string;
+}
+
 export interface RegularizationOrderRow {
   detail: string;
   orderId: number;
