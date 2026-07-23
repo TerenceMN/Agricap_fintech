@@ -6,11 +6,13 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from common import idempotency
+from common import idempotency, makuta
+from common.makuta import MakutaConfigurationError
 from rbac.permissions import HasCapability
 from rbac.role_registry import get_role
 
-from . import cash_register, partner_link, payments, regularization, serializers, services, withdrawal_tiers
+from . import cash_register, channels, partner_link, payments, regularization, serializers, services, \
+    withdrawal_tiers
 from .models import CashRegisterSession, ClientWallet, PaymentOrder, RegularizationOrder, TreasuryAccount, \
     WithdrawalRequest
 
@@ -204,22 +206,71 @@ def _get_or_create_wallet(user, currency: str) -> ClientWallet:
     return wallet
 
 
+def _deposit_kind(payload: dict) -> dict:
+    """Discriminant de la réponse de dépôt (contrat front). Un `payment_order_row` porte
+    `reference` ; un `movement_row` n'a que `movementId`. On dérive `kind` de la forme, pour
+    que le rejeu idempotent (qui rend le snapshot brut) porte le même discriminant que la
+    réponse d'origine."""
+    kind = "payment_order" if "reference" in payload else "movement"
+    return {"kind": kind, **payload}
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def my_deposit(request):
+    """Dépôt sur le portefeuille du demandeur — routé par CANAL (décision « une seule porte »).
+
+    * **interne** (`agent` / vide : espèces, agence) → mouvement crédité directement, comme
+      avant. Réponse `{"kind": "movement", ...}`.
+    * **externe** (`mobile_money` / `bank`) → **aucun crédit tant que le fournisseur n'a pas
+      confirmé.** On crée un ordre d'ENCAISSEMENT (Makuta), on le transmet si Makuta est
+      configuré, et le portefeuille n'est crédité qu'à la confirmation (rappel entrant /
+      réconciliation). Réponse `{"kind": "payment_order", ...}` : le front affiche « en
+      attente de confirmation », jamais « dépôt effectué »."""
     data = request.data or {}
     key = data.get("idempotencyKey")
     if not key:
         return Response({"detail": "idempotencyKey requis."}, status=400)
+    channel = data.get("channel", "") or ""
+    if not channels.is_known(channel):
+        return Response({"code": "unknown_channel", "message": f"Canal de dépôt inconnu : {channel}."},
+                        status=422)
     wallet = _get_or_create_wallet(request.user, data.get("currency", "USD"))
+    by = getattr(request.user, "sub", "")
+
+    if channels.is_external(channel):
+        counterparty = data.get("counterparty", "") or ""
+        if not counterparty:
+            return Response({"code": "counterparty_required",
+                             "message": "Le numéro Mobile Money / compte source est requis pour "
+                                        "un dépôt externe."}, status=422)
+        try:
+            order = payments.create_payment_order(
+                wallet_id=wallet.pk, direction=PaymentOrder.Direction.COLLECTION,
+                operation=channels.collect_operation(channel), amount=data.get("amount", "0"),
+                counterparty=counterparty, idempotency_key=key, by=by,
+            )
+        except idempotency.IdempotentReplay as exc:
+            return Response(_deposit_kind(exc.record.response_snapshot), status=200)
+        except MakutaConfigurationError:
+            # Catalogue d'opérations non fourni par Wolf Technologies : on refuse proprement
+            # (503) SANS créditer le portefeuille — jamais un crédit sur un dépôt non reçu.
+            return Response({"code": "external_deposit_unavailable",
+                             "message": "Le dépôt par Mobile Money / banque est momentanément "
+                                        "indisponible. Réessayez plus tard ou déposez en agence."},
+                            status=503)
+        if makuta.is_configured():
+            order = payments.dispatch_payment_order(reference=order.reference, by=by)
+        return Response(_deposit_kind(serializers.payment_order_row(order)), status=201)
+
     try:
         movement = services.deposit(
-            wallet_id=wallet.pk, amount=data.get("amount", "0"), channel=data.get("channel", ""),
-            idempotency_key=key, by=getattr(request.user, "sub", ""),
+            wallet_id=wallet.pk, amount=data.get("amount", "0"), channel=channel,
+            idempotency_key=key, by=by,
         )
     except idempotency.IdempotentReplay as exc:
-        return idempotency.replay_response(exc)
-    return Response(serializers.movement_row(movement, verb="Dépôt effectué."))
+        return Response(_deposit_kind(exc.record.response_snapshot), status=200)
+    return Response(_deposit_kind(serializers.movement_row(movement, verb="Dépôt effectué.")))
 
 
 @api_view(["POST"])
@@ -228,19 +279,39 @@ def my_withdraw(request):
     """Passe par le workflow à paliers (`withdrawal_tiers`) plutôt que par
     `services.withdraw()` (débit inconditionnel) : un retrait sous le seuil auto est traité
     immédiatement (même effet qu'avant), au-dessus il crée une demande PENDING_VALIDATION,
-    débitée seulement une fois le palier manager/quorum atteint."""
+    débitée seulement une fois le palier manager/quorum atteint.
+
+    Le canal reste optionnel — entrée inchangée pour un retrait interne (espèces/agence). Un
+    canal externe (`mobile_money`/`bank`) + une contrepartie déclenchent, **au règlement**, un
+    ordre de décaissement Makuta (visible via les endpoints `payments`). Le versement externe
+    ne part jamais avant l'approbation humaine (P2)."""
     data = request.data or {}
     key = data.get("idempotencyKey")
     if not key:
         return Response({"detail": "idempotencyKey requis."}, status=400)
+    channel = data.get("channel", "") or ""
+    if not channels.is_known(channel):
+        return Response({"code": "unknown_channel", "message": f"Canal de retrait inconnu : {channel}."},
+                        status=422)
+    counterparty = data.get("counterparty", "") or ""
+    if channels.is_external(channel) and not counterparty:
+        return Response({"code": "counterparty_required",
+                         "message": "Le numéro Mobile Money / compte destinataire est requis "
+                                    "pour un retrait externe."}, status=422)
     wallet = _get_or_create_wallet(request.user, data.get("currency", "USD"))
     try:
         request_obj = withdrawal_tiers.create_withdrawal_request(
             wallet_id=wallet.pk, amount=data.get("amount", "0"),
             idempotency_key=key, by=getattr(request.user, "sub", ""),
+            channel=channel, counterparty=counterparty,
         )
     except idempotency.IdempotentReplay as exc:
         return idempotency.replay_response(exc)
+    except MakutaConfigurationError:
+        return Response({"code": "external_withdrawal_unavailable",
+                         "message": "Le retrait par Mobile Money / banque est momentanément "
+                                    "indisponible. Réessayez plus tard ou retirez en agence."},
+                        status=503)
     return Response(serializers.withdrawal_request_row(request_obj))
 
 

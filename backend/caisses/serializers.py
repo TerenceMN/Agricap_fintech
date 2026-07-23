@@ -27,6 +27,11 @@ def withdrawal_request_row(r: WithdrawalRequest) -> dict:
         "requestId": r.pk, "amount": float(r.amount), "status": r.status, "autoValidated": r.auto_validated,
         "requiredApprovals": needed, "approvalsCount": approvals_count,
         "movementId": r.movement_id,
+        # Jambe externe (Mobile Money / banque) : canal + référence de l'ordre de décaissement
+        # Makuta créé au règlement. `channel` vide/`agent` = retrait interne (aucun versement
+        # fournisseur, `payoutOrderRef` nul).
+        "channel": r.channel or None, "counterparty": r.counterparty or None,
+        "payoutOrderRef": r.payout_order.reference if r.payout_order_id else None,
     }
 
 

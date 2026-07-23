@@ -200,13 +200,28 @@ class WithdrawalThreshold(models.Model):
 class WithdrawalRequest(models.Model):
     """Retrait au-dessus du palier auto : le solde n'est débité qu'à l'approbation (palier
     manager) ou à l'atteinte du quorum (palier quorum) — jamais à la création de la
-    demande, pour ne jamais tenir des fonds "gelés" sans mécanisme de hold dédié."""
+    demande, pour ne jamais tenir des fonds "gelés" sans mécanisme de hold dédié.
+
+    Deux jambes possibles au règlement (décision « une seule porte », cf. `caisses/channels`) :
+    interne (`channel` vide/`agent` : espèces/agence, aucun fournisseur) ou externe
+    (`mobile_money`/`bank`). Un retrait externe débite d'abord le portefeuille — comme un
+    retrait interne — PUIS déclenche un décaissement Makuta (`payout_order`) vers la
+    `counterparty` : le versement ne part JAMAIS avant l'approbation humaine (P2)."""
     wallet = models.ForeignKey(ClientWallet, on_delete=models.CASCADE, related_name="withdrawal_requests")
     amount = models.DecimalField(max_digits=18, decimal_places=2)
     status = models.CharField(max_length=20, choices=FlowStatus.choices, default=FlowStatus.PENDING_VALIDATION)
     auto_validated = models.BooleanField(default=False)
+    #: Canal de versement (`caisses.channels`). Vide/`agent` = interne (aucun fournisseur).
+    channel = models.CharField(max_length=14, blank=True)
+    #: Destination externe (numéro Mobile Money / compte) quand `channel` est externe —
+    #: format non spécifié par la documentation fournisseur, stocké tel que saisi.
+    counterparty = models.CharField(max_length=64, blank=True)
     movement = models.ForeignKey(WalletMovement, null=True, blank=True, on_delete=models.SET_NULL,
                                   related_name="withdrawal_request")
+    #: Ordre de décaissement Makuta créé au règlement d'un retrait externe (traçabilité de la
+    #: jambe fournisseur). Nul pour un retrait interne.
+    payout_order = models.ForeignKey("PaymentOrder", null=True, blank=True, on_delete=models.SET_NULL,
+                                      related_name="settled_withdrawal")
     idempotency_key = models.CharField(max_length=128, blank=True)
     created_by = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

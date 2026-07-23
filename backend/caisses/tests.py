@@ -1291,3 +1291,270 @@ class PaymentApiTests(PaymentOrderMixin, AuthedAPITestCase):
         res = self.client.post(f"/api/caisses/payments/{order.reference}/reconcile",
                                {"motive": "je veux mon argent"}, format="json")
         self.assertEqual(res.status_code, 403)
+
+
+# ═══════════════════════════════════════ « UNE SEULE PORTE » : DÉPÔT/RETRAIT ↔ MAKUTA
+#
+# Le portefeuille est le seul point de contact avec l'extérieur : SEULS le dépôt et le retrait
+# externes appellent Makuta. Un dépôt externe n'est jamais crédité avant confirmation ; un
+# retrait externe n'est versé qu'après l'approbation humaine et le débit du portefeuille.
+
+DEPOSIT_URL = "/api/caisses/wallets/mine/deposit"
+
+
+@override_settings(MAKUTA=makuta_test_settings(BASE_URL="", PRIVATE_KEY_PEM=""))
+class DepositChannelRoutingTests(PaymentOrderMixin, AuthedAPITestCase):
+    """Makuta VOLONTAIREMENT non configuré (pas d'URL/clé) — l'état réel du projet aujourd'hui."""
+
+    def test_internal_channel_credits_directly_and_returns_movement_kind(self):
+        wallet = self._wallet("dch-1")
+        res = self.client.post(DEPOSIT_URL, {"amount": "100", "currency": "USD", "channel": "agent",
+                                             "idempotencyKey": "dch-1"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["kind"], "movement")
+        self.assertEqual(res.data["detail"], "Dépôt effectué.")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("100.00"))
+
+    def test_empty_channel_defaults_to_internal(self):
+        """Compatibilité : l'ancien dépôt ne portait pas de canal — reste un dépôt interne."""
+        wallet = self._wallet("dch-2")
+        res = self.client.post(DEPOSIT_URL, {"amount": "50", "currency": "USD",
+                                             "idempotencyKey": "dch-2"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["kind"], "movement")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("50.00"))
+
+    def test_unknown_channel_is_rejected_422(self):
+        self._wallet("dch-3")
+        res = self.client.post(DEPOSIT_URL, {"amount": "10", "currency": "USD", "channel": "crypto",
+                                             "idempotencyKey": "dch-3"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "unknown_channel")
+
+    def test_external_channel_without_counterparty_is_rejected_422(self):
+        self._wallet("dch-4")
+        res = self.client.post(DEPOSIT_URL, {"amount": "10", "currency": "USD", "channel": "mobile_money",
+                                             "idempotencyKey": "dch-4"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "counterparty_required")
+
+    def test_external_deposit_unconfigured_stays_pending_and_credits_nothing(self):
+        """Dégradation gracieuse : Makuta non branché → l'ordre est créé, PENDING, RIEN n'est
+        envoyé et le portefeuille reste intact. Le dépôt ne casse pas, il attend."""
+        wallet = self._wallet("dch-5")
+        with patch("common.makuta.requests.post") as post:
+            res = self.client.post(DEPOSIT_URL, {"amount": "100", "currency": "USD",
+                                                 "channel": "mobile_money", "counterparty": "+243900000005",
+                                                 "idempotencyKey": "dch-5"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["kind"], "payment_order")
+        self.assertEqual(res.data["status"], "PENDING")
+        self.assertEqual(post.call_count, 0)  # rien n'est parti
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_external_deposit_is_idempotent_one_order_only(self):
+        from .models import PaymentOrder
+        wallet = self._wallet("dch-6")
+        body = {"amount": "100", "currency": "USD", "channel": "mobile_money",
+                "counterparty": "+243900000006", "idempotencyKey": "dch-6"}
+        first = self.client.post(DEPOSIT_URL, body, format="json")
+        second = self.client.post(DEPOSIT_URL, body, format="json")
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)  # rejeu idempotent
+        self.assertEqual(second.data["kind"], "payment_order")
+        self.assertEqual(second.data["reference"], first.data["reference"])
+        self.assertEqual(PaymentOrder.objects.filter(wallet=wallet).count(), 1)
+
+    def test_external_deposit_locks_the_wallet_row(self):
+        """Verrou-espion : le dépôt externe verrouille la ligne portefeuille (`select_for_update`)
+        avant toute écriture — la protection contre le double débit/crédit concurrent."""
+        from django.db.models.query import QuerySet
+        wallet = self._wallet("dch-7")
+        locked_models: list[str] = []
+        original = QuerySet.select_for_update
+
+        def spy(self, *args, **kwargs):
+            locked_models.append(self.model.__name__)
+            return original(self, *args, **kwargs)
+
+        with patch.object(QuerySet, "select_for_update", spy):
+            res = self.client.post(DEPOSIT_URL, {"amount": "100", "currency": "USD",
+                                                 "channel": "mobile_money", "counterparty": "+243900000007",
+                                                 "idempotencyKey": "dch-7"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertIn("ClientWallet", locked_models)
+
+
+@override_settings(MAKUTA=makuta_test_settings())
+class ExternalDepositConfirmationTests(PaymentOrderMixin, AuthedAPITestCase):
+    """Makuta configuré : le dépôt externe est transmis, mais le portefeuille n'est crédité
+    qu'à la confirmation du fournisseur — jamais avant."""
+
+    def test_awaiting_confirmation_does_not_credit(self):
+        wallet = self._wallet("edc-1")
+        with patch("common.makuta.requests.post",
+                   return_value=_FakeHttpResponse(payload={"status": "PENDING"})):
+            res = self.client.post(DEPOSIT_URL, {"amount": "100", "currency": "USD",
+                                                 "channel": "mobile_money", "counterparty": "+243900000010",
+                                                 "idempotencyKey": "edc-1"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["kind"], "payment_order")
+        self.assertEqual(res.data["status"], "AWAITING_CONFIRMATION")
+        self.assertIs(res.data["awaitingReconciliation"], True)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_provider_confirmation_credits_exactly_once(self):
+        wallet = self._wallet("edc-2")
+        with patch("common.makuta.requests.post",
+                   return_value=_FakeHttpResponse(payload={"status": "SUCCESS", "transactionId": "MK-D2"})):
+            res = self.client.post(DEPOSIT_URL, {"amount": "250", "currency": "USD",
+                                                 "channel": "mobile_money", "counterparty": "+243900000011",
+                                                 "idempotencyKey": "edc-2"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["kind"], "payment_order")
+        self.assertEqual(res.data["status"], "CONFIRMED")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("250.00"))
+        self.assertEqual(wallet.movements.count(), 1)
+
+    def test_force_settle_confirms_a_pending_external_deposit_and_credits(self):
+        """L'ordre est accusé (AWAITING) sans issue lisible, puis réglé par le staff sur preuve
+        externe (relevé opérateur) — le crédit ne survient qu'à ce moment."""
+        from . import payments
+        wallet = self._wallet("edc-3")
+        with patch("common.makuta.requests.post",
+                   return_value=_FakeHttpResponse(payload={"status": "PENDING"})):
+            res = self.client.post(DEPOSIT_URL, {"amount": "80", "currency": "USD",
+                                                 "channel": "mobile_money", "counterparty": "+243900000012",
+                                                 "idempotencyKey": "edc-3"}, format="json")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+        order = payments.force_settle(
+            reference=res.data["reference"], outcome="CONFIRMED",
+            motive="Relevé opérateur MM du 23/07 ligne 12 : encaissement effectif.", by="agent-1")
+        self.assertEqual(order.status, "CONFIRMED")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("80.00"))
+
+
+@override_settings(MAKUTA=makuta_test_settings(BASE_URL="", PRIVATE_KEY_PEM=""))
+class ExternalWithdrawalSettlementTests(PaymentOrderMixin, AuthedAPITestCase):
+    """Makuta non configuré : le décaissement est CRÉÉ au règlement (PENDING) mais non envoyé.
+    On vérifie qu'il n'apparaît qu'APRÈS l'approbation, sans jamais re-débiter le portefeuille."""
+
+    def test_above_threshold_creates_disbursement_only_after_approval(self):
+        from . import withdrawal_tiers
+        from .models import PaymentOrder
+        wallet = self._wallet("xw-1", balance="10000")
+        req = withdrawal_tiers.create_withdrawal_request(
+            wallet_id=wallet.pk, amount="1000", idempotency_key="xw-1", by="xw-1",
+            channel="mobile_money", counterparty="+243900000020")
+        self.assertEqual(req.status, "pending_validation")
+        self.assertIsNone(req.payout_order_id)
+        self.assertEqual(PaymentOrder.objects.filter(wallet=wallet).count(), 0)  # aucun ordre avant approbation
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("10000.00"))  # pas encore débité
+
+        req = withdrawal_tiers.approve(request_id=req.pk, approver_sub="mgr1", approver_role="gest_caisse")
+        self.assertEqual(req.status, "posted")
+        req.refresh_from_db()
+        self.assertIsNotNone(req.payout_order_id)
+        payout = PaymentOrder.objects.get(pk=req.payout_order_id)
+        self.assertEqual(payout.direction, "PAYOUT")
+        self.assertEqual(payout.status, "PENDING")  # non configuré -> non dispatché
+        self.assertEqual(payout.amount, Decimal("1000.00"))
+        self.assertEqual(payout.movement_id, req.movement_id)  # RÉUTILISE le mouvement de retrait
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("9000.00"))  # débité UNE fois
+        self.assertEqual(wallet.movements.count(), 1)
+
+    def test_auto_tier_external_creates_payout_at_settlement_without_double_debit(self):
+        from . import withdrawal_tiers
+        wallet = self._wallet("xw-2", balance="10000")
+        req = withdrawal_tiers.create_withdrawal_request(
+            wallet_id=wallet.pk, amount="100", idempotency_key="xw-2", by="xw-2",
+            channel="mobile_money", counterparty="+243900000021")
+        self.assertEqual(req.status, "posted")
+        self.assertIsNotNone(req.payout_order_id)
+        self.assertEqual(req.payout_order.direction, "PAYOUT")
+        self.assertEqual(req.payout_order.movement_id, req.movement_id)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("9900.00"))
+        self.assertEqual(wallet.movements.count(), 1)  # un seul débit
+
+    def test_internal_withdrawal_creates_no_payout(self):
+        from . import withdrawal_tiers
+        from .models import PaymentOrder
+        wallet = self._wallet("xw-3", balance="10000")
+        req = withdrawal_tiers.create_withdrawal_request(
+            wallet_id=wallet.pk, amount="100", idempotency_key="xw-3", by="xw-3")
+        self.assertEqual(req.status, "posted")
+        self.assertIsNone(req.payout_order_id)
+        self.assertEqual(PaymentOrder.objects.filter(wallet=wallet).count(), 0)
+
+    def test_external_withdrawal_via_api_without_counterparty_is_422(self):
+        self._wallet("xw-4", balance="10000")
+        res = self.client.post("/api/caisses/wallets/mine/withdraw",
+                               {"amount": "100", "currency": "USD", "channel": "mobile_money",
+                                "idempotencyKey": "xw-4"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "counterparty_required")
+
+    def test_external_withdrawal_on_unconfigured_operation_is_503_without_debit(self):
+        """Canal externe dont l'opération n'est pas au catalogue (`bank` → BANK_PAYOUT absent
+        des fixtures) : refus propre (503) AVANT tout débit — on ne règle pas un retrait qu'on
+        ne saura jamais verser."""
+        wallet = self._wallet("xw-5", balance="10000")
+        res = self.client.post("/api/caisses/wallets/mine/withdraw",
+                               {"amount": "100", "currency": "USD", "channel": "bank",
+                                "counterparty": "CD12-0001", "idempotencyKey": "xw-5"}, format="json")
+        self.assertEqual(res.status_code, 503)
+        self.assertEqual(res.data["code"], "external_withdrawal_unavailable")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("10000.00"))
+
+
+@override_settings(MAKUTA=makuta_test_settings())
+class ExternalWithdrawalDispatchTests(PaymentOrderMixin, AuthedAPITestCase):
+    """Makuta configuré : au règlement, le décaissement est réellement transmis (post-commit)."""
+
+    def test_settlement_dispatches_the_payout_when_makuta_is_configured(self):
+        from . import withdrawal_tiers
+        wallet = self._wallet("xwd-1", balance="10000")
+        with patch("common.makuta.requests.post",
+                   return_value=_FakeHttpResponse(payload={"status": "PENDING", "transactionId": "MK-P1"})) as post, \
+                self.captureOnCommitCallbacks(execute=True):
+            req = withdrawal_tiers.create_withdrawal_request(
+                wallet_id=wallet.pk, amount="100", idempotency_key="xwd-1", by="xwd-1",
+                channel="mobile_money", counterparty="+243900000030")
+        self.assertEqual(post.call_count, 1)  # le décaissement a bien été envoyé
+        payout = req.payout_order
+        payout.refresh_from_db()
+        self.assertEqual(payout.status, "AWAITING_CONFIRMATION")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("9900.00"))  # débit unique, pas de re-débit à l'envoi
+
+    def test_refused_disbursement_returns_the_funds_to_the_wallet(self):
+        """Décaissement externe refusé définitivement → contre-passation : les fonds débités
+        au retrait reviennent au portefeuille (P3, append-only : un mouvement en plus, pas une
+        rature). Le versement n'a pas eu lieu, le client est rendu entier."""
+        from . import withdrawal_tiers
+        wallet = self._wallet("xwd-2", balance="10000")
+        refusal = _FakeHttpResponse(status_code=400, payload={"message": "numéro invalide"})
+        with patch("common.makuta.requests.post", return_value=refusal), \
+                self.captureOnCommitCallbacks(execute=True):
+            req = withdrawal_tiers.create_withdrawal_request(
+                wallet_id=wallet.pk, amount="100", idempotency_key="xwd-2", by="xwd-2",
+                channel="mobile_money", counterparty="+243900000031")
+        payout = req.payout_order
+        payout.refresh_from_db()
+        self.assertEqual(payout.status, "REFUSED")
+        self.assertIsNotNone(payout.reversal_movement_id)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("10000.00"))  # débit rendu
+        self.assertEqual(wallet.movements.count(), 2)  # WITHDRAW + REVERSAL

@@ -374,6 +374,54 @@ def create_payment_order(*, wallet_id: int, direction: str, operation: str,
     return order
 
 
+@transaction.atomic
+def create_settlement_payout(*, withdrawal_request, operation: str, counterparty: str,
+                            treasury_account_code: str = "", metadata: dict | None = None,
+                            by: str = "") -> PaymentOrder:
+    """Ordre de DÉCAISSEMENT adossé à un retrait DÉJÀ réglé — la jambe externe de la « seule
+    porte » : le portefeuille a été débité par `withdrawal_tiers._post_withdrawal`, cet ordre
+    ne fait que porter l'argent jusqu'à la contrepartie via Makuta.
+
+    Différence NON négociable avec `create_payment_order(direction=PAYOUT)` : ici on ne
+    RÉSERVE aucun fonds. Le débit a déjà eu lieu (c'est le mouvement du retrait) ; le refaire
+    paierait deux fois. L'ordre RÉUTILISE le mouvement de retrait — de sorte qu'un refus
+    définitif du fournisseur déclenche la contre-passation standard (`_reverse_payout_
+    reservation`) et rend les fonds au portefeuille, ce qui est correct : le versement
+    externe n'a pas eu lieu.
+
+    Ne dispatche rien (l'appel réseau est un acte séparé, hors transaction — cf. `dispatch_
+    payment_order`). Échoue AVANT toute écriture si l'opération n'est pas configurée, pour ne
+    pas régler un retrait externe qu'on ne saura jamais verser.
+    """
+    if not counterparty:
+        raise ValidationFailed("La contrepartie (numéro Mobile Money / compte) est requise "
+                               "pour un versement externe.")
+    if withdrawal_request.movement_id is None:
+        raise ConflictError("Le retrait n'est pas encore réglé : aucun mouvement à décaisser.")
+    operation_config(operation)  # échoue tôt si le catalogue fournisseur manque
+
+    wallet = ClientWallet.objects.select_for_update().get(pk=withdrawal_request.wallet_id)
+    order = PaymentOrder.objects.create(
+        wallet=wallet, direction=Direction.PAYOUT, operation=operation, counterparty=counterparty,
+        amount=withdrawal_request.amount, currency=wallet.currency,
+        treasury_account=(TreasuryAccount.objects.filter(code=treasury_account_code).first()
+                          if treasury_account_code else None),
+        metadata={**(metadata or {}), "withdrawalRequestId": withdrawal_request.pk},
+        movement_id=withdrawal_request.movement_id, created_by=by,
+    )
+    _log_event(order, kind=EventKind.CREATED, actor=by, to_status=order.status,
+               motive="Décaissement adossé à un retrait déjà réglé (aucune réservation : le "
+                      "portefeuille est déjà débité).",
+               payload={"amount": str(order.amount), "currency": order.currency,
+                        "operation": operation, "withdrawalRequestId": withdrawal_request.pk,
+                        "movementId": withdrawal_request.movement_id})
+    audit_record(actor=by, action="caisses.payment_order.create_settlement_payout",
+                 entity_type="PaymentOrder", entity_id=order.reference,
+                 details={"amount": str(order.amount), "currency": order.currency,
+                          "withdrawalRequestId": withdrawal_request.pk})
+    return order
+
+
 def _check_kyc_headroom(*, wallet: ClientWallet, amount: Decimal) -> None:
     """Le plafond KYC se vérifie AVANT d'ordonner un encaissement — refuser un dépôt déjà
     encaissé chez l'opérateur ne le fait pas revenir."""

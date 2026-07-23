@@ -65,7 +65,11 @@ def quorum_met(request_obj: WithdrawalRequest) -> bool:
 def _post_withdrawal(*, request_obj: WithdrawalRequest, by: str = "") -> WithdrawalRequest:
     """Débit réel — appelé soit immédiatement (palier auto), soit une fois le palier requis
     atteint (palier manager/quorum). Verrouille le portefeuille pour re-vérifier le solde au
-    moment du débit (il a pu changer entre la demande et l'approbation)."""
+    moment du débit (il a pu changer entre la demande et l'approbation).
+
+    Retrait EXTERNE : une fois le portefeuille débité, on adosse un ordre de décaissement
+    Makuta (jambe fournisseur) — jamais avant, jamais sans l'approbation qui vient d'avoir
+    lieu (P2)."""
     wallet = ClientWallet.objects.select_for_update().get(pk=request_obj.wallet_id)
     if wallet.balance < request_obj.amount:
         raise InsufficientFundsError(account_id=wallet.pk)
@@ -77,20 +81,70 @@ def _post_withdrawal(*, request_obj: WithdrawalRequest, by: str = "") -> Withdra
     request_obj.save(update_fields=["movement", "status", "updated_at"])
     audit_record(actor=by, action="caisses.withdrawal_request.post", entity_type="WithdrawalRequest",
                  entity_id=str(request_obj.pk), details={"amount": str(request_obj.amount)})
+    _settle_external_leg(request_obj=request_obj, by=by)
     return request_obj
+
+
+def _settle_external_leg(*, request_obj: WithdrawalRequest, by: str = "") -> None:
+    """Adosse le décaissement Makuta d'un retrait EXTERNE au portefeuille déjà débité, et
+    programme son envoi après le commit. Interne (canal vide/`agent`) ou payout déjà créé :
+    ne fait rien. La création de l'ordre est dans la MÊME transaction que le débit (tout ou
+    rien) ; l'envoi réseau, lui, est post-commit et hors transaction."""
+    from . import channels, payments
+    if not channels.is_external(request_obj.channel) or request_obj.payout_order_id:
+        return
+    order = payments.create_settlement_payout(
+        withdrawal_request=request_obj,
+        operation=channels.payout_operation(request_obj.channel),
+        counterparty=request_obj.counterparty, by=by,
+    )
+    request_obj.payout_order = order
+    request_obj.save(update_fields=["payout_order", "updated_at"])
+    transaction.on_commit(lambda: _dispatch_settlement_payout(reference=order.reference, by=by))
+
+
+def _dispatch_settlement_payout(*, reference: str, by: str = "") -> None:
+    """Envoi post-commit du décaissement — hors transaction (appel réseau) et SEULEMENT si
+    Makuta est configuré. Non configuré : l'ordre reste PENDING, le staff le règle via la
+    réconciliation / `force_settle`. Un échec réseau n'annule pas le retrait (déjà réglé) : il
+    laisse l'ordre à réconcilier, il ne casse rien."""
+    from common import makuta
+
+    from . import payments
+    if not makuta.is_configured():
+        return
+    try:
+        payments.dispatch_payment_order(reference=reference, by=by)
+    except Exception:  # noqa: BLE001 — le retrait est réglé ; l'envoi se réconcilie.
+        logger.exception("Dispatch du décaissement %s en échec — ordre à réconcilier.", reference)
 
 
 @transaction.atomic
 def create_withdrawal_request(*, wallet_id: int, amount: Decimal | str, idempotency_key: str,
-                               by: str = "") -> WithdrawalRequest:
+                               by: str = "", channel: str = "", counterparty: str = "") -> WithdrawalRequest:
     from compliance.kyc_levels import monthly_limit_for, monthly_withdrawal_total
+
+    from . import channels, payments
 
     amount = to_decimal(amount)
     if amount <= 0:
         raise ValidationFailed("Le montant du retrait doit être strictement positif.")
 
+    channel = channel or ""
+    counterparty = counterparty or ""
+    if not channels.is_known(channel):
+        raise ValidationFailed(f"Canal de retrait inconnu : {channel}.")
+    if channels.is_external(channel):
+        if not counterparty:
+            raise ValidationFailed("La contrepartie (numéro Mobile Money / compte) est requise "
+                                   "pour un retrait externe.")
+        # Échoue AVANT tout débit si le catalogue fournisseur manque : ne pas régler un
+        # retrait externe qu'on ne saura jamais verser (le versement se fait au règlement).
+        payments.operation_config(channels.payout_operation(channel))
+
     rec = idempotency.begin(scope="caisses.withdrawal_request", key=idempotency_key,
-                             params={"wallet": wallet_id, "amount": str(amount)}, by=by)
+                             params={"wallet": wallet_id, "amount": str(amount),
+                                     "channel": channel, "counterparty": counterparty}, by=by)
 
     wallet = ClientWallet.objects.select_for_update().filter(pk=wallet_id).first()
     if not wallet:
@@ -110,6 +164,7 @@ def create_withdrawal_request(*, wallet_id: int, amount: Decimal | str, idempote
     auto = amount < threshold.auto_limit
     request_obj = WithdrawalRequest.objects.create(
         wallet=wallet, amount=amount, status=FlowStatus.PENDING_VALIDATION, auto_validated=auto,
+        channel=channel, counterparty=counterparty,
         idempotency_key=idempotency_key, created_by=by,
     )
     audit_record(actor=by, action="caisses.withdrawal_request.create", entity_type="WithdrawalRequest",
