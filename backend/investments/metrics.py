@@ -37,7 +37,7 @@ from .models import (
 #: `serializers` ne dépend que de `models` : l'import est sûr (aucun cycle) et évite de
 #: redéfinir ici une seconde table d'unités, ce qui serait exactement la faute que ces
 #: tables servent à empêcher.
-from .serializers import OFFER_RATE_UNITS
+from .serializers import IDENTITY_DISCLOSED_STATUSES, OFFER_RATE_UNITS
 
 getcontext().prec = 40
 
@@ -308,17 +308,25 @@ def _top(buckets: dict[str, Decimal]) -> tuple[str | None, Decimal]:
     return cle, _q(buckets[cle] / base, Decimal("0.0001"))
 
 
-def _concentration(subs) -> dict:
+def _concentration(subs, *, geography_field: str = "location") -> dict:
     """Concentration mesurée sur les axes secteur et géographie + part du plus gros
     engagement — les trois chiffres de l'Annexe D, avec leur seuil d'alerte.
 
     Chaque part porte son **effectif** (`sectorsCount`, `locationsCount`,
     `projectsCount`) : « 60 % sur un secteur » ne veut rien dire sans savoir s'il y a
     deux secteurs ou vingt.
+
+    `geography_field` porte l'anonymat : la vue institution ventile sur la
+    localisation FINE (`location`), la vue investisseur sur la zone LARGE
+    (`broad_zone`). La ventilation géographique d'un portefeuille est un axe de
+    risque, mais la clé de chaque tranche nomme un lieu — servir la commune de
+    l'emprunteur à un investisseur pendant la levée reviendrait à le désigner par
+    l'adresse. L'axe est déclaré dans la réponse (`geographyAxisField`) : un écran ne
+    compare pas deux ventilations de granularités différentes sans le savoir.
     """
     seuil = Decimal(InvestmentConfig.active().concentration_threshold)
-    secteurs = _exposure_by("sector", subs)
-    zones = _exposure_by("location", subs)
+    secteurs = _exposure_by("value_chain_label", subs)
+    zones = _exposure_by(geography_field, subs)
     engagements: dict[str, Decimal] = {}
     for sub in subs:
         engagements[sub.offer.project.code] = engagements.get(
@@ -339,6 +347,7 @@ def _concentration(subs) -> dict:
         # côté client — c'est-à-dire à produire un chiffre métier dans le navigateur.
         "exposureBySector": _breakdown(secteurs),
         "exposureByLocation": _breakdown(zones),
+        "geographyAxisField": geography_field,
         "herfindahlSector": h_secteur,
         "herfindahlGeography": h_zone,
         "herfindahlRetained": max(h_secteur, h_zone),
@@ -592,14 +601,23 @@ def _valuation(subs, *, with_positions: bool = False) -> dict:
         capital_recu = ventile.get(Distribution.Kind.CAPITAL, Decimal("0"))
         coupons_recus = ventile.get(Distribution.Kind.COUPON, Decimal("0"))
         principal = max(Decimal("0"), encaisse - capital_recu)
+        # Le détail par position est servi à l'investisseur qui A ENCAISSÉ sur ce
+        # projet : il porte donc la filière et la zone LARGE en toutes circonstances,
+        # et l'identité de l'emprunteur seulement à partir du décaissement (P08) —
+        # même règle que les sérialiseurs de projet, appliquée à la même granularité.
+        identite_lisible = projet.status in IDENTITY_DISCLOSED_STATUSES
         ligne = {
             "subscriptionId": sub.pk, "offerCode": sub.offer.code, "projectCode": projet.code,
             "projectStatus": projet.status, "typeOfTitle": sub.offer.type_of_title,
-            "sector": projet.sector, "location": projet.location,
+            "sector": projet.value_chain_label, "zone": projet.broad_zone,
+            "identityDisclosed": identite_lisible,
             "settledAmount": _q(encaisse), "capitalRepaid": _q(capital_recu),
             "couponsReceived": _q(coupons_recus), "principalAtPar": _q(principal),
             "recoveryRate": None, "impairment": Decimal("0"), "latentGain": Decimal("0"),
         }
+        if identite_lisible:
+            ligne["promoter"] = projet.borrower_name
+            ligne["location"] = projet.fine_location
 
         if projet.status == Project.Status.P12:
             decaisse = Decimal(projet.disbursed_amount)
@@ -770,7 +788,8 @@ def investor_metrics(investor: Investor) -> dict:
     taux, motif = xirr_or_none(flux)
     valorisation = _valuation(subs, with_positions=True)
     defauts = _default_rates(subs)
-    conc = _concentration(subs)
+    # Vue INVESTISSEUR : ventilation géographique sur la zone LARGE (anonymat).
+    conc = _concentration(subs, geography_field="broad_zone")
     retard = _late(subs)
     sante = _health(default_rate=defauts["byValue"], hhi=conc["herfindahlRetained"],
                     late=retard["share"])
@@ -884,17 +903,27 @@ def open_offers_summary() -> list[dict]:
     refuse en fin de parcours ce qu'il aurait fallu empêcher au début. Une règle
     appliquée côté serveur et invisible côté écran est une règle qui se découvre par
     l'échec.
+
+    **Catalogue ANONYME par construction** : il ne sert que des offres de projets en
+    P06, c'est-à-dire en pleine levée — la phase où l'emprunteur n'est identifié pour
+    personne (décision du fondateur : identité révélée à partir de P08). Ni promoteur,
+    ni contact, ni localisation fine n'y figurent donc, pour aucun appelant ; la
+    géographie servie est la zone LARGE. Le personnel dispose de `GET /projects` et
+    `GET /offers` pour l'instruction.
     """
     return [
         {
             "offerId": o.pk, "offerCode": o.code, "projectCode": o.project.code,
-            "title": o.project.title, "sector": o.project.sector, "location": o.project.location,
+            "title": o.project.title, "sector": o.project.value_chain_label,
+            "zone": o.project.broad_zone,
+            "identityDisclosed": False,
             "typeOfTitle": o.type_of_title, "paymentFrequency": o.payment_frequency,
             "couponRate": float(o.coupon_rate), "maturityMonths": o.maturity_months,
             "minTicket": float(o.min_ticket), "bondUnitValue": float(o.bond_unit_value),
             "minBonds": o.min_bonds, "maxBonds": o.max_bonds,
             "availableBonds": o.available_bonds, "fundingGoal": float(o.funding_goal),
-            "riskScore": o.project.risk_score, "globalScore": o.project.global_score,
+            "riskScore": o.project.risk_score,
+            "globalScore": float(o.project.effective_global_score),
             "riskCategory": o.project.risk_category,
             # `couponRate` est ici le taux CONTRACTUEL brut de `Offer.coupon_rate`, en
             # points de pourcentage — pas le `fraction` des taux calculés de

@@ -1,21 +1,4 @@
-/**
- * Briques d'état partagées par les écrans du backoffice crédit.
- *
- * Chaque écran de données doit exposer trois états explicites : chargement,
- * erreur, vide (CLAUDE.md §5 « Frontend »). Les centraliser ici évite qu'un
- * écran oublie le cas vide ou affiche un spinner éternel sur une 403.
- *
- * `api.ts::ApiError` porte désormais `code` (code métier du backend) et
- * `errors[]` (422 multi-erreurs du pipeline de validation), en plus de `status`
- * et `message`. `toFieldErrors` les restitue tels quels : une ligne par erreur
- * serveur, avec son propre code — le principe 5 (« réponse 422 structurée
- * {code, message} par erreur, jamais un message générique ») est donc tenu de
- * bout en bout.
- *
- * Règle : ne JAMAIS présenter le statut HTTP comme un code métier. « 422 » dit à
- * l'utilisateur que sa requête a été refusée, pas pourquoi. Quand le backend
- * n'envoie pas de `code`, on n'en invente pas — on affiche le seul message.
- */
+
 import React from 'react';
 import { ApiError } from '@/services/api';
 
@@ -35,14 +18,7 @@ export interface FieldError {
   message: string;
 }
 
-/**
- * Extrait la liste d'erreurs affichables d'une exception.
- *
- * Ordre de préférence, du plus précis au plus pauvre :
- *   1. `errors[]` — une ligne par erreur de validation, chacune avec son code ;
- *   2. `code` + `message` — erreur métier unitaire (ex. `ASSET_VERIFY_REFUSED`) ;
- *   3. `message` seul — le backend n'a pas envoyé de code : on n'en fabrique pas.
- */
+
 export function toFieldErrors(err: unknown): FieldError[] {
   if (err instanceof ApiError) {
     if (err.errors.length > 0) {
@@ -77,11 +53,7 @@ export const ErrorPanel: React.FC<{ errors: FieldError[]; title?: string }> = ({
   );
 };
 
-/**
- * Écran de refus serveur (403). Traité à part d'une erreur technique : ce n'est
- * pas une panne, c'est une décision d'autorisation — et le front ne la contourne
- * ni ne la devine.
- */
+
 export const Forbidden: React.FC<{ message?: string; detail?: string }> = ({
   message = 'Accès refusé.',
   detail,
@@ -96,11 +68,7 @@ export const Forbidden: React.FC<{ message?: string; detail?: string }> = ({
   </div>
 );
 
-/**
- * Carte de KPI honnête : un chiffre ne s'affiche jamais seul. `scope` (périmètre)
- * et `period` (période) sont requis — c'est la contrainte du §7.2 rendue
- * structurelle plutôt que laissée à la discipline de chaque écran.
- */
+
 export const KpiCard: React.FC<{
   label: string;
   value: string;
@@ -120,7 +88,6 @@ export const KpiCard: React.FC<{
   </div>
 );
 
-/** Bandeau de troncature — toute liste coupée par le serveur l'annonce. */
 export const TruncationNotice: React.FC<{ shown: number; total: number; cap: number }> = ({
   shown,
   total,

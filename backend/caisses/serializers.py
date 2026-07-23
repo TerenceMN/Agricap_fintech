@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from common.choices import FlowStatus
 
-from .models import CashRegisterSession, FundTransfer, RegularizationOrder, TreasuryAccount, WalletMovement, \
-    WithdrawalRequest
+from .models import CashRegisterSession, FundTransfer, PaymentOrder, PaymentOrderEvent, RegularizationOrder, \
+    TreasuryAccount, WalletMovement, WithdrawalRequest
 
 
 def transfer_row(t: FundTransfer) -> dict:
@@ -40,6 +40,58 @@ def regularization_order_row(o: RegularizationOrder) -> dict:
         "orderId": o.pk, "amount": float(o.amount), "status": o.status, "autoValidated": o.auto_validated,
         "requiredApprovals": needed, "approvalsCount": approvals_count,
         "movementId": o.movement_id, "ticketId": o.ticket_id,
+    }
+
+
+#: Message affichable par statut d'ordre de paiement. Le front NE DOIT PAS déduire l'issue
+#: d'un code HTTP : un ordre indéterminé se répond en 200 avec `status: INDETERMINATE`, parce
+#: qu'il n'y a ni erreur du client, ni succès — il y a une incertitude à afficher comme telle.
+PAYMENT_STATUS_DETAIL = {
+    PaymentOrder.Status.PENDING: "Ordre de paiement créé — pas encore transmis au fournisseur.",
+    PaymentOrder.Status.SENT: "Ordre transmis au fournisseur — réponse en attente.",
+    PaymentOrder.Status.AWAITING_CONFIRMATION: "Le fournisseur a accusé réception — issue pas encore connue.",
+    PaymentOrder.Status.INDETERMINATE: "Issue inconnue : la liaison a été coupée après l'envoi. "
+                                        "L'opération est en cours de vérification auprès du fournisseur.",
+    PaymentOrder.Status.CONFIRMED: "Paiement confirmé par le fournisseur.",
+    PaymentOrder.Status.REFUSED: "Paiement refusé par le fournisseur.",
+    PaymentOrder.Status.CANCELLED: "Ordre de paiement annulé avant tout envoi.",
+}
+
+
+def payment_order_row(o: PaymentOrder) -> dict:
+    """Vue CLIENT/STAFF d'un ordre. Les montants sortent en **chaînes** (`str(Decimal)`) et
+    non en `float` : un ordre de paiement est la pièce qui sera comparée au relevé de
+    l'opérateur, et `float` y introduit des écarts au centime (principe 4)."""
+    return {
+        "reference": o.reference,
+        "status": o.status,
+        "detail": PAYMENT_STATUS_DETAIL.get(o.status, ""),
+        "direction": o.direction,
+        "operation": o.operation,
+        "amount": str(o.amount),
+        "currency": o.currency,
+        "counterparty": o.counterparty,
+        "walletId": o.wallet_id,
+        "treasuryAccountCode": o.treasury_account.code if o.treasury_account_id else None,
+        "providerReference": o.provider_reference or None,
+        "movementId": o.movement_id,
+        "reversalMovementId": o.reversal_movement_id,
+        # Vrai tant que l'issue n'est pas connue : c'est CE drapeau qui doit empêcher le
+        # front de proposer « réessayer » — un rejeu à l'aveugle paie deux fois.
+        "awaitingReconciliation": o.status in PaymentOrder.OPEN_STATUSES,
+        "failureDetail": o.failure_detail or None,
+        "createdAt": o.created_at.isoformat() if o.created_at else None,
+        "sentAt": o.sent_at.isoformat() if o.sent_at else None,
+        "settledAt": o.settled_at.isoformat() if o.settled_at else None,
+        "createdBy": o.created_by,
+    }
+
+
+def payment_event_row(e: PaymentOrderEvent) -> dict:
+    return {
+        "id": e.pk, "kind": e.kind, "source": e.source, "fromStatus": e.from_status or None,
+        "toStatus": e.to_status or None, "actor": e.actor or None, "motive": e.motive or None,
+        "payload": e.payload or {}, "at": e.at.isoformat() if e.at else None,
     }
 
 

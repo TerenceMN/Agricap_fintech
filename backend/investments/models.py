@@ -78,6 +78,25 @@ class InvestmentConfig(models.Model):
 
 
 class Project(models.Model):
+    """Un projet d'investissement EST une demande de crédit client.
+
+    Décision du fondateur (juillet 2026) : **1 projet = 1 dossier de crédit**. Le
+    dossier (`credits.CreditApplication`) porte l'emprunteur, la filière, la zone, le
+    montant demandé et — via le moteur d'analyse — le score. Le projet porte la LEVÉE
+    (objectif, offres, souscriptions, cycle P01→P13). Les grandeurs communes ne sont
+    donc pas re-saisies ici : elles sont LUES dans le dossier (principe 6, une seule
+    source par concept). Les colonnes locales restent le repli des projets non encore
+    rattachés — jamais une seconde vérité concurrente d'un dossier rattaché.
+
+    **Anonymat (décision du fondateur, P08).** Pendant la levée (P01→P07), un non-staff
+    ne reçoit ni nom, ni contact, ni localisation fine de l'emprunteur : filière, zone
+    LARGE, score et nature du risque uniquement. À partir du décaissement (P08),
+    l'identité devient lisible pour les SEULS investisseurs dont une souscription a été
+    encaissée sur ce projet — jamais pour tout porteur du rôle `invest`. La règle est
+    appliquée par le choix du sérialiseur (`investments.serializers`), jamais par un
+    `if` d'affichage côté écran.
+    """
+
     class Status(models.TextChoices):
         P01 = "P01", "Prospection"
         P02 = "P02", "Analyse initiale"
@@ -94,6 +113,23 @@ class Project(models.Model):
         P13 = "P13", "Annulé"
 
     code = models.CharField(max_length=32, unique=True, db_index=True)
+
+    #: Dossier de crédit financé par ce projet — **un-à-un**.
+    #:
+    #: `OneToOneField` et non `ForeignKey` : la contrainte d'unicité est le fond de la
+    #: décision (« deux projets ne peuvent pas financer le même dossier »), pas une
+    #: précaution. Elle vit en base, pas dans une vue.
+    #: `null=True` le temps de la reprise : les projets créés avant cette décision
+    #: n'ont pas de dossier, et on ne leur en invente pas.
+    #: `PROTECT` : un dossier de crédit qui a été financé par des investisseurs ne
+    #: s'efface pas — c'est une pièce probante (principe 3).
+    credit_application = models.OneToOneField(
+        "credits.CreditApplication", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="investment_project",
+        help_text="Dossier de crédit instruit par le module crédit. Source unique du "
+                  "promoteur, de la filière, de la zone, du montant demandé et du score.",
+    )
+
     title = models.CharField(max_length=200)
     sector = models.CharField(max_length=120, blank=True)
     location = models.CharField(max_length=150, blank=True)
@@ -126,7 +162,18 @@ class Project(models.Model):
     status = models.CharField(max_length=3, choices=Status.choices, default=Status.P01)
     risk_category = models.CharField(max_length=80, blank=True)
     risk_score = models.IntegerField(default=5)  # 1-10
-    global_score = models.FloatField(default=0)
+
+    #: Score global /100. `DecimalField` et non `FloatField` (principe 4) : c'est la
+    #: grandeur qui décide de l'entrée en due diligence (garde P03) et qui est publiée
+    #: à l'investisseur ; un binaire flottant y introduit des écarts non reproductibles.
+    #: Même forme que `credits.AnalyseCredit.score_global` (5,1) — une seule
+    #: représentation pour une seule grandeur.
+    #:
+    #: Cette colonne n'est le score QUE pour un projet sans dossier de crédit. Dès
+    #: qu'un dossier est rattaché, le score est RELU dans le moteur crédit
+    #: (`effective_global_score`) : le module crédit possède un moteur de scoring, ce
+    #: module n'en a pas et n'en fabrique pas.
+    global_score = models.DecimalField(max_digits=5, decimal_places=1, default=Decimal("0"))
 
     start_date = models.DateField(null=True, blank=True)
     expected_maturity = models.DateField(null=True, blank=True)
@@ -168,6 +215,91 @@ class Project(models.Model):
     @property
     def is_investable(self) -> bool:
         return self.status == Project.Status.P06
+
+    # ── Données DÉRIVÉES du dossier de crédit (principe 6) ────────────────────
+    #
+    # Chaque accesseur lit le dossier quand il existe, et retombe sur la colonne
+    # locale sinon. Aucun ne recopie : la colonne locale n'est jamais réécrite
+    # depuis le dossier après le rattachement, pour qu'un auditeur voie toujours
+    # quelle valeur venait d'où.
+
+    @property
+    def borrower_name(self) -> str:
+        """Nom de l'emprunteur — l'identité protégée jusqu'à P08."""
+        app = self.credit_application
+        if app is None:
+            return self.promoter
+        client = app.client
+        return client.company_name or client.full_name or client.sub
+
+    @property
+    def borrower_contact(self) -> str:
+        app = self.credit_application
+        if app is None:
+            return self.promoter_contact
+        return app.client.phone or app.client.email
+
+    @property
+    def value_chain_label(self) -> str:
+        """Filière — servie à tous, y compris pendant l'anonymat : elle ne désigne
+        personne."""
+        app = self.credit_application
+        if app is None or app.value_chain_id is None:
+            return self.sector
+        return app.value_chain.label
+
+    @property
+    def fine_location(self) -> str:
+        """Localisation FINE (ville/commune de l'agence d'instruction) — identité."""
+        app = self.credit_application
+        if app is None or app.agency_id is None:
+            return self.location
+        return app.agency.city or self.location
+
+    @property
+    def broad_zone(self) -> str:
+        """Zone LARGE (province) — la seule géographie servie pendant l'anonymat.
+
+        Sans dossier rattaché, elle est INDÉTERMINABLE : `Project.location` est un
+        texte libre dont personne ne connaît la granularité (« Kongo-Central » est une
+        province, « Kimbanseke » une commune). On retourne une chaîne vide et on le
+        DIT dans la réponse plutôt que de servir une localisation dont on ignore si
+        elle désigne l'emprunteur. C'est exactement ce que le rattachement au dossier
+        vient réparer.
+        """
+        app = self.credit_application
+        if app is not None and app.agency_id:
+            return app.agency.province or ""
+        return ""
+
+    @property
+    def requested_amount(self):
+        """Montant demandé — celui du dossier de crédit quand il existe."""
+        app = self.credit_application
+        if app is None or app.amount_requested is None:
+            return self.funding_target
+        return app.amount_requested
+
+    @property
+    def effective_global_score(self) -> Decimal:
+        """Score global — RELU dans le moteur crédit dès qu'un dossier est rattaché.
+
+        `credits.scoring.derniere_analyse` rend la dernière `AnalyseCredit` du dossier
+        (append-only : on ré-analyse, on ne corrige pas). Aucune copie n'est conservée
+        ici pour un projet rattaché : deux copies d'un score, c'est deux écrans qui
+        affichent deux notes pour le même dossier.
+
+        Dossier rattaché mais jamais analysé → 0, comme un projet non scoré : le
+        moteur n'a rien produit, ce module n'invente pas de note de remplacement.
+        """
+        app = self.credit_application
+        if app is None:
+            return Decimal(self.global_score)
+        from credits.scoring import derniere_analyse
+        analyse = derniere_analyse(app)
+        if analyse is None:
+            return Decimal("0")
+        return Decimal(analyse.score_global)
 
 
 class Offer(models.Model):
@@ -738,19 +870,41 @@ class FinancialAnalysis(models.Model):
 # dans Subscription (pas des vues alternatives de la même ligne). ---
 
 class ObligationPosition(models.Model):
+    """Position obligataire d'un investisseur — « du cash converti en obligation ».
+
+    Une position NAÎT D'UN DÉBIT RÉEL de portefeuille et d'un encaissement de
+    souscription (B10) : elle n'est jamais déclarée. Voir `investments/obligations.py`,
+    seul chemin de création côté API.
+
+    **Les termes ne s'inventent pas.** `coupon_amount`, `rate` et `term_months`
+    portaient les constantes du prototype (250 / 9 % / 24 mois) en valeurs par défaut :
+    toute position créée sans les préciser héritait donc de termes que personne n'avait
+    décidés. Les défauts sont supprimés — les trois champs sont désormais renseignés
+    depuis l'`Offer` qui porte les conditions, et une création sans offre est refusée.
+    Ce sont des SNAPSHOTS (même parti pris que `Subscription.coupon_rate_snapshot`) :
+    un recalibrage ultérieur de l'offre ne réécrit pas les conditions d'une position
+    déjà souscrite.
+    """
+
     class Status(models.TextChoices):
         ACTIF = "ACTIF", "Actif"
         EN_ATTENTE = "EN_ATTENTE", "En attente"
         MATURE = "MATURE", "Maturé"
 
     investor = models.ForeignKey(Investor, on_delete=models.CASCADE, related_name="obligation_positions")
+    #: Offre dont la position TIRE ses termes. Nullable pour les positions
+    #: antérieures à cette règle uniquement — le service de création l'exige.
     offer = models.ForeignKey(Offer, null=True, blank=True, on_delete=models.SET_NULL,
                                related_name="obligation_positions")
+    #: Souscription encaissée qui a financé la position — le lien vers l'argent.
+    #: `PROTECT` : la pièce qui prouve l'encaissement ne s'efface pas.
+    subscription = models.OneToOneField(Subscription, null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="obligation_position")
     name = models.CharField(max_length=150)
-    coupon_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("250"))
+    coupon_amount = models.DecimalField(max_digits=12, decimal_places=2)
     invested_amount = models.DecimalField(max_digits=16, decimal_places=2)
-    rate = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("9.0"))
-    term_months = models.IntegerField(default=24)
+    rate = models.DecimalField(max_digits=6, decimal_places=3)
+    term_months = models.IntegerField()
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.ACTIF)
     date_created = models.DateTimeField(auto_now_add=True)
 

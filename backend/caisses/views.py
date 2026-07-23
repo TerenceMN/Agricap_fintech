@@ -2,16 +2,17 @@
 clients (ClientWallet.jsx)."""
 from __future__ import annotations
 
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from common import idempotency
 from rbac.permissions import HasCapability
 from rbac.role_registry import get_role
 
-from . import cash_register, partner_link, regularization, serializers, services, withdrawal_tiers
-from .models import CashRegisterSession, ClientWallet, RegularizationOrder, TreasuryAccount, WithdrawalRequest
+from . import cash_register, partner_link, payments, regularization, serializers, services, withdrawal_tiers
+from .models import CashRegisterSession, ClientWallet, PaymentOrder, RegularizationOrder, TreasuryAccount, \
+    WithdrawalRequest
 
 
 def _require(request, capability: str) -> bool:
@@ -352,3 +353,185 @@ def regularization_otp_verify(request, order_id):
     data = request.data or {}
     ok = regularization.verify_step_up_otp(challenge_id=data.get("challengeId", ""), code=data.get("code", ""))
     return Response({"verified": ok})
+
+
+# ═══════════════════════════════════════ ORDRES DE PAIEMENT (fournisseur Makuta)
+
+def _payment_staff(request) -> bool:
+    """Vue « supervision des paiements ». Volontairement PAS `read` : la capacité `read` est
+    portée par les rôles CLIENT (`agri_op`, `invest`) — s'en servir ici exposerait à chaque
+    client la file des ordres de toute la coopérative."""
+    role = get_role(getattr(request.user, "role", ""))
+    return bool(role.validate or role.audit or role.config)
+
+
+def _payment_order_or_403(request, reference: str):
+    """Un client ne voit que SES ordres ; le staff paiements les voit tous. Renvoie
+    `(order, response_erreur)` — 404 indifférencié pour un ordre d'autrui, pour ne pas
+    transformer l'endpoint en oracle d'existence de références."""
+    order = PaymentOrder.objects.select_related("wallet", "treasury_account").filter(
+        reference=reference).first()
+    if not order:
+        return None, Response({"detail": "Ordre de paiement introuvable."}, status=404)
+    if order.wallet.user_id == getattr(request.user, "pk", None):
+        return order, None
+    if _payment_staff(request):
+        return order, None
+    return None, Response({"detail": "Ordre de paiement introuvable."}, status=404)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def my_payment_orders(request):
+    """Crée un ordre de paiement sur le portefeuille du demandeur.
+
+    `send: true` enchaîne l'envoi — mais en DEUX appels de service distincts, la création
+    étant committée avant que le réseau ne soit sollicité. Un échec d'envoi laisse donc
+    toujours un ordre exploitable en base."""
+    data = request.data or {}
+    key = data.get("idempotencyKey")
+    if not key:
+        return Response({"detail": "idempotencyKey requis."}, status=400)
+    wallet = _get_or_create_wallet(request.user, data.get("currency", "USD"))
+    by = getattr(request.user, "sub", "")
+    try:
+        order = payments.create_payment_order(
+            wallet_id=wallet.pk, direction=data.get("direction", PaymentOrder.Direction.COLLECTION),
+            operation=data.get("operation", ""), amount=data.get("amount", "0"),
+            counterparty=data.get("counterparty", ""),
+            treasury_account_code=data.get("treasuryAccountCode", ""),
+            metadata=data.get("metadata") or {}, idempotency_key=key, by=by,
+        )
+    except idempotency.IdempotentReplay as exc:
+        return idempotency.replay_response(exc)
+    if data.get("send"):
+        order = payments.dispatch_payment_order(reference=order.reference, by=by)
+        return Response(serializers.payment_order_row(order))
+    return Response(serializers.payment_order_row(order), status=201)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def my_payment_order_list(request):
+    qs = PaymentOrder.objects.select_related("wallet", "treasury_account").filter(
+        wallet__user=request.user)
+    status = request.GET.get("status")
+    if status:
+        qs = qs.filter(status=status)
+    return Response([serializers.payment_order_row(o) for o in qs[:200]])
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def payment_orders(request):
+    if not _payment_staff(request):
+        return Response({"detail": "Capacité requise : validate ou audit."}, status=403)
+    qs = payments.open_orders(status=request.GET.get("status"),
+                              direction=request.GET.get("direction"))
+    return Response([serializers.payment_order_row(o) for o in qs])
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def payment_orders_indeterminate(request):
+    """File de réconciliation : tout ordre dont l'issue n'est pas connue. C'est l'outil que
+    le principe 2 exige — un humain regarde cette liste et décide ; rien ne s'y résout seul."""
+    if not _payment_staff(request):
+        return Response({"detail": "Capacité requise : validate ou audit."}, status=403)
+    orders = payments.indeterminate_orders()
+    return Response({
+        "count": len(orders),
+        "orders": [serializers.payment_order_row(o) for o in orders],
+        "consigne": "Ces ordres ont peut-être abouti chez le fournisseur. Les relire "
+                    "(réconciliation), jamais les rejouer.",
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def payment_order_detail(request, reference):
+    order, error = _payment_order_or_403(request, reference)
+    if error:
+        return error
+    row = serializers.payment_order_row(order)
+    # Le journal complet (motifs, réponses fournisseur) est une pièce d'audit interne :
+    # il ne part pas vers le client (principe 7 — asymétrie d'information).
+    if _payment_staff(request):
+        row["events"] = [serializers.payment_event_row(e) for e in order.events.all()]
+    return Response(row)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def payment_order_send(request, reference):
+    order, error = _payment_order_or_403(request, reference)
+    if error:
+        return error
+    order = payments.dispatch_payment_order(reference=order.reference,
+                                            by=getattr(request.user, "sub", ""))
+    return Response(serializers.payment_order_row(order))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def payment_order_cancel(request, reference):
+    order, error = _payment_order_or_403(request, reference)
+    if error:
+        return error
+    order = payments.cancel_payment_order(
+        reference=order.reference, motive=(request.data or {}).get("motive", ""),
+        by=getattr(request.user, "sub", ""),
+    )
+    return Response(serializers.payment_order_row(order))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def payment_order_reconcile(request, reference):
+    order = payments.reconcile_payment_order(
+        reference=reference, motive=(request.data or {}).get("motive", ""),
+        by=getattr(request.user, "sub", ""),
+    )
+    return Response(serializers.payment_order_row(order))
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("validate")])
+def payment_order_force_settle(request, reference):
+    """Clôture manuelle sur preuve externe — décision humaine assumée, motif circonstancié
+    obligatoire. Réservée aux cas où la relecture de statut n'est pas disponible."""
+    data = request.data or {}
+    order = payments.force_settle(
+        reference=reference, outcome=data.get("outcome", ""), motive=data.get("motive", ""),
+        by=getattr(request.user, "sub", ""),
+    )
+    return Response(serializers.payment_order_row(order))
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def payment_callback(request):
+    """Point d'entrée du rappel fournisseur — **ouvert au réseau, fermé à la confiance**.
+
+    Il n'est ouvert que parce qu'un rappel arrive sans session ; il ne croit personne : sans
+    clé publique Makuta configurée, tout est refusé (503), et avec une clé, seule une
+    signature valide sur les OCTETS BRUTS du corps donne accès à la suite. Aucun rappel ne
+    peut créditer quoi que ce soit sans franchir ces deux verrous.
+
+    Tant que Wolf Technologies n'a pas fourni sa clé publique, son format de rappel et le
+    nom de son en-tête de signature, cet endpoint refuse tout — c'est le comportement
+    correct, pas une régression.
+    """
+    ip = request.META.get("REMOTE_ADDR", "")
+    signature = request.META.get(
+        "HTTP_" + payments.callback_signature_header().upper().replace("-", "_"), "",
+    )
+    try:
+        order = payments.handle_callback(raw_body=request.body, signature=signature, ip=ip)
+    except payments.CallbackRejected as exc:
+        payments.log_rejected_callback(reason=exc.message, ip=ip)
+        return Response({"detail": exc.message, "code": "makuta_callback_rejected"},
+                        status=exc.http_status)
+    return Response({"detail": "Rappel pris en compte.", "reference": order.reference,
+                     "status": order.status})

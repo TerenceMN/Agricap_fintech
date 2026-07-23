@@ -16,6 +16,15 @@ def _generate_otp_id() -> str:
     return uuid.uuid4().hex
 
 
+def _generate_payment_reference() -> str:
+    """Notre référence propre, portée dans le corps envoyé au fournisseur.
+
+    Le protocole Makuta n'offre AUCUN jeton d'idempotence et ne met ni horodatage ni nonce
+    dans le contenu signé (cf. `common/makuta.py`, écart n°3) : cette référence est la seule
+    chose qui permette, chez eux comme chez nous, de dire « c'est le même paiement »."""
+    return f"AGC{uuid.uuid4().hex[:24]}"
+
+
 class TreasuryAccount(models.Model):
     class Kind(models.TextChoices):
         CAISSE = "CAISSE", "Caisse"
@@ -158,6 +167,10 @@ class WalletMovement(models.Model):
         FX_BUY = "FX_BUY", "Achat devise"
         FX_SELL = "FX_SELL", "Vente devise"
         REGULARIZATION = "REGULARIZATION", "Régularisation"
+        # Contre-passation d'un mouvement antérieur (ex. décaissement réservé puis refusé
+        # par le fournisseur). Distinct de REGULARIZATION, qui est un crédit forcé décidé
+        # par un agent : ici personne ne décide, on annule un engagement qui n'a pas eu lieu.
+        REVERSAL = "REVERSAL", "Contre-passation"
 
     wallet = models.ForeignKey(ClientWallet, on_delete=models.CASCADE, related_name="movements")
     kind = models.CharField(max_length=14, choices=Kind.choices)
@@ -304,6 +317,156 @@ class RegularizationOtpChallenge(models.Model):
 
     def __str__(self) -> str:
         return f"OTP {self.id[:8]} order={self.order_id} approver={self.approver_sub}"
+
+
+class PaymentOrder(models.Model):
+    """Ordre de paiement adressé à la plateforme **Makuta** — le chaînon manquant entre un
+    mouvement de portefeuille et un vrai déplacement d'argent.
+
+    Trois choix structurent ce modèle :
+
+    1. **Une nomenclature de statuts propre, distincte de `common.choices.FlowStatus`**
+       (principe 6 : une seule nomenclature PAR CONCEPT — ce n'en est pas le même). Le cycle
+       de vie d'un ordre chez un fournisseur externe comporte un état que le workflow interne
+       n'a pas et ne peut pas avoir : `INDETERMINATE`, « la requête est partie, l'issue est
+       INCONNUE ». `FlowStatus` n'offre que `posted`/`rejected` — deux certitudes. Plier
+       l'incertitude sur une certitude, c'est exactement l'erreur qui fait payer deux fois.
+
+    2. **Le portefeuille n'est crédité qu'à `CONFIRMED`** (`movement` reste nul avant). Un
+       dépôt annoncé n'est pas un dépôt reçu. Un ordre `SENT`, `AWAITING_CONFIRMATION` ou
+       `INDETERMINATE` n'a produit aucun `WalletMovement`.
+
+    3. **Le pied de trésorerie n'est PAS posé ici.** `treasury_account` est une traçabilité
+       (sur quel compte Mobile Money les fonds atterrissent), pas un compte mouvementé
+       automatiquement : l'écriture de contrepartie relève du module trésorerie/comptabilité
+       et de son propriétaire. Trou déclaré, pas trou silencieux.
+    """
+
+    class Direction(models.TextChoices):
+        COLLECTION = "COLLECTION", "Encaissement (client → AGRICAP)"
+        PAYOUT = "PAYOUT", "Décaissement (AGRICAP → client)"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Créé — rien n'est parti"
+        SENT = "SENT", "Envoyé — aucune réponse encore enregistrée"
+        AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION", "Accusé par le fournisseur — issue non connue"
+        INDETERMINATE = "INDETERMINATE", "Issue INCONNUE — à réconcilier"
+        CONFIRMED = "CONFIRMED", "Confirmé par le fournisseur"
+        REFUSED = "REFUSED", "Refusé par le fournisseur"
+        CANCELLED = "CANCELLED", "Annulé avant tout envoi"
+
+    #: Statuts terminaux : plus aucune transition, plus aucune écriture monétaire.
+    SETTLED_STATUSES = (Status.CONFIRMED, Status.REFUSED, Status.CANCELLED)
+    #: Statuts qui appellent une réconciliation manuelle (P2 : outillée, jamais automatique).
+    OPEN_STATUSES = (Status.SENT, Status.AWAITING_CONFIRMATION, Status.INDETERMINATE)
+
+    reference = models.CharField(max_length=64, unique=True, db_index=True,
+                                 default=_generate_payment_reference)
+    wallet = models.ForeignKey(ClientWallet, on_delete=models.PROTECT, related_name="payment_orders")
+    treasury_account = models.ForeignKey(TreasuryAccount, null=True, blank=True, on_delete=models.SET_NULL,
+                                          related_name="payment_orders")
+    direction = models.CharField(max_length=12, choices=Direction.choices)
+    #: Nom LOGIQUE de l'opération fournisseur (clé de `settings.MAKUTA["OPERATIONS"]`).
+    #: Aucun endpoint Makuta n'est codé en dur : la documentation fournie ne décrit que
+    #: l'authentification, pas le catalogue des opérations.
+    operation = models.CharField(max_length=64)
+    #: Contrepartie chez le fournisseur (numéro Mobile Money, compte marchand…) — format
+    #: non spécifié par la documentation, stocké tel que saisi.
+    counterparty = models.CharField(max_length=64, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=3, choices=TreasuryAccount.Currency.choices)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    #: Ce qui est RÉELLEMENT parti (chemin + corps signé), figé à l'envoi : sans cela, une
+    #: réconciliation six mois plus tard compare une réponse à un corps reconstruit.
+    request_path = models.CharField(max_length=255, blank=True)
+    request_body = models.JSONField(null=True, blank=True)
+    provider_reference = models.CharField(max_length=128, blank=True, db_index=True)
+    last_response = models.JSONField(null=True, blank=True)
+    failure_detail = models.TextField(blank=True)
+
+    #: Mouvement de portefeuille produit par l'ordre. COLLECTION : créé à la confirmation
+    #: SEULEMENT. PAYOUT : créé à la CRÉATION (les fonds sont réservés — on n'ordonne pas
+    #: un décaissement qu'on ne détient pas), contre-passé par `reversal_movement` en cas
+    #: de refus.
+    movement = models.ForeignKey(WalletMovement, null=True, blank=True, on_delete=models.SET_NULL,
+                                  related_name="payment_order")
+    reversal_movement = models.ForeignKey(WalletMovement, null=True, blank=True, on_delete=models.SET_NULL,
+                                           related_name="payment_order_reversal")
+
+    idempotency_key = models.CharField(max_length=128, blank=True)
+    created_by = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    settled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(condition=Q(amount__gt=0), name="payment_order_amount_positive"),
+        ]
+        indexes = [
+            models.Index(fields=["status"], name="payment_order_status_idx"),
+            models.Index(fields=["status", "created_at"], name="payment_order_status_date_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.reference} {self.direction} {self.amount} {self.currency} [{self.status}]"
+
+
+class PaymentOrderEvent(models.Model):
+    """Journal **append-only** d'un ordre de paiement (principe 3).
+
+    `PaymentOrder.status` est un curseur : il dit où l'on en est. Ce journal est la preuve :
+    il dit d'où vient chaque changement, qui l'a provoqué et sur quelle réponse fournisseur.
+    Toute écriture corrective (réconciliation) y laisse son motif obligatoire — sans quoi
+    « l'ordre est passé de INDETERMINATE à CONFIRMED » est une affirmation sans auteur."""
+
+    class Source(models.TextChoices):
+        SYSTEM = "SYSTEM", "Système AGRICAP"
+        PROVIDER_RESPONSE = "PROVIDER_RESPONSE", "Réponse synchrone du fournisseur"
+        RECONCILIATION = "RECONCILIATION", "Réconciliation (relecture de statut)"
+        CALLBACK = "CALLBACK", "Rappel entrant du fournisseur"
+
+    class Kind(models.TextChoices):
+        CREATED = "CREATED", "Ordre créé"
+        SENT = "SENT", "Requête envoyée"
+        RESPONSE = "RESPONSE", "Réponse enregistrée"
+        TRANSPORT_ERROR = "TRANSPORT_ERROR", "Erreur de transport — issue inconnue"
+        CONFIRMED = "CONFIRMED", "Issue confirmée"
+        REFUSED = "REFUSED", "Issue refusée"
+        UNCLASSIFIED = "UNCLASSIFIED", "Réponse non classable (contrat fournisseur manquant)"
+        WALLET_POSTED = "WALLET_POSTED", "Mouvement de portefeuille posté"
+        WALLET_REVERSED = "WALLET_REVERSED", "Mouvement de portefeuille contre-passé"
+        CANCELLED = "CANCELLED", "Ordre annulé avant envoi"
+        CALLBACK_REJECTED = "CALLBACK_REJECTED", "Rappel entrant refusé (non authentifié)"
+
+    order = models.ForeignKey(PaymentOrder, on_delete=models.CASCADE, related_name="events")
+    kind = models.CharField(max_length=24, choices=Kind.choices)
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.SYSTEM)
+    from_status = models.CharField(max_length=24, blank=True)
+    to_status = models.CharField(max_length=24, blank=True)
+    actor = models.CharField(max_length=255, blank=True)
+    motive = models.TextField(blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["at", "id"]
+        indexes = [models.Index(fields=["order", "at"], name="payment_event_order_at_idx")]
+
+    def save(self, *args, **kwargs):
+        if self.pk and not self._state.adding:
+            raise RuntimeError("Journal d'ordre de paiement : append-only, aucune modification.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise RuntimeError("Journal d'ordre de paiement : append-only, aucune suppression.")
+
+    def __str__(self) -> str:
+        return f"{self.order_id} {self.kind} ({self.from_status}→{self.to_status})"
 
 
 class RegularizationApproval(models.Model):

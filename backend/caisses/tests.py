@@ -4,6 +4,7 @@ from decimal import Decimal
 from unittest.mock import Mock, patch
 
 import requests
+from django.test import override_settings
 
 from common.exceptions import (
     ConflictError,
@@ -763,3 +764,530 @@ class RegularizationOrderApiTests(AuthedAPITestCase):
         self.assertEqual(approved.data["status"], "posted")
         wallet.refresh_from_db()
         self.assertEqual(wallet.balance, Decimal("500.00"))
+
+
+# ═══════════════════════════════════════ ORDRES DE PAIEMENT (fournisseur Makuta)
+#
+# AUCUN appel réseau dans ces tests : `settings.MAKUTA` est neutralisé sous `test`
+# (config/settings.py), chaque classe réinjecte une configuration FICTIVE via
+# `override_settings`, et `requests.post`/`requests.get` du module `common.makuta` sont
+# systématiquement remplacés. Les chemins, noms de champs et valeurs de statut ci-dessous
+# sont des FIXTURES, pas une hypothèse sur le vrai contrat Makuta : celui-ci n'est pas
+# documenté (cf. rapport). Les tests vérifient le MÉCANISME, pas le protocole.
+
+_TEST_KEYS: dict[str, str] = {}
+
+
+def _test_key_pair() -> tuple[str, str]:
+    """Paire RSA générée une seule fois pour toute la suite (2048 bits coûte ~0,2 s)."""
+    if not _TEST_KEYS:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        _TEST_KEYS["private"] = key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("utf-8")
+        _TEST_KEYS["public"] = key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("utf-8")
+    return _TEST_KEYS["private"], _TEST_KEYS["public"]
+
+
+def makuta_test_settings(**overrides) -> dict:
+    private_pem, _public_pem = _test_key_pair()
+    config = {
+        "BASE_URL": "https://makuta.invalid",
+        "PRIVATE_KEY_PEM": private_pem,
+        "PRIVATE_KEY_PATH": "",
+        "PRIVATE_KEY_PASSPHRASE": "",
+        "SIGNATURE_HEADER": "X-Makuta-Signature",
+        "CALLBACK_PUBLIC_KEY_PEM": "",          # non fournie par Wolf Technologies à ce jour
+        "CALLBACK_SIGNATURE_HEADER": "X-Makuta-Signature",
+        "CALLBACK_REFERENCE_FIELD": "reference",
+        "STATUS_FIELD": "status",
+        "STATUS_CONFIRMED": ["SUCCESS"],
+        "STATUS_REFUSED": ["FAILED"],
+        "STATUS_PENDING": ["PENDING"],
+        "PROVIDER_REFERENCE_FIELD": "transactionId",
+        "OPERATIONS": {
+            "MM_COLLECT": {
+                "path": "/fixture/collect",
+                "body": {"amount": "{amount}", "currency": "{currency}",
+                         "msisdn": "{counterparty}", "partnerReference": "{reference}"},
+                "status_path": "/fixture/transactions/{reference}",
+            },
+            "MM_PAYOUT": {
+                "path": "/fixture/payout",
+                "body": {"amount": "{amount}", "currency": "{currency}",
+                         "msisdn": "{counterparty}", "partnerReference": "{reference}"},
+                "status_path": "/fixture/transactions/{reference}",
+            },
+        },
+    }
+    config.update(overrides)
+    return config
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code=200, payload=None, unreadable=False):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self._unreadable = unreadable
+
+    def json(self):
+        if self._unreadable:
+            raise ValueError("réponse non JSON")
+        return self._payload
+
+
+class PaymentOrderMixin:
+    def _wallet(self, sub, balance="0", kyc_level="T3"):
+        from accounts.models import FintechUser
+        from compliance.kyc_levels import LEVEL_LIMITS
+        from compliance.models import KycProfile
+        self.login(role="client", sub=sub)
+        self.client.get("/api/rbac/me")  # provisioning JIT
+        user = FintechUser.objects.get(sub=sub)
+        if kyc_level:
+            KycProfile.objects.get_or_create(
+                user=user,
+                defaults={"kyc_level": kyc_level, "monthly_limit": LEVEL_LIMITS[kyc_level]},
+            )
+        return ClientWallet.objects.create(user=user, currency="USD", balance=Decimal(balance))
+
+    def _order(self, wallet, *, direction="COLLECTION", operation="MM_COLLECT",
+               amount="100", key="pay-1", by="u"):
+        from . import payments
+        return payments.create_payment_order(
+            wallet_id=wallet.pk, direction=direction, operation=operation, amount=amount,
+            counterparty="+243900000000", idempotency_key=key, by=by,
+        )
+
+
+class PaymentStateMachineTests(AuthedAPITestCase):
+    def test_terminal_states_have_no_outgoing_transition(self):
+        from .models import PaymentOrder
+        from .payments import TRANSITIONS
+        for terminal in PaymentOrder.SETTLED_STATUSES:
+            self.assertEqual(TRANSITIONS[terminal], frozenset(), terminal)
+
+    def test_indeterminate_can_only_be_resolved_by_reading_an_outcome(self):
+        """Un ordre indéterminé ne revient JAMAIS à PENDING : ce serait autoriser le rejeu."""
+        from .models import PaymentOrder
+        from .payments import TRANSITIONS
+        self.assertNotIn(PaymentOrder.Status.PENDING, TRANSITIONS[PaymentOrder.Status.INDETERMINATE])
+        self.assertNotIn(PaymentOrder.Status.SENT, TRANSITIONS[PaymentOrder.Status.INDETERMINATE])
+
+    def test_confirmed_cannot_become_refused(self):
+        from .models import PaymentOrder
+        from .payments import TRANSITIONS
+        self.assertNotIn(PaymentOrder.Status.REFUSED, TRANSITIONS[PaymentOrder.Status.CONFIRMED])
+
+
+@override_settings(MAKUTA=makuta_test_settings())
+class PaymentCollectionTests(PaymentOrderMixin, AuthedAPITestCase):
+    def test_creation_never_credits_the_wallet(self):
+        wallet = self._wallet("pay-c1")
+        order = self._order(wallet, key="c1")
+        wallet.refresh_from_db()
+        self.assertEqual(order.status, "PENDING")
+        self.assertIsNone(order.movement_id)
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_same_idempotency_key_creates_one_order_only(self):
+        from .models import PaymentOrder
+        wallet = self._wallet("pay-c2")
+        self._order(wallet, key="c2")
+        with self.assertRaises(IdempotentReplay):
+            self._order(wallet, key="c2")
+        self.assertEqual(PaymentOrder.objects.filter(wallet=wallet).count(), 1)
+
+    def test_transport_error_leaves_order_indeterminate_without_crediting(self):
+        from . import payments
+        wallet = self._wallet("pay-c3")
+        order = self._order(wallet, key="c3")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")) as post:
+            order = payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(order.status, "INDETERMINATE")
+        self.assertIsNone(order.movement_id)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_double_send_pays_only_once(self):
+        """Le second envoi est REFUSÉ, pas rejoué : le test qui protège du double paiement."""
+        from . import payments
+        wallet = self._wallet("pay-c4")
+        order = self._order(wallet, key="c4")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")) as post:
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+            with self.assertRaises(ConflictError):
+                payments.dispatch_payment_order(reference=order.reference, by="u")
+            self.assertEqual(post.call_count, 1)  # une seule requête est partie
+
+    def test_provider_refusal_does_not_credit(self):
+        from . import payments
+        wallet = self._wallet("pay-c5")
+        order = self._order(wallet, key="c5")
+        refusal = _FakeHttpResponse(status_code=402, payload={"message": "solde insuffisant"})
+        with patch("common.makuta.requests.post", return_value=refusal):
+            order = payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertEqual(order.status, "REFUSED")
+        self.assertIsNone(order.movement_id)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_unreadable_status_is_not_a_confirmation(self):
+        """200 OK ne vaut pas confirmation : sans statut interprétable, rien n'est crédité."""
+        from . import payments
+        wallet = self._wallet("pay-c6")
+        order = self._order(wallet, key="c6")
+        ok = _FakeHttpResponse(payload={"status": "QUELQUE_CHOSE_DE_NOUVEAU"})
+        with patch("common.makuta.requests.post", return_value=ok):
+            order = payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertEqual(order.status, "AWAITING_CONFIRMATION")
+        self.assertIsNone(order.movement_id)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_confirmation_credits_exactly_once(self):
+        from . import payments
+        wallet = self._wallet("pay-c7")
+        order = self._order(wallet, amount="250", key="c7")
+        ok = _FakeHttpResponse(payload={"status": "SUCCESS", "transactionId": "MK-123"})
+        with patch("common.makuta.requests.post", return_value=ok):
+            order = payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertEqual(order.status, "CONFIRMED")
+        self.assertEqual(order.provider_reference, "MK-123")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("250.00"))
+        self.assertEqual(wallet.movements.count(), 1)
+
+    def test_reconciliation_of_indeterminate_order_that_actually_succeeded(self):
+        """Le scénario coûteux : le réseau a coupé, mais l'argent est bien parti chez Makuta.
+        La relecture confirme et crédite UNE fois — sans jamais réémettre le paiement."""
+        from . import payments
+        wallet = self._wallet("pay-c8")
+        order = self._order(wallet, amount="300", key="c8")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            order = payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertEqual(order.status, "INDETERMINATE")
+
+        read = _FakeHttpResponse(payload={"status": "SUCCESS", "transactionId": "MK-999"})
+        with patch("common.makuta.requests.get", return_value=read) as get, \
+                patch("common.makuta.requests.post") as post:
+            order = payments.reconcile_payment_order(
+                reference=order.reference, motive="Ordre indéterminé depuis 20 min.", by="agent-1")
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(post.call_count, 0)  # réconcilier n'est PAS rejouer
+        self.assertEqual(order.status, "CONFIRMED")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("300.00"))
+        self.assertEqual(wallet.movements.count(), 1)
+
+    def test_reconciliation_that_reads_nothing_usable_keeps_the_alarm(self):
+        """Une relecture illisible ne lève pas le doute : elle le confirme. L'ordre reste
+        INDETERMINATE et donc dans la file de réconciliation."""
+        from . import payments
+        wallet = self._wallet("pay-c15")
+        order = self._order(wallet, key="c15")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        read = _FakeHttpResponse(payload={"status": "MYSTERE"})
+        with patch("common.makuta.requests.get", return_value=read):
+            order = payments.reconcile_payment_order(
+                reference=order.reference, motive="Vérification quotidienne.", by="agent-1")
+        self.assertEqual(order.status, "INDETERMINATE")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_reconciliation_requires_a_motive(self):
+        from . import payments
+        wallet = self._wallet("pay-c9")
+        order = self._order(wallet, key="c9")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        with self.assertRaises(ValidationFailed):
+            payments.reconcile_payment_order(reference=order.reference, motive="", by="agent-1")
+
+    def test_reconciliation_of_a_settled_order_is_refused(self):
+        from . import payments
+        wallet = self._wallet("pay-c10")
+        order = self._order(wallet, key="c10")
+        ok = _FakeHttpResponse(payload={"status": "SUCCESS"})
+        with patch("common.makuta.requests.post", return_value=ok):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        with self.assertRaises(ConflictError):
+            payments.reconcile_payment_order(reference=order.reference, motive="Doute.", by="agent-1")
+
+    def test_unknown_operation_is_refused_before_any_write(self):
+        from common.makuta import MakutaConfigurationError
+        from .models import PaymentOrder
+        wallet = self._wallet("pay-c11")
+        with self.assertRaises(MakutaConfigurationError):
+            self._order(wallet, operation="OPERATION_INVENTEE", key="c11")
+        self.assertEqual(PaymentOrder.objects.filter(wallet=wallet).count(), 0)
+
+    def test_indeterminate_queue_lists_every_open_order(self):
+        from . import payments
+        wallet = self._wallet("pay-c12")
+        order = self._order(wallet, key="c12")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        references = [o.reference for o in payments.indeterminate_orders()]
+        self.assertIn(order.reference, references)
+
+    def test_events_journal_is_append_only(self):
+        wallet = self._wallet("pay-c13")
+        order = self._order(wallet, key="c13")
+        event = order.events.first()
+        event.motive = "réécriture"
+        with self.assertRaises(RuntimeError):
+            event.save()
+        with self.assertRaises(RuntimeError):
+            event.delete()
+
+    def test_force_settle_demands_a_circumstantiated_motive(self):
+        from . import payments
+        wallet = self._wallet("pay-c14")
+        order = self._order(wallet, key="c14")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        with self.assertRaises(ValidationFailed):
+            payments.force_settle(reference=order.reference, outcome="CONFIRMED", motive="ok", by="dg-1")
+        order = payments.force_settle(
+            reference=order.reference, outcome="CONFIRMED",
+            motive="Relevé opérateur MM du 12/07 ligne 44 : encaissement effectif.", by="dg-1")
+        self.assertEqual(order.status, "CONFIRMED")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("100.00"))
+
+
+@override_settings(MAKUTA=makuta_test_settings(BASE_URL="", PRIVATE_KEY_PEM=""))
+class PaymentUnconfiguredProviderTests(PaymentOrderMixin, AuthedAPITestCase):
+    def test_missing_credentials_leave_the_order_pending_and_send_nothing(self):
+        """Sous `test`, la configuration Makuta est neutralisée : rien ne peut partir. L'ordre
+        doit revenir à PENDING — un ordre « envoyé » qui ne l'a jamais été pollue la file de
+        réconciliation avec un faux doute."""
+        from common.makuta import MakutaConfigurationError
+        from . import payments
+        wallet = self._wallet("pay-u1")
+        order = self._order(wallet, key="u1")
+        with patch("common.makuta.requests.post") as post:
+            with self.assertRaises(MakutaConfigurationError):
+                payments.dispatch_payment_order(reference=order.reference, by="u")
+            self.assertEqual(post.call_count, 0)
+        order.refresh_from_db()
+        self.assertEqual(order.status, "PENDING")
+
+
+@override_settings(MAKUTA=makuta_test_settings())
+class PaymentPayoutTests(PaymentOrderMixin, AuthedAPITestCase):
+    def test_payout_reserves_the_funds_at_creation(self):
+        wallet = self._wallet("pay-p1", balance="500")
+        order = self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="200", key="p1")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("300.00"))
+        self.assertIsNotNone(order.movement_id)
+
+    def test_payout_without_funds_is_refused(self):
+        wallet = self._wallet("pay-p2", balance="50")
+        with self.assertRaises(InsufficientFundsError):
+            self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="200", key="p2")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("50.00"))
+
+    def test_payout_refusal_gives_the_funds_back(self):
+        from . import payments
+        wallet = self._wallet("pay-p3", balance="500")
+        order = self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="200", key="p3")
+        refusal = _FakeHttpResponse(status_code=400, payload={"message": "numéro invalide"})
+        with patch("common.makuta.requests.post", return_value=refusal):
+            order = payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertEqual(order.status, "REFUSED")
+        self.assertIsNotNone(order.reversal_movement_id)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("500.00"))
+
+    def test_payout_indeterminate_keeps_the_funds_reserved(self):
+        """Tant que l'issue est inconnue, on NE rend PAS les fonds : si le paiement a abouti,
+        les rendre les ferait dépenser deux fois."""
+        from . import payments
+        wallet = self._wallet("pay-p4", balance="500")
+        order = self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="200", key="p4")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            order = payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertEqual(order.status, "INDETERMINATE")
+        self.assertIsNone(order.reversal_movement_id)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("300.00"))
+
+    def test_cancel_before_send_gives_the_funds_back(self):
+        from . import payments
+        wallet = self._wallet("pay-p5", balance="500")
+        order = self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="200", key="p5")
+        order = payments.cancel_payment_order(reference=order.reference, motive="Erreur de saisie.",
+                                              by="agent-1")
+        self.assertEqual(order.status, "CANCELLED")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("500.00"))
+
+    def test_cannot_cancel_once_sent(self):
+        from . import payments
+        wallet = self._wallet("pay-p6", balance="500")
+        order = self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="200", key="p6")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        with self.assertRaises(ConflictError):
+            payments.cancel_payment_order(reference=order.reference, motive="Trop tard.", by="agent-1")
+
+
+class PaymentCallbackTests(PaymentOrderMixin, AuthedAPITestCase):
+    URL = "/api/caisses/payments/callback"
+
+    def _signed(self, payload: dict) -> tuple[bytes, str]:
+        """Signe avec la clé PRIVÉE de test comme le ferait Makuta avec la sienne."""
+        import base64
+        import json
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        private_pem, _ = _test_key_pair()
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        key = serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+        signature = base64.b64encode(key.sign(body, padding.PKCS1v15(), hashes.SHA256())).decode("ascii")
+        return body, signature
+
+    @override_settings(MAKUTA=makuta_test_settings())
+    def test_callback_is_refused_while_no_provider_public_key_is_configured(self):
+        """État réel du projet : Wolf Technologies ne nous a pas donné sa clé publique. Tant
+        qu'elle manque, l'endpoint refuse TOUT — c'est le comportement correct."""
+        wallet = self._wallet("cb-1")
+        order = self._order(wallet, key="cb1")
+        body, signature = self._signed({"reference": order.reference, "status": "SUCCESS"})
+        res = self.client.post(self.URL, data=body, content_type="application/json",
+                               HTTP_X_MAKUTA_SIGNATURE=signature)
+        self.assertEqual(res.status_code, 503)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    @override_settings(MAKUTA=makuta_test_settings(CALLBACK_PUBLIC_KEY_PEM=_test_key_pair()[1]))
+    def test_unsigned_callback_is_rejected_and_credits_nothing(self):
+        wallet = self._wallet("cb-2")
+        order = self._order(wallet, key="cb2")
+        body, _ = self._signed({"reference": order.reference, "status": "SUCCESS"})
+        res = self.client.post(self.URL, data=body, content_type="application/json")
+        self.assertEqual(res.status_code, 401)
+        order.refresh_from_db()
+        wallet.refresh_from_db()
+        self.assertEqual(order.status, "PENDING")
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    @override_settings(MAKUTA=makuta_test_settings(CALLBACK_PUBLIC_KEY_PEM=_test_key_pair()[1]))
+    def test_badly_signed_callback_is_rejected_and_credits_nothing(self):
+        wallet = self._wallet("cb-3")
+        order = self._order(wallet, key="cb3")
+        body, _ = self._signed({"reference": order.reference, "status": "SUCCESS"})
+        res = self.client.post(self.URL, data=body, content_type="application/json",
+                               HTTP_X_MAKUTA_SIGNATURE="c2lnbmF0dXJlIGJpZG9u")
+        self.assertEqual(res.status_code, 401)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    @override_settings(MAKUTA=makuta_test_settings(CALLBACK_PUBLIC_KEY_PEM=_test_key_pair()[1]))
+    def test_tampered_body_invalidates_the_signature(self):
+        """Le corps est signé : le modifier après coup casse la vérification."""
+        wallet = self._wallet("cb-4")
+        order = self._order(wallet, key="cb4")
+        body, signature = self._signed({"reference": order.reference, "status": "SUCCESS"})
+        tampered = body.replace(b"SUCCESS", b"SUCCESZ")
+        res = self.client.post(self.URL, data=tampered, content_type="application/json",
+                               HTTP_X_MAKUTA_SIGNATURE=signature)
+        self.assertEqual(res.status_code, 401)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    @override_settings(MAKUTA=makuta_test_settings(CALLBACK_PUBLIC_KEY_PEM=_test_key_pair()[1]))
+    def test_correctly_signed_callback_confirms_and_credits_once(self):
+        from . import payments
+        wallet = self._wallet("cb-5")
+        order = self._order(wallet, amount="150", key="cb5")
+        with patch("common.makuta.requests.post",
+                   return_value=_FakeHttpResponse(payload={"status": "PENDING"})):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+
+        body, signature = self._signed({"reference": order.reference, "status": "SUCCESS",
+                                        "transactionId": "MK-77"})
+        first = self.client.post(self.URL, data=body, content_type="application/json",
+                                 HTTP_X_MAKUTA_SIGNATURE=signature)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.data["status"], "CONFIRMED")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("150.00"))
+
+        # Rappel rejoué (les fournisseurs réémettent) — aucun second crédit.
+        second = self.client.post(self.URL, data=body, content_type="application/json",
+                                  HTTP_X_MAKUTA_SIGNATURE=signature)
+        self.assertEqual(second.status_code, 200)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("150.00"))
+        self.assertEqual(wallet.movements.count(), 1)
+
+    @override_settings(MAKUTA=makuta_test_settings(CALLBACK_PUBLIC_KEY_PEM=_test_key_pair()[1]))
+    def test_signed_callback_on_unknown_reference_is_refused(self):
+        self._wallet("cb-6")
+        body, signature = self._signed({"reference": "AGCinconnue", "status": "SUCCESS"})
+        res = self.client.post(self.URL, data=body, content_type="application/json",
+                               HTTP_X_MAKUTA_SIGNATURE=signature)
+        self.assertEqual(res.status_code, 404)
+
+
+@override_settings(MAKUTA=makuta_test_settings())
+class PaymentApiTests(PaymentOrderMixin, AuthedAPITestCase):
+    def test_client_creates_an_order_without_sending_it(self):
+        self._wallet("api-p1")
+        res = self.client.post("/api/caisses/wallets/mine/payment-orders", {
+            "direction": "COLLECTION", "operation": "MM_COLLECT", "amount": "120",
+            "counterparty": "+243900000001", "currency": "USD", "idempotencyKey": "api-p1",
+        }, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["status"], "PENDING")
+        self.assertEqual(res.data["amount"], "120.00")  # chaîne, jamais un float
+        self.assertIs(res.data["awaitingReconciliation"], False)
+
+    def test_client_cannot_read_another_clients_order(self):
+        wallet = self._wallet("api-p2")
+        order = self._order(wallet, key="api-p2")
+        self.login(role="client", sub="api-p3")
+        self.client.get("/api/rbac/me")
+        res = self.client.get(f"/api/caisses/payments/{order.reference}")
+        self.assertEqual(res.status_code, 404)
+
+    def test_reconciliation_queue_is_closed_to_clients(self):
+        self._wallet("api-p4")
+        res = self.client.get("/api/caisses/payments/indeterminate")
+        self.assertEqual(res.status_code, 403)
+
+    def test_staff_sees_the_reconciliation_queue_and_the_journal(self):
+        from . import payments
+        wallet = self._wallet("api-p5")
+        order = self._order(wallet, key="api-p5")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+
+        self.login(role="gest_caisse", sub="api-staff1")
+        queue = self.client.get("/api/caisses/payments/indeterminate")
+        self.assertEqual(queue.status_code, 200)
+        self.assertEqual(queue.data["count"], 1)
+        detail = self.client.get(f"/api/caisses/payments/{order.reference}")
+        self.assertEqual(detail.status_code, 200)
+        kinds = [e["kind"] for e in detail.data["events"]]
+        self.assertIn("CREATED", kinds)
+        self.assertIn("TRANSPORT_ERROR", kinds)
+
+    def test_client_cannot_reconcile(self):
+        wallet = self._wallet("api-p6")
+        order = self._order(wallet, key="api-p6")
+        res = self.client.post(f"/api/caisses/payments/{order.reference}/reconcile",
+                               {"motive": "je veux mon argent"}, format="json")
+        self.assertEqual(res.status_code, 403)

@@ -1,6 +1,9 @@
 """API épargne (Savings.jsx + admin/savings/*) — CRUD léger, toujours audité."""
 from __future__ import annotations
 
+from decimal import ROUND_HALF_UP, Decimal
+
+from django.db import transaction
 from django.db.models import F
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -52,16 +55,55 @@ def all_plans(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def plan_deposit(request, plan_id):
+    """Dépôt sur un plan d'épargne.
+
+    Les contrôles ci-dessous ne sont PAS un doublon de la validation d'écran :
+    `to_decimal` est tolérant par construction (il rend `0` sur une saisie
+    illisible et accepte les négatifs), si bien qu'un `amount` de `-500` posté
+    directement débitait le plan — un retrait déguisé en dépôt, sans permission
+    ni confirmation. Le refus est structuré `{code, message}` (principe 5) pour
+    que l'écran puisse déplier chaque cause au lieu d'afficher « Erreur 422 ».
+    """
     plan = SavingsPlan.objects.filter(pk=plan_id, user=request.user).first()
     if not plan:
-        return Response({"detail": "Plan introuvable."}, status=404)
-    amount = to_decimal((request.data or {}).get("amount"))
-    channel = (request.data or {}).get("channel", SavingsPlan.Channel.AGENT)
-    SavingsDeposit.objects.create(plan=plan, amount=amount, channel=channel)
-    SavingsPlan.objects.filter(pk=plan.pk).update(balance=F("balance") + amount)
+        return Response({"detail": "Plan introuvable.", "code": "PLAN_NOT_FOUND"}, status=404)
+
+    data = request.data or {}
+    errors: list[dict] = []
+
+    raw_amount = data.get("amount")
+    amount = to_decimal(raw_amount, default="-1")  # -1 = sentinelle « illisible »
+    if amount <= 0:
+        errors.append({
+            "code": "AMOUNT_INVALID",
+            "message": "Le montant du dépôt doit être un nombre strictement positif.",
+        })
+    else:
+        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    channel = data.get("channel", SavingsPlan.Channel.AGENT)
+    if channel not in SavingsPlan.Channel.values:
+        errors.append({
+            "code": "CHANNEL_UNKNOWN",
+            "message": f"Canal de dépôt inconnu : {channel}.",
+        })
+
+    if plan.status != SavingsPlan.Status.ACTIF:
+        errors.append({
+            "code": "PLAN_CLOSED",
+            "message": "Ce plan est clôturé : il n'accepte plus de dépôt.",
+        })
+
+    if errors:
+        return Response({"detail": errors[0]["message"], "errors": errors}, status=422)
+
+    with transaction.atomic():
+        SavingsDeposit.objects.create(plan=plan, amount=amount, channel=channel)
+        SavingsPlan.objects.filter(pk=plan.pk).update(balance=F("balance") + amount)
+        audit_record(actor=getattr(request.user, "sub", ""), action="savings.plan.deposit",
+                     entity_type="SavingsPlan", entity_id=str(plan.pk),
+                     details={"amount": str(amount), "channel": channel})
     plan.refresh_from_db()
-    audit_record(actor=getattr(request.user, "sub", ""), action="savings.plan.deposit",
-                 entity_type="SavingsPlan", entity_id=str(plan.pk), details={"amount": str(amount)})
     return Response(_plan_row(plan))
 
 

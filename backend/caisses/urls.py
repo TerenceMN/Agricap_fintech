@@ -19,6 +19,18 @@ urlpatterns = [
     path("withdrawal-requests/<int:request_id>/reject", views.withdrawal_request_reject),
     path("withdrawal-requests/<int:request_id>/otp", views.withdrawal_otp_request),
     path("withdrawal-requests/<int:request_id>/otp/verify", views.withdrawal_otp_verify),
+    # Ordres de paiement (fournisseur Makuta). Les chemins littéraux précèdent
+    # `<str:reference>`, sans quoi « /payments/callback » serait lu comme une référence.
+    path("wallets/mine/payment-orders", views.my_payment_orders),
+    path("wallets/mine/payment-orders/list", views.my_payment_order_list),
+    path("payments/callback", views.payment_callback),
+    path("payments/indeterminate", views.payment_orders_indeterminate),
+    path("payments", views.payment_orders),
+    path("payments/<str:reference>", views.payment_order_detail),
+    path("payments/<str:reference>/send", views.payment_order_send),
+    path("payments/<str:reference>/cancel", views.payment_order_cancel),
+    path("payments/<str:reference>/reconcile", views.payment_order_reconcile),
+    path("payments/<str:reference>/force-settle", views.payment_order_force_settle),
     path("regularization-orders", views.regularization_orders),
     path("regularization-orders/<int:order_id>/approve", views.regularization_order_approve),
     path("regularization-orders/<int:order_id>/reject", views.regularization_order_reject),

@@ -1080,3 +1080,198 @@ class BaremeRevision(models.Model):
             for f in self._meta.concrete_fields
             if f.attname not in self.MUTABLE_FIELDS and f.attname != "id"
         }
+
+
+class ImmutableGuaranteeProposal(Exception):
+    """Tentative de réécriture du contenu figé d'une proposition de caution.
+
+    Même motif que `ImmutableBaremeRevision` : ce que le client a demandé, à qui
+    et pour combien est la matière même de la décision de l'agent. Si le contenu
+    reste modifiable après coup, la décision ne prouve plus rien — on ne saurait
+    pas sur quoi elle a porté.
+    """
+
+
+class GuaranteeProposal(models.Model):
+    """Le client PROPOSE un garant ; l'agent valide ou refuse (décision du fondateur).
+
+    Ce modèle existe parce que la désignation d'un garant
+    (`credits.guarantees.register_moral_guarantee`) est un acte lourd : elle crée
+    un engagement, notifie un tiers et ouvre une fenêtre de consentement de 72 h.
+    Le laisser au client reviendrait à permettre à n'importe qui d'inonder
+    n'importe qui de demandes de caution. Le lui interdire — l'état antérieur —
+    rendait la branche caution solidaire inatteignable : aucun écran n'appelait
+    l'endpoint réservé au personnel, et la boîte de réception du garant restait
+    vide parce que personne ne pouvait jamais rien lui demander.
+
+    **Une proposition n'est PAS une désignation.** C'est la propriété centrale de
+    ce modèle, et celle que `tests_guarantee_proposals` verrouille :
+
+      - elle ne crée aucune `CreditGuarantee` ;
+      - elle n'entre donc ni dans la couverture des garanties, ni dans le
+        scoring, ni dans aucune décision (principe 9 : « toute garantie est
+        opposable ou n'est pas ») ;
+      - elle ne notifie pas le garant pressenti : tant qu'un agent n'a pas
+        validé, la personne proposée n'a rien à répondre, et n'apprend même pas
+        qu'on a pensé à elle.
+
+    La validation par l'agent (`credits.guarantee_proposals.validate`) est un
+    acte humain motivé (principe 2) qui appelle la désignation existante — elle
+    ne réimplémente pas une seconde voie vers `CreditGuarantee` (principe 6).
+    C'est à ce moment seulement que naissent l'engagement, la notification et la
+    fenêtre de consentement.
+
+    Le refus (`refuse`) est également motivé, journalisé, et **ne supprime rien**
+    (principe 3) : une proposition refusée reste dans l'historique du dossier.
+    """
+
+    class Status(models.TextChoices):
+        PROPOSED = "proposed", "Proposée (en attente de validation)"
+        VALIDATED = "validated", "Validée par l'agent"
+        REFUSED = "refused", "Refusée par l'agent"
+
+    class RefusalReason(models.TextChoices):
+        """Motifs de refus — vocabulaire FIXE, et non-divulguant par construction.
+
+        Le libellé de chaque motif est ce que le demandeur lira. Aucun d'eux ne
+        décrit la situation financière du garant : « la personne ne peut pas se
+        porter caution en ce moment » ne dit ni son épargne, ni ses cautions en
+        cours, ni ses incidents. Le détail existe — l'agent le voit — mais il
+        appartient au garant, pas au demandeur.
+        """
+
+        GARANT_INDISPONIBLE = (
+            "garant_indisponible",
+            "Cette personne ne peut pas se porter caution en ce moment.",
+        )
+        LIEN_NON_ETABLI = (
+            "lien_non_etabli",
+            "Le lien de groupe avec cette personne n'a pas pu être établi.",
+        )
+        PIECE_MANQUANTE = (
+            "piece_manquante",
+            "Les pièces d'identité du garant n'ont pas pu être relevées.",
+        )
+        MONTANT_INADAPTE = (
+            "montant_inadapte",
+            "Le montant proposé ne convient pas pour ce dossier.",
+        )
+        AUTRE = ("autre", "Proposition non retenue par l'agence.")
+
+    application = models.ForeignKey(
+        CreditApplication, on_delete=models.CASCADE, related_name="guarantee_proposals",
+    )
+    # Le PROPOSANT est le titulaire du dossier, contrôlé à la création
+    # (`credits.guarantee_proposals.propose`). Stocké malgré tout : le titulaire
+    # d'un dossier pourrait changer, la proposition reste l'acte de quelqu'un.
+    proposed_by = models.ForeignKey(
+        "accounts.FintechUser", on_delete=models.PROTECT,
+        related_name="cautions_proposees",
+    )
+    # Le garant PRESSENTI — une personne du système, jamais trois chaînes de
+    # caractères. PROTECT pour la même raison que `CreditGuarantee.guarantor` :
+    # une trace de sollicitation ne disparaît pas avec un compte.
+    guarantor = models.ForeignKey(
+        "accounts.FintechUser", on_delete=models.PROTECT,
+        related_name="cautions_pressenties",
+    )
+    #: Montant que le demandeur souhaite voir couvert. `covered_amount` reprend
+    #: EXACTEMENT le nom du champ de `CreditGuarantee` : c'est le même concept,
+    #: donc le même nom (principe 6).
+    covered_amount = models.DecimalField(max_digits=15, decimal_places=2)
+    currency = models.CharField(max_length=3, default="USD")
+    #: Ce que le demandeur dit à son agent. Visible du personnel et de lui-même.
+    message = models.TextField(blank=True)
+
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.PROPOSED,
+    )
+
+    # ── Décision de l'agent (principe 2 : acte humain motivé) ────────────────
+    decided_by_sub = models.CharField(max_length=255, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    #: Motif libre de l'agent — **interne**. Il n'est jamais servi au demandeur :
+    #: rien n'empêche un agent d'y écrire « il a déjà trois cautions », et ce
+    #: serait la fuite que le motif codifié existe précisément pour éviter.
+    decision_comment = models.TextField(blank=True)
+    refusal_reason_code = models.CharField(
+        max_length=25, choices=RefusalReason.choices, blank=True,
+    )
+
+    #: La caution née de la validation. `OneToOne` : une proposition produit au
+    #: plus une désignation, une désignation vient d'au plus une proposition.
+    #: PROTECT — la caution est probante, la proposition en est l'origine.
+    guarantee = models.OneToOneField(
+        "credits.CreditGuarantee", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="proposal",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            # La file de validation filtre sur (statut, ancienneté) ; le suivi du
+            # demandeur sur (proposant, ancienneté) ; le quota sur (dossier, statut).
+            models.Index(fields=["status", "created_at"]),
+            models.Index(fields=["proposed_by", "status"]),
+            models.Index(fields=["application", "status"]),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"Proposition de caution [{self.status}] — dossier "
+            f"{self.application.code}"
+        )
+
+    # ── Immuabilité du contenu proposé (principe 3) ──────────────────────────
+    #
+    # Mécanisme repris tel quel de `BaremeRevision` : mêmes noms, même logique.
+    # Le dupliquer plutôt que le factoriser est un choix assumé — une classe de
+    # base abstraite obligerait à une migration de table sur trois modèles déjà
+    # en production pour économiser douze lignes.
+
+    #: Seuls champs qu'une proposition déjà écrite accepte de voir évoluer.
+    MUTABLE_FIELDS = (
+        "status", "decided_by_sub", "decided_at", "decision_comment",
+        "refusal_reason_code", "guarantee_id", "updated_at",
+    )
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._db_snapshot = {
+            name: copy.deepcopy(getattr(instance, name))
+            for name in field_names
+            if name not in cls.MUTABLE_FIELDS and name != "id"
+        }
+        return instance
+
+    def save(self, *args, **kwargs):
+        snapshot = getattr(self, "_db_snapshot", None)
+        if snapshot is not None:
+            modifies = [
+                name for name, ancien in snapshot.items()
+                if getattr(self, name) != ancien
+            ]
+            if modifies:
+                raise ImmutableGuaranteeProposal(
+                    "Le contenu d'une proposition de caution est figé : on en "
+                    "dépose une nouvelle, on ne réécrit pas celle sur laquelle "
+                    "une décision a porté. Champs immuables modifiés : "
+                    f"{', '.join(sorted(modifies))}."
+                )
+        super().save(*args, **kwargs)
+        self._db_snapshot = {
+            f.attname: copy.deepcopy(getattr(self, f.attname))
+            for f in self._meta.concrete_fields
+            if f.attname not in self.MUTABLE_FIELDS and f.attname != "id"
+        }
+
+    # ── Dérivés ──────────────────────────────────────────────────────────────
+
+    @property
+    def is_open(self) -> bool:
+        """Proposition en attente d'une décision d'agent — celles que le quota compte."""
+        return self.status == self.Status.PROPOSED

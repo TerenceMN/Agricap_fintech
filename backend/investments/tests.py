@@ -19,14 +19,14 @@ from decimal import Decimal
 
 from django.utils import timezone
 
-from common.exceptions import ConflictError, ValidationFailed
+from common.exceptions import ConflictError, NotFoundError, ValidationFailed
 from common.idempotency import IdempotentReplay
 from common.testing import AuthedAPITestCase
 
 from . import committee, funding, metrics, serializers, services, workflow
 from .models import (
     AnalystObservation, BondConversion, BondWithdrawal, Collateral, Distribution,
-    FinancialAnalysis, InvestmentCommitteeVote, InvestmentEvent, Investor, Offer,
+    FinancialAnalysis, InvestmentCommitteeVote, InvestmentEvent, Investor, Movement, Offer,
     ObligationPosition, Project, ProjectQuestion, ProjectTransition, RepaymentSchedule,
     Subscription, TechnicalAnalysis,
 )
@@ -128,6 +128,99 @@ def to_p10(project: Project, offer: Offer, *, amount: str = "8000", due_in_days:
                                       amount_due=Decimal("8800"))
     return services.transition_status(project=project, to_status=S.P10, by="mgr",
                                        reason="Échéancier de retour démarré.")
+
+
+def disbursed_project(code: str, investor: Investor) -> tuple[Project, Offer, Subscription]:
+    """Projet DÉCAISSÉ (P08) doté d'une souscription encaissée — le stade à partir
+    duquel l'identité de l'emprunteur devient lisible pour ses souscripteurs."""
+    project, offer, sub = funded_project(code, investor)
+    project = funding.close_fundraising(project=project, by="dg",
+                                         reason="Clôture de la période de souscription.")
+    project = funding.disburse(project=project, amount="8000",
+                                idempotency_key=f"disb-{code}", by="dg")
+    sub.refresh_from_db()
+    return project, offer, sub
+
+
+def make_wallet(investor: Investor, amount: str = "10000"):
+    """Alimente le portefeuille USD de l'investisseur — le cash qu'on convertira."""
+    from caisses.models import ClientWallet
+
+    wallet, _ = ClientWallet.objects.get_or_create(user=investor.user, currency="USD")
+    ClientWallet.objects.filter(pk=wallet.pk).update(balance=Decimal(amount))
+    wallet.refresh_from_db()
+    return wallet
+
+
+def wallet_balance(investor: Investor) -> Decimal:
+    from caisses.models import ClientWallet
+
+    wallet = ClientWallet.objects.filter(user=investor.user, currency="USD").first()
+    return Decimal(wallet.balance) if wallet else Decimal("0")
+
+
+def make_obligation(investor: Investor, *, amount: str = "1000", rate: str = "9.0",
+                    term_months: int = 24, coupon_amount: str = "22.50",
+                    name: str = "Position héritée") -> ObligationPosition:
+    """Position obligataire écrite DIRECTEMENT en base — fixture des positions
+    antérieures au rattachement obligatoire à une offre.
+
+    Les termes y sont EXPLICITES : le modèle ne les fabrique plus (les défauts
+    250 / 9 % / 24 mois du prototype ont été supprimés). Une fixture qui les omettrait
+    échouerait, et c'est le but : personne ne crée plus une obligation sans termes.
+    """
+    return ObligationPosition.objects.create(
+        investor=investor, name=name, invested_amount=Decimal(amount), rate=Decimal(rate),
+        term_months=term_months, coupon_amount=Decimal(coupon_amount),
+    )
+
+
+def make_credit_application(*, code: str = "CRD-INV-1", amount: str = "12000",
+                             sub: str = "emprunteur-1", full_name: str = "Jean-Pierre Kabasele",
+                             phone: str = "+243810000000", city: str = "Kimbanseke",
+                             province: str = "Kinshasa", filiere: str = "Maïs grain"):
+    """Dossier de crédit complet : client identifié, agence d'instruction, filière."""
+    from accounts.models import FintechUser
+    from agencies.models import Agency
+    from credits.models import CreditApplication
+    from reference_data.models import ReferenceFileUpload, ValueChain
+
+    client, _ = FintechUser.objects.get_or_create(
+        sub=sub, defaults={"email": f"{sub}@test.local", "full_name": full_name,
+                            "phone": phone, "role": "agri_op"})
+    agency, _ = Agency.objects.get_or_create(
+        code=f"AG-{province}", defaults={"name": f"Agence {city}", "city": city,
+                                          "province": province})
+    upload, _ = ReferenceFileUpload.objects.get_or_create(
+        file_type=ReferenceFileUpload.FileType.VALUE_CHAINS,
+        defaults={"file": "ref.xlsx", "uploaded_by": "admin"})
+    chain, _ = ValueChain.objects.get_or_create(
+        code="MAIS", defaults={"label": filiere, "source_file": upload, "cycle_months": 6,
+                                "cost_per_hectare_usd": Decimal("800"),
+                                "cost_per_hectare_cdf": Decimal("2200000"),
+                                "module_weights": {}, "risk_factor": Decimal("1.2"),
+                                "min_score_required": 50, "base_rate": Decimal("18")})
+    return CreditApplication.objects.create(
+        code=code, client=client, agency=agency, value_chain=chain,
+        amount_requested=Decimal(amount), currency="USD",
+    )
+
+
+def make_credit_analysis(application, score: str = "72.5"):
+    """Analyse du moteur de crédit — la SEULE origine du score d'un projet rattaché."""
+    from credits.models import AnalyseCredit, ReferentielFiliere
+    from dataio.models import DataSource
+
+    source = DataSource.objects.create(file="besoins.xlsx", original_name="besoins.xlsx",
+                                        dataset_key=f"besoins-{application.code}")
+    referentiel, _ = ReferentielFiliere.objects.get_or_create(
+        code="AGRICAP_FIN_SIM_01_Cereales_Mais", defaults={"filiere": "Céréales — Maïs"})
+    return AnalyseCredit.objects.create(
+        application=application, needs_source=source, referentiel=referentiel,
+        duree_mois=8, taux_annuel=Decimal("18"), capital=Decimal("12000"),
+        score_global=Decimal(score),
+        recommandation=AnalyseCredit.Recommandation.APPROBATION,
+    )
 
 
 def funded_subs(investor: Investor) -> list[Subscription]:
@@ -1264,13 +1357,30 @@ class KpiContextTests(AuthedAPITestCase):
         self.assertIsNotNone(res["mixedCurrencyWarning"])
 
     def test_exposition_par_secteur_et_par_zone_est_servie(self):
+        """La ventilation géographique servie à l'INVESTISSEUR est celle des zones LARGES.
+
+        Elle valait « Kongo-Central » avant ce lot, c'est-à-dire la valeur brute de
+        `Project.location` — un texte libre dont personne ne garantit qu'il désigne une
+        province plutôt qu'une commune. Nommer la commune d'un emprunteur dans la
+        ventilation revient à le désigner par son adresse, ce que l'anonymat de la
+        levée interdit. Tant que le projet n'est pas rattaché à un dossier de crédit,
+        sa zone large est INDÉTERMINABLE et la ventilation le dit — c'est exactement le
+        trou que le rattachement au dossier vient combler (cf.
+        `BorrowerAnonymityTests.test_la_zone_large_vient_du_dossier_et_nest_jamais_devinee`).
+        La vue institution, elle, continue de ventiler sur la localisation fine.
+        """
         res = metrics.investor_metrics(self.inv)
         secteurs = res["concentration"]["exposureBySector"]
         self.assertEqual(len(secteurs), 1)
         self.assertEqual(secteurs[0]["key"], "Maïs")
         self.assertEqual(secteurs[0]["amount"], 8000.0)
         self.assertEqual(secteurs[0]["share"], 1.0)
-        self.assertEqual(res["concentration"]["exposureByLocation"][0]["key"], "Kongo-Central")
+        self.assertEqual(res["concentration"]["geographyAxisField"], "broad_zone")
+        self.assertEqual(res["concentration"]["exposureByLocation"][0]["key"], "(non renseigné)")
+        institution = metrics.portfolio_metrics()
+        self.assertEqual(institution["concentration"]["geographyAxisField"], "location")
+        self.assertEqual(institution["concentration"]["exposureByLocation"][0]["key"],
+                          "Kongo-Central")
 
     def test_chaque_taux_declare_son_unite(self):
         res = metrics.investor_metrics(self.inv)
@@ -1316,7 +1426,7 @@ class KpiContextTests(AuthedAPITestCase):
 
     def test_les_obligations_declarent_aussi_leurs_taux(self):
         from .models import ObligationPosition
-        position = ObligationPosition.objects.create(investor=self.inv, invested_amount="1000")
+        position = make_obligation(self.inv, amount="1000")
         BondWithdrawal.objects.create(position=position, amount="100")
         self.login(role="invest", sub="k-1")
         obligations = self.client.get("/api/investments/obligations").data
@@ -1814,7 +1924,7 @@ class PortfolioAllocationTests(AuthedAPITestCase):
         from .models import ObligationPosition
         inv = make_investor("alloc-1")
         funded_project("ALLOC-1", inv)                      # 8 000 encaissés
-        ObligationPosition.objects.create(investor=inv, invested_amount="1000")
+        make_obligation(inv, amount="1000")
         res = services.portfolio_allocation(investor=inv)
         self.assertEqual(res["bonds"], 9000.0)              # total inchangé
         self.assertEqual(res["bondsFromSubscriptions"], 8000.0)
@@ -1825,7 +1935,7 @@ class PortfolioAllocationTests(AuthedAPITestCase):
         from .models import ObligationPosition
         inv = make_investor("alloc-2")
         funded_project("ALLOC-2", inv)
-        ObligationPosition.objects.create(investor=inv, invested_amount="1000")
+        make_obligation(inv, amount="1000")
         allocation = services.portfolio_allocation(investor=inv)
         metriques = metrics.investor_metrics(inv)
         # Deux chiffres différents pour « investi » sur deux écrans : l'incident de
@@ -1922,19 +2032,223 @@ class QuestionsAndReportsApiTests(AuthedAPITestCase):
 
 
 class ObligationApiTests(AuthedAPITestCase):
+    """Une position obligataire naît d'un DÉBIT, pas d'une déclaration.
+
+    Le test historique (`test_subscribe_then_list`) postait 1 000 sans portefeuille et
+    vérifiait que la position valait 1 000 : il consacrait le défaut — de l'argent
+    créé par une requête. Il est remplacé par la suite ci-dessous, qui vérifie
+    l'inverse : sans offre, sans solde ou sans allocation, aucune position n'existe.
+    """
+
     def setUp(self):
         self.investor = make_investor("inv-ob")
+        self.project = advance_to(make_project("OBL-1"), S.P06)
+        self.offer = self.project.offers.first()
         self.login(role="invest", sub="inv-ob")
 
-    def test_subscribe_then_list(self):
+    def _post(self, **corps):
+        payload = {"offerId": self.offer.pk, "bonds": 10, "idempotencyKey": "obl-k1"}
+        payload.update(corps)
+        return self.client.post("/api/investments/obligations", payload, format="json")
+
+    # ── Ce qui est refusé ────────────────────────────────────────────────────
+
+    def test_creation_sans_offre_refusee(self):
+        """Sans offre, il n'y a pas de termes : on refuse, on n'invente pas."""
+        make_wallet(self.investor)
+        res = self._post(offerId=None)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "OBLIGATION_OFFER_REQUIRED")
+        self.assertIn("message", res.data)
+        self.assertFalse(ObligationPosition.objects.exists())
+
+    def test_creation_sans_portefeuille_refusee(self):
+        res = self._post()
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "OBLIGATION_WALLET_MISSING")
+        self.assertFalse(ObligationPosition.objects.exists())
+
+    def test_solde_insuffisant_refuse_sans_position_partielle(self):
+        make_wallet(self.investor, amount="400")
+        res = self._post()   # 10 titres × 100 = 1 000 demandés
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "OBLIGATION_INSUFFICIENT_FUNDS")
+        self.assertFalse(ObligationPosition.objects.exists())
+        # Rien n'a bougé : ni le solde, ni les titres de l'offre, ni la souscription.
+        self.assertEqual(wallet_balance(self.investor), Decimal("400.00"))
+        self.offer.refresh_from_db()
+        self.assertEqual(self.offer.available_bonds, 100)
+        self.assertFalse(Subscription.objects.exists())
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.funded_amount, Decimal("0"))
+
+    def test_offre_en_titres_de_capital_refusee(self):
+        make_wallet(self.investor)
+        Offer.objects.filter(pk=self.offer.pk).update(type_of_title=Offer.TypeOfTitle.ACTION)
+        res = self._post()
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "OBLIGATION_OFFER_NOT_A_BOND")
+
+    def test_quantite_nulle_refusee(self):
+        make_wallet(self.investor)
+        res = self._post(bonds=0)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "OBLIGATION_INVALID_QUANTITY")
+
+    def test_cle_didempotence_obligatoire(self):
+        make_wallet(self.investor)
         res = self.client.post("/api/investments/obligations",
-                                {"name": "Plan A", "investedAmount": "1000"}, format="json")
+                                {"offerId": self.offer.pk, "bonds": 10}, format="json")
+        self.assertEqual(res.status_code, 400)
+
+    def test_souscription_non_servie_ne_cree_pas_de_position(self):
+        """Politique prorata : l'allocation n'est connue qu'à la clôture — on n'encaisse
+        pas d'argent pour une part que personne ne peut encore chiffrer."""
+        make_wallet(self.investor)
+        Offer.objects.filter(pk=self.offer.pk).update(
+            oversubscription_policy=Offer.Oversubscription.PRORATA)
+        res = self._post()
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "OBLIGATION_OFFER_NOT_SERVED")
+        self.assertEqual(wallet_balance(self.investor), Decimal("10000.00"))
+        self.assertFalse(ObligationPosition.objects.exists())
+
+    # ── Ce qui est produit ───────────────────────────────────────────────────
+
+    def test_conversion_du_cash_debite_le_portefeuille_et_cree_la_position(self):
+        make_wallet(self.investor, amount="10000")
+        res = self._post(name="Plan A")
         self.assertEqual(res.status_code, 201)
-        listed = self.client.get("/api/investments/obligations")
-        self.assertEqual(listed.data[0]["investedAmount"], 1000.0)
+        self.assertEqual(res.data["investedAmount"], 1000.0)
+        # Le cash a réellement quitté le portefeuille.
+        self.assertEqual(wallet_balance(self.investor), Decimal("9000.00"))
+        position = ObligationPosition.objects.get()
+        self.assertEqual(position.invested_amount, Decimal("1000.00"))
+        self.assertEqual(position.status, ObligationPosition.Status.ACTIF)
+
+    def test_les_termes_viennent_de_loffre_jamais_des_defauts(self):
+        """9 % trimestriel sur 24 mois → coupon de 22,50 pour 1 000 investis.
+
+        Les constantes du prototype (250 / 9 % / 24 mois) n'existent plus : ce sont
+        les conditions de l'offre qui s'appliquent, et le coupon en est la conséquence
+        arithmétique (1 000 × 9 % = 90 par an ; 90 / 4 = 22,50 par trimestre).
+        """
+        make_wallet(self.investor)
+        Offer.objects.filter(pk=self.offer.pk).update(
+            coupon_rate=Decimal("12.000"), maturity_months=36,
+            payment_frequency=Offer.Frequency.ANNUAL)
+        self._post()
+        position = ObligationPosition.objects.get()
+        self.assertEqual(position.rate, Decimal("12.000"))
+        self.assertEqual(position.term_months, 36)
+        self.assertEqual(position.coupon_amount, Decimal("120.00"))   # 1 000 × 12 % / 1
+
+    def test_coupon_trimestriel_par_defaut_de_loffre(self):
+        make_wallet(self.investor)
+        self._post()
+        self.assertEqual(ObligationPosition.objects.get().coupon_amount, Decimal("22.50"))
+
+    def test_coupon_in_fine_est_verse_une_fois_a_lecheance(self):
+        make_wallet(self.investor)
+        Offer.objects.filter(pk=self.offer.pk).update(
+            payment_frequency=Offer.Frequency.BULLET, maturity_months=24)
+        self._post()
+        # 1 000 × 9 % = 90 par an, sur 24 mois = 180,00 versés une seule fois.
+        self.assertEqual(ObligationPosition.objects.get().coupon_amount, Decimal("180.00"))
+
+    def test_la_position_est_un_encaissement_journalise(self):
+        """Débit + Movement + encaissement B10 + position : une seule transaction."""
+        make_wallet(self.investor)
+        self._post()
+        position = ObligationPosition.objects.get()
+        self.assertIsNotNone(position.subscription_id)
+        self.assertEqual(position.subscription.status, Subscription.Status.SETTLED)
+        self.assertEqual(position.subscription.settled_amount, Decimal("1000.00"))
+        mouvement = Movement.objects.get(type=Movement.Type.SETTLEMENT)
+        self.assertEqual(mouvement.amount, Decimal("1000.00"))
+        self.assertEqual(mouvement.investor_id, self.investor.pk)
+        self.assertTrue(InvestmentEvent.objects.filter(
+            event_type=InvestmentEvent.Type.SUBSCRIPTION_SETTLED,
+            amount=Decimal("1000.00")).exists())
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.funded_amount, Decimal("1000.00"))
+
+    def test_les_titres_de_loffre_sont_consommes(self):
+        make_wallet(self.investor)
+        self._post()
+        self.offer.refresh_from_db()
+        self.assertEqual(self.offer.available_bonds, 90)
+        self.assertEqual(self.offer.funded_amount, Decimal("1000.00"))
+
+    def test_la_liste_expose_la_provenance_des_termes(self):
+        make_wallet(self.investor)
+        self._post()
+        ligne = self.client.get("/api/investments/obligations").data[0]
+        self.assertEqual(ligne["offerCode"], self.offer.code)
+        self.assertEqual(ligne["projectCode"], self.project.code)
+        self.assertEqual(ligne["termsSource"], "investments.Offer")
+        self.assertEqual(ligne["units"]["rate"], "percent")
+        self.assertEqual(ligne["settledAmount"], 1000.0)
+
+    def test_rejeu_idempotent_ne_debite_pas_deux_fois(self):
+        make_wallet(self.investor)
+        premier = self._post()
+        self.assertEqual(premier.status_code, 201)
+        rejeu = self._post()
+        self.assertEqual(rejeu.status_code, 200)
+        self.assertEqual(rejeu.data["id"], premier.data["id"])
+        self.assertEqual(ObligationPosition.objects.count(), 1)
+        self.assertEqual(wallet_balance(self.investor), Decimal("9000.00"))
+
+    # ── Double débit concurrent ──────────────────────────────────────────────
+
+    def test_le_portefeuille_est_relu_sous_verrou_pendant_le_debit(self):
+        """Le double débit concurrent est écarté par un VERROU DE LIGNE, pas par un espoir.
+
+        La base de test est SQLite, qui ignore `SELECT … FOR UPDATE` : deux threads y
+        prouveraient la sérialisation des écritures de SQLite, pas la pose du verrou —
+        et le test passerait en cachant l'absence de verrou sur PostgreSQL. On vérifie
+        donc ce qui protège réellement en production : que le portefeuille est relu
+        SOUS VERROU (`select_for_update`, posé par `caisses.services.withdraw`) à
+        l'intérieur de la transaction, avant tout débit.
+        """
+        from unittest.mock import patch
+
+        from django.db.models.query import QuerySet
+
+        make_wallet(self.investor)
+        verrouilles = []
+        original = QuerySet.select_for_update
+
+        def espion(self, *args, **kwargs):
+            verrouilles.append(self.model.__name__)
+            return original(self, *args, **kwargs)
+
+        with patch.object(QuerySet, "select_for_update", espion):
+            self.assertEqual(self._post().status_code, 201)
+        self.assertIn("ClientWallet", verrouilles,
+                      "Le portefeuille a été débité sans verrou de ligne.")
+
+    def test_deux_souscriptions_sur_le_meme_solde_nen_servent_quune(self):
+        """L'invariant que le verrou protège : le solde ne passe jamais sous zéro et
+        aucune seconde position n'est créée sur de l'argent déjà consommé."""
+        make_wallet(self.investor, amount="1000")
+        self.assertEqual(self._post(idempotencyKey="k-a").status_code, 201)
+        seconde = self._post(idempotencyKey="k-b")
+        self.assertEqual(seconde.status_code, 422)
+        self.assertEqual(seconde.data["code"], "OBLIGATION_INSUFFICIENT_FUNDS")
+        self.assertEqual(ObligationPosition.objects.count(), 1)
+        self.assertEqual(wallet_balance(self.investor), Decimal("0.00"))
+
+    def test_investisseur_suspendu_ne_convertit_pas(self):
+        make_wallet(self.investor)
+        services.investor_action(investor=self.investor, action="suspend", by="dg")
+        res = self._post()
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(wallet_balance(self.investor), Decimal("10000.00"))
 
     def test_withdrawals_and_conversions_listed(self):
-        position = ObligationPosition.objects.create(investor=self.investor, invested_amount="1000")
+        position = make_obligation(self.investor, amount="1000")
         BondWithdrawal.objects.create(position=position, amount="200", reason="Test")
         BondConversion.objects.create(position=position, coupons=4, value="1188", shares=11)
         self.assertEqual(len(self.client.get(
@@ -1944,9 +2258,319 @@ class ObligationApiTests(AuthedAPITestCase):
 
     def test_cannot_list_other_investors_withdrawals(self):
         other = make_investor("inv-ob2")
-        position = ObligationPosition.objects.create(investor=other, invested_amount="500")
+        position = make_obligation(other, amount="500")
         res = self.client.get(f"/api/investments/obligations/{position.pk}/withdrawals")
         self.assertEqual(res.status_code, 404)
+
+
+# ── 11. Un projet EST une demande de crédit ──────────────────────────────────
+
+class CreditApplicationLinkTests(AuthedAPITestCase):
+    """« 1 projet = 1 demande de crédit client » — décision du fondateur.
+
+    Ce qui était retapé à la main (titre, promoteur, filière, zone, montant, score)
+    est désormais LU dans le dossier : une seule source par concept (principe 6).
+    """
+
+    def setUp(self):
+        self.dossier = make_credit_application(code="CRD-L1", amount="12000")
+        self.project = make_project("LNK-1")
+
+    def test_rattachement_derive_les_champs_du_dossier(self):
+        p = services.link_credit_application(project=self.project, application_code="CRD-L1",
+                                              by="mgr")
+        self.assertEqual(p.borrower_name, "Jean-Pierre Kabasele")
+        self.assertEqual(p.borrower_contact, "+243810000000")
+        self.assertEqual(p.value_chain_label, "Maïs grain")
+        self.assertEqual(p.fine_location, "Kimbanseke")
+        self.assertEqual(p.broad_zone, "Kinshasa")
+        self.assertEqual(p.requested_amount, Decimal("12000.00"))
+
+    def test_lobjectif_de_levee_vient_du_montant_demande(self):
+        p = services.link_credit_application(project=self.project, application_code="CRD-L1",
+                                              by="mgr")
+        self.assertEqual(p.funding_target, Decimal("12000.00"))
+
+    def test_deux_projets_ne_financent_pas_le_meme_dossier(self):
+        services.link_credit_application(project=self.project, application_code="CRD-L1", by="mgr")
+        autre = make_project("LNK-2")
+        with self.assertRaises(ConflictError) as ctx:
+            services.link_credit_application(project=autre, application_code="CRD-L1", by="mgr")
+        self.assertEqual(ctx.exception.code, "CREDIT_APPLICATION_ALREADY_FINANCED")
+        autre.refresh_from_db()
+        self.assertIsNone(autre.credit_application_id)
+
+    def test_unicite_portee_par_la_base_et_non_par_la_vue(self):
+        """La contrainte vit en base : même en contournant le service, c'est refusé."""
+        from django.db import IntegrityError, transaction as db_transaction
+
+        services.link_credit_application(project=self.project, application_code="CRD-L1", by="mgr")
+        autre = make_project("LNK-3")
+        autre.credit_application = self.dossier
+        with self.assertRaises(IntegrityError), db_transaction.atomic():
+            autre.save(update_fields=["credit_application"])
+
+    def test_un_projet_ne_change_pas_de_dossier(self):
+        services.link_credit_application(project=self.project, application_code="CRD-L1", by="mgr")
+        make_credit_application(code="CRD-L9", amount="5000", sub="emprunteur-9")
+        with self.assertRaises(ConflictError) as ctx:
+            services.link_credit_application(project=self.project, application_code="CRD-L9",
+                                              by="mgr")
+        self.assertEqual(ctx.exception.code, "PROJECT_ALREADY_LINKED")
+
+    def test_dossier_introuvable_refuse(self):
+        with self.assertRaises(NotFoundError):
+            services.link_credit_application(project=self.project, application_code="CRD-INEXISTANT",
+                                              by="mgr")
+
+    def test_dossier_sans_montant_demande_refuse(self):
+        from credits.models import CreditApplication
+
+        vide = make_credit_application(code="CRD-VIDE", amount="1", sub="emprunteur-vide")
+        CreditApplication.objects.filter(pk=vide.pk).update(amount_requested=None)
+        with self.assertRaises(ValidationFailed) as ctx:
+            services.link_credit_application(project=self.project, application_code="CRD-VIDE",
+                                              by="mgr")
+        self.assertEqual(ctx.exception.code, "CREDIT_APPLICATION_WITHOUT_AMOUNT")
+
+    def test_rattachement_apres_ouverture_de_la_levee_refuse(self):
+        ouvert = advance_to(make_project("LNK-P06"), S.P06)
+        with self.assertRaises(ConflictError) as ctx:
+            services.link_credit_application(project=ouvert, application_code="CRD-L1", by="mgr")
+        self.assertEqual(ctx.exception.code, "LINK_AFTER_FUNDRAISING")
+
+    def test_creation_de_projet_avec_dossier_via_lapi(self):
+        self.login(role="gest_port", sub="staff-lnk")
+        res = self.client.post("/api/investments/projects",
+                                {"code": "LNK-API", "title": "Levée maïs T3",
+                                 "creditApplicationCode": "CRD-L1"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["creditApplicationCode"], "CRD-L1")
+        self.assertEqual(res.data["fundingTarget"], 12000.0)
+        self.assertEqual(res.data["sector"], "Maïs grain")
+
+    def test_rattachement_via_lapi_est_reserve_au_personnel(self):
+        self.login(role="invest", sub="inv-lnk")
+        res = self.client.post(f"/api/investments/projects/{self.project.code}/credit-application",
+                                {"applicationCode": "CRD-L1"}, format="json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_champ_derive_ne_se_resaisit_plus(self):
+        services.link_credit_application(project=self.project, application_code="CRD-L1", by="mgr")
+        self.login(role="gest_port", sub="staff-lnk2")
+        res = self.client.patch(f"/api/investments/projects/{self.project.code}",
+                                 {"globalScore": 99}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "FIELD_DERIVED_FROM_CREDIT_APPLICATION")
+        self.assertEqual(res.data["errors"][0]["code"], "FIELD_DERIVED_FROM_CREDIT_APPLICATION")
+
+    def test_rattachement_journalise(self):
+        from audit.models import AuditEntry
+
+        services.link_credit_application(project=self.project, application_code="CRD-L1", by="mgr")
+        entree = AuditEntry.objects.filter(
+            action="investments.project.link_credit_application").first()
+        self.assertIsNotNone(entree)
+        self.assertEqual(entree.details["application"], "CRD-L1")
+
+
+class CreditScoreSourceTests(AuthedAPITestCase):
+    """Le score d'un projet rattaché est celui du MOTEUR CRÉDIT, jamais une saisie."""
+
+    def setUp(self):
+        self.dossier = make_credit_application(code="CRD-S1")
+        self.project = services.link_credit_application(
+            project=make_project("SCO-1"), application_code="CRD-S1", by="mgr")
+
+    def test_score_relu_dans_le_moteur_credit(self):
+        self.project.global_score = Decimal("99.0")   # saisie locale : ignorée
+        self.project.save(update_fields=["global_score"])
+        make_credit_analysis(self.dossier, score="72.5")
+        self.assertEqual(self.project.effective_global_score, Decimal("72.5"))
+
+    def test_derniere_analyse_prime_sur_les_precedentes(self):
+        make_credit_analysis(self.dossier, score="61.0")
+        make_credit_analysis(self.dossier, score="78.0")
+        self.assertEqual(self.project.effective_global_score, Decimal("78.0"))
+
+    def test_dossier_sans_analyse_ne_fabrique_pas_de_score(self):
+        self.project.global_score = Decimal("88.0")
+        self.project.save(update_fields=["global_score"])
+        self.assertEqual(self.project.effective_global_score, Decimal("0"))
+
+    def test_la_garde_p03_lit_le_score_du_moteur(self):
+        """Sans analyse crédit, un projet rattaché ne passe pas en due diligence, même
+        si quelqu'un a écrit un score sur le projet."""
+        self.project.global_score = Decimal("90.0")
+        self.project.save(update_fields=["global_score"])
+        services.transition_status(project=self.project, to_status=S.P02, by="mgr",
+                                    reason="Dossier promoteur reçu et complet.")
+        with self.assertRaises(workflow.TransitionGuardFailed):
+            services.transition_status(project=self.project, to_status=S.P03, by="mgr",
+                                        reason="Analyse initiale.")
+        make_credit_analysis(self.dossier, score="72.5")
+        self.project.refresh_from_db()
+        p = services.transition_status(project=self.project, to_status=S.P03, by="mgr",
+                                        reason="Analyse initiale scorée à 72,5.")
+        self.assertEqual(p.status, S.P03)
+
+    def test_le_score_est_un_decimal_jamais_un_flottant(self):
+        """Principe 4 : `float` nulle part dans une grandeur financière.
+
+        0,1 + 0,2 ≠ 0,3 en binaire flottant ; un score de 72,5 stocké en `float` ne
+        se compare pas de façon reproductible à un seuil filière de 72,5.
+        """
+        champ = Project._meta.get_field("global_score")
+        self.assertEqual(champ.get_internal_type(), "DecimalField")
+        self.assertEqual(champ.decimal_places, 1)
+        p = make_project("SCO-DEC")
+        p.global_score = "72.5"
+        p.save(update_fields=["global_score"])
+        p.refresh_from_db()
+        self.assertEqual(p.global_score, Decimal("72.5"))
+        self.assertIsInstance(p.effective_global_score, Decimal)
+
+    def test_le_serialiseur_publie_la_source_du_score(self):
+        make_credit_analysis(self.dossier, score="72.5")
+        ligne = serializers.project_row(self.project)
+        self.assertEqual(ligne["globalScore"], 72.5)
+        self.assertEqual(ligne["scoreSource"], "credits.AnalyseCredit")
+        self.assertEqual(serializers.project_row(make_project("SCO-2"))["scoreSource"],
+                          "investments.Project.global_score")
+
+
+# ── 12. Anonymat de l'emprunteur (P01→P07) et révélation aux souscripteurs (P08) ──
+
+class BorrowerAnonymityTests(AuthedAPITestCase):
+    """Anonymisé pendant la levée, identifié après le décaissement — pour les seuls
+    souscripteurs encaissés (décision du fondateur, P08).
+
+    Le rôle `invest` porte `read` comme `client`, `agri_op` et `partner` : la capacité
+    ne prouve donc jamais rien ici. Ce qui donne droit à l'identité, c'est une
+    souscription ENCAISSÉE sur CE projet, et un projet DÉCAISSÉ.
+    """
+
+    IDENTITE = ("promoter", "promoterContact", "location")
+
+    def setUp(self):
+        self.souscripteur = make_investor("inv-anon-1")
+        self.curieux = make_investor("inv-anon-2")
+        self.dossier = make_credit_application(code="CRD-A1")
+
+    def _projet_en_levee(self):
+        project, offer, sub = funded_project("ANON-1", self.souscripteur)
+        return project, offer, sub
+
+    def _lire(self, code, *, sub: str, role: str = "invest"):
+        self.login(role=role, sub=sub)
+        return self.client.get(f"/api/investments/projects/{code}")
+
+    def test_identite_absente_avant_le_decaissement(self):
+        """Échoue si l'identité fuit avant P08 — y compris à un souscripteur encaissé."""
+        project, _, _ = self._projet_en_levee()
+        self.assertEqual(project.status, S.P06)
+        res = self._lire(project.code, sub="inv-anon-1")
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.data["identityDisclosed"])
+        for champ in self.IDENTITE:
+            self.assertNotIn(champ, res.data,
+                              f"« {champ} » a fuité pendant la levée ({project.status}).")
+        # Ce que l'investisseur a le droit de connaître reste servi.
+        self.assertEqual(res.data["sector"], "Maïs")
+        self.assertIn("riskAnalysis", res.data)
+        self.assertIn("globalScore", res.data)
+
+    def test_identite_absente_de_la_liste_pendant_la_levee(self):
+        project, _, _ = self._projet_en_levee()
+        self.login(role="invest", sub="inv-anon-1")
+        ligne = next(r for r in self.client.get("/api/investments/projects").data
+                     if r["code"] == project.code)
+        for champ in self.IDENTITE:
+            self.assertNotIn(champ, ligne)
+
+    def test_identite_revelee_au_souscripteur_encaisse_apres_p08(self):
+        project, _, _ = disbursed_project("ANON-2", self.souscripteur)
+        self.assertEqual(project.status, S.P08)
+        res = self._lire(project.code, sub="inv-anon-1")
+        self.assertTrue(res.data["identityDisclosed"])
+        self.assertEqual(res.data["promoter"], "Coop Kimbanseke")
+        self.assertIn("promoterContact", res.data)
+        self.assertIn("location", res.data)
+
+    def test_investisseur_non_souscripteur_nobtient_pas_lidentite(self):
+        """Échoue si porter le rôle `invest` suffit à connaître l'emprunteur."""
+        project, _, _ = disbursed_project("ANON-3", self.souscripteur)
+        res = self._lire(project.code, sub="inv-anon-2")
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.data["identityDisclosed"])
+        for champ in self.IDENTITE:
+            self.assertNotIn(champ, res.data,
+                              f"« {champ} » servi à un investisseur non souscripteur.")
+
+    def test_reservation_non_encaissee_ne_donne_pas_lidentite(self):
+        """Une intention n'achète pas le droit de savoir qui l'on finance."""
+        project, offer, _ = funded_project("ANON-4", self.souscripteur)
+        funding.reserve(investor=self.curieux, offer_id=offer.pk, bonds=5,
+                         idempotency_key="anon-res", by="inv-anon-2")
+        project = funding.close_fundraising(project=project, by="dg", reason="Clôture.")
+        project = funding.disburse(project=project, amount="8000",
+                                    idempotency_key="anon-d", by="dg")
+        self.assertEqual(project.status, S.P08)
+        res = self._lire(project.code, sub="inv-anon-2")
+        self.assertFalse(res.data["identityDisclosed"])
+        for champ in self.IDENTITE:
+            self.assertNotIn(champ, res.data)
+
+    def test_personnel_voit_lidentite_a_tout_stade(self):
+        project, _, _ = self._projet_en_levee()
+        res = self._lire(project.code, sub="staff-anon", role="gest_port")
+        self.assertTrue(res.data["identityDisclosed"])
+        self.assertEqual(res.data["promoter"], "Coop Kimbanseke")
+
+    def test_le_catalogue_des_offres_ouvertes_est_anonyme(self):
+        self._projet_en_levee()
+        ligne = metrics.open_offers_summary()[0]
+        self.assertFalse(ligne["identityDisclosed"])
+        for champ in ("promoter", "promoterContact", "location"):
+            self.assertNotIn(champ, ligne)
+        self.assertIn("zone", ligne)
+        self.assertIn("sector", ligne)
+
+    def test_les_positions_de_linvestisseur_sont_anonymes_avant_p08(self):
+        self._projet_en_levee()
+        position = metrics.investor_metrics(self.souscripteur)["valuation"]["positions"][0]
+        self.assertFalse(position["identityDisclosed"])
+        self.assertNotIn("promoter", position)
+        self.assertNotIn("location", position)
+
+    def test_les_positions_portent_lidentite_apres_p08(self):
+        disbursed_project("ANON-5", self.souscripteur)
+        position = metrics.investor_metrics(self.souscripteur)["valuation"]["positions"][0]
+        self.assertTrue(position["identityDisclosed"])
+        self.assertEqual(position["promoter"], "Coop Kimbanseke")
+
+    def test_la_zone_large_vient_du_dossier_et_nest_jamais_devinee(self):
+        """Sans dossier rattaché, la granularité de `location` est inconnue : on ne la
+        sert pas et on dit pourquoi, plutôt que de publier une commune en croyant
+        publier une province."""
+        project, _, _ = self._projet_en_levee()
+        self.login(role="invest", sub="inv-anon-1")
+        res = self.client.get(f"/api/investments/projects/{project.code}")
+        self.assertEqual(res.data["zone"], "")
+        self.assertIn("zoneUnavailableReason", res.data)
+
+        rattache = services.link_credit_application(
+            project=make_project("ANON-Z"), application_code="CRD-A1", by="mgr")
+        ligne = serializers.project_public_row(rattache)
+        self.assertEqual(ligne["zone"], "Kinshasa")
+        self.assertNotIn("zoneUnavailableReason", ligne)
+        self.assertNotIn("location", ligne)
+
+    def test_la_regle_de_divulgation_est_publiee_avec_la_reponse(self):
+        project, _, _ = self._projet_en_levee()
+        res = self._lire(project.code, sub="inv-anon-2")
+        self.assertIn("identityDisclosureRule", res.data)
+        self.assertIn("P08", res.data["identityDisclosureRule"])
 
 
 class ProjectCreationTests(AuthedAPITestCase):

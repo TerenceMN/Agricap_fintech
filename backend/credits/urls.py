@@ -33,10 +33,25 @@ urlpatterns = [
     # dossier, il a accès à SON engagement.
     path("guarantee-requests/", views.list_guarantee_requests),
     path("guarantee-requests/<int:guarantee_id>/consent/", views.consent_guarantee_request),
+    # Propositions de caution — le client propose, l'agent valide.
+    # `guarantee-proposals/` (le demandeur) est symétrique de
+    # `guarantee-requests/` (le garant) : deux surfaces personnelles, deux
+    # publics. `queue/` est celle du personnel ; elle est déclarée avant la route
+    # à identifiant pour rester lisible, même si `<int:…>` ne peut pas la capter.
+    path("guarantee-proposals/", views.list_my_guarantee_proposals),
+    path("guarantee-proposals/queue/", views.guarantee_proposal_queue),
+    path("guarantee-proposals/<int:proposal_id>/validate/",
+         views.validate_guarantee_proposal),
+    path("guarantee-proposals/<int:proposal_id>/refuse/",
+         views.refuse_guarantee_proposal),
     # Garanties (Étape 4)
     path("applications/<str:code>/guarantees/", views.list_guarantees),
     path("applications/<str:code>/guarantees/savings/", views.place_savings_guarantee),
     path("applications/<str:code>/guarantees/moral/", views.register_moral_guarantee),
+    path("applications/<str:code>/guarantee-proposals/",
+         views.application_guarantee_proposals),
+    path("applications/<str:code>/guarantee-proposals/candidates/",
+         views.guarantee_proposal_candidates),
     path("applications/<str:code>/guarantees/asset/", views.place_asset_guarantee_view),
     path("applications/<str:code>/guarantees/<int:guarantee_id>/confirm/", views.confirm_guarantee),
     path("applications/<str:code>/guarantees/<int:guarantee_id>/release/", views.release_guarantee),

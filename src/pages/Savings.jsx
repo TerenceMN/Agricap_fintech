@@ -9,12 +9,14 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { useToast } from '@/components/ui/use-toast';
-import { PiggyBank, Plus, ShieldCheck, Banknote, Smartphone, Wallet, User, Landmark, Calculator, TrendingUp, ArrowUpRight, ArrowDownLeft, Users, Building, Hourglass, CheckCircle2, Factory, Truck, Sprout, Briefcase, Home } from 'lucide-react';
+import { PiggyBank, Plus, ShieldCheck, User, Calculator, TrendingUp, Users, Factory, Truck, Sprout, Briefcase, Home } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext.jsx';
 import AdminSavingsDashboard from '@/components/admin/savings/AdminSavingsDashboard';
+import SavingsDepositDialog from '@/components/savings/SavingsDepositDialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from '@/components/ui/textarea';
-import { api, ApiError } from '@/services/api';
+import { api } from '@/services/api';
+import { savingsOperationErrors } from '@/components/savings/savingsOperations';
 
 // --- Types ---
 const AGRO_OBJECTIVES = [
@@ -93,96 +95,6 @@ const ConfirmationModal = ({ open, onOpenChange, plan, onConfirm }) => {
             Confirmer et Activer
           </Button>
         </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-};
-
-const DepositModal = ({ open, onOpenChange, plan, onDeposit, user }) => {
-  const [formData, setFormData] = useState({
-    amount: '',
-    channel: 'mobile_money',
-    reference: '',
-    note: '',
-    agreed: false
-  });
-
-  const handleChange = (e) => {
-    const { name, value, type, checked } = e.target;
-    setFormData(prev => ({
-      ...prev,
-      [name]: type === 'checkbox' ? checked : value
-    }));
-  };
-  
-  const resetAndClose = () => {
-    setFormData({ amount: '', channel: 'mobile_money', reference: '', note: '', agreed: false });
-    onOpenChange(false);
-  };
-
-  const handleConfirmDeposit = (e) => {
-    e.preventDefault();
-    onDeposit(plan.id, parseFloat(formData.amount), formData.channel);
-    resetAndClose();
-  };
-  
-  const channelIcons = {
-    agent: User,
-    mobile_money: Smartphone,
-    bank: Landmark,
-    wallet: Wallet,
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={resetAndClose}>
-      <DialogContent className="glass-effect text-white [&>option]:bg-slate-800 [&>option]:text-white">
-        <DialogHeader>
-          <DialogTitle className="text-2xl font-bold gradient-text">Effectuer un Dépôt Sécurisé</DialogTitle>
-          <DialogDescription className="text-gray-400">
-            Alimentez votre plan d'épargne : {plan?.name || plan?.id}
-          </DialogDescription>
-        </DialogHeader>
-        
-        <form onSubmit={handleConfirmDeposit} className="space-y-4 my-4">
-          <div>
-            <Label htmlFor="amount">Montant du Dépôt ({plan?.currency})</Label>
-            <Input id="amount" name="amount" type="number" value={formData.amount} onChange={handleChange} className="bg-white/5 mt-1 border-white/10" required />
-          </div>
-          <div>
-            <Label>Canal de Dépôt</Label>
-            <div className="flex flex-wrap gap-2 mt-2">
-              {Object.entries({agent: "Agent Agricap", mobile_money: "Mobile Money", bank: "Compte Bancaire"}).map(([key, label]) => {
-                const Icon = channelIcons[key];
-                return (
-                  <Button key={key} type="button" variant={formData.channel === key ? "secondary" : "outline"} onClick={() => setFormData(p => ({...p, channel: key}))} className={`flex-1 ${formData.channel === key ? "bg-emerald-500/20 text-emerald-300 border-emerald-400" : "border-white/10"}`}>
-                    <Icon className="w-4 h-4 mr-2" />
-                    {label}
-                  </Button>
-                );
-              })}
-            </div>
-          </div>
-          {(formData.channel === 'mobile_money' || formData.channel === 'bank') && (
-            <div>
-              <Label htmlFor="reference">Référence Transaction</Label>
-              <Input id="reference" name="reference" value={formData.reference} onChange={handleChange} className="bg-white/5 mt-1 border-white/10" required />
-            </div>
-          )}
-          <div className="flex items-start space-x-3 pt-2">
-            <Checkbox id="agreed" name="agreed" checked={formData.agreed} onCheckedChange={(checked) => setFormData(p => ({...p, agreed: checked}))} required className="mt-1" />
-            <div className="grid gap-1.5 leading-none">
-              <label htmlFor="agreed" className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
-                Je confirme l'exactitude des informations et le dépôt autorisé.
-              </label>
-            </div>
-          </div>
-          <DialogFooter className="!mt-6">
-            <Button type="button" variant="ghost" onClick={resetAndClose}>Annuler</Button>
-            <Button type="submit" disabled={!formData.agreed || !formData.amount} className="bg-gradient-to-r from-emerald-500 to-blue-600">
-              <Banknote className="w-4 h-4 mr-2" /> Valider le Dépôt
-            </Button>
-          </DialogFooter>
-        </form>
       </DialogContent>
     </Dialog>
   );
@@ -439,19 +351,21 @@ const ClientSavingsView = () => {
             setSavingsPlans(prev => [...prev, plan]);
             toast({ title: "Objectif créé !", description: "Un nouveau plan d'épargne a été ajouté à votre tableau de bord." });
         } catch (e) {
-            toast({ variant: 'destructive', title: 'Échec', description: e instanceof ApiError ? e.message : String(e) });
+            // 422 déplié : chaque cause garde son code et son message.
+            toast({
+                variant: 'destructive', title: 'Échec',
+                description: savingsOperationErrors(e).map(c => `${c.code ? `${c.code} — ` : ''}${c.message}`).join(' · '),
+            });
         }
         setPlanToConfirm(null);
     };
 
-    const handleDeposit = async (planId, amount, channel) => {
-        try {
-            const plan = await api.savings.deposit(planId, amount, channel);
-            setSavingsPlans(prev => prev.map(p => p.id === planId ? plan : p));
-            toast({ title: `Dépôt Réussi`, description: `Votre dépôt de ${amount} ${plan.currency} a été enregistré.` });
-        } catch (e) {
-            toast({ variant: 'destructive', title: 'Échec', description: e instanceof ApiError ? e.message : String(e) });
-        }
+    // Le dépôt lui-même (validation, confirmation, appel serveur, refus dépliés)
+    // vit dans `SavingsDepositDialog`. Ici on ne fait qu'accueillir le plan
+    // rafraîchi que le serveur vient de renvoyer.
+    const handleDeposited = (updatedPlan) => {
+        if (!updatedPlan || updatedPlan.id === undefined) return;
+        setSavingsPlans(prev => prev.map(p => (p.id === updatedPlan.id ? updatedPlan : p)));
     };
 
     const handleJoinRequest = async (groupId, reason) => {
@@ -460,7 +374,11 @@ const ClientSavingsView = () => {
             api.savings.myGroupRequests().then(setMyRequests).catch(() => {});
             toast({ title: "Demande envoyée", description: "L'administrateur du groupe examinera votre demande." });
         } catch (e) {
-            toast({ variant: 'destructive', title: 'Échec', description: e instanceof ApiError ? e.message : String(e) });
+            // 422 déplié : chaque cause garde son code et son message.
+            toast({
+                variant: 'destructive', title: 'Échec',
+                description: savingsOperationErrors(e).map(c => `${c.code ? `${c.code} — ` : ''}${c.message}`).join(' · '),
+            });
         }
     };
 
@@ -473,7 +391,12 @@ const ClientSavingsView = () => {
     return (
         <div className="space-y-12">
             <ConfirmationModal open={!!planToConfirm} onOpenChange={() => setPlanToConfirm(null)} plan={planToConfirm} onConfirm={handleConfirmPlan} />
-            <DepositModal open={!!planToDeposit} onOpenChange={() => setPlanToDeposit(null)} plan={planToDeposit} onDeposit={handleDeposit} user={user} />
+            <SavingsDepositDialog
+                open={!!planToDeposit}
+                plan={planToDeposit}
+                onOpenChange={() => setPlanToDeposit(null)}
+                onDeposited={handleDeposited}
+            />
             <JoinGroupModal open={isJoinGroupOpen} onOpenChange={setIsJoinGroupOpen} onJoinRequest={handleJoinRequest} user={user} />
 
             <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}>

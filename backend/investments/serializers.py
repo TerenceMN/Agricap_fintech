@@ -29,29 +29,124 @@ OBLIGATION_RATE_UNITS = {"rate": UNIT_PERCENT}
 WITHDRAWAL_RATE_UNITS = {"penaltyRate": UNIT_FRACTION}
 
 
-def project_row(p: Project) -> dict:
+#: Statuts à partir desquels l'identité de l'emprunteur devient lisible — pour les
+#: SEULS souscripteurs encaissés du projet (décision du fondateur : révélation à
+#: partir du décaissement P08). P13 (annulé) n'y figure pas : les souscriptions y ont
+#: été remboursées, il n'y a plus de souscripteur à qui révéler quoi que ce soit.
+IDENTITY_DISCLOSED_STATUSES = (
+    Project.Status.P08, Project.Status.P09, Project.Status.P10,
+    Project.Status.P11, Project.Status.P12,
+)
+
+IDENTITY_DISCLOSURE_RULE = (
+    "L'identité du promoteur (nom, contact, localisation fine) est anonymisée pendant "
+    "la levée (P01→P07). Elle devient lisible à partir du décaissement (P08), et "
+    "uniquement pour les investisseurs dont une souscription a été encaissée sur ce "
+    "projet."
+)
+
+ZONE_UNAVAILABLE_REASON = (
+    "Zone large indisponible : ce projet n'est pas rattaché à un dossier de crédit, et "
+    "la localisation saisie sur le projet est un texte libre dont la granularité "
+    "(province ? commune ?) est inconnue — elle n'est donc pas servie pendant l'anonymat."
+)
+
+
+def _project_amounts(p: Project) -> dict:
+    """Grandeurs financières du projet — publiques à tous les stades.
+
+    L'avancement d'une levée n'est pas une information d'identité : un investisseur a
+    le droit de savoir combien a été collecté sur ce qu'il envisage de financer.
+    """
     return {
-        "id": p.pk, "code": p.code, "title": p.title, "sector": p.sector, "location": p.location,
-        "promoter": p.promoter, "status": p.status, "fundingTarget": float(p.funding_target),
+        "fundingTarget": float(p.funding_target),
+        # `requestedAmount` = le montant DEMANDÉ dans le dossier de crédit ; il peut
+        # différer de l'objectif de levée (co-financement, tranche).
+        "requestedAmount": float(p.requested_amount),
         # `fundedAmount` = ENCAISSÉ (B10). Les réservations vivent sur l'offre.
         "fundedAmount": float(p.funded_amount), "progressPercent": p.progress_percent,
         "disbursedAmount": float(p.disbursed_amount), "returnedAmount": float(p.returned_amount),
         "distributedAmount": float(p.distributed_amount),
-        "riskScore": p.risk_score, "globalScore": p.global_score, "managerName": p.manager_name,
-        "managerSub": p.manager_sub, "isInvestable": p.is_investable,
     }
 
 
-def project_detail_row(p: Project) -> dict:
-    """Version enrichie de `project_row` pour la vue détail (ProjectDetailsModal,
-    ProjectQA...) — champs narratifs/JSON volontairement absents de la liste pour ne pas
-    alourdir `GET /investments/projects`. Fusionne les conditions de la dernière offre
-    (l'offre elle-même reste une entité séparée, gérée par `OffersManagement.jsx`)."""
+def project_row(p: Project) -> dict:
+    """Sérialiseur PERSONNEL — identité complète, provenance du dossier de crédit.
+
+    Il n'est jamais servi à un client : le choix du sérialiseur se fait dans la vue,
+    par rôle et par droit, jamais par un `if` d'affichage (CLAUDE.md §5).
+    """
+    return {
+        "id": p.pk, "code": p.code, "title": p.title,
+        # Filière et localisation LUES dans le dossier quand il existe (principe 6).
+        "sector": p.value_chain_label, "location": p.fine_location,
+        "zone": p.broad_zone,
+        "promoter": p.borrower_name, "promoterContact": p.borrower_contact,
+        "status": p.status,
+        **_project_amounts(p),
+        "riskScore": p.risk_score, "riskCategory": p.risk_category,
+        "globalScore": float(p.effective_global_score),
+        "managerName": p.manager_name,
+        "managerSub": p.manager_sub, "isInvestable": p.is_investable,
+        # Provenance : quel dossier de crédit ce projet finance, et d'où vient le score.
+        "creditApplicationCode": (p.credit_application.code if p.credit_application_id else None),
+        "scoreSource": ("credits.AnalyseCredit" if p.credit_application_id
+                         else "investments.Project.global_score"),
+        "identityDisclosed": True,
+    }
+
+
+def project_public_row(p: Project) -> dict:
+    """Sérialiseur CLIENT anonymisé — filière, zone large, score, nature du risque.
+
+    Ni nom, ni contact, ni localisation fine de l'emprunteur : les clés n'existent
+    pas dans la réponse (elles ne sont pas vidées — une clé présente et vide invite
+    l'écran à la remplir autrement).
+    """
     row = {
-        **project_row(p),
+        "id": p.pk, "code": p.code, "title": p.title,
+        "sector": p.value_chain_label,
+        "zone": p.broad_zone,
+        "status": p.status,
+        **_project_amounts(p),
+        "riskScore": p.risk_score, "riskCategory": p.risk_category,
+        "globalScore": float(p.effective_global_score),
+        "isInvestable": p.is_investable,
+        "identityDisclosed": False,
+        "identityDisclosureRule": IDENTITY_DISCLOSURE_RULE,
+    }
+    if not p.broad_zone:
+        row["zoneUnavailableReason"] = ZONE_UNAVAILABLE_REASON
+    return row
+
+
+def project_identified_row(p: Project) -> dict:
+    """Sérialiseur SOUSCRIPTEUR — le client anonymisé, plus l'identité révélée.
+
+    Servi aux seuls investisseurs qui ont une souscription ENCAISSÉE sur un projet
+    décaissé (P08+). C'est l'ajout d'un bloc, pas une variante conditionnelle du
+    sérialiseur client.
+    """
+    row = project_public_row(p)
+    row.update({
+        "promoter": p.borrower_name, "promoterContact": p.borrower_contact,
+        "location": p.fine_location,
+        "identityDisclosed": True,
+    })
+    return row
+
+
+def _project_detail_extras(p: Project) -> dict:
+    """Champs narratifs de la vue détail, communs à tous les sérialiseurs.
+
+    Ils décrivent le PROJET (objectifs, analyse de risque, allocation des fonds,
+    impact) et non l'emprunteur : ils sont servis y compris pendant l'anonymat, où
+    « la nature du risque » fait explicitement partie de ce que l'investisseur doit
+    connaître avant d'engager son argent.
+    """
+    row = {
         "objectives": p.objectives, "description": p.description, "riskAnalysis": p.risk_analysis,
         "fundAllocation": p.fund_allocation, "impactEsg": p.impact_esg, "imageUrl": p.image_url,
-        "promoterContact": p.promoter_contact,
         "startDate": p.start_date.isoformat() if p.start_date else None,
         "expectedMaturity": p.expected_maturity.isoformat() if p.expected_maturity else None,
         # Valorisation d'expert : les trois champs voyagent ENSEMBLE. Servir la valeur
@@ -71,6 +166,24 @@ def project_detail_row(p: Project) -> dict:
             "units": OFFER_RATE_UNITS,
         })
     return row
+
+
+def project_detail_row(p: Project) -> dict:
+    """Vue détail PERSONNEL (ProjectDetailsModal, ProjectQA…) — champs narratifs/JSON
+    volontairement absents de la liste pour ne pas alourdir `GET /investments/projects`.
+    Fusionne les conditions de la dernière offre (l'offre reste une entité séparée,
+    gérée par `OffersManagement.jsx`)."""
+    return {**project_row(p), **_project_detail_extras(p)}
+
+
+def project_public_detail_row(p: Project) -> dict:
+    """Vue détail CLIENT anonymisée."""
+    return {**project_public_row(p), **_project_detail_extras(p)}
+
+
+def project_identified_detail_row(p: Project) -> dict:
+    """Vue détail SOUSCRIPTEUR d'un projet décaissé — identité révélée."""
+    return {**project_identified_row(p), **_project_detail_extras(p)}
 
 
 def offer_row(o: Offer) -> dict:
@@ -116,6 +229,30 @@ def subscription_row(s: Subscription) -> dict:
         "nextPaymentDate": s.next_payment_date.isoformat() if s.next_payment_date else None,
         "totalReceived": float(s.total_received), "subPortfolioId": s.sub_portfolio_id,
         "units": SUBSCRIPTION_RATE_UNITS,
+    }
+
+
+def obligation_row(p) -> dict:
+    """Position obligataire d'un investisseur.
+
+    `offerCode` / `projectCode` / `subscriptionId` sont la PROVENANCE des termes et de
+    l'argent : sans eux, `rate` et `couponAmount` seraient des nombres sans auteur —
+    ce qu'ils étaient quand ils tombaient des valeurs par défaut du modèle.
+    """
+    return {
+        "id": p.pk, "name": p.name, "couponAmount": float(p.coupon_amount),
+        "investedAmount": float(p.invested_amount), "rate": float(p.rate),
+        "termMonths": p.term_months, "status": p.status,
+        "dateCreated": p.date_created.isoformat(),
+        "offerId": p.offer_id,
+        "offerCode": p.offer.code if p.offer_id else None,
+        "projectCode": p.offer.project.code if p.offer_id else None,
+        "paymentFrequency": p.offer.payment_frequency if p.offer_id else None,
+        "subscriptionId": p.subscription_id,
+        "settledAmount": (float(p.subscription.settled_amount) if p.subscription_id else None),
+        "termsSource": ("investments.Offer" if p.offer_id else "AUCUNE (position antérieure "
+                        "au rattachement obligatoire à une offre)"),
+        "units": OBLIGATION_RATE_UNITS,
     }
 
 

@@ -56,3 +56,28 @@ class IsDesignatedGuarantor(BasePermission):
             return True
 
         return str(guarantor_id) == str(getattr(user, "pk", ""))
+
+
+class CanInstructCredit(BasePermission):
+    """Le personnel qui instruit un dossier (`credits.roles.CAN_INSTRUCT`).
+
+    Déclarative plutôt qu'un `_require_group()` en première ligne de vue : la
+    règle devient lisible sur le décorateur, s'exécute dans `initial()` avant le
+    corps, et aucun `return` mal placé ne peut la contourner (§5 du prompt
+    système). Les vues antérieures conservent leur helper — les migrer toutes
+    n'est pas le périmètre de ce lot, mais rien de neuf ne doit s'y ajouter.
+
+    Attention à la nomenclature : `client`, `agri_op`, `investor` et `partner`
+    portent tous `read=True` dans le registre RBAC. `HasCapability("read")` ne
+    signifie donc JAMAIS « interne » — d'où l'appartenance à un groupe
+    fonctionnel explicite, et non une capacité.
+    """
+
+    message = "Action réservée au personnel qui instruit les dossiers de crédit."
+
+    def has_permission(self, request, view) -> bool:
+        from credits.roles import CAN_INSTRUCT, in_group
+        user = getattr(request, "user", None)
+        if not user or not getattr(user, "is_authenticated", False):
+            return False
+        return in_group(request, CAN_INSTRUCT)

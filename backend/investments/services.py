@@ -21,7 +21,7 @@ from django.db.models import Sum
 from django.utils import timezone
 
 from audit.services import record as audit_record
-from common.exceptions import ValidationFailed
+from common.exceptions import ConflictError, NotFoundError, ValidationFailed
 from common.parsing import to_date, to_decimal
 
 from . import funding, workflow
@@ -50,7 +50,14 @@ cancel_project = funding.cancel_project
 @transaction.atomic
 def create_project(*, code: str, title: str, sector: str = "", location: str = "",
                     funding_target: Decimal | str = "0", promoter: str = "", manager_sub: str = "",
-                    by: str = "") -> Project:
+                    credit_application_code: str = "", by: str = "") -> Project:
+    """Crée un projet d'investissement.
+
+    `credit_application_code` est le chemin NORMAL depuis la décision « 1 projet =
+    1 demande de crédit » : le dossier apporte le promoteur, la filière, la zone, le
+    montant demandé et le score, et le projet n'a plus qu'à porter la levée. La
+    création sans dossier reste possible pour la reprise de l'existant.
+    """
     if not code or not title:
         raise ValidationFailed("Code et titre du projet requis.")
     if Project.objects.filter(code=code).exists():
@@ -60,7 +67,112 @@ def create_project(*, code: str, title: str, sector: str = "", location: str = "
         funding_target=to_decimal(funding_target), promoter=promoter, manager_sub=manager_sub, created_by=by,
     )
     audit_record(actor=by, action="investments.project.create", entity_type="Project", entity_id=project.code)
+    if credit_application_code:
+        project = link_credit_application(project=project,
+                                           application_code=credit_application_code, by=by)
     return project
+
+
+#: Statuts pendant lesquels un dossier de crédit peut encore être rattaché : tant que
+#: la levée n'est pas ouverte. Après P06, des investisseurs ont souscrit sur la foi de
+#: la filière, de la zone, du montant et du score PUBLIÉS — changer le dossier
+#: sous-jacent réécrirait ce qu'ils ont financé.
+LINKABLE_STATUSES = (Project.Status.P01, Project.Status.P02, Project.Status.P03,
+                     Project.Status.P04, Project.Status.P05)
+
+
+@transaction.atomic
+def link_credit_application(*, project: Project, application_code: str = "",
+                             application=None, by: str = "") -> Project:
+    """Rattache un dossier de crédit à un projet — un dossier, un projet.
+
+    L'unicité est portée par la base (`OneToOneField`) ; elle est aussi vérifiée ici
+    pour rendre un refus lisible (« déjà financé par PRJ-… ») plutôt qu'une violation
+    d'intégrité. Le montant demandé du dossier devient l'objectif de levée : c'est le
+    seul champ recopié, parce que c'est celui sur lequel portent les gardes de
+    min-funding et de décaissement (les autres sont lus à la volée, cf. `Project`).
+    """
+    from credits.models import CreditApplication
+
+    if application is None:
+        application = CreditApplication.objects.filter(code=application_code).first()
+        if application is None:
+            raise NotFoundError(f"Dossier de crédit introuvable : « {application_code} ».")
+
+    if project.credit_application_id == application.pk:
+        return project
+    if project.credit_application_id:
+        raise ConflictError(
+            f"Le projet {project.code} finance déjà le dossier "
+            f"{project.credit_application.code} : un projet ne change pas de dossier "
+            "(créez un autre projet).",
+            code="PROJECT_ALREADY_LINKED",
+        )
+    deja = Project.objects.filter(credit_application=application).exclude(pk=project.pk).first()
+    if deja is not None:
+        raise ConflictError(
+            f"Le dossier {application.code} est déjà financé par le projet {deja.code} : "
+            "deux projets ne peuvent pas financer la même demande de crédit.",
+            code="CREDIT_APPLICATION_ALREADY_FINANCED",
+        )
+    if project.status not in LINKABLE_STATUSES:
+        raise ConflictError(
+            f"Le projet {project.code} est en {project.status} : le dossier de crédit "
+            "se rattache avant l'ouverture de la levée (P06). Après, les investisseurs "
+            "ont souscrit sur la foi du dossier publié.",
+            code="LINK_AFTER_FUNDRAISING",
+        )
+    if application.amount_requested is None:
+        raise ValidationFailed(
+            f"Le dossier {application.code} ne porte pas de montant demandé : il n'y a "
+            "pas d'objectif de levée à en dériver.",
+            code="CREDIT_APPLICATION_WITHOUT_AMOUNT",
+        )
+
+    ancien_objectif = project.funding_target
+    project.credit_application = application
+    project.funding_target = to_decimal(application.amount_requested)
+    project.save(update_fields=["credit_application", "funding_target", "updated_at"])
+    audit_record(actor=by, action="investments.project.link_credit_application",
+                 entity_type="Project", entity_id=project.code,
+                 details={"application": application.code,
+                          "previousFundingTarget": str(ancien_objectif),
+                          "fundingTarget": str(project.funding_target),
+                          "score": str(project.effective_global_score)})
+    return project
+
+
+#: Champs du projet qui, une fois le dossier de crédit rattaché, ne se saisissent plus :
+#: ils sont LUS dans le dossier (principe 6 — une seule source par concept).
+DERIVED_FIELDS = {
+    "title": None,  # aucun équivalent au dossier — voir `project_detail` (divergence assumée)
+    "sector": "value_chain",
+    "location": "agency",
+    "promoter": "client",
+    "promoterContact": "client",
+    "fundingTarget": "amount_requested",
+    "globalScore": "AnalyseCredit.score_global",
+}
+
+
+def identity_disclosed_to(project: Project, investor: Investor | None) -> bool:
+    """L'identité de l'emprunteur est-elle lisible par CET investisseur ?
+
+    Deux conditions cumulatives (décision du fondateur) :
+
+    1. le projet est décaissé (P08 et au-delà) — avant, la levée est anonyme pour tous ;
+    2. l'investisseur a une souscription **encaissée** sur ce projet — porter le rôle
+       `invest` ne suffit jamais, et une réservation non encaissée non plus : une
+       intention n'achète pas le droit de savoir qui l'on finance.
+    """
+    from .serializers import IDENTITY_DISCLOSED_STATUSES
+
+    if investor is None or project.status not in IDENTITY_DISCLOSED_STATUSES:
+        return False
+    return Subscription.objects.filter(
+        offer__project=project, investor=investor,
+        status__in=Subscription.FUNDED_STATUSES, settled_amount__gt=Decimal("0"),
+    ).exists()
 
 
 def transition_status(*, project: Project, to_status: str, by: str = "", reason: str = "",

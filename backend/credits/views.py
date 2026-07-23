@@ -28,7 +28,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from credits.permissions import IsDesignatedGuarantor
+from credits.permissions import CanInstructCredit, IsDesignatedGuarantor
 
 from credits.needs_parser import NeedsSheetParseError, parse_needs_sheet
 from credits.needs_template import generate_needs_sheet_template
@@ -2166,3 +2166,270 @@ def bareme_activate(request: Request, revision_id: int) -> Response:
         return _bareme_error(exc)
 
     return Response(serialize_revision(revision, with_preview=True))
+
+
+# ── Propositions de caution : le client propose, l'agent valide ───────────────
+#
+# Trois surfaces, trois publics, trois sérialiseurs :
+#   • le DEMANDEUR propose et suit ses propositions   → serialize_for_applicant
+#   • le PERSONNEL instruit sa file et décide          → serialize_for_staff
+#   • le GARANT répond, sur la surface qui existe déjà → guarantee-requests/
+#
+# Rien ici ne double la surface du garant : une proposition validée devient une
+# `CreditGuarantee` par le chemin unique `guarantees.register_moral_guarantee`,
+# et c'est la boîte de réception existante qui la sert au garant.
+
+
+def _proposal_error(exc) -> Response:
+    """Réponse unique pour tout refus de règle sur une proposition.
+
+    `code` ET statut HTTP viennent de l'exception, jamais d'une valeur réécrite
+    dans la vue — même discipline que `_workflow_error`. `GuarantorError` et
+    `ProposalError` partagent cette convention, un seul relais suffit donc pour
+    les deux familles.
+    """
+    return Response(
+        {"detail": str(exc), "code": exc.code, "errors": exc.as_errors()},
+        status=getattr(exc, "http_status", 422),
+    )
+
+
+def _get_proposal(proposal_id: int):
+    from credits.models import GuaranteeProposal
+    return (
+        GuaranteeProposal.objects
+        .select_related("application__client", "proposed_by", "guarantor", "guarantee")
+        .filter(pk=proposal_id)
+        .first()
+    )
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def application_guarantee_proposals(request: Request, code: str) -> Response:
+    """GET/POST /api/credits/applications/<code>/guarantee-proposals/
+
+    POST — le TITULAIRE du dossier propose un garant.
+      Corps : {guarantor_sub, covered_amount?, message?}
+      201 avec la proposition. Aucune caution n'est créée, aucun tiers notifié :
+      une proposition n'est pas une désignation.
+
+    GET — les propositions du dossier. Le titulaire reçoit sa vue, le personnel
+    la sienne : deux sérialiseurs distincts, choisis ici et jamais mélangés dans
+    un seul par des `if` d'affichage.
+    """
+    from credits.guarantee_proposals import (
+        ProposalError, propose, serialize_for_applicant, serialize_for_staff,
+    )
+    from credits.guarantor import GuarantorError
+
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    est_titulaire = str(app.client_id) == str(getattr(request.user, "pk", ""))
+    est_personnel = in_group(request, CAN_INSTRUCT)
+
+    if request.method == "GET":
+        if not (est_titulaire or est_personnel):
+            return Response({"detail": "Permission refusée."}, status=403)
+        proposals = app.guarantee_proposals.select_related(
+            "proposed_by", "guarantor", "guarantee",
+        ).order_by("-created_at")
+        serialize = serialize_for_staff if est_personnel else serialize_for_applicant
+        items = [serialize(p) for p in proposals]
+        return Response({"total_rows": len(items), "items": items})
+
+    # POST — le personnel ne passe PAS par ici : il dispose de la désignation
+    # directe (`guarantees/moral/`), qui n'a jamais changé de permissions. Une
+    # proposition est l'acte du demandeur, et il faut que cela reste lisible dans
+    # le journal : `proposed_by` doit vouloir dire quelque chose.
+    if not est_titulaire:
+        return Response(
+            {"detail": "Vous ne pouvez proposer un garant que pour votre propre "
+                       "dossier.",
+             "code": "NOT_APPLICATION_OWNER",
+             "errors": [{"code": "NOT_APPLICATION_OWNER",
+                         "message": "Ce dossier n'est pas le vôtre."}]},
+            status=403,
+        )
+
+    data = request.data or {}
+    try:
+        proposal = propose(
+            application=app,
+            proposer=request.user,
+            guarantor_sub=str(data.get("guarantor_sub") or ""),
+            covered_amount=data.get("covered_amount"),
+            message=data.get("message", ""),
+            ip=_client_ip(request),
+        )
+    except (ProposalError, GuarantorError) as exc:
+        return _proposal_error(exc)
+
+    return Response(serialize_for_applicant(proposal), status=201)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def guarantee_proposal_candidates(request: Request, code: str) -> Response:
+    """GET /api/credits/applications/<code>/guarantee-proposals/candidates/
+
+    Les membres des groupes du titulaire — le vivier dans lequel il choisit.
+
+    Aucune donnée de capacité n'y figure : une liste qui distinguerait les
+    personnes « éligibles » des autres serait l'oracle exact que le principe 7
+    interdit. Le demandeur voit des noms et des groupes, rien de financier.
+    """
+    from credits.guarantee_proposals import candidates_for
+
+    app = _get_application(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    est_titulaire = str(app.client_id) == str(getattr(request.user, "pk", ""))
+    if not (est_titulaire or in_group(request, CAN_INSTRUCT)):
+        return Response({"detail": "Permission refusée."}, status=403)
+
+    items = candidates_for(app)
+    return Response({"total_rows": len(items), "items": items})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_my_guarantee_proposals(request: Request) -> Response:
+    """GET /api/credits/guarantee-proposals/  [?status=]
+
+    Le suivi du DEMANDEUR : ce qu'il a proposé, à qui, et où ça en est. Aucun
+    rôle n'élargit ce périmètre — c'est la liste de SES demandes, symétrique de
+    `guarantee-requests/` qui est celle des engagements du garant.
+    """
+    from credits.guarantee_proposals import proposals_of, serialize_for_applicant
+    from credits.guarantor import consent_window_hours
+
+    status_filter = request.query_params.get("status", "")
+    items = [serialize_for_applicant(p)
+             for p in proposals_of(request.user, status=status_filter)]
+    return Response({
+        "total_rows": len(items),
+        # Fenêtre CONFIGURÉE : le front décompte dessus et n'écrit « 72 h » nulle
+        # part (principe 8 jusque dans l'affichage).
+        "consent_window_hours": consent_window_hours(),
+        "items": items,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
+def guarantee_proposal_queue(request: Request) -> Response:
+    """GET /api/credits/guarantee-proposals/queue/  [?status=&application=&limit=]
+
+    La file de validation du personnel. Chaque ligne porte le diagnostic de
+    capacité du garant et, le cas échéant, la règle qui bloquerait la
+    désignation : l'agent sait avant de cliquer si sa validation passera. Ce
+    diagnostic ne sort jamais vers le demandeur (principe 7).
+    """
+    from credits.guarantee_proposals import pending_queue, serialize_for_staff
+
+    try:
+        limit = min(int(request.query_params.get("limit", 50)), 200)
+    except (TypeError, ValueError):
+        limit = 50
+
+    qs = pending_queue(
+        status=request.query_params.get("status", ""),
+        application_code=request.query_params.get("application", ""),
+    )
+    total = qs.count()
+    items = [serialize_for_staff(p, with_capacity=True) for p in qs[:limit]]
+    return Response({
+        "total_rows": total,          # avant troncature — jamais len(items)
+        "returned_rows": len(items),
+        "truncated": total > len(items),
+        "items": items,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
+def validate_guarantee_proposal(request: Request, proposal_id: int) -> Response:
+    """POST /api/credits/guarantee-proposals/<id>/validate/
+
+    Corps : {comment, guarantor_id_number, guarantor_name?, guarantor_phone?,
+             covered_amount?}
+
+    L'acte humain motivé qui transforme une proposition en désignation
+    opposable. Il réutilise `guarantees.register_moral_guarantee` : les sept
+    contrôles de capacité, la fenêtre de consentement et la notification du
+    garant sont ceux qui existaient déjà, et un refus de règle remonte avec SON
+    code — destiné à l'agent, jamais relayé au demandeur.
+    """
+    from credits.guarantee_proposals import (
+        ProposalError, serialize_for_staff, validate,
+    )
+    from credits.guarantees import GuaranteeError
+    from credits.guarantor import GuarantorError
+
+    proposal = _get_proposal(proposal_id)
+    if proposal is None:
+        return Response({"detail": "Proposition introuvable."}, status=404)
+
+    data = request.data or {}
+    try:
+        validate(
+            proposal,
+            agent_sub=getattr(request.user, "sub", "") or "",
+            comment=data.get("comment", ""),
+            guarantor_id_number=data.get("guarantor_id_number", ""),
+            guarantor_name=data.get("guarantor_name", ""),
+            guarantor_phone=data.get("guarantor_phone", ""),
+            covered_amount=data.get("covered_amount"),
+            ip=_client_ip(request),
+        )
+    except (ProposalError, GuarantorError) as exc:
+        return _proposal_error(exc)
+    except GuaranteeError as exc:
+        # `GuaranteeError` porte un `code` mais pas de `http_status` : 422, comme
+        # dans `register_moral_guarantee`.
+        return Response(
+            {"detail": str(exc), "code": exc.code,
+             "errors": [{"code": exc.code, "message": str(exc)}]},
+            status=422,
+        )
+
+    proposal.refresh_from_db()
+    return Response(serialize_for_staff(proposal))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
+def refuse_guarantee_proposal(request: Request, proposal_id: int) -> Response:
+    """POST /api/credits/guarantee-proposals/<id>/refuse/
+
+    Corps : {reason_code, comment}
+
+    Le refus est motivé et journalisé, et la proposition n'est pas supprimée
+    (principe 3). Deux motifs distincts : `reason_code`, vocabulaire fixe dont
+    le libellé est ce que lira le demandeur, et `comment`, motif libre de
+    l'agent qui reste interne.
+    """
+    from credits.guarantee_proposals import ProposalError, refuse, serialize_for_staff
+
+    proposal = _get_proposal(proposal_id)
+    if proposal is None:
+        return Response({"detail": "Proposition introuvable."}, status=404)
+
+    data = request.data or {}
+    try:
+        refuse(
+            proposal,
+            agent_sub=getattr(request.user, "sub", "") or "",
+            reason_code=str(data.get("reason_code") or ""),
+            comment=data.get("comment", ""),
+            ip=_client_ip(request),
+        )
+    except ProposalError as exc:
+        return _proposal_error(exc)
+
+    proposal.refresh_from_db()
+    return Response(serialize_for_staff(proposal))

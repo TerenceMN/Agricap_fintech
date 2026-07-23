@@ -114,8 +114,13 @@ def _guard_p02(project: Project, **_) -> None:
 
 
 def _guard_p03(project: Project, **_) -> None:
-    """Analyse initiale scorée."""
-    if not project.global_score or project.global_score <= 0:
+    """Analyse initiale scorée.
+
+    Le score lu est `effective_global_score` : pour un projet rattaché à un dossier de
+    crédit, c'est celui du moteur de scoring du module crédit — la garde ne se
+    satisfait donc plus d'un nombre saisi à la main sur le projet.
+    """
+    if project.effective_global_score <= Decimal("0"):
         _fail("L'analyse initiale n'est pas scorée : le score global du projet est nul.")
 
 

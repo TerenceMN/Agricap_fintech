@@ -22,7 +22,8 @@ from common import idempotency
 from rbac.permissions import HasCapability
 from rbac.role_registry import get_role
 
-from . import committee, funding, metrics, serializers, services, workflow
+from . import committee, funding, metrics, obligations as obligations_service, serializers, \
+    services, workflow
 from .models import (
     AnalystObservation, BondConversion, BondWithdrawal, Collateral, Distribution,
     FinancialAnalysis, InvestmentEvent, Investor, Movement, Offer, ObligationPosition,
@@ -88,6 +89,36 @@ def _committee_error(exc) -> Response:
                      status=exc.http_status)
 
 
+def _structured_error(exc) -> Response:
+    """Réponse 422 structurée `{code, message}` — un code par erreur, jamais un message
+    générique (CLAUDE.md principe 5)."""
+    return Response({"detail": str(exc), "code": exc.code, "message": str(exc),
+                     "errors": exc.as_errors()}, status=exc.http_status)
+
+
+def _project_row_for(request, project: Project) -> dict:
+    """Choisit le SÉRIALISEUR selon le rôle et le droit — jamais un `if` d'affichage.
+
+    Trois sérialiseurs distincts, trois publics : le personnel (identité complète et
+    provenance du dossier), le client pendant l'anonymat (filière, zone large, score,
+    nature du risque), le souscripteur encaissé d'un projet décaissé (identité révélée,
+    décision du fondateur P08).
+    """
+    if _is_staff(request):
+        return serializers.project_row(project)
+    if services.identity_disclosed_to(project, _my_investor(request)):
+        return serializers.project_identified_row(project)
+    return serializers.project_public_row(project)
+
+
+def _project_detail_row_for(request, project: Project) -> dict:
+    if _is_staff(request):
+        return serializers.project_detail_row(project)
+    if services.identity_disclosed_to(project, _my_investor(request)):
+        return serializers.project_identified_detail_row(project)
+    return serializers.project_public_detail_row(project)
+
+
 # --- Projects ----------------------------------------------------------------
 
 @api_view(["GET", "POST"])
@@ -100,7 +131,7 @@ def projects(request):
             qs = qs.filter(status=status)
         # Forme de liste conservée telle quelle : le front existant la consomme ainsi,
         # et cette liste n'est jamais tronquée (pas de `total_rows` à annoncer).
-        return Response([serializers.project_row(p) for p in qs])
+        return Response([_project_row_for(request, p) for p in qs])
     if not _is_staff(request) or not _require(request, "create"):
         return Response({"detail": "Capacité requise : create."}, status=403)
     data = request.data or {}
@@ -108,9 +139,32 @@ def projects(request):
         code=data.get("code", ""), title=data.get("title", ""), sector=data.get("sector", ""),
         location=data.get("location", ""), funding_target=data.get("fundingTarget", "0"),
         promoter=data.get("promoter", ""), manager_sub=getattr(request.user, "sub", ""),
+        credit_application_code=data.get("creditApplicationCode", ""),
         by=getattr(request.user, "sub", ""),
     )
     return Response(serializers.project_row(project), status=201)
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("create")])
+def project_link_credit_application(request, code):
+    """Rattache un dossier de crédit à un projet — « 1 projet = 1 demande de crédit ».
+
+    Acte de personnel : c'est lui qui décide quel dossier part en levée. Le rattachement
+    est journalisé (append-only) parce qu'il change l'origine du promoteur, de la
+    filière, de la zone, du montant et du score servis à tous les écrans.
+    """
+    if not _is_staff(request):
+        return Response({"detail": "Réservé au personnel de l'institution."}, status=403)
+    project = Project.objects.filter(code=code).first()
+    if not project:
+        return Response({"detail": "Projet introuvable."}, status=404)
+    data = request.data or {}
+    project = services.link_credit_application(
+        project=project, application_code=data.get("applicationCode", ""),
+        by=getattr(request.user, "sub", ""),
+    )
+    return Response(serializers.project_detail_row(project))
 
 
 @api_view(["GET", "PATCH"])
@@ -125,6 +179,24 @@ def project_detail(request, code):
         if not _is_staff(request) or not _require(request, "create"):
             return Response({"detail": "Capacité requise : create."}, status=403)
         data = request.data or {}
+        # Un champ dérivé du dossier de crédit ne se re-saisit pas : accepter la
+        # modification créerait une seconde vérité à côté du dossier (principe 6).
+        # Le refus nomme le champ ET sa source — l'écran sait où corriger.
+        if project.credit_application_id:
+            usurpes = [f for f in ("sector", "location", "promoter", "promoterContact",
+                                    "fundingTarget", "globalScore") if f in data]
+            if usurpes:
+                return Response(
+                    {"detail": "Ces champs sont dérivés du dossier de crédit "
+                               f"{project.credit_application.code} : ils se corrigent "
+                               "dans le dossier, pas sur le projet.",
+                     "code": "FIELD_DERIVED_FROM_CREDIT_APPLICATION",
+                     "errors": [{"code": "FIELD_DERIVED_FROM_CREDIT_APPLICATION",
+                                 "message": f"« {champ} » est lu dans le dossier "
+                                            f"({services.DERIVED_FIELDS.get(champ)})."}
+                                for champ in usurpes]},
+                    status=422,
+                )
         for field, model_field in (
             ("title", "title"), ("description", "description"), ("objectives", "objectives"),
             ("riskAnalysis", "risk_analysis"), ("impactEsg", "impact_esg"),
@@ -133,7 +205,7 @@ def project_detail(request, code):
             if field in data:
                 setattr(project, model_field, data[field])
         project.save()
-    return Response(serializers.project_detail_row(project))
+    return Response(_project_detail_row_for(request, project))
 
 
 @api_view(["GET"])
@@ -764,21 +836,36 @@ def performance_reports(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def obligations(request):
+    """Positions obligataires de l'investisseur — et leur création par DÉBIT du cash.
+
+    `POST` ne déclare plus un montant : il convertit du cash. Corps attendu :
+    `{offerId, bonds, idempotencyKey, name?}`. Le montant est calculé par l'offre
+    (`bonds × bondUnitValue`), le portefeuille est débité, la souscription est
+    encaissée (B10) et la position hérite des termes de l'offre. Sans offre
+    applicable ou sans solde, la création est refusée — jamais partielle.
+    """
     investor, _ = Investor.objects.get_or_create(user=request.user)
     if request.method == "GET":
         return Response([
-            {"id": p.pk, "name": p.name, "couponAmount": float(p.coupon_amount),
-             "investedAmount": float(p.invested_amount), "rate": float(p.rate),
-             "termMonths": p.term_months, "status": p.status, "dateCreated": p.date_created.isoformat(),
-             "units": serializers.OBLIGATION_RATE_UNITS}
-            for p in investor.obligation_positions.all()
+            serializers.obligation_row(p)
+            for p in investor.obligation_positions.select_related("offer__project", "subscription")
         ])
     data = request.data or {}
-    position = ObligationPosition.objects.create(
-        investor=investor, name=data.get("name", "Obligation AGRICAP"),
-        invested_amount=data.get("investedAmount", "0"),
-    )
-    return Response({"id": position.pk}, status=201)
+    key = data.get("idempotencyKey")
+    if not key:
+        return Response({"detail": "idempotencyKey requis.", "code": "IDEMPOTENCY_KEY_REQUIRED"},
+                         status=400)
+    try:
+        position = obligations_service.souscrire(
+            investor=investor, offer_id=data.get("offerId"), bonds=data.get("bonds", 0),
+            idempotency_key=key, by=getattr(request.user, "sub", ""),
+            name=data.get("name", ""),
+        )
+    except idempotency.IdempotentReplay as exc:
+        return idempotency.replay_response(exc)
+    except obligations_service.ObligationError as exc:
+        return _structured_error(exc)
+    return Response(serializers.obligation_row(position), status=201)
 
 
 @api_view(["GET"])

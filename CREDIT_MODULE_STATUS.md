@@ -258,7 +258,10 @@ Routes déclarées dans [credits/urls.py](backend/credits/urls.py), préfixe `/a
 | `POST` | `/api/credits/applications/<code>/client-consent/` | Consentement client (dossier « pour le compte de ») |
 | `GET` | `/api/credits/applications/<code>/guarantees/` | Liste des garanties + ratio de couverture |
 | `POST` | `/api/credits/applications/<code>/guarantees/savings/` | Pose d'une garantie épargne (hold wallet) |
-| `POST` | `/api/credits/applications/<code>/guarantees/moral/` | Enregistrement d'une caution solidaire |
+| `POST` | `/api/credits/applications/<code>/guarantees/moral/` | Désignation d'un garant par le personnel (`CAN_INSTRUCT`) |
+| `GET`/`POST` | `/api/credits/applications/<code>/guarantee-proposals/` | Propositions de caution du dossier / dépôt par le **titulaire** |
+| `GET` | `/api/credits/applications/<code>/guarantee-proposals/candidates/` | Membres des groupes du titulaire — aucune donnée de capacité |
+| `GET` | `/api/credits/guarantee-proposals/` | Suivi du demandeur : SES propositions |
 | `POST` | `/api/credits/applications/<code>/guarantees/asset/` | Gage sur un actif vérifié — `{asset_id}` |
 | `POST` | `/api/credits/applications/<code>/guarantees/<id>/confirm/` | Confirmation — gage effectif de l'actif (staff) |
 | `GET` | `/api/credits/applications/<code>/disbursement/` | Détail du décaissement |
@@ -321,6 +324,9 @@ Les groupes cités sont ceux de [credits/roles.py](backend/credits/roles.py).
 | `POST` | `…/<code>/disbursement/confirm/` | Confirmation (checker) | `CAN_CONFIRM_DISBURSEMENT` |
 | `POST` | `…/<code>/disbursement/cancel/` | `pending_disbursement` → `approved` | `CAN_REQUEST_DISBURSEMENT` |
 | `POST` | `…/<code>/guarantees/<id>/release/` | Libère une garantie | `CAN_INSTRUCT` |
+| `GET` | `/api/credits/guarantee-proposals/queue/` | File des propositions de caution à valider (+ diagnostic de capacité du garant) | `CanInstructCredit` |
+| `POST` | `/api/credits/guarantee-proposals/<id>/validate/` | Valide une proposition → désignation opposable (motif + pièce d'identité obligatoires) | `CanInstructCredit` |
+| `POST` | `/api/credits/guarantee-proposals/<id>/refuse/` | Refuse une proposition (motif codifié + commentaire interne) | `CanInstructCredit` |
 | `GET` | `…/<code>/analysis-report/` | Rapport d'analyse documentaire | authentifié + étanchéité client |
 | `POST` | `…/<code>/analysis-report/` | Décision analyste sur un finding | `CAN_INSTRUCT` |
 
@@ -595,7 +601,7 @@ Nomenclature canonique des garanties (**backend fait foi**, le front mappe) :
 | Code | Libellé | Adossé à |
 |---|---|---|
 | `epargne` | Nantissement Épargne | hold sur `SavingsPlan` |
-| `morale` | Caution Solidaire | garant du groupe (consentement : voir reste à faire) |
+| `morale` | Caution Solidaire | garant du groupe (consentement 72 h ✅ ; proposition client → validation agent ✅) |
 | `materiel` | Gage matériel | `assets.Asset` mobilier vérifié |
 | `foncier` | Hypothèque / Foncier | `assets.Asset` immobilier vérifié |
 
@@ -615,6 +621,55 @@ valeur retenue non nulle. Le gage effectif n'a lieu qu'à la **confirmation par 
 agent**, sous `select_for_update` — c'est là qu'est empêché le double gage.
 
 28 tests ajoutés, dont l'invariant « un actif ne peut être gagé deux fois ».
+
+### ✅ Résolu (juillet 2026) — le client propose une caution, l'agent valide
+
+**Le constat** : `POST …/guarantees/moral/` exige `CAN_INSTRUCT`, et **aucun
+écran front ne l'appelait**. La branche caution solidaire était donc
+inatteignable depuis l'application, ce qui expliquait mécaniquement que la boîte
+de réception du garant (`GET /guarantee-requests/`) soit toujours vide : personne
+ne pouvait jamais rien lui demander. Le côté garant — consentement 72 h, refus
+explicite, cinq règles de capacité re-vérifiées au consentement — était complet
+et attendait un déclencheur qui n'existait pas.
+
+**La décision du fondateur** : le client propose, l'agent valide. Ni l'ouverture
+de la désignation au client (elle notifie un tiers et immobilise sa capacité
+d'engagement), ni le statu quo.
+
+| Élément | État |
+|---|---|
+| `GuaranteeProposal` — contenu figé, décision seule mutable | ✅ migration `0014_guaranteeproposal` |
+| `credits/guarantee_proposals.py` — machine à états `proposed → validated / refused` | ✅ |
+| Validation = appel de `guarantees.register_moral_guarantee` (aucune seconde voie) | ✅ |
+| Sérialiseurs séparés : `serialize_for_applicant` / `serialize_for_staff` | ✅ |
+| Permission déclarative `CanInstructCredit` (`credits/permissions.py`) | ✅ |
+| 73 tests ([credits/tests_guarantee_proposals.py](backend/credits/tests_guarantee_proposals.py)) | ✅ |
+
+**Une proposition ne compte pour rien.** C'est l'invariant central, et il est
+testé sur des dictionnaires entiers, pas sur un champ choisi : `coverage` de
+`get_guarantee_summary` et le résultat de `scorer_garanties` sont **identiques**
+avec et sans proposition. Une proposition ne crée aucune `CreditGuarantee`, ne
+notifie pas le garant pressenti, n'apparaît pas dans sa boîte de réception et
+n'immobilise pas sa capacité d'engagement. Seule la validation par un agent —
+acte humain motivé, pièce d'identité relevée — produit une désignation.
+
+**Le piège de la fuite de tiers.** Les règles de capacité portent sur la
+situation financière d'une AUTRE personne. Choix retenu : les quatre règles
+financières (épargne, cautions vivantes, défaut, caution croisée) ne sont
+**jamais évaluées à la proposition** — ce qui n'est pas calculé ne peut pas
+fuir. Le demandeur apprend au plus, par un libellé figé, que « cette personne ne
+peut pas se porter caution en ce moment ». Le commentaire libre de l'agent ne
+sort jamais vers lui ; le diagnostic chiffré (épargne, plafond, cautions
+vivantes, règle bloquante) n'existe que dans la file de validation du personnel.
+Deux tests le verrouillent : l'un cherche les **noms** de champs interdits,
+l'autre les **valeurs** — renommer un champ ne suffit pas à passer.
+
+**Anti-sondage** : plafond de propositions simultanées par dossier
+(`CREDIT_MAX_OPEN_GUARANTEE_PROPOSALS`, défaut 3) et plafond total sur la vie du
+dossier (`CREDIT_MAX_GUARANTEE_PROPOSALS_PER_APPLICATION`, défaut 10). Tout
+blocage est journalisé (`credit.guarantee.proposal_blocked`) — jamais silencieux.
+Ces deux seuils appartiennent à `InstitutionConfig` (comité) et y sont attendus :
+en attendant, ils vivent dans `settings` et tout repli est loggé.
 
 ### ✅ Résolu (juillet 2026) — rattachement dossier ↔ agence
 
@@ -663,7 +718,7 @@ reçoit pas d'agence rétroactivement — la prise en charge n'existe pas encore
 | 3 | Front simulateur en calque strict | ⏳ partiel — score fictif supprimé, calque strict non fait |
 | 4 | App `assets` : modèle, vérification terrain | ✅ **fait** (backend + front client + file agent) |
 | 5 | Garantie sur actif, gage atomique | ✅ **fait** (backend + front) |
-| 6 | Caution solidaire : consentement garant 72 h, 5 règles | ❌ non commencé |
+| 6 | Caution solidaire : consentement garant 72 h, 5 règles | ✅ **backend fait** — proposition client → validation agent comprise ; 3 écrans front à construire |
 | 7 | Nomenclature des rôles / délégation | ✅ fait |
 
 ### SPEC Moteur d'analyse — ✅ livrée
@@ -722,6 +777,21 @@ Livrés : file d'instruction analyste (`/credit/dossiers`), file de vérificatio
 actifs (`/credit/actifs`), corbeille du comité (`/credit/comite`), journal d'audit
 (`/credit/journal`). Non faits : onglet Analyse, onglet Référence (principe 11),
 suivi des garanties, décision collégiale avec quorum.
+
+**Trois écrans attendus par le backend des propositions de caution** (contrat
+figé, endpoints livrés et testés) :
+
+1. **Proposer un garant** — client, sur son dossier :
+   `GET …/guarantee-proposals/candidates/` pour le sélecteur, puis
+   `POST …/guarantee-proposals/`. Aucun champ de capacité à afficher : il n'en
+   arrive aucun, et il ne doit jamais en arriver.
+2. **File de validation** — agent : `GET /guarantee-proposals/queue/`, puis
+   `POST /guarantee-proposals/<id>/validate/` (motif + `guarantor_id_number`
+   obligatoires, montant ajustable) ou `…/refuse/` (motif codifié + commentaire).
+   `blockingRule` dit à l'avance si la validation passera.
+3. **Suivi de mes cautions** — client : `GET /guarantee-proposals/`, état lu dans
+   `state` (jamais recomposé côté client), compte à rebours sur
+   `consentExpiresAt` avec `consent_window_hours` servi par la réponse.
 
 ### Deux failles supplémentaires trouvées et corrigées
 
