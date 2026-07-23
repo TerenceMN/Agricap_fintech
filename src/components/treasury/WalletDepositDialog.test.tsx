@@ -43,7 +43,11 @@ describe('WalletDepositDialog', () => {
 
     fireEvent.click(screen.getByText('Confirmer et Exécuter'));
 
-    await waitFor(() => expect(deposit).toHaveBeenCalledWith(5000, 'USD', 'mobile_money'));
+    // Contrat objet : le dépôt joint désormais la contrepartie (numéro source),
+    // obligatoire pour un canal externe (mobile money).
+    await waitFor(() => expect(deposit).toHaveBeenCalledWith({
+      amount: 5000, currency: 'USD', channel: 'mobile_money', counterparty: '+243900000000',
+    }));
     // Succès : la boîte de dépôt se referme d'elle-même.
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });

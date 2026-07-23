@@ -93,9 +93,39 @@ describe('DepositForm', () => {
     fireEvent.click(screen.getByText('Confirmer et Exécuter'));
 
     await waitFor(() => expect(deposit).toHaveBeenCalledTimes(1));
-    // Montant, devise saisie, moyen de paiement — dans cet ordre, sans constante.
-    expect(deposit).toHaveBeenCalledWith(150, 'USD', 'mobile_money');
+    // Contrat objet : montant + devise saisie + canal serveur + contrepartie.
+    // Le canal (`mobile_money`) et la contrepartie (le numéro) sont désormais
+    // OBLIGATOIRES pour un dépôt externe — le serveur refuse leur absence.
+    expect(deposit).toHaveBeenCalledWith({
+      amount: 150, currency: 'USD', channel: 'mobile_money', counterparty: '+243900000000',
+    });
     await waitFor(() => expect(onCompleted).toHaveBeenCalled());
+  });
+
+  it('traduit « Virement bancaire » en canal serveur `bank` et joint la contrepartie', async () => {
+    deposit.mockResolvedValueOnce({});
+    const { container } = render(<DepositForm />);
+    // Bascule sur le virement bancaire : le champ contrepartie doit rester exigé.
+    fireEvent.click(screen.getByText('Virement Bancaire'));
+    fill(container, { amount: '200', phone: 'BE68539007547034' });
+    submit(container);
+    fireEvent.click(await screen.findByText('Confirmer et Exécuter'));
+
+    await waitFor(() => expect(deposit).toHaveBeenCalledTimes(1));
+    // `bank_transfer` (UI) est traduit en `bank` (serveur) — sans quoi 422 unknown_channel.
+    expect(deposit).toHaveBeenCalledWith({
+      amount: 200, currency: 'USD', channel: 'bank', counterparty: 'BE68539007547034',
+    });
+  });
+
+  it('refuse un dépôt bancaire sans contrepartie, avant tout envoi', () => {
+    const { container } = render(<DepositForm />);
+    fireEvent.click(screen.getByText('Virement Bancaire'));
+    fill(container, { amount: '200', phone: '' });
+    submit(container);
+
+    expect(container.textContent).toContain('Contrepartie requise');
+    expect(deposit).not.toHaveBeenCalled();
   });
 
   it('un dépôt externe (payment_order) non confirmé affiche « en attente », JAMAIS « effectué »', async () => {

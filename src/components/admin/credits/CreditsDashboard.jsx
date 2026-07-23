@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import CreditsTable from './CreditsTable';
 import CreditFormDialog from './CreditFormDialog';
+import RepaymentCalendar from '@/components/echeances/RepaymentCalendar';
 import { useToast } from '@/components/ui/use-toast';
 import { api } from '@/services/api';
 import { DollarSign, AlertTriangle, Calendar, CheckSquare, BarChart, Repeat, TrendingUp, TrendingDown, Loader2 } from 'lucide-react';
@@ -37,6 +38,8 @@ const AdminCreditsDashboard = () => {
   const [summaryData, setSummaryData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
+  // Agenda global des remboursements (gap #5) : ouvert par « Vue Échéances ».
+  const [calendarOpen, setCalendarOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -137,7 +140,10 @@ const AdminCreditsDashboard = () => {
       } catch (e) { toast({ variant: 'destructive', title: 'Erreur', description: e.message }); }
       return;
     }
-    if (action === 'calendar_view') { toast({ title: 'Vue Échéancier', description: 'Cliquez sur « Détails » d\'un dossier puis ouvrez l\'onglet « Échéancier ».' }); return; }
+    // Ouvre l'agenda global des remboursements (`GET /portfolio/calendar`), d'où
+    // l'on peut plonger dans l'échéancier complet d'un dossier — remplace le
+    // toast « allez voir ailleurs » par les données réelles servies par le serveur.
+    if (action === 'calendar_view') { setCalendarOpen(true); return; }
     if (action === 'simulator') { toast({ title: 'Simulateur', description: 'Ouvrez « Config. Taux & Maturité » sur un dossier pour simuler.' }); return; }
 
     // Actions par dossier → endpoint générique.
@@ -188,6 +194,7 @@ const AdminCreditsDashboard = () => {
       </motion.div>
       <CreditsTable credits={credits} onAction={handleAction} />
       <CreditFormDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={load} />
+      <RepaymentCalendar open={calendarOpen} onClose={() => setCalendarOpen(false)} />
     </div>
   );
 };

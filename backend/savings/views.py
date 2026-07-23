@@ -1,8 +1,9 @@
 """API épargne (Savings.jsx + admin/savings/*) — CRUD léger, toujours audité."""
 from __future__ import annotations
 
+import datetime
 import uuid
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from django.db import transaction
 from django.db.models import F
@@ -13,11 +14,34 @@ from rest_framework.response import Response
 from audit.services import record as audit_record
 from common import idempotency
 from common.exceptions import InsufficientFundsError
-from common.parsing import to_decimal
+from common.parsing import to_date, to_decimal
 from rbac.permissions import HasCapability
 from rbac.role_registry import get_role
 
-from .models import GroupIntegrationRequest, SavingsDeposit, SavingsGroup, SavingsGroupMember, SavingsPlan
+from .models import (
+    GroupIntegrationRequest, SavingsAdjustment, SavingsDeposit, SavingsGroup,
+    SavingsGroupMember, SavingsPlan, SavingsRateChange,
+)
+
+#: Plafond de taux annuel — le seul seuil métier de ce module. Vécu côté serveur (les
+#: modales le vérifiaient côté client, où il n'engageait rien). 6 % = plancher de refus,
+#: pas une valeur cachée : il est renvoyé dans le refus pour que l'écran l'explique.
+MAX_ANNUAL_RATE = Decimal("6")
+
+#: Nombre d'occurrences projetées par la simulation de croissance (côté serveur).
+PROJECTION_ROWS = 10
+
+#: Fréquence de versement → pas en jours, pour la projection. Miroir serveur du
+#: `freqMap` que la modale calculait côté navigateur (interdit §5).
+_FREQUENCY_DAYS = {
+    "hebdomadaire": 7, "bimensuel": 15, "mensuel": 30, "trimestriel": 90, "annuel": 365,
+}
+
+
+def _monthly_rate(annual: Decimal) -> Decimal:
+    """Taux mensuel équivalent = annuel / 12, quantize 0.0001. CALCUL SERVEUR : c'est
+    la ligne que le front faisait en `(val/12)` — désormais la seule source."""
+    return (annual / Decimal("12")).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
 def _plan_row(p: SavingsPlan) -> dict:
@@ -26,6 +50,12 @@ def _plan_row(p: SavingsPlan) -> dict:
         "objectif": float(p.objectif), "balance": float(p.balance), "status": p.status,
         "currency": p.currency, "accruedInterest": float(p.accrued_interest),
         "interestRate": float(p.interest_rate),
+        # Taux mensuel et statut de taux servis par le serveur — le front n'en calcule
+        # ni n'en déduit aucun (§5).
+        "monthlyRate": float(p.monthly_rate),
+        "rateStatus": p.rate_status,
+        "frequency": p.frequency,
+        "periodicDeposit": float(p.periodic_deposit),
     }
 
 
@@ -48,10 +78,20 @@ def my_plans(request):
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def all_plans(request):
-    """Vue admin (AdminSavingsTable) — tous les plans, tous titulaires."""
+    """Vue admin (AdminSavingsTable) — tous les plans, tous titulaires.
+
+    Sert aussi le `sub` du titulaire et ses adhésions de groupe, pour que l'écran
+    n'ait plus à déduire l'affectation d'un `localStorage` (l'ancien
+    `admin_savings_groups` était un référentiel de groupes fantôme, côté navigateur)."""
     plans = SavingsPlan.objects.select_related("user").all()
+    # Adhésions préchargées une fois (pas de N+1) : titulaire → noms de groupes.
+    holder_groups: dict = {}
+    for m in SavingsGroupMember.objects.select_related("group", "user").all():
+        holder_groups.setdefault(m.user_id, []).append(m.group.name)
     return Response([
-        {**_plan_row(p), "holder": p.user.full_name or p.user.email} for p in plans
+        {**_plan_row(p), "holder": p.user.full_name or p.user.email,
+         "holderSub": p.user_id, "holderGroups": holder_groups.get(p.user_id, [])}
+        for p in plans
     ])
 
 
@@ -160,6 +200,281 @@ def plan_deposit(request, plan_id):
     return Response(_plan_row(plan))
 
 
+# ─────────────────────────── Configuration de taux (admin) ───────────────────────────
+#
+# GAP Critique de l'audit : `SavingsRateModal`/`SavingsAdjustmentModal` écrivaient la
+# config de taux, les ajustements ET l'audit dans `localStorage`, et calculaient le taux
+# mensuel côté client (`val/12`). Il n'existait AUCUN endpoint. Ces vues rapatrient tout :
+# écriture atomique en base, taux mensuel calculé serveur, journal d'audit serveur
+# (AuditEntry) + historique append-only (SavingsRateChange), consultable par la modale.
+
+
+def _rate_change_row(c: SavingsRateChange) -> dict:
+    return {
+        "id": c.pk, "annualRate": float(c.annual_rate), "monthlyRate": float(c.monthly_rate),
+        "status": c.status, "action": c.action, "effectiveDate": c.effective_date.isoformat(),
+        "reason": c.reason, "actor": c.actor, "date": c.created_at.isoformat(),
+    }
+
+
+def _rate_config_payload(plan: SavingsPlan) -> dict:
+    """Configuration de taux COURANTE d'un plan (valeurs vives, servies par le serveur)
+    + historique append-only. Aucun taux mensuel n'est laissé au client à calculer."""
+    return {
+        "planId": plan.pk,
+        "annualRate": float(plan.interest_rate),
+        "monthlyRate": float(plan.monthly_rate),
+        "status": plan.rate_status,
+        "maxAnnualRate": float(MAX_ANNUAL_RATE),
+        "history": [_rate_change_row(c) for c in plan.rate_changes.all()],
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([HasCapability("config")])
+def plan_rate_config(request, plan_id):
+    """GET : config de taux courante + historique. POST : applique un changement.
+
+    Le taux mensuel n'est JAMAIS lu du corps : il est recalculé (`annuel / 12`). Le
+    plafond de 6 % est vérifié ici (les modales le vérifiaient côté client, sans effet
+    opposable). Écriture atomique : la ligne d'historique, la mise à jour du plan et
+    l'audit committent ensemble ou pas du tout (P3 append-only + §5 écriture atomique)."""
+    plan = SavingsPlan.objects.filter(pk=plan_id).first()
+    if not plan:
+        return Response({"detail": "Plan introuvable.", "code": "PLAN_NOT_FOUND"}, status=404)
+
+    if request.method == "GET":
+        return Response(_rate_config_payload(plan))
+
+    data = request.data or {}
+    action = data.get("action", SavingsRateChange.Action.RATE_UPDATE)
+    if action not in SavingsRateChange.Action.values:
+        return Response({"detail": f"Action inconnue : {action}.",
+                         "errors": [{"code": "ACTION_UNKNOWN",
+                                     "message": f"Action de taux inconnue : {action}."}]}, status=422)
+
+    errors: list[dict] = []
+    # Selon l'action, on calcule l'état cible. Le blocage force le taux à 0 (pas de
+    # rémunération) ; la suspension/réactivation conserve le taux courant.
+    if action == SavingsRateChange.Action.BLOCK:
+        annual, status = Decimal("0"), SavingsPlan.RateStatus.BLOQUE
+    elif action == SavingsRateChange.Action.SUSPEND:
+        annual, status = plan.interest_rate, SavingsPlan.RateStatus.SUSPENDU
+    elif action == SavingsRateChange.Action.RESUME:
+        annual, status = plan.interest_rate, SavingsPlan.RateStatus.ACTIF
+    else:  # RATE_UPDATE
+        annual = to_decimal(data.get("annualRate"), default="-1")
+        status = SavingsPlan.RateStatus.ACTIF
+        if annual < 0:
+            errors.append({"code": "RATE_NEGATIVE", "message": "Le taux ne peut pas être négatif."})
+        elif annual > MAX_ANNUAL_RATE:
+            errors.append({"code": "RATE_ABOVE_MAX",
+                           "message": f"Le taux ne peut excéder {MAX_ANNUAL_RATE} %."})
+
+    if errors:
+        return Response({"detail": errors[0]["message"], "errors": errors}, status=422)
+
+    annual = annual.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    monthly = _monthly_rate(annual)
+    effective = to_date(data.get("effectiveDate")) or datetime.date.today()
+    reason = (data.get("reason") or "").strip()
+    actor = getattr(request.user, "sub", "")
+
+    with transaction.atomic():
+        change = SavingsRateChange.objects.create(
+            plan=plan, annual_rate=annual, monthly_rate=monthly, status=status,
+            effective_date=effective, action=action, reason=reason, actor=actor,
+        )
+        SavingsPlan.objects.filter(pk=plan.pk).update(
+            interest_rate=annual, monthly_rate=monthly, rate_status=status)
+        audit_record(actor=actor, action="savings.plan.rate_change",
+                     entity_type="SavingsPlan", entity_id=str(plan.pk),
+                     details={"action": action, "annualRate": str(annual),
+                              "monthlyRate": str(monthly), "status": status,
+                              "effectiveDate": effective.isoformat(), "reason": reason,
+                              "changeId": change.pk})
+    plan.refresh_from_db()
+    return Response(_rate_config_payload(plan))
+
+
+# ─────────────────────────── Ajustement des modalités (admin) ───────────────────────────
+
+
+def _growth_projection(balance: Decimal, periodic: Decimal, frequency: str,
+                       target: Decimal) -> list[dict]:
+    """Simulation de croissance PROJETÉE CÔTÉ SERVEUR (l'ancienne modale la calculait en
+    JS). Dépôts réguliers, sans intérêt ni retrait — projection assumée comme telle. Les
+    dates avancent d'un pas fixe par fréquence ; on s'arrête à l'atteinte de la cible."""
+    if periodic <= 0:
+        return []
+    rows: list[dict] = []
+    step = _FREQUENCY_DAYS.get(frequency, 30)
+    current = datetime.date.today()
+    projected = balance
+    for i in range(1, PROJECTION_ROWS + 1):
+        current = current + datetime.timedelta(days=step)
+        projected = (projected + periodic).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        rows.append({"num": i, "date": current.isoformat(),
+                     "deposit": float(periodic), "projected": float(projected)})
+        if target > 0 and projected >= target:
+            break
+    return rows
+
+
+def _adjustment_metrics(plan: SavingsPlan) -> dict:
+    """Métriques dérivées de l'ajustement — CALCULÉES SERVEUR (reste à épargner, nombre de
+    dépôts nécessaires). `depositsNeeded` est `null` sans versement périodique : on ne rend
+    pas « ∞ » comme un nombre, on dit qu'il n'est pas calculable."""
+    target = plan.objectif
+    balance = plan.balance
+    periodic = plan.periodic_deposit
+    remaining = max(Decimal("0"), target - balance)
+    deposits_needed = None
+    if periodic > 0:
+        deposits_needed = int((remaining / periodic).to_integral_value(rounding=ROUND_CEILING))
+    projection = _growth_projection(balance, periodic, plan.frequency, target)
+    maturity = projection[-1]["date"] if deposits_needed and projection else None
+    return {
+        "remaining": float(remaining),
+        "depositsNeeded": deposits_needed,
+        "projectedMaturity": maturity,
+        "projection": projection,
+    }
+
+
+def _adjustment_row(a: SavingsAdjustment) -> dict:
+    return {
+        "id": a.pk, "targetAmount": float(a.target_amount), "depositMode": a.deposit_mode,
+        "frequency": a.frequency, "periodicDeposit": float(a.periodic_deposit),
+        "reason": a.reason, "actor": a.actor, "date": a.created_at.isoformat(),
+    }
+
+
+def _adjustment_payload(plan: SavingsPlan) -> dict:
+    return {
+        "planId": plan.pk,
+        "targetAmount": float(plan.objectif),
+        "currentBalance": float(plan.balance),
+        "depositMode": plan.deposit_channel,
+        "frequency": plan.frequency,
+        "periodicDeposit": float(plan.periodic_deposit),
+        "currency": plan.currency,
+        "metrics": _adjustment_metrics(plan),
+        "history": [_adjustment_row(a) for a in plan.adjustments.all()],
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([HasCapability("config")])
+def plan_adjustment(request, plan_id):
+    """GET : modalités courantes + métriques/projection serveur + historique. POST :
+    persiste un ajustement de MODALITÉS. Le solde n'est jamais modifié ici : il ne bouge
+    que par un mouvement d'argent tracé (conservation, §4)."""
+    plan = SavingsPlan.objects.filter(pk=plan_id).first()
+    if not plan:
+        return Response({"detail": "Plan introuvable.", "code": "PLAN_NOT_FOUND"}, status=404)
+
+    if request.method == "GET":
+        return Response(_adjustment_payload(plan))
+
+    data = request.data or {}
+    errors: list[dict] = []
+
+    # Champ absent = « garder la valeur courante » (comme fréquence/mode plus bas) ; on ne
+    # valide donc que ce qui est explicitement fourni. Sentinelle `-1` pour distinguer une
+    # saisie négative d'une absence.
+    target = to_decimal(data.get("targetAmount"), default=str(plan.objectif)) \
+        if "targetAmount" in data else plan.objectif
+    if target < 0:
+        errors.append({"code": "TARGET_INVALID", "message": "L'objectif cible doit être positif ou nul."})
+    periodic = to_decimal(data.get("periodicDeposit"), default="-1") \
+        if "periodicDeposit" in data else plan.periodic_deposit
+    if periodic < 0:
+        errors.append({"code": "PERIODIC_INVALID",
+                       "message": "Le versement périodique doit être positif ou nul."})
+    frequency = data.get("frequency", plan.frequency)
+    if frequency not in SavingsPlan.DepositFrequency.values:
+        errors.append({"code": "FREQUENCY_UNKNOWN", "message": f"Fréquence inconnue : {frequency}."})
+    deposit_mode = data.get("depositMode", plan.deposit_channel)
+    if deposit_mode not in SavingsPlan.Channel.values:
+        errors.append({"code": "MODE_UNKNOWN", "message": f"Mode de dépôt inconnu : {deposit_mode}."})
+
+    if errors:
+        return Response({"detail": errors[0]["message"], "errors": errors}, status=422)
+
+    target = target.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    periodic = periodic.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    reason = (data.get("reason") or "").strip()
+    actor = getattr(request.user, "sub", "")
+
+    with transaction.atomic():
+        adj = SavingsAdjustment.objects.create(
+            plan=plan, target_amount=target, deposit_mode=deposit_mode,
+            frequency=frequency, periodic_deposit=periodic, reason=reason, actor=actor,
+        )
+        SavingsPlan.objects.filter(pk=plan.pk).update(
+            objectif=target, frequency=frequency, deposit_channel=deposit_mode,
+            periodic_deposit=periodic)
+        audit_record(actor=actor, action="savings.plan.adjustment",
+                     entity_type="SavingsPlan", entity_id=str(plan.pk),
+                     details={"targetAmount": str(target), "frequency": frequency,
+                              "depositMode": deposit_mode, "periodicDeposit": str(periodic),
+                              "reason": reason, "adjustmentId": adj.pk})
+    plan.refresh_from_db()
+    return Response(_adjustment_payload(plan))
+
+
+# ─────────────────────────── Affectation de groupe (admin) ───────────────────────────
+
+
+@api_view(["POST"])
+@permission_classes([HasCapability("cooperatives")])
+def assign_group(request):
+    """Affecte un titulaire (par `sub`) à un groupe, ou le désaffecte (`groupId` vide/`none`).
+
+    Remplace l'ancien `admin_savings_groups` de `localStorage`, qui stockait les membres
+    par NOM dans le navigateur : une affectation qui ne survivait pas à un vidage de cache
+    et qu'aucun autre poste ne voyait. L'adhésion est désormais l'unique source
+    (`SavingsGroupMember`), exclusive (un titulaire = au plus un groupe d'épargne à ce
+    stade), et l'affectation est auditée côté serveur."""
+    data = request.data or {}
+    user_sub = (data.get("userSub") or "").strip()
+    if not user_sub:
+        return Response({"detail": "Titulaire (userSub) requis.",
+                         "errors": [{"code": "USER_REQUIRED",
+                                     "message": "Titulaire (userSub) requis."}]}, status=422)
+
+    from accounts.models import FintechUser
+    user = FintechUser.objects.filter(sub=user_sub).first()
+    if not user:
+        return Response({"detail": "Titulaire introuvable.", "code": "USER_NOT_FOUND"}, status=404)
+
+    raw_group = data.get("groupId")
+    target_group = None
+    if raw_group not in (None, "", "none"):
+        target_group = SavingsGroup.objects.filter(pk=raw_group).first()
+        if not target_group:
+            return Response({"detail": "Groupe introuvable.", "code": "GROUP_NOT_FOUND"}, status=404)
+
+    actor = getattr(request.user, "sub", "")
+    with transaction.atomic():
+        # Affectation exclusive : on retire de tout groupe d'abord, puis on ajoute.
+        SavingsGroupMember.objects.filter(user=user).delete()
+        if target_group is not None:
+            SavingsGroupMember.objects.get_or_create(group=target_group, user=user)
+        audit_record(actor=actor, action="savings.group.assign_member",
+                     entity_type="SavingsGroup",
+                     entity_id=str(target_group.pk) if target_group else "",
+                     details={"userSub": user_sub,
+                              "groupId": target_group.pk if target_group else None,
+                              "groupName": target_group.name if target_group else None})
+    return Response({
+        "userSub": user_sub,
+        "groupId": target_group.pk if target_group else None,
+        "groupName": target_group.name if target_group else None,
+    })
+
+
 def _group_row(g: SavingsGroup) -> dict:
     return {
         "id": g.pk, "name": g.name, "type": g.type, "description": g.description,
@@ -167,6 +482,33 @@ def _group_row(g: SavingsGroup) -> dict:
         "membersCount": g.members.count(),
         "members": [m.user.full_name or m.user.email for m in g.members.select_related("user").all()],
         "status": "Actif",  # pas de cycle de vie suspendu/fermé pour les groupes à ce stade
+    }
+
+
+def _group_detail_payload(g: SavingsGroup) -> dict:
+    """Fiche détaillée d'un groupe (gap #6) — SUPERSET de `_group_row`, servie au panneau
+    de détail. Ajoute l'historique des membres (date d'adhésion) et le journal des demandes
+    d'intégration. On ne FABRIQUE pas de « cotisations individuelles » : aucun mouvement
+    d'argent n'est aujourd'hui rattaché à un groupe, donc afficher un montant par membre
+    serait un chiffre inventé (§4.6). Le champ existe, honnêtement à null, tant que le
+    modèle de cotisation de groupe n'existe pas."""
+    members = [
+        {"sub": m.user_id, "name": m.user.full_name or m.user.email,
+         "joinedAt": m.joined_at.isoformat(), "contribution": None}
+        for m in g.members.select_related("user").order_by("joined_at")
+    ]
+    requests = [
+        {"id": r.pk, "userName": r.user.full_name or r.user.email, "reason": r.reason,
+         "status": r.status, "date": r.created_at.isoformat()}
+        for r in g.integration_requests.select_related("user").all()
+    ]
+    return {
+        **_group_row(g),
+        "adminSub": g.admin_sub,
+        "createdAt": g.created_at.isoformat(),
+        "memberHistory": members,
+        "requests": requests,
+        "contributionsTracked": False,
     }
 
 
@@ -210,8 +552,32 @@ def group_detail(request, group_id):
                 setattr(group, model_field, data[field])
         group.save()
         audit_record(actor=getattr(request.user, "sub", ""), action="savings.group.update",
-                     entity_type="SavingsGroup", entity_id=str(group.pk))
-    return Response(_group_row(group))
+                     entity_type="SavingsGroup", entity_id=str(group.pk),
+                     details={"rate": str(group.rate), "frequency": group.frequency})
+    # GET/PATCH renvoient la fiche détaillée (superset de la ligne de liste) : le panneau
+    # de détail (gap #6) et la modale de gestion lisent la même source.
+    return Response(_group_detail_payload(group))
+
+
+@api_view(["GET"])
+@permission_classes([HasCapability("read")])
+def group_audit(request, group_id):
+    """Journal d'audit SERVEUR d'un groupe (création, mise à jour de taux, affectations,
+    décisions d'intégration). Remplace `group_audit_${id}` de `localStorage`, qui vivait
+    dans un seul navigateur. Lecture du journal append-only partagé (`AuditEntry`)."""
+    group = SavingsGroup.objects.filter(pk=group_id).first()
+    if not group:
+        return Response({"detail": "Groupe introuvable."}, status=404)
+    from audit.models import AuditEntry
+
+    entries = AuditEntry.objects.filter(
+        entity_type="SavingsGroup", entity_id=str(group_id),
+    ).order_by("-created_at")[:100]
+    return Response([
+        {"id": e.pk, "action": e.action, "actor": e.actor, "details": e.details,
+         "date": e.created_at.isoformat()}
+        for e in entries
+    ])
 
 
 @api_view(["GET"])

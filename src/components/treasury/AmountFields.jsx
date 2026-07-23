@@ -7,6 +7,9 @@ import {
 } from '@/components/ui/select';
 import { AlertCircle, Smartphone, Landmark } from 'lucide-react';
 import { WALLET_CURRENCIES } from '@/components/treasury/walletOperations';
+import {
+  counterpartyLabel, counterpartyPlaceholder, isExternalMethod,
+} from '@/components/payments/depositContract';
 
 /**
  * Les champs communs au dépôt et au retrait : montant, DEVISE, moyen, coordonnées.
@@ -14,12 +17,21 @@ import { WALLET_CURRENCIES } from '@/components/treasury/walletOperations';
  * La devise est un `Select` et non une valeur implicite. C'est tout l'enjeu :
  * un formulaire qui ne montre pas la devise oblige le code appelant à en choisir
  * une — et le code appelant, lui, choisit toujours la même.
+ *
+ * Le champ « coordonnées » porte la CONTREPARTIE d'un canal externe (numéro
+ * Mobile Money / compte source), que le serveur exige pour un dépôt Makuta. Il
+ * s'affiche donc pour TOUT moyen externe — plus seulement le Mobile Money — et
+ * son libellé s'adapte au moyen choisi, à moins que l'appelant n'en impose un
+ * (le retrait fournit le sien). Sans ce champ pour le virement bancaire, un
+ * dépôt banque partait sans contrepartie et se faisait refuser en 422.
  */
 const AmountFields = ({
   form, onChange, errors, methodLabel, phoneLabel, phonePlaceholder, phoneAlways = false,
 }) => {
   const set = (patch) => onChange({ ...form, ...patch });
-  const showPhone = phoneAlways || form.method === 'mobile_money';
+  const showPhone = phoneAlways || isExternalMethod(form.method);
+  const resolvedPhoneLabel = phoneLabel ?? counterpartyLabel(form.method);
+  const resolvedPhonePlaceholder = phonePlaceholder ?? counterpartyPlaceholder(form.method);
 
   return (
     <>
@@ -76,10 +88,10 @@ const AmountFields = ({
 
       {showPhone && (
         <div className="space-y-2">
-          <Label htmlFor="wallet-phone">{phoneLabel}</Label>
+          <Label htmlFor="wallet-phone">{resolvedPhoneLabel}</Label>
           <Input
             id="wallet-phone"
-            placeholder={phonePlaceholder}
+            placeholder={resolvedPhonePlaceholder}
             value={form.phone}
             onChange={(e) => set({ phone: e.target.value })}
             className={`bg-slate-900/50 ${errors.phone ? 'border-red-500' : ''}`}

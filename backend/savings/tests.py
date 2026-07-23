@@ -4,7 +4,10 @@ from decimal import Decimal
 
 from common.testing import AuthedAPITestCase
 
-from .models import SavingsDeposit, SavingsGroup, SavingsPlan
+from .models import (
+    SavingsAdjustment, SavingsDeposit, SavingsGroup, SavingsGroupMember, SavingsPlan,
+    SavingsRateChange,
+)
 
 
 def _fund_wallet(sub: str, amount: str = "1000", currency: str = "USD"):
@@ -183,3 +186,268 @@ class SavingsTests(AuthedAPITestCase):
                                    {"decision": "approved"}, format="json")
         self.assertEqual(decide.data["status"], "approved")
         self.assertEqual(SavingsGroup.objects.get(pk=group_id).members.count(), 1)
+
+
+class SavingsRateConfigTests(AuthedAPITestCase):
+    """GAP Critique : la config de taux vivait en `localStorage` et le taux mensuel était
+    calculé côté client (`val/12`). Ces tests verrouillent le calcul serveur, la
+    persistance atomique, l'append-only et l'audit."""
+
+    def _client_plan(self, sub: str = "rc-owner") -> int:
+        self.login(role="client", sub=sub)
+        return self.client.post("/api/savings/plans/mine", {"name": "Plan"}, format="json").data["id"]
+
+    def test_rate_config_get_defaults(self):
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        res = self.client.get(f"/api/savings/plans/{plan_id}/rate-config")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["annualRate"], 4.5)
+        self.assertEqual(res.data["monthlyRate"], 0.375)
+        self.assertEqual(res.data["status"], "actif")
+        self.assertEqual(res.data["history"], [])
+
+    def test_rate_update_computes_monthly_server_side(self):
+        """Le taux mensuel n'est PAS lu du corps : il est recalculé (annuel/12)."""
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        # Le client tenterait d'imposer un monthlyRate fantaisiste — il est ignoré.
+        res = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                                {"action": "rate_update", "annualRate": "3.6",
+                                 "monthlyRate": "99"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["annualRate"], 3.6)
+        self.assertEqual(res.data["monthlyRate"], 0.3)
+        plan = SavingsPlan.objects.get(pk=plan_id)
+        self.assertEqual(plan.interest_rate, Decimal("3.600"))
+        self.assertEqual(plan.monthly_rate, Decimal("0.3000"))
+        self.assertEqual(len(res.data["history"]), 1)
+
+    def test_rate_above_max_is_rejected(self):
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                                {"action": "rate_update", "annualRate": "7"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["errors"][0]["code"], "RATE_ABOVE_MAX")
+        self.assertEqual(SavingsRateChange.objects.filter(plan_id=plan_id).count(), 0)
+
+    def test_rate_negative_is_rejected(self):
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                                {"action": "rate_update", "annualRate": "-2"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["errors"][0]["code"], "RATE_NEGATIVE")
+
+    def test_block_zeroes_rate_and_sets_status(self):
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                                {"action": "block"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["annualRate"], 0.0)
+        self.assertEqual(res.data["monthlyRate"], 0.0)
+        self.assertEqual(res.data["status"], "bloque")
+
+    def test_suspend_then_resume_keeps_rate(self):
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                         {"action": "rate_update", "annualRate": "4.8"}, format="json")
+        suspend = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                                    {"action": "suspend"}, format="json")
+        self.assertEqual(suspend.data["status"], "suspendu")
+        self.assertEqual(suspend.data["annualRate"], 4.8)
+        resume = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                                   {"action": "resume"}, format="json")
+        self.assertEqual(resume.data["status"], "actif")
+        self.assertEqual(resume.data["annualRate"], 4.8)
+
+    def test_rate_changes_are_append_only(self):
+        """Chaque changement ajoute une ligne d'historique — jamais d'UPDATE/DELETE (P3)."""
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                         {"action": "rate_update", "annualRate": "3.0"}, format="json")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                               {"action": "rate_update", "annualRate": "5.0"}, format="json")
+        self.assertEqual(SavingsRateChange.objects.filter(plan_id=plan_id).count(), 2)
+        # Historique renvoyé le plus récent d'abord.
+        self.assertEqual(res.data["history"][0]["annualRate"], 5.0)
+        self.assertEqual(res.data["history"][1]["annualRate"], 3.0)
+
+    def test_rate_config_requires_config_capability(self):
+        plan_id = self._client_plan()
+        self.login(role="client", sub="rc-nope")  # pas de capacité config
+        res = self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                               {"action": "rate_update", "annualRate": "3"}, format="json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_rate_change_is_audited(self):
+        from audit.models import AuditEntry
+
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                         {"action": "rate_update", "annualRate": "3.6", "reason": "revue"},
+                         format="json")
+        entry = AuditEntry.objects.filter(action="savings.plan.rate_change",
+                                          entity_id=str(plan_id)).first()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.details["monthlyRate"], "0.3000")
+        self.assertEqual(entry.actor, "dg1")
+
+
+class SavingsAdjustmentTests(AuthedAPITestCase):
+    def _client_plan(self, sub: str = "adj-owner") -> int:
+        self.login(role="client", sub=sub)
+        return self.client.post("/api/savings/plans/mine", {"name": "Plan"}, format="json").data["id"]
+
+    def test_adjustment_persists_and_returns_server_metrics(self):
+        plan_id = self._client_plan()
+        self.login(role="dg", sub="dg1")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/adjustment",
+                               {"targetAmount": "1000", "periodicDeposit": "100",
+                                "frequency": "mensuel", "depositMode": "agent"}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["metrics"]["remaining"], 1000.0)
+        self.assertEqual(res.data["metrics"]["depositsNeeded"], 10)
+        self.assertEqual(len(res.data["metrics"]["projection"]), 10)
+        plan = SavingsPlan.objects.get(pk=plan_id)
+        self.assertEqual(plan.objectif, Decimal("1000.00"))
+        self.assertEqual(plan.periodic_deposit, Decimal("100.00"))
+
+    def test_adjustment_never_touches_balance(self):
+        """Conservation de la monnaie : l'ajustement configure, il ne crédite pas."""
+        plan_id = self._client_plan("adj-bal")
+        SavingsPlan.objects.filter(pk=plan_id).update(balance=Decimal("250"))
+        self.login(role="dg", sub="dg1")
+        self.client.post(f"/api/savings/plans/{plan_id}/adjustment",
+                         {"targetAmount": "5000", "periodicDeposit": "50"}, format="json")
+        self.assertEqual(SavingsPlan.objects.get(pk=plan_id).balance, Decimal("250"))
+
+    def test_adjustment_deposits_needed_null_without_periodic(self):
+        plan_id = self._client_plan("adj-noperiodic")
+        self.login(role="dg", sub="dg1")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/adjustment",
+                               {"targetAmount": "1000", "periodicDeposit": "0"}, format="json")
+        self.assertIsNone(res.data["metrics"]["depositsNeeded"])
+        self.assertEqual(res.data["metrics"]["projection"], [])
+
+    def test_adjustment_rejects_unknown_frequency(self):
+        plan_id = self._client_plan("adj-freq")
+        self.login(role="dg", sub="dg1")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/adjustment",
+                               {"targetAmount": "100", "frequency": "lunaire"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["errors"][0]["code"], "FREQUENCY_UNKNOWN")
+
+    def test_adjustment_is_append_only(self):
+        plan_id = self._client_plan("adj-append")
+        self.login(role="dg", sub="dg1")
+        self.client.post(f"/api/savings/plans/{plan_id}/adjustment",
+                         {"targetAmount": "100", "periodicDeposit": "10"}, format="json")
+        self.client.post(f"/api/savings/plans/{plan_id}/adjustment",
+                         {"targetAmount": "200", "periodicDeposit": "20"}, format="json")
+        self.assertEqual(SavingsAdjustment.objects.filter(plan_id=plan_id).count(), 2)
+
+
+class SavingsGroupAssignTests(AuthedAPITestCase):
+    def _make_group(self, name: str = "AVEC 1") -> int:
+        self.login(role="gest_zone", sub="gz1")  # create + cooperatives
+        return self.client.post("/api/savings/groups", {"name": name}, format="json").data["id"]
+
+    def _ensure_user(self, sub: str):
+        """Fait exister le FintechUser en l'authentifiant une fois."""
+        self.login(role="client", sub=sub)
+        self.client.get("/api/savings/plans/mine")
+
+    def test_assign_creates_membership_and_audit(self):
+        from audit.models import AuditEntry
+
+        group_id = self._make_group()
+        self._ensure_user("member-a")
+        self.login(role="gest_zone", sub="gz1")
+        res = self.client.post("/api/savings/groups/assign",
+                               {"userSub": "member-a", "groupId": group_id}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(SavingsGroupMember.objects.filter(group_id=group_id, user_id="member-a").exists())
+        self.assertTrue(AuditEntry.objects.filter(action="savings.group.assign_member",
+                                                  entity_id=str(group_id)).exists())
+
+    def test_reassign_is_exclusive(self):
+        group_a = self._make_group("A")
+        group_b = self._make_group("B")
+        self._ensure_user("member-x")
+        self.login(role="gest_zone", sub="gz1")
+        self.client.post("/api/savings/groups/assign",
+                         {"userSub": "member-x", "groupId": group_a}, format="json")
+        self.client.post("/api/savings/groups/assign",
+                         {"userSub": "member-x", "groupId": group_b}, format="json")
+        self.assertFalse(SavingsGroupMember.objects.filter(group_id=group_a, user_id="member-x").exists())
+        self.assertTrue(SavingsGroupMember.objects.filter(group_id=group_b, user_id="member-x").exists())
+
+    def test_unassign_removes_membership(self):
+        group_id = self._make_group()
+        self._ensure_user("member-y")
+        self.login(role="gest_zone", sub="gz1")
+        self.client.post("/api/savings/groups/assign",
+                         {"userSub": "member-y", "groupId": group_id}, format="json")
+        res = self.client.post("/api/savings/groups/assign",
+                               {"userSub": "member-y", "groupId": "none"}, format="json")
+        self.assertIsNone(res.data["groupId"])
+        self.assertFalse(SavingsGroupMember.objects.filter(user_id="member-y").exists())
+
+    def test_assign_requires_cooperatives_capability(self):
+        group_id = self._make_group()
+        self._ensure_user("member-z")
+        self.login(role="client", sub="member-z")  # pas de capacité cooperatives
+        res = self.client.post("/api/savings/groups/assign",
+                               {"userSub": "member-z", "groupId": group_id}, format="json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_assign_unknown_user_is_404(self):
+        group_id = self._make_group()
+        self.login(role="gest_zone", sub="gz1")
+        res = self.client.post("/api/savings/groups/assign",
+                               {"userSub": "ghost", "groupId": group_id}, format="json")
+        self.assertEqual(res.status_code, 404)
+
+
+class SavingsGroupDetailTests(AuthedAPITestCase):
+    def test_group_detail_includes_member_history_and_requests(self):
+        self.login(role="gest_zone", sub="gz1")
+        group_id = self.client.post("/api/savings/groups", {"name": "Coop"}, format="json").data["id"]
+        # Un membre affecté + une demande d'intégration en attente.
+        self.login(role="client", sub="m1")
+        self.client.get("/api/savings/plans/mine")
+        self.client.post(f"/api/savings/groups/{group_id}/requests/join", {"reason": "x"}, format="json")
+        self.login(role="gest_zone", sub="gz1")
+        self.client.post("/api/savings/groups/assign",
+                         {"userSub": "m1", "groupId": group_id}, format="json")
+        res = self.client.get(f"/api/savings/groups/{group_id}")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.data["memberHistory"]), 1)
+        self.assertEqual(res.data["memberHistory"][0]["sub"], "m1")
+        self.assertIsNone(res.data["memberHistory"][0]["contribution"])
+        self.assertEqual(len(res.data["requests"]), 1)
+        self.assertFalse(res.data["contributionsTracked"])
+
+    def test_all_plans_includes_holder_sub_and_groups(self):
+        self.login(role="client", sub="holder-1")
+        self.client.post("/api/savings/plans/mine", {"name": "Plan"}, format="json")
+        self.login(role="gest_zone", sub="gz1")
+        group_id = self.client.post("/api/savings/groups", {"name": "G"}, format="json").data["id"]
+        self.client.post("/api/savings/groups/assign",
+                         {"userSub": "holder-1", "groupId": group_id}, format="json")
+        rows = self.client.get("/api/savings/plans").data
+        row = next(r for r in rows if r["holderSub"] == "holder-1")
+        self.assertEqual(row["holderGroups"], ["G"])
+
+    def test_group_audit_returns_entries(self):
+        self.login(role="gest_zone", sub="gz1")
+        group_id = self.client.post("/api/savings/groups", {"name": "GA"}, format="json").data["id"]
+        res = self.client.get(f"/api/savings/groups/{group_id}/audit")
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(any(e["action"] == "savings.group.create" for e in res.data))

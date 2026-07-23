@@ -62,7 +62,15 @@ def chains(request):
 @api_view(["GET"])
 @permission_classes([IsStaff])
 def config(request):
-    """Configuration institution active (seuils/pondérations, §8.1)."""
+    """Configuration institution active (seuils/pondérations, §8.1).
+
+    `decote_garantie` (décote appliquée aux actifs gagés, cf.
+    `assets/services.py::valeur_apres_decote`) est exposée ICI pour que la file de
+    vérification des actifs (agent de terrain) affiche le taux en vigueur —
+    donnée STAFF, protégée par `IsStaff` comme le reste des paramètres du moteur
+    (principe 7 : elle ne transite jamais vers un rôle client). La valeur retenue
+    d'un actif reste calculée serveur ; le taux n'est ici qu'informatif.
+    """
     c = InstitutionConfig.active()
     return Response({
         "seuil_dscr": c.seuil_dscr, "seuil_dscr_stresse": c.seuil_dscr_stresse,
@@ -71,6 +79,7 @@ def config(request):
                   "stress": c.poids_stress, "comportemental": c.poids_comportemental,
                   "garanties": c.poids_garanties},
         "taux_interet_annuel": c.taux_interet_annuel, "plafond_delegue": c.plafond_delegue,
+        "decote_garantie": c.decote_garantie,
         "phase_deploiement": c.phase_deploiement,
     })
 

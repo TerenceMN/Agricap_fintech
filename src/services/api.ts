@@ -342,8 +342,11 @@ export const api = {
   application: (code: string) => request<AnalysisResult>(`/credits/applications/${code}`),
   reportUrl: (code: string, format: 'excel' | 'word') =>
     `/api/credits/applications/${code}/rapport?format=${format}`,
-  justify: (code: string, form: FormData) =>
-    request(`/credits/applications/${code}/justifications`, { method: 'POST', body: form, isForm: true }),
+  // NB : le canal de justification d'un indicateur hors plage est `credits.justifyIndicator`
+  // (`POST .../analyse/justifier/`). L'ancien wrapper `justify` visait une route
+  // `.../justifications` qui n'a jamais existé côté serveur (cf. credits/urls.py) et
+  // n'était appelé nulle part — supprimé pour ne pas laisser deux chemins pour un
+  // même concept (principe 6).
 
   // ── Module Crédits Agricoles complet (Étapes 1-7) ────────────────────────
   credits: {
@@ -600,7 +603,22 @@ export const api = {
     request<{ version: string | null; ranges: ReferenceRange[] }>(
       `/referentiel/ranges${chain ? `?chain=${chain}` : ''}`),
   chains: () => request<Array<{ code: string; libelle: string; specialite: string }>>('/referentiel/chains'),
-  config: () => request<Record<string, unknown>>('/referentiel/config'),
+  /** Configuration institution active (§8.1) — DONNÉE STAFF, `IsStaff` côté serveur
+   *  (403 pour tout rôle client, cf. principe 7). Porte `decote_garantie`, la
+   *  décote appliquée aux actifs gagés : elle informe l'écran de vérification du
+   *  taux en vigueur, mais la valeur retenue reste calculée serveur (jamais ici). */
+  config: () => request<{
+    seuil_dscr: number; seuil_dscr_stresse: number;
+    couverture_min: number; score_global_min: number;
+    poids: {
+      technique: number; financier: number;
+      stress: number; comportemental: number; garanties: number;
+    };
+    taux_interet_annuel: number; plafond_delegue: number;
+    /** Décote de garantie sur actif gagé, fraction 0..1 (0,30 = 30 %). */
+    decote_garantie: number;
+    phase_deploiement: string;
+  }>('/referentiel/config'),
   /** Historique des versions du référentiel — sans écran jusqu'ici, alors que
    *  c'est ce qui permet de savoir SOUS QUELLE version un dossier a été scoré. */
   referentielVersions: () => request<unknown>('/referentiel/versions'),
@@ -1010,9 +1028,33 @@ export const api = {
       // `kind: "payment_order"` (dépôt externe confié à Makuta, encore en
       // attente). Le site d'appel ne décide pas « effectué » lui-même : il passe
       // la réponse à `classifyDepositOutcome`.
-      deposit: (amount: number, currency = 'USD', channel = 'agent') =>
+      //
+      // Signature en OBJET (et non plus positionnelle) depuis que `counterparty`
+      // est entré dans le contrat : le serveur (`caisses/views.py::my_deposit`)
+      // exige une contrepartie (numéro Mobile Money / compte) pour tout canal
+      // EXTERNE (`mobile_money`, `bank`) et la refuse en 422 `counterparty_required`
+      // sinon ; un canal interne (`agent`, ou vide) n'en a pas besoin. Le wrapper
+      // se contente de la transmettre — la règle « obligatoire si externe » est
+      // arbitrée serveur, jamais devinée ici. `currency` est requise (aucune
+      // valeur par défaut : elle doit venir de la saisie confirmée, cf. le
+      // garde-fou `noHardcodedCurrency`), `channel` retombe sur `agent` (interne),
+      // `idempotencyKey` est généré si l'appelant ne fournit pas le sien.
+      deposit: (params: {
+        amount: number;
+        currency: string;
+        channel?: string;
+        counterparty?: string;
+        idempotencyKey?: string;
+      }) =>
         request<WalletDepositResult>('/caisses/wallets/mine/deposit', {
-          method: 'POST', body: { amount, currency, channel, idempotencyKey: crypto.randomUUID() },
+          method: 'POST',
+          body: {
+            amount: params.amount,
+            currency: params.currency,
+            channel: params.channel ?? 'agent',
+            counterparty: params.counterparty ?? '',
+            idempotencyKey: params.idempotencyKey ?? crypto.randomUUID(),
+          },
         }),
       withdraw: (amount: number, currency = 'USD') =>
         request<WithdrawalRequestRow>('/caisses/wallets/mine/withdraw', {

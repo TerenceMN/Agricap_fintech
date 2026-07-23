@@ -13,10 +13,13 @@
  * (`InstitutionConfig.decote_garantie` — cf. `assets/services.py::valeur_apres_decote`).
  * L'agent constate, il ne négocie pas la décote, et le front n'en simule jamais
  * le résultat : la valeur retenue n'est affichée qu'APRÈS retour du serveur.
- * Le taux de décote n'est exposé par aucun endpoint (`GET /api/referentiel/config`
- * sert les seuils et pondérations, pas `decote_garantie`) — la décote montrée
- * après enregistrement est donc l'écart CONSTATÉ entre les deux montants du
- * serveur, jamais un taux recopié côté écran. Cf. `RetainedValueBreakdown`.
+ * Le taux de décote EN VIGUEUR est désormais servi par `GET /api/referentiel/config`
+ * (champ `decote_garantie`, réservé au staff), et affiché ici À TITRE INFORMATIF
+ * pour que l'agent sache l'abattement à attendre — mais l'écran ne l'applique
+ * jamais lui-même : la valeur retenue reste calculée serveur, et la décote
+ * montrée dans le récapitulatif après enregistrement demeure l'écart CONSTATÉ
+ * entre les deux montants du serveur, pas un produit du taux côté écran.
+ * Cf. `RetainedValueBreakdown`.
  *
  * L'écran instruit sur pièces : `image` et `documents` (JSONField libre) sont
  * consultables ligne à ligne via `AssetEvidence`, et l'absence de pièce est
@@ -344,6 +347,12 @@ const AssetVerification: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [forbidden, setForbidden] = useState(false);
   const [errors, setErrors] = useState<FieldError[]>([]);
+  // Taux de décote EN VIGUEUR (`InstitutionConfig.decote_garantie`), servi par
+  // `GET /api/referentiel/config` (donnée staff). Purement informatif : il dit à
+  // l'agent l'abattement à attendre, mais l'écran n'applique jamais ce taux —
+  // la valeur retenue reste calculée serveur. `null` tant qu'il n'est pas connu
+  // (ou si l'appel échoue) : l'écran reste fonctionnel sans lui.
+  const [decoteRate, setDecoteRate] = useState<number | null>(null);
 
   const [openId, setOpenId] = useState<number | null>(null);
   const [mode, setMode] = useState<'verify' | 'reject'>('verify');
@@ -376,6 +385,24 @@ const AssetVerification: React.FC = () => {
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+
+  // Taux de décote en vigueur — chargé une fois. Échec silencieux : c'est un
+  // confort d'affichage, pas un préalable à instruire (la valeur retenue vient
+  // du serveur de toute façon).
+  useEffect(() => {
+    let vivant = true;
+    void (async () => {
+      try {
+        const cfg = await api.config();
+        if (vivant && typeof cfg.decote_garantie === 'number') {
+          setDecoteRate(cfg.decote_garantie);
+        }
+      } catch {
+        /* config indisponible : on n'affiche simplement pas le taux */
+      }
+    })();
+    return () => { vivant = false; };
+  }, []);
 
   const openPanel = (asset: AssetRow, next: 'verify' | 'reject') => {
     setOpenId(asset.id);
@@ -536,6 +563,14 @@ const AssetVerification: React.FC = () => {
           serveur l'a calculée, avec l'abattement qu'elle a subi. C'est elle, et elle seule,
           qui couvrira un crédit.
         </p>
+        {decoteRate != null && (
+          <p className="mt-2 text-blue-100/90">
+            Décote institutionnelle en vigueur :{' '}
+            <strong>{(decoteRate * 100).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} %</strong>.
+            Chiffre indicatif servi par la configuration institution — le serveur l'applique à
+            la valeur constatée ; cet écran ne calcule pas la valeur retenue.
+          </p>
+        )}
       </div>
 
       {forbidden ? (

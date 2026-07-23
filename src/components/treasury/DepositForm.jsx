@@ -9,6 +9,9 @@ import {
   EMPTY_AMOUNT_FORM, validateDeposit, walletOperationErrors,
 } from '@/components/treasury/walletOperations';
 import { classifyDepositOutcome } from '@/components/treasury/depositOutcome';
+import {
+  buildDepositArgs, counterpartyErrors, isCounterpartyRequired,
+} from '@/components/payments/depositContract';
 
 /**
  * LE formulaire de dépôt — un seul, pour toutes les surfaces qui en proposent un.
@@ -45,7 +48,11 @@ const DepositForm = ({ onCompleted = () => {}, submitLabel = 'Initier le Dépôt
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    const found = validateDeposit(form);
+    // Deux contrôles complémentaires : les règles de saisie génériques
+    // (`validateDeposit`) ET l'exigence de contrepartie d'un canal externe
+    // (`counterpartyErrors`). `validateDeposit` passe en dernier pour que son
+    // « Numéro requis » précis l'emporte sur le message générique en Mobile Money.
+    const found = { ...counterpartyErrors({ method: form.method, counterparty: form.phone }), ...validateDeposit(form) };
     setErrors(found);
     if (Object.keys(found).length > 0) return;
     setServerErrors([]);
@@ -62,7 +69,13 @@ const DepositForm = ({ onCompleted = () => {}, submitLabel = 'Initier le Dépôt
     setSubmitting(true);
     try {
       // La devise vient de la saisie confirmée, jamais d'une constante d'appel.
-      const result = await api.caisses.wallets.deposit(pending.amount, pending.currency, form.method);
+      // Le canal externe est traduit (`bank_transfer` → `bank`) et la
+      // contrepartie jointe : sans quoi le serveur refuse en 422
+      // (`unknown_channel` / `counterparty_required`).
+      const result = await api.caisses.wallets.deposit(buildDepositArgs({
+        amount: pending.amount, currency: pending.currency,
+        method: form.method, counterparty: form.phone,
+      }));
       // La réponse est DISCRIMINÉE : mouvement réglé vs ordre de paiement en
       // attente. Seul `classifyDepositOutcome` tranche « effectué vs en attente ».
       const verdict = classifyDepositOutcome(result);
@@ -82,6 +95,14 @@ const DepositForm = ({ onCompleted = () => {}, submitLabel = 'Initier le Dépôt
       // pendant qu'il lit les causes du refus.
       const causes = walletOperationErrors(err);
       setServerErrors(causes);
+      // 422 de contrat : si le serveur réclame la contrepartie, on rallume le
+      // champ concerné pour que la correction soit évidente, en plus du message.
+      if (isCounterpartyRequired(err)) {
+        setErrors((prev) => ({
+          ...prev,
+          phone: 'Contrepartie requise par le fournisseur (numéro Mobile Money / compte source).',
+        }));
+      }
       toast({
         variant: 'destructive',
         title: 'Échec',
@@ -95,13 +116,13 @@ const DepositForm = ({ onCompleted = () => {}, submitLabel = 'Initier le Dépôt
   return (
     <>
       <form onSubmit={handleSubmit} className="space-y-4">
+        {/* Ni `phoneLabel` ni `phonePlaceholder` : le champ contrepartie s'étiquette
+            selon le moyen choisi (numéro Mobile Money vs compte source). */}
         <AmountFields
           form={form}
           onChange={setForm}
           errors={errors}
           methodLabel="Méthode de Paiement"
-          phoneLabel="Numéro de téléphone"
-          phonePlaceholder="+243..."
         />
         <Button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-700 mt-4">
           {submitLabel}

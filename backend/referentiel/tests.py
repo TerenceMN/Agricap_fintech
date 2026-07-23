@@ -60,3 +60,27 @@ class AntiGamingReferentielTests(AuthedAPITestCase):
         futur parcours client légitime (choisir sa filière)."""
         self.login(role="client", sub="demandeur-2")
         self.assertEqual(self.client.get("/api/referentiel/chains").status_code, 200)
+
+
+class ConfigDecoteExpositionTests(AuthedAPITestCase):
+    """`config` expose la décote de garantie au PERSONNEL (file de vérification
+    des actifs), et à lui seul."""
+
+    def test_le_personnel_lit_la_decote_de_garantie(self):
+        """La file de vérification (agent terrain) a besoin du taux de décote en
+        vigueur pour l'afficher ; le serveur le sert dans `config` sous la garde
+        `IsStaff`."""
+        from referentiel.models import InstitutionConfig
+
+        InstitutionConfig.objects.create(is_active=True, decote_garantie=0.35)
+        self.login(role="admin", sub="staff-decote")
+        res = self.client.get("/api/referentiel/config")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("decote_garantie", res.data)
+        self.assertAlmostEqual(res.data["decote_garantie"], 0.35)
+
+    def test_le_client_ne_lit_pas_la_decote(self):
+        """Le taux de décote est un paramètre du moteur : un demandeur ne l'atteint
+        pas (l'endpoint entier est refusé en 403, principe 7)."""
+        self.login(role="client", sub="demandeur-decote")
+        self.assertEqual(self.client.get("/api/referentiel/config").status_code, 403)
