@@ -7,7 +7,7 @@ import {
   UserCog, ShieldAlert, ClipboardCheck, Landmark, BookOpen, UserCheck2,
   ShieldCheck, History, Share2, Eye, Code2, UserX as UserSwitch, MessageSquare,
   FileCheck2, Folder, Package, PieChart, Briefcase, Banknote, ArrowRightLeft,
-  Store, Network, LineChart, CheckSquare2,
+  Store, Network, LineChart, CheckSquare2, Ruler, Coins,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
@@ -107,11 +107,17 @@ const allMenuItems = {
     { icon: ClipboardCheck, label: 'Vérification des actifs', path: '/credit/actifs' },
     { icon: Landmark, label: 'Corbeille du comité', path: '/credit/comite' },
     { icon: Package, label: 'Données de référence', path: '/credit/reference' },
+    // Barèmes chiffrés du moteur (plages, seuils, poids — P7). Écran de PERSONNEL :
+    // il ne figure que dans les menus de staff, jamais côté client/investisseur.
+    { icon: Ruler, label: 'Référentiel technico-éco', path: '/credit/referentiel' },
     { section: 'Institution' },
     { icon: Landmark, label: 'Trésorerie', path: '/treasury' },
     { icon: BookOpen, label: 'Comptabilité', path: '/accounting' },
     { section: 'Contrôle' },
     { icon: CheckSquare2, label: 'Approbations Caisse', path: '/caisses/approbations' },
+    // Back-office des ordres de paiement Makuta (réconciliation, suivi de caisse).
+    // Réservé au staff porteur de validate/audit ; le serveur re-vérifie (403).
+    { icon: Coins, label: 'Ordres de paiement', path: '/caisses/paiements' },
     { icon: ClipboardCheck, label: 'Validation', path: '/validation-journal' },
     { icon: ShieldAlert, label: 'Cas Spéciaux', path: '/special-cases' },
     { icon: ShieldCheck, label: 'Conformité', path: '/compliance' },
@@ -145,6 +151,9 @@ const allMenuItems = {
     { icon: Store, label: 'Mon Agence', path: '/agencies' },
     { icon: Landmark, label: 'Trésorerie', path: '/treasury' },
     { icon: Repeat, label: 'Transactions', path: '/transactions' },
+    // Face caisse du circuit Makuta : réconcilier et trancher les ordres dont
+    // l'issue est inconnue. Le serveur restreint l'action à la capacité validate.
+    { icon: Coins, label: 'Ordres de paiement', path: '/caisses/paiements' },
     { icon: Eye, label: 'Supervision', path: '/supervision' },
   ],
   auditeur: [
@@ -152,6 +161,9 @@ const allMenuItems = {
     { icon: Store, label: 'Réseau Agences', path: '/agencies' },
     { icon: ShieldCheck, label: 'Conformité', path: '/compliance' },
     { icon: History, label: 'Journal d\'Audit', path: '/audit-log' },
+    // Lecture d'audit sur les ordres de paiement (capacité audit). L'écran s'ouvre
+    // en supervision ; les actions monétaires restent réservées à validate (serveur).
+    { icon: Coins, label: 'Ordres de paiement', path: '/caisses/paiements' },
     // Le journal append-only du module crédit — c'est LITTÉRALEMENT l'écran de
     // l'auditeur (§7.1 point 8) : filtres par dossier/acteur/étape/période et
     // export CSV complet. L'omettre du rôle auditeur aurait été l'ironie du lot.

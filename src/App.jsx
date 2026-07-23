@@ -22,6 +22,7 @@ import AuditJournal from '@/pages/credit/AuditJournal';
 import Guarantees from '@/pages/credit/Guarantees';
 import ReferenceData from '@/pages/credit/ReferenceData';
 import CreditDashboard from '@/pages/credit/Dashboard';
+import Referentiel from '@/pages/Referentiel';
 import DataAdmin from '@/pages/admin/DataAdmin';
 
 // Client Specific Pages
@@ -69,6 +70,7 @@ import AdminConsole from '@/pages/AdminConsole';
 import ApproversConfig from '@/pages/ApproversConfig';
 import SmsTest from '@/pages/SmsTest';
 import CaisseApprobations from '@/pages/CaisseApprobations';
+import PaymentsBackOffice from '@/pages/PaymentsBackOffice';
 
 const PrivateRoute = ({ children, roles }) => {
   const { isAuthenticated, loading, user } = useAuth();
@@ -112,6 +114,15 @@ const AppRoutes = () => {
       <Route path="/credit/journal" element={<PrivateRoute><Layout><AuditJournal /></Layout></PrivateRoute>} />
       <Route path="/credit/garanties" element={<PrivateRoute><Layout><Guarantees /></Layout></PrivateRoute>} />
       <Route path="/credit/reference" element={<PrivateRoute><Layout><ReferenceData /></Layout></PrivateRoute>} />
+      {/* Référentiel technico-économique (barèmes, plages, seuils, poids — P7).
+          Comme les autres écrans backoffice ci-dessus, volontairement SANS prop
+          `roles` : la page elle-même n'ouvre qu'à `me.is_staff` (calculé par le
+          serveur) et chaque endpoint `ranges/config/versions` est `IsStaff` (403).
+          Un garde `roles` côté route reposerait sur `menuKeyFor`, qui écrase les
+          16 rôles canoniques en 5 clés de menu et fermerait la page à des rôles
+          internes qui y ont droit. La restriction « staff, jamais client » est
+          portée par la nav (entrée présente dans les seuls menus de personnel). */}
+      <Route path="/credit/referentiel" element={<PrivateRoute><Layout><Referentiel /></Layout></PrivateRoute>} />
       <Route path="/credit/tableau-de-bord" element={<PrivateRoute><Layout><CreditDashboard /></Layout></PrivateRoute>} />
       <Route path="/admin/data" element={<PrivateRoute roles={['admin']}><Layout><DataAdmin /></Layout></PrivateRoute>} />
       
@@ -185,6 +196,13 @@ const AppRoutes = () => {
       <Route path="/admin/approvers" element={<PrivateRoute roles={['admin']}><Layout><ApproversConfig /></Layout></PrivateRoute>} />
       <Route path="/admin/sms-test" element={<PrivateRoute roles={['admin']}><Layout><SmsTest /></Layout></PrivateRoute>} />
       <Route path="/caisses/approbations" element={<PrivateRoute roles={['admin']}><Layout><CaisseApprobations /></Layout></PrivateRoute>} />
+      {/* Back-office des ordres de paiement Makuta (file de réconciliation,
+          suivi, actions de caisse). Volontairement SANS prop `roles` : l'écran
+          exige la capacité `validate`/`audit`/`config`, notion de CAPACITÉ que
+          `menuKeyFor` (5 clés de menu) ne sait pas exprimer. Le serveur tranche
+          (403 sur `GET /caisses/payments`) et la page restitue ce refus tel quel ;
+          la restriction « staff, jamais client » est portée par la nav. */}
+      <Route path="/caisses/paiements" element={<PrivateRoute><Layout><PaymentsBackOffice /></Layout></PrivateRoute>} />
       
       <Route path="*" element={<Navigate to="/" />} />
     </Routes>
