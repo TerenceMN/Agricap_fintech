@@ -13,7 +13,7 @@ import { api } from '@/services/api';
 const AUCUNE = { read: false, create: false, validate: false, config: false };
 
 export function useAccountingAccess() {
-  const [state, setState] = useState({ loading: true, isStaff: false, can: AUCUNE, error: null });
+  const [state, setState] = useState({ loading: true, isStaff: false, can: AUCUNE, sub: '', error: null });
 
   useEffect(() => {
     let vivant = true;
@@ -24,6 +24,11 @@ export function useAccountingAccess() {
         setState({
           loading: false,
           isStaff: Boolean(me?.is_staff),
+          // Le `sub` de l'utilisateur courant : indispensable au garde maker ≠ checker côté
+          // affichage (on ne montre pas « Valider » au saisisseur d'une pièce). Le serveur
+          // reste seul juge (`services.valider_piece` refuse `par == cree_par`), mais un
+          // bouton mort qui échouera de toute façon n'a rien à faire à l'écran.
+          sub: me?.sub || '',
           can: {
             read: Boolean(caps.read),
             create: Boolean(caps.create),
@@ -35,7 +40,7 @@ export function useAccountingAccess() {
       })
       .catch((error) => {
         if (!vivant) return;
-        setState({ loading: false, isStaff: false, can: AUCUNE, error });
+        setState({ loading: false, isStaff: false, can: AUCUNE, sub: '', error });
       });
     return () => { vivant = false; };
   }, []);

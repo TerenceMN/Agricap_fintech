@@ -6,50 +6,27 @@ import { ChevronDown, ChevronRight, Users, UserPlus, FolderOpen } from 'lucide-r
 import { motion, AnimatePresence } from 'framer-motion';
 import SavingsObjectiveRow from './SavingsObjectiveRow';
 import AssignGroupModal from './AssignGroupModal';
-import { useToast } from "@/components/ui/use-toast";
 
 const SavingsRow = ({ holderName, objectives, onAction }) => {
-    const { toast } = useToast();
     const [isExpanded, setIsExpanded] = useState(false);
     const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
-    const [groupName, setGroupName] = useState(null);
+
+    // L'affectation de groupe et le `sub` du titulaire viennent du serveur
+    // (`GET /savings/plans`, champs `holderGroups`/`holderSub`) — plus de
+    // référentiel de groupes fantôme en `localStorage` (§5). L'affectation
+    // d'épargne est exclusive : au plus un groupe, donc on affiche le premier.
+    const holderSub = objectives[0]?.holderSub;
+    const serverGroup = objectives[0]?.holderGroups?.[0] || null;
+    // État local d'affichage : reflète immédiatement une (dé)affectation confirmée
+    // par le serveur, puis se resynchronise sur les données servies au rechargement.
+    const [groupName, setGroupName] = useState(serverGroup);
+    useEffect(() => { setGroupName(serverGroup); }, [serverGroup]);
 
     // Calculate Aggregates
     const totalBalance = objectives.reduce((sum, obj) => sum + (obj.balance || 0), 0);
     const avgRate = objectives.length > 0 ? (objectives.reduce((sum, obj) => sum + (obj.rate || 0), 0) / objectives.length).toFixed(1) : 0;
     const activeCount = objectives.filter(o => o.status === 'Actif').length;
     const currency = objectives[0]?.currency || 'USD';
-
-    useEffect(() => {
-        // Check group assignment from localStorage
-        const groups = JSON.parse(localStorage.getItem('admin_savings_groups') || '[]');
-        const foundGroup = groups.find(g => g.members && g.members.includes(holderName));
-        if (foundGroup) setGroupName(foundGroup.name);
-        else setGroupName(null);
-    }, [holderName, isAssignModalOpen]);
-
-    const handleAssignGroup = (holder, group) => {
-        const groups = JSON.parse(localStorage.getItem('admin_savings_groups') || '[]');
-        let updatedGroups = groups.map(g => ({
-            ...g,
-            members: g.members.filter(m => m !== holder) // Remove from all first
-        }));
-
-        if (group && group.id !== 'none') {
-            const targetGroup = updatedGroups.find(g => g.id === group.id);
-            if (targetGroup) {
-                targetGroup.members.push(holder);
-                // Audit
-                const auditEntry = { date: new Date().toISOString(), action: 'Assignation', details: `Membre ${holder} assigné` };
-                const oldAudit = JSON.parse(localStorage.getItem(`group_audit_${targetGroup.id}`) || '[]');
-                localStorage.setItem(`group_audit_${targetGroup.id}`, JSON.stringify([auditEntry, ...oldAudit]));
-            }
-        }
-        
-        localStorage.setItem('admin_savings_groups', JSON.stringify(updatedGroups));
-        setGroupName(group && group.id !== 'none' ? group.name : null);
-        toast({ title: "Assignation mise à jour", description: `${holder} a été mis à jour.` });
-    };
 
     return (
         <>
@@ -123,12 +100,13 @@ const SavingsRow = ({ holderName, objectives, onAction }) => {
                 )}
             </AnimatePresence>
 
-            <AssignGroupModal 
-                isOpen={isAssignModalOpen} 
-                onOpenChange={setIsAssignModalOpen} 
+            <AssignGroupModal
+                isOpen={isAssignModalOpen}
+                onOpenChange={setIsAssignModalOpen}
                 holderName={holderName}
-                currentGroup={groupName}
-                onAssign={handleAssignGroup}
+                holderSub={holderSub}
+                currentGroupName={groupName}
+                onAssigned={setGroupName}
             />
         </>
     );

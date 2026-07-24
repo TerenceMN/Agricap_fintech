@@ -278,3 +278,101 @@ export function frequencyLabel(freq: string): string {
   };
   return map[freq] ?? freq;
 }
+
+/**
+ * Canaux de dépôt canoniques (miroir de `SavingsPlan.Channel` côté serveur). Le
+ * mode d'ajustement DOIT être l'un d'eux : l'ancienne modale proposait
+ * `virement`/`especes`/… que le serveur refuse en `MODE_UNKNOWN` (principe 6 —
+ * une seule nomenclature par concept). Le front mappe pour l'affichage, mais
+ * n'envoie que ces codes.
+ */
+export const DEPOSIT_MODES: readonly { id: string; label: string }[] = [
+  { id: 'agent', label: 'Agent Agricap' },
+  { id: 'mobile_money', label: 'Mobile Money' },
+  { id: 'bank', label: 'Banque' },
+  { id: 'wallet', label: 'Portefeuille' },
+] as const;
+
+/** Libellé fr d'un mode de dépôt. Un code inconnu se montre tel quel. */
+export function depositModeLabel(mode: string): string {
+  return DEPOSIT_MODES.find((m) => m.id === mode)?.label ?? mode;
+}
+
+/** Libellé fr d'une action de taux. Code inconnu montré tel quel — jamais deviné. */
+export function rateActionLabel(action: string): string {
+  return RATE_ACTION_LABELS[action as SavingsRateAction] ?? action;
+}
+
+/**
+ * Restitution lisible d'une ligne d'HISTORIQUE de taux servie par le serveur.
+ * Ne calcule rien : les taux (annuel ET mensuel) viennent du serveur, on ne fait
+ * que les mettre en forme. Le mensuel garde 4 décimales (c'est `annuel / 12`,
+ * arrondi serveur), les autres 3.
+ */
+export function describeRateChange(row: RateChangeRow): { actionLabel: string; detail: string } {
+  const parts = [
+    `Taux annuel ${formatPct(row.annualRate)}`,
+    `mensuel ${formatPct(row.monthlyRate, 4)}`,
+    `statut ${rateStatusLabel(row.status)}`,
+  ];
+  if (row.reason) parts.push(`motif : ${row.reason}`);
+  return { actionLabel: rateActionLabel(row.action), detail: parts.join(' · ') };
+}
+
+/**
+ * Nombre de dépôts nécessaires, tel qu'affiché. `null` = non calculable (aucun
+ * versement périodique) : on le DIT, on ne rend jamais « ∞ » comme un nombre —
+ * c'était le défaut de l'ancienne modale (§4.6). Le nombre lui-même vient du
+ * serveur, on ne le recalcule pas.
+ */
+export function depositsNeededLabel(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 'Non calculable (aucun versement périodique)';
+  }
+  return `${value}`;
+}
+
+/** Libellés fr des actions du journal d'audit d'un groupe (codes serveur). */
+export const GROUP_AUDIT_LABELS: Record<string, string> = {
+  'savings.group.create': 'Création du groupe',
+  'savings.group.update': 'Mise à jour des paramètres',
+  'savings.group.assign_member': 'Affectation de membre',
+  'savings.group.integration_decision': "Décision d'adhésion",
+};
+
+/** Libellé fr d'une action d'audit de groupe. Code inconnu montré tel quel. */
+export function groupAuditLabel(action: string): string {
+  return GROUP_AUDIT_LABELS[action] ?? action;
+}
+
+/**
+ * Résumé lisible du `details` d'une entrée d'audit de groupe servie par le
+ * serveur. Ciblé sur les clés connues ; renvoie une chaîne vide plutôt que
+ * d'exposer un dictionnaire brut ou d'inventer du sens sur une action inconnue.
+ */
+export function summarizeGroupAudit(entry: GroupAuditRow): string {
+  const d = (entry.details ?? {}) as Record<string, unknown>;
+  switch (entry.action) {
+    case 'savings.group.assign_member': {
+      const name = d.groupName ? String(d.groupName) : null;
+      const who = d.userSub ? String(d.userSub) : 'Un membre';
+      return name ? `${who} affecté au groupe « ${name} »` : `${who} retiré de son groupe`;
+    }
+    case 'savings.group.update': {
+      const bits: string[] = [];
+      if (d.rate !== undefined && d.rate !== null && `${d.rate}` !== '') {
+        bits.push(`taux ${d.rate} %`);
+      }
+      if (d.frequency) bits.push(`fréquence ${frequencyLabel(String(d.frequency))}`);
+      return bits.join(', ');
+    }
+    case 'savings.group.integration_decision': {
+      const decision = String(d.decision ?? '');
+      if (decision === 'approved') return 'Demande approuvée';
+      if (decision === 'rejected') return 'Demande rejetée';
+      return decision;
+    }
+    default:
+      return '';
+  }
+}

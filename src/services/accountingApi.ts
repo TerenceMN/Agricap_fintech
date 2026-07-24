@@ -778,6 +778,32 @@ export function pieceEquilibree(totaux: TotalPieceParDevise[] | undefined): bool
   return totaux.every((t) => t.equilibre);
 }
 
+/** Le saisisseur d'une pièce ne peut PAS être son valideur (maker ≠ checker). Cette fonction
+ *  DÉCIDE de l'affichage du bouton « Valider » ; le serveur reste seul juge
+ *  (`services.valider_piece` refuse `par == cree_par`), mais un bouton qui échouera à coup sûr
+ *  ne doit pas s'afficher. Conditions cumulées : capacité `validate`, pièce en BROUILLON, et
+ *  l'utilisateur courant ≠ l'auteur. Un `sub` courant inconnu ⇒ on masque (défaut fermé). */
+export function peutValider(
+  piece: Pick<Piece, 'statut' | 'creePar'> | null | undefined,
+  subCourant: string,
+  peutValiderCap: boolean,
+): boolean {
+  if (!piece || !peutValiderCap) return false;
+  if (piece.statut !== 'BROUILLON') return false;
+  if (!subCourant) return false;
+  return piece.creePar !== subCourant;
+}
+
+/** La contrepassation n'a de sens que sur une pièce VALIDÉE (on ne contrepasse pas un
+ *  brouillon : on le corrige ou on l'abandonne). Exige la capacité `validate`. */
+export function peutContrepasser(
+  piece: Pick<Piece, 'statut'> | null | undefined,
+  peutValiderCap: boolean,
+): boolean {
+  if (!piece || !peutValiderCap) return false;
+  return piece.statut === 'VALIDEE';
+}
+
 /** Déplie une `ApiError` en liste de `{code, message}` pour l'affichage — un 422 multi-erreurs
  *  restitue chaque refus ; sinon on retombe sur le message principal. */
 export function deplierErreur(err: unknown): Array<{ code: string; message: string }> {

@@ -9,7 +9,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
-import { Users, Save, CheckCircle, XCircle, ShieldCheck, History } from 'lucide-react';
+import { Users, Save, CheckCircle, XCircle, History } from 'lucide-react';
+import { savingsAdminApi, groupAuditLabel, summarizeGroupAudit } from '@/services/savingsApi';
 
 const GroupManagementModal = ({ isOpen, onOpenChange, group, onSave, requests = [], onHandleRequest }) => {
     const { toast } = useToast();
@@ -35,9 +36,14 @@ const GroupManagementModal = ({ isOpen, onOpenChange, group, onSave, requests = 
                 depositMode: group.depositMode || 'virement',
                 adminUser: group.adminUser || 'Admin'
             });
-            // Load specific audit for this group from localStorage
-            const savedAudit = localStorage.getItem(`group_audit_${group.id}`);
-            if (savedAudit) setAudit(JSON.parse(savedAudit));
+            // Journal d'audit du groupe servi par le serveur (append-only partagé),
+            // et non plus `group_audit_<id>` de `localStorage`, falsifiable et local
+            // à un seul navigateur (§5).
+            if (isOpen) {
+                savingsAdminApi.groups.audit(group.id)
+                    .then(setAudit)
+                    .catch(() => setAudit([]));
+            }
         } else {
             setFormData({
                 name: '',
@@ -188,13 +194,19 @@ const GroupManagementModal = ({ isOpen, onOpenChange, group, onSave, requests = 
 
                         {audit.length > 0 && (
                              <div className="space-y-2">
-                                <h4 className="font-semibold text-slate-400 flex items-center gap-2"><History className="w-4 h-4"/> Historique Audit</h4>
+                                <h4 className="font-semibold text-slate-400 flex items-center gap-2"><History className="w-4 h-4"/> Journal d'audit (serveur)</h4>
                                 <div className="max-h-[150px] overflow-y-auto border border-slate-700 rounded-lg p-2 bg-slate-900/30 text-xs space-y-1">
-                                    {audit.map((entry, i) => (
-                                        <div key={i} className="text-slate-400 border-b border-slate-800 pb-1 last:border-0">
-                                            <span className="text-slate-500">[{new Date(entry.date).toLocaleDateString()}]</span> {entry.action} - {entry.details}
-                                        </div>
-                                    ))}
+                                    {audit.map((entry) => {
+                                        const summary = summarizeGroupAudit(entry);
+                                        return (
+                                            <div key={entry.id} className="text-slate-400 border-b border-slate-800 pb-1 last:border-0">
+                                                <span className="text-slate-500">[{new Date(entry.date).toLocaleDateString('fr-FR')}]</span>{' '}
+                                                <span className="text-slate-200">{groupAuditLabel(entry.action)}</span>
+                                                {summary && <span> — {summary}</span>}
+                                                {entry.actor && <span className="text-slate-600"> (par {entry.actor})</span>}
+                                            </div>
+                                        );
+                                    })}
                                 </div>
                             </div>
                         )}
