@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import Mock, patch
 
 import requests
@@ -1558,3 +1559,578 @@ class ExternalWithdrawalDispatchTests(PaymentOrderMixin, AuthedAPITestCase):
         wallet.refresh_from_db()
         self.assertEqual(wallet.balance, Decimal("10000.00"))  # débit rendu
         self.assertEqual(wallet.movements.count(), 2)  # WITHDRAW + REVERSAL
+
+
+# ═══════════════════════════════════════ CAS LIMITES DE CRÉATION D'UN ORDRE
+#
+# Un ordre de paiement mal formé qui atteint la base est une dette de réconciliation : il
+# faudra un humain pour décider de son sort. Tout ce qui peut être refusé AVANT écriture doit
+# l'être avant écriture — d'où cette série, qui vérifie systématiquement les deux faces :
+# l'exception est levée ET rien n'a été écrit (ni ordre, ni mouvement, ni solde touché).
+
+@override_settings(MAKUTA=makuta_test_settings())
+class PaymentOrderEdgeCaseTests(PaymentOrderMixin, AuthedAPITestCase):
+    def _nothing_was_written(self, wallet, balance="0.00"):
+        from .models import PaymentOrder
+        wallet.refresh_from_db()
+        self.assertEqual(PaymentOrder.objects.filter(wallet=wallet).count(), 0)
+        self.assertEqual(wallet.movements.count(), 0)
+        self.assertEqual(wallet.balance, Decimal(balance))
+
+    def test_zero_amount_is_refused(self):
+        wallet = self._wallet("edge-1")
+        with self.assertRaises(ValidationFailed):
+            self._order(wallet, amount="0", key="edge-1")
+        self._nothing_was_written(wallet)
+
+    def test_negative_amount_is_refused(self):
+        """Un montant négatif sur un encaissement serait un débit déguisé."""
+        wallet = self._wallet("edge-2", balance="500")
+        with self.assertRaises(ValidationFailed):
+            self._order(wallet, amount="-50", key="edge-2")
+        self._nothing_was_written(wallet, balance="500.00")
+
+    def test_negative_payout_cannot_inflate_a_wallet(self):
+        wallet = self._wallet("edge-3", balance="500")
+        with self.assertRaises(ValidationFailed):
+            self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="-200",
+                        key="edge-3")
+        self._nothing_was_written(wallet, balance="500.00")
+
+    def test_unreadable_amount_never_becomes_an_order(self):
+        """`to_decimal` est tolérant et rend 0 sur une saisie illisible : c'est le contrôle
+        « strictement positif » qui empêche « abc » de devenir un ordre à zéro."""
+        wallet = self._wallet("edge-4")
+        with self.assertRaises(ValidationFailed):
+            self._order(wallet, amount="abc", key="edge-4")
+        self._nothing_was_written(wallet)
+
+    def test_amount_is_quantized_at_creation_and_never_a_float(self):
+        """P4 : le montant est quantizé À LA CRÉATION — la référence, l'empreinte
+        d'idempotence et le corps signé portent tous le même « 120.00 »."""
+        from . import payments
+        wallet = self._wallet("edge-5")
+        order = self._order(wallet, amount="120.004", key="edge-5")
+        self.assertEqual(order.amount, Decimal("120.00"))
+        self.assertIsInstance(order.amount, Decimal)
+        body = payments.payment_payload(order)
+        self.assertEqual(body["amount"], "120.00")
+        self.assertNotIsInstance(body["amount"], float)
+
+    def test_treasury_account_in_another_currency_is_refused(self):
+        """Devise incohérente : aucune conversion implicite dans un ordre de paiement."""
+        from . import payments
+        wallet = self._wallet("edge-6")
+        TreasuryAccount.objects.create(code="MM-CDF", name="MM Congo", currency="CDF",
+                                       balance=Decimal("0"))
+        with self.assertRaises(ValidationFailed):
+            payments.create_payment_order(
+                wallet_id=wallet.pk, direction="COLLECTION", operation="MM_COLLECT",
+                amount="100", counterparty="+243900000000", treasury_account_code="MM-CDF",
+                idempotency_key="edge-6", by="u")
+        self._nothing_was_written(wallet)
+
+    def test_unknown_treasury_account_code_is_refused_instead_of_ignored(self):
+        """Trou corrigé côté versement externe : un code inconnu était silencieusement
+        remplacé par `None`, ce qui faisait perdre le rattachement du flux sans témoin."""
+        from common.exceptions import NotFoundError
+        from . import payments
+        wallet = self._wallet("edge-7")
+        with self.assertRaises(NotFoundError):
+            payments.create_payment_order(
+                wallet_id=wallet.pk, direction="COLLECTION", operation="MM_COLLECT",
+                amount="100", counterparty="+243900000000", treasury_account_code="INEXISTANT",
+                idempotency_key="edge-7", by="u")
+        self._nothing_was_written(wallet)
+
+    def test_operation_and_direction_must_agree(self):
+        """Un « encaissement » posté sur le chemin de décaissement enverrait de l'argent en
+        croyant en recevoir. Le sens et l'opération doivent raconter la même histoire."""
+        wallet = self._wallet("edge-8", balance="500")
+        with self.assertRaises(ValidationFailed):
+            self._order(wallet, direction="COLLECTION", operation="MM_PAYOUT", key="edge-8")
+        self._nothing_was_written(wallet, balance="500.00")
+
+    def test_payout_direction_on_a_collect_operation_is_refused(self):
+        wallet = self._wallet("edge-9", balance="500")
+        with self.assertRaises(ValidationFailed):
+            self._order(wallet, direction="PAYOUT", operation="MM_COLLECT", key="edge-9")
+        self._nothing_was_written(wallet, balance="500.00")
+
+    def test_unknown_direction_is_refused(self):
+        wallet = self._wallet("edge-10")
+        with self.assertRaises(ValidationFailed):
+            self._order(wallet, direction="VIREMENT_MAGIQUE", key="edge-10")
+        self._nothing_was_written(wallet)
+
+    def test_counterparty_is_required(self):
+        from . import payments
+        wallet = self._wallet("edge-11")
+        with self.assertRaises(ValidationFailed):
+            payments.create_payment_order(
+                wallet_id=wallet.pk, direction="COLLECTION", operation="MM_COLLECT",
+                amount="100", counterparty="", idempotency_key="edge-11", by="u")
+        self._nothing_was_written(wallet)
+
+    def test_overlong_counterparty_is_refused_rather_than_truncated(self):
+        """SQLite tronquerait en silence : un numéro Mobile Money tronqué, c'est un versement
+        à quelqu'un d'autre."""
+        from . import payments
+        wallet = self._wallet("edge-12")
+        with self.assertRaises(ValidationFailed):
+            payments.create_payment_order(
+                wallet_id=wallet.pk, direction="COLLECTION", operation="MM_COLLECT",
+                amount="100", counterparty="+" + "9" * 90, idempotency_key="edge-12", by="u")
+        self._nothing_was_written(wallet)
+
+    def test_metadata_that_is_not_an_object_is_refused_at_creation(self):
+        """Sinon le rendu du gabarit échouerait À L'ENVOI, sur un ordre déjà créé."""
+        from . import payments
+        wallet = self._wallet("edge-13")
+        with self.assertRaises(ValidationFailed):
+            payments.create_payment_order(
+                wallet_id=wallet.pk, direction="COLLECTION", operation="MM_COLLECT",
+                amount="100", counterparty="+243900000000", metadata="pas-un-objet",
+                idempotency_key="edge-13", by="u")
+        self._nothing_was_written(wallet)
+
+    def test_blocked_wallet_accepts_no_payment_order(self):
+        wallet = self._wallet("edge-14", balance="500")
+        wallet.status = ClientWallet.Status.BLOQUE
+        wallet.save(update_fields=["status"])
+        with self.assertRaises(ConflictError):
+            self._order(wallet, key="edge-14")
+        self._nothing_was_written(wallet, balance="500.00")
+
+    def test_two_payouts_cannot_spend_the_same_balance_twice(self):
+        """Le solde est relu sous verrou à chaque réservation : deux décaissements de 60 sur
+        un solde de 100 ne peuvent pas passer tous les deux."""
+        wallet = self._wallet("edge-15", balance="100")
+        self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="60", key="edge-15a")
+        with self.assertRaises(InsufficientFundsError):
+            self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="60",
+                        key="edge-15b")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("40.00"))
+        self.assertEqual(wallet.movements.count(), 1)
+
+    def test_payout_creation_and_dispatch_lock_the_rows_they_move(self):
+        """Verrou-espion : la réservation verrouille le portefeuille, l'envoi verrouille
+        l'ordre. C'est ce qui interdit qu'un second envoi concurrent parte en parallèle."""
+        from django.db.models.query import QuerySet
+        from . import payments
+        wallet = self._wallet("edge-16", balance="500")
+        locked: list[str] = []
+        original = QuerySet.select_for_update
+
+        def spy(self, *args, **kwargs):
+            locked.append(self.model.__name__)
+            return original(self, *args, **kwargs)
+
+        with patch.object(QuerySet, "select_for_update", spy):
+            order = self._order(wallet, direction="PAYOUT", operation="MM_PAYOUT", amount="100",
+                                key="edge-16")
+            self.assertIn("ClientWallet", locked)
+            locked.clear()
+            with patch("common.makuta.requests.post",
+                       return_value=_FakeHttpResponse(payload={"status": "PENDING"})):
+                payments.dispatch_payment_order(reference=order.reference, by="u")
+        self.assertIn("PaymentOrder", locked)
+
+
+@override_settings(MAKUTA=makuta_test_settings())
+class PaymentChannelEdgeCaseTests(PaymentOrderMixin, AuthedAPITestCase):
+    WITHDRAW_URL = "/api/caisses/wallets/mine/withdraw"
+
+    def test_unknown_channel_on_withdrawal_is_422(self):
+        self._wallet("chan-1", balance="500")
+        res = self.client.post(self.WITHDRAW_URL, {"amount": "10", "currency": "USD",
+                                                   "channel": "pigeon-voyageur",
+                                                   "idempotencyKey": "chan-1"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "unknown_channel")
+
+    def test_unknown_channel_on_withdrawal_debits_nothing(self):
+        wallet = self._wallet("chan-2", balance="500")
+        self.client.post(self.WITHDRAW_URL, {"amount": "10", "currency": "USD",
+                                             "channel": "pigeon-voyageur",
+                                             "idempotencyKey": "chan-2"}, format="json")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("500.00"))
+        self.assertEqual(wallet.movements.count(), 0)
+
+    def test_external_withdrawal_without_counterparty_is_422(self):
+        self._wallet("chan-3", balance="500")
+        res = self.client.post(self.WITHDRAW_URL, {"amount": "10", "currency": "USD",
+                                                   "channel": "mobile_money",
+                                                   "idempotencyKey": "chan-3"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["code"], "counterparty_required")
+
+    def test_internal_channel_has_no_external_operation(self):
+        """`collect_operation("agent")` levait un `KeyError` (500 opaque) : c'est désormais un
+        refus métier nommé."""
+        from . import channels
+        with self.assertRaises(ValidationFailed):
+            channels.collect_operation("agent")
+        with self.assertRaises(ValidationFailed):
+            channels.payout_operation("")
+
+    def test_the_operation_catalogue_and_the_channels_stay_in_step(self):
+        """Principe 6 : la liste que `check_makuta` déroule est DÉRIVÉE des canaux, jamais
+        recopiée. Ce test tombe si quelqu'un ajoute un canal externe sans son opération."""
+        from . import channels
+        required = channels.required_operations()
+        self.assertEqual(set(required), {"MM_COLLECT", "MM_PAYOUT", "BANK_COLLECT", "BANK_PAYOUT"})
+        for channel in channels.EXTERNAL_CHANNELS:
+            self.assertIn(channels.collect_operation(channel), required)
+            self.assertIn(channels.payout_operation(channel), required)
+
+
+# ═══════════════════════════════════════ RÉCONCILIATION AUTOMATISÉE (EN LOT)
+#
+# La règle qui tient tout : la commande RELIT, elle ne décide pas. Ces tests vérifient les
+# deux moitiés — qu'elle applique fidèlement ce que le fournisseur affirme, et qu'elle laisse
+# intact tout ce dont le fournisseur ne dit rien de lisible.
+
+@override_settings(MAKUTA=makuta_test_settings())
+class BatchReconciliationTests(PaymentOrderMixin, AuthedAPITestCase):
+    def _indeterminate(self, wallet, *, amount="300", key="rec", direction="COLLECTION",
+                       operation="MM_COLLECT"):
+        from . import payments
+        order = self._order(wallet, amount=amount, key=key, direction=direction,
+                            operation=operation)
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            return payments.dispatch_payment_order(reference=order.reference, by="u")
+
+    def test_batch_confirms_what_the_provider_confirms_and_credits_once(self):
+        from . import payments
+        wallet = self._wallet("bat-1")
+        order = self._indeterminate(wallet, amount="300", key="bat-1")
+        read = _FakeHttpResponse(payload={"status": "SUCCESS", "transactionId": "MK-1"})
+        with patch("common.makuta.requests.get", return_value=read), \
+                patch("common.makuta.requests.post") as post:
+            report = payments.reconcile_open_orders(by="ops-1")
+        self.assertEqual(post.call_count, 0)  # réconcilier n'est JAMAIS rejouer
+        self.assertEqual(report["totals"], {"CONFIRMED": 1})
+        order.refresh_from_db()
+        wallet.refresh_from_db()
+        self.assertEqual(order.status, "CONFIRMED")
+        self.assertEqual(wallet.balance, Decimal("300.00"))
+        self.assertEqual(wallet.movements.count(), 1)
+
+    def test_running_the_batch_twice_credits_once(self):
+        """Idempotence : un ordre résolu quitte la file, un second passage ne le revoit pas."""
+        from . import payments
+        wallet = self._wallet("bat-2")
+        self._indeterminate(wallet, amount="150", key="bat-2")
+        read = _FakeHttpResponse(payload={"status": "SUCCESS"})
+        with patch("common.makuta.requests.get", return_value=read) as get:
+            payments.reconcile_open_orders(by="ops-1")
+            second = payments.reconcile_open_orders(by="ops-1")
+        self.assertEqual(get.call_count, 1)  # le second passage ne relit même pas
+        self.assertEqual(second["results"], [])
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("150.00"))
+        self.assertEqual(wallet.movements.count(), 1)
+
+    def test_unreadable_status_leaves_the_order_for_a_human(self):
+        """Principe 2 : ce que le paramétrage ne sait pas lire n'est PAS tranché par l'outil."""
+        from . import payments
+        wallet = self._wallet("bat-3")
+        order = self._indeterminate(wallet, key="bat-3")
+        with patch("common.makuta.requests.get",
+                   return_value=_FakeHttpResponse(payload={"status": "MYSTERE"})):
+            report = payments.reconcile_open_orders(by="ops-1")
+        self.assertEqual(report["totals"], {"UNREADABLE_STATUS": 1})
+        order.refresh_from_db()
+        wallet.refresh_from_db()
+        self.assertEqual(order.status, "INDETERMINATE")
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_provider_refusal_read_in_batch_gives_the_funds_back(self):
+        from . import payments
+        wallet = self._wallet("bat-4", balance="500")
+        order = self._indeterminate(wallet, amount="200", key="bat-4", direction="PAYOUT",
+                                    operation="MM_PAYOUT")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("300.00"))  # fonds réservés
+        with patch("common.makuta.requests.get",
+                   return_value=_FakeHttpResponse(payload={"status": "FAILED"})):
+            report = payments.reconcile_open_orders(by="ops-1")
+        self.assertEqual(report["totals"], {"REFUSED": 1})
+        order.refresh_from_db()
+        wallet.refresh_from_db()
+        self.assertEqual(order.status, "REFUSED")
+        self.assertIsNotNone(order.reversal_movement_id)
+        self.assertEqual(wallet.balance, Decimal("500.00"))
+
+    def test_an_unreachable_provider_does_not_stop_the_batch(self):
+        """Une coupure sur un ordre ne doit pas priver les suivants de leur relecture."""
+        from . import payments
+        wallet = self._wallet("bat-5")
+        first = self._indeterminate(wallet, amount="100", key="bat-5a")
+        second = self._indeterminate(wallet, amount="200", key="bat-5b")
+        responses = [requests.ConnectionError("coupure"),
+                     _FakeHttpResponse(payload={"status": "SUCCESS"})]
+        with patch("common.makuta.requests.get", side_effect=responses):
+            report = payments.reconcile_open_orders(by="ops-1")
+        self.assertEqual(report["totals"], {"UNREACHABLE": 1, "CONFIRMED": 1})
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.status, "INDETERMINATE")  # inchangé
+        self.assertEqual(second.status, "CONFIRMED")
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("200.00"))
+
+    def test_dry_run_reads_nothing_and_writes_nothing(self):
+        from . import payments
+        wallet = self._wallet("bat-6")
+        order = self._indeterminate(wallet, key="bat-6")
+        events_before = order.events.count()
+        with patch("common.makuta.requests.get") as get, patch("common.makuta.requests.post") as post:
+            report = payments.reconcile_open_orders(by="ops-1", dry_run=True)
+        self.assertEqual(get.call_count, 0)
+        self.assertEqual(post.call_count, 0)
+        self.assertEqual(report["totals"], {"WOULD_READ": 1})
+        order.refresh_from_db()
+        self.assertEqual(order.status, "INDETERMINATE")
+        self.assertEqual(order.events.count(), events_before)
+
+    def test_a_named_reference_that_is_already_settled_is_reported_not_replayed(self):
+        from . import payments
+        wallet = self._wallet("bat-7")
+        order = self._order(wallet, key="bat-7")
+        with patch("common.makuta.requests.post",
+                   return_value=_FakeHttpResponse(payload={"status": "SUCCESS"})):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        with patch("common.makuta.requests.get") as get:
+            report = payments.reconcile_open_orders(references=[order.reference], by="ops-1")
+        self.assertEqual(get.call_count, 0)
+        self.assertEqual(report["totals"], {"NOT_OPEN": 1})
+
+    def test_an_unknown_reference_is_reported_not_swallowed(self):
+        from . import payments
+        report = payments.reconcile_open_orders(references=["AGC-INEXISTANTE"], by="ops-1")
+        self.assertEqual(report["totals"], {"NOT_FOUND": 1})
+
+    def test_the_batch_journals_every_reading_with_its_motive(self):
+        """P3 : chaque relecture laisse une trace, motif compris — « l'ordre est passé de
+        INDETERMINATE à CONFIRMED » sans auteur ni motif n'est pas une preuve."""
+        from . import payments
+        wallet = self._wallet("bat-8")
+        order = self._indeterminate(wallet, key="bat-8")
+        with patch("common.makuta.requests.get",
+                   return_value=_FakeHttpResponse(payload={"status": "SUCCESS"})):
+            payments.reconcile_open_orders(by="ops-9")
+        confirmation = order.events.filter(kind="CONFIRMED").first()
+        self.assertIsNotNone(confirmation)
+        self.assertEqual(confirmation.source, "RECONCILIATION")
+        self.assertEqual(confirmation.actor, "ops-9")
+        self.assertIn("relecture", confirmation.motive.lower())
+
+    def test_status_filter_narrows_the_queue(self):
+        from . import payments
+        wallet = self._wallet("bat-9")
+        self._indeterminate(wallet, key="bat-9")
+        report = payments.reconcile_open_orders(status="AWAITING_CONFIRMATION", dry_run=True)
+        self.assertEqual(report["results"], [])
+
+
+@override_settings(MAKUTA=makuta_test_settings(OPERATIONS={
+    "MM_COLLECT": {"path": "/fixture/collect",
+                   "body": {"amount": "{amount}", "partnerReference": "{reference}"}},
+}))
+class BatchReconciliationWithoutStatusPathTests(PaymentOrderMixin, AuthedAPITestCase):
+    """Cas RÉEL tant que Wolf Technologies n'a pas fourni son chemin de relecture : on peut
+    émettre un paiement mais pas en relire l'issue. L'outil doit le dire, pas le masquer."""
+
+    def test_missing_status_path_is_named_not_guessed(self):
+        from . import payments
+        wallet = self._wallet("nsp-1")
+        order = self._order(wallet, key="nsp-1")
+        with patch("common.makuta.requests.post", side_effect=requests.ConnectionError("coupure")):
+            payments.dispatch_payment_order(reference=order.reference, by="u")
+        with patch("common.makuta.requests.get") as get:
+            report = payments.reconcile_open_orders(by="ops-1")
+        self.assertEqual(get.call_count, 0)  # on ne devine aucun chemin
+        self.assertEqual(report["totals"], {"CONTRACT_MISSING": 1})
+        order.refresh_from_db()
+        self.assertEqual(order.status, "INDETERMINATE")
+
+
+@override_settings(MAKUTA=makuta_test_settings(BASE_URL="", PRIVATE_KEY_PEM=""))
+class BatchReconciliationUnconfiguredTests(PaymentOrderMixin, AuthedAPITestCase):
+    """État actuel du projet : Makuta n'est pas branché. La commande doit le DIRE et ne
+    toucher à rien — un outil qui explose sur une intégration absente n'apprend rien."""
+
+    def test_nothing_is_touched_and_the_degradation_is_explicit(self):
+        from . import payments
+        wallet = self._wallet("unc-1")
+        order = self._order(wallet, key="unc-1")
+        order.status = "INDETERMINATE"
+        order.save(update_fields=["status"])
+        events_before = order.events.count()
+        with patch("common.makuta.requests.get") as get, patch("common.makuta.requests.post") as post:
+            report = payments.reconcile_open_orders(by="ops-1")
+        self.assertFalse(report["configured"])
+        self.assertEqual(get.call_count, 0)
+        self.assertEqual(post.call_count, 0)
+        self.assertIn("non configurée", report["degradation"])
+        self.assertIn("check_makuta", report["degradation"])
+        self.assertEqual(report["scanned"], 1)
+        order.refresh_from_db()
+        self.assertEqual(order.status, "INDETERMINATE")
+        self.assertEqual(order.events.count(), events_before)
+        wallet.refresh_from_db()
+        self.assertEqual(wallet.balance, Decimal("0.00"))
+
+    def test_the_command_runs_and_reports_the_degradation(self):
+        from django.core.management import call_command
+        out = StringIO()
+        call_command("reconcile_payment_orders", stdout=out)
+        printed = out.getvalue()
+        self.assertIn("non configurée", printed)
+        self.assertIn("check_makuta", printed)
+
+
+# ═══════════════════════════════════════ DIAGNOSTIC DU CONTRAT FOURNISSEUR
+#
+# `check_makuta` n'a qu'une obligation morale : ne rien inventer. Un chemin absent reste
+# absent — il n'est jamais « probablement /api/collect ». Ces tests protègent cette promesse.
+
+def makuta_complete_settings(**overrides) -> dict:
+    """Contrat fournisseur COMPLET — la cible, pas l'état actuel. Sert à vérifier que le
+    diagnostic sait aussi dire « rien ne manque »."""
+    _private, public = _test_key_pair()
+    operation = {
+        "path": "/api/op", "method": "POST",
+        "body": {"amount": "{amount}", "msisdn": "{counterparty}", "partnerRef": "{reference}"},
+        "status_path": "/api/transactions/{reference}",
+    }
+    config = makuta_test_settings(
+        CALLBACK_PUBLIC_KEY_PEM=public,
+        CALLBACK_SIGNATURE_HEADER="X-Makuta-Signature",
+        OPERATIONS={name: dict(operation) for name in
+                    ("MM_COLLECT", "MM_PAYOUT", "BANK_COLLECT", "BANK_PAYOUT")},
+    )
+    config.update(overrides)
+    return config
+
+
+class MakutaDiagnosticsTests(AuthedAPITestCase):
+    def _item(self, report: dict, key: str) -> dict:
+        for section in report["sections"]:
+            for item in section["items"]:
+                if item["key"] == key:
+                    return item
+        self.fail(f"Point de contrôle « {key} » absent du diagnostic.")
+
+    @override_settings(MAKUTA={})
+    def test_an_empty_configuration_names_every_missing_operation(self):
+        from . import makuta_diagnostics
+        report = makuta_diagnostics.diagnose()
+        self.assertFalse(report["operational"])
+        keys = {item["key"] for section in report["sections"] for item in section["items"]}
+        for operation in ("MM_COLLECT", "MM_PAYOUT", "BANK_COLLECT", "BANK_PAYOUT"):
+            self.assertIn(f"{operation}.*", keys)
+        self.assertGreater(report["counts"]["blocking"], 0)
+        self.assertTrue(report["questions"])
+
+    @override_settings(MAKUTA={})
+    def test_the_diagnostic_invents_no_value(self):
+        """Aucun chemin n'est proposé quand rien n'est configuré : le diagnostic liste des
+        MANQUES, il ne remplit pas les blancs."""
+        from . import makuta_diagnostics
+        report = makuta_diagnostics.diagnose()
+        details = " ".join(item["detail"] for section in report["sections"]
+                           for item in section["items"]
+                           if item["state"] == makuta_diagnostics.MISSING)
+        self.assertNotIn("/api/", details)
+
+    @override_settings(MAKUTA=makuta_complete_settings())
+    def test_a_complete_contract_has_no_blocking_point(self):
+        from . import makuta_diagnostics
+        report = makuta_diagnostics.diagnose()
+        blocking = [item["key"] for section in report["sections"] for item in section["items"]
+                    if item["state"] in makuta_diagnostics.BLOCKING_STATES]
+        self.assertEqual(blocking, [])
+        self.assertTrue(report["operational"])
+
+    @override_settings(MAKUTA=makuta_complete_settings(OPERATIONS={
+        "MM_COLLECT": {"path": "/api/op", "method": "POST",
+                       "body": {"amount": "{amount}"},
+                       "status_path": "/api/transactions/{reference}"},
+    }))
+    def test_a_body_without_our_reference_is_flagged_as_a_gap(self):
+        """Sans notre référence dans la requête, aucun rappel ni relevé n'est rattachable :
+        c'est la réconciliation qui devient impossible."""
+        from . import makuta_diagnostics
+        report = makuta_diagnostics.diagnose()
+        self.assertEqual(self._item(report, "MM_COLLECT.body")["state"], makuta_diagnostics.GAP)
+
+    @override_settings(MAKUTA=makuta_complete_settings(OPERATIONS={
+        "MM_COLLECT": {"path": "/api/op", "method": "POST",
+                       "body": {"partnerRef": "{reference}"},
+                       "status_path": "/api/transactions"},
+    }))
+    def test_a_status_path_without_an_identifier_is_flagged_as_a_gap(self):
+        from . import makuta_diagnostics
+        report = makuta_diagnostics.diagnose()
+        self.assertEqual(self._item(report, "MM_COLLECT.status_path")["state"],
+                         makuta_diagnostics.GAP)
+
+    @override_settings(MAKUTA=makuta_complete_settings(OPERATIONS={
+        "MM_COLLECT": {"path": "/api/op", "method": "PATCH",
+                       "body": {"partnerRef": "{reference}"},
+                       "status_path": "/api/transactions/{reference}"},
+    }))
+    def test_a_method_the_connector_cannot_emit_is_flagged_as_a_gap(self):
+        from . import makuta_diagnostics
+        report = makuta_diagnostics.diagnose()
+        self.assertEqual(self._item(report, "MM_COLLECT.method")["state"], makuta_diagnostics.GAP)
+
+
+class CheckMakutaCommandTests(AuthedAPITestCase):
+    @override_settings(MAKUTA={})
+    def test_the_command_runs_unconfigured_and_prints_the_checklist(self):
+        from django.core.management import call_command
+        out = StringIO()
+        call_command("check_makuta", stdout=out)
+        printed = out.getvalue()
+        self.assertIn("DIAGNOSTIC MAKUTA", printed)
+        self.assertIn("A DEMANDER A WOLF TECHNOLOGIES", printed)
+        for operation in ("MM_COLLECT", "MM_PAYOUT", "BANK_COLLECT", "BANK_PAYOUT"):
+            self.assertIn(operation, printed)
+        self.assertIn("[MANQUE]", printed)
+
+    @override_settings(MAKUTA={})
+    def test_json_output_is_machine_readable(self):
+        import json
+        from django.core.management import call_command
+        out = StringIO()
+        call_command("check_makuta", "--format", "json", stdout=out)
+        report = json.loads(out.getvalue())
+        self.assertFalse(report["operational"])
+        self.assertGreater(report["counts"]["blocking"], 0)
+
+    @override_settings(MAKUTA={})
+    def test_strict_mode_exits_non_zero_while_a_blocking_point_remains(self):
+        from django.core.management import call_command
+        with self.assertRaises(SystemExit):
+            call_command("check_makuta", "--strict", stdout=StringIO())
+
+    @override_settings(MAKUTA=makuta_complete_settings())
+    def test_strict_mode_is_silent_when_the_contract_is_complete(self):
+        from django.core.management import call_command
+        out = StringIO()
+        call_command("check_makuta", "--strict", stdout=out)
+        self.assertIn("Aucun point bloquant", out.getvalue())
+
+    @override_settings(MAKUTA={})
+    def test_the_command_makes_no_network_call(self):
+        from django.core.management import call_command
+        with patch("common.makuta.requests.get") as get, patch("common.makuta.requests.post") as post:
+            call_command("check_makuta", stdout=StringIO())
+        self.assertEqual(get.call_count, 0)
+        self.assertEqual(post.call_count, 0)

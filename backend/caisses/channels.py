@@ -22,6 +22,8 @@ documentation fournisseur ne décrivant que l'authentification (cf. `payments.py
 """
 from __future__ import annotations
 
+from common.exceptions import ValidationFailed
+
 #: Canal interne — le staff constate la remise physique (espèces/agence).
 AGENT = "agent"
 #: Canaux externes — l'argent traverse un tiers, donc passe par un ordre de paiement Makuta.
@@ -37,6 +39,17 @@ KNOWN_CHANNELS = INTERNAL_CHANNELS | EXTERNAL_CHANNELS
 _COLLECT_OPERATION = {MOBILE_MONEY: "MM_COLLECT", BANK: "BANK_COLLECT"}
 _PAYOUT_OPERATION = {MOBILE_MONEY: "MM_PAYOUT", BANK: "BANK_PAYOUT"}
 
+#: Table INVERSE : chaque opération du catalogue impose un sens. Elle existe pour qu'un
+#: appelant ne puisse pas demander un encaissement sur l'opération de décaissement (et
+#: réciproquement) : le sens et le chemin fournisseur partiraient alors dans deux directions
+#: opposées, et l'ordre serait irréconciliable. Les sens repris ici sont exactement ceux de
+#: `PaymentOrder.Direction` — la valeur, pas l'énumération, pour ne pas importer les modèles
+#: dans ce module de nomenclature.
+_OPERATION_DIRECTION = {
+    **{operation: "COLLECTION" for operation in _COLLECT_OPERATION.values()},
+    **{operation: "PAYOUT" for operation in _PAYOUT_OPERATION.values()},
+}
+
 
 def is_known(channel: str) -> bool:
     return (channel or "") in KNOWN_CHANNELS
@@ -49,9 +62,40 @@ def is_external(channel: str) -> bool:
 
 def collect_operation(channel: str) -> str:
     """Nom logique de l'opération d'ENCAISSEMENT pour ce canal externe (dépôt)."""
-    return _COLLECT_OPERATION[channel]
+    try:
+        return _COLLECT_OPERATION[channel]
+    except KeyError:
+        raise ValidationFailed(
+            f"Canal d'encaissement externe inconnu : « {channel or '(vide)'} »."
+        ) from None
 
 
 def payout_operation(channel: str) -> str:
     """Nom logique de l'opération de DÉCAISSEMENT pour ce canal externe (retrait)."""
-    return _PAYOUT_OPERATION[channel]
+    try:
+        return _PAYOUT_OPERATION[channel]
+    except KeyError:
+        raise ValidationFailed(
+            f"Canal de décaissement externe inconnu : « {channel or '(vide)'} »."
+        ) from None
+
+
+def direction_for_operation(operation: str) -> str:
+    """Sens imposé par une opération du catalogue AGRICAP.
+
+    Renvoie `""` pour toute opération hors catalogue : une configuration sur mesure peut
+    exister, et nous ne présumons rien de son sens (principe 2) — la vérification de
+    cohérence ne s'applique qu'à ce que nous nommons nous-mêmes.
+    """
+    return _OPERATION_DIRECTION.get(operation or "", "")
+
+
+def required_operations() -> tuple[str, ...]:
+    """Les opérations que `settings.MAKUTA["OPERATIONS"]` doit couvrir pour que dépôt ET
+    retrait fonctionnent sur les deux canaux externes. C'est la liste que `manage.py
+    check_makuta` déroule — elle est dérivée d'ici, jamais recopiée ailleurs (principe 6)."""
+    return tuple(
+        operation
+        for channel in (MOBILE_MONEY, BANK)
+        for operation in (_COLLECT_OPERATION[channel], _PAYOUT_OPERATION[channel])
+    )
