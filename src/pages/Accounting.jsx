@@ -11,23 +11,40 @@ import ExchangeRateManager from '@/components/accounting/ExchangeRateManager';
 import PiecesViewer from '@/components/accounting/PiecesViewer';
 import ProvisionsViewer from '@/components/accounting/ProvisionsViewer';
 import RestitutionsViewer from '@/components/accounting/RestitutionsViewer';
+import EtatsComptables from '@/components/accounting/EtatsComptables';
 import { api } from '@/services/api';
 
 /*
- * ⚠ `EtatsComptables.jsx` existe mais n'est VOLONTAIREMENT pas monté ici.
+ * ⚠ DEUX GRANDS LIVRES COEXISTENT — et cette page les montre tous les deux.
  *
- * Il sert bilan et compte de résultat depuis l'app `accounting` (bi-devise),
- * alors que l'onglet « États Financiers » ci-dessous sert les MÊMES états depuis
- * l'app `ledger` (SYSCOHADA, mono-devise). Les afficher côte à côte donnerait
- * deux bilans contradictoires dans le même écran, sans qu'un comptable puisse
- * savoir lequel fait foi. L'audit a classé ce doublon de grands livres en
- * constat majeur — dont la collision du compte 137, qui vaut « Provisions pour
- * risques de crédit » d'un côté et « Résultat des activités ordinaires » de
- * l'autre.
+ * L'onglet « États — SYSCOHADA » lit l'app `ledger` (mono-devise) ; l'onglet
+ * « États — bi-devise » lit l'app `accounting`. Les deux produisent un bilan et
+ * un compte de résultat, à partir d'écritures différentes : leurs chiffres
+ * peuvent donc diverger légitimement.
  *
- * Quel moteur fait autorité est une décision du fondateur, pas un arbitrage
- * d'ingénierie. Tant qu'elle n'est pas prise, on n'en affiche qu'un seul.
+ * On les affiche côte à côte MAIS jamais anonymement : chaque onglet annonce sa
+ * source. Masquer l'un donnerait l'illusion d'une comptabilité unique ; les
+ * confondre serait pire. L'audit a classé ce doublon en constat majeur — dont la
+ * collision du compte 137, qui vaut « Provisions pour risques de crédit » d'un
+ * côté et « Résultat des activités ordinaires » de l'autre.
+ *
+ * Désigner le moteur qui fait autorité est une décision du fondateur, pas un
+ * arbitrage d'ingénierie. Tant qu'elle n'est pas prise, on nomme la source.
  */
+
+/** Bandeau de provenance — un état financier sans son grand livre d'origine
+ *  n'est pas interprétable tant que les deux moteurs coexistent. */
+const SourceGrandLivre = ({ app, description }) => (
+  <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3">
+    <p className="text-sm text-amber-200">
+      Source : grand livre <span className="font-mono font-semibold">{app}</span> — {description}
+    </p>
+    <p className="text-xs text-amber-300/70 mt-1">
+      Deux grands livres coexistent dans l’institution et n’ont pas été rapprochés.
+      Les chiffres de cet onglet ne sont comparables qu’à ceux de la même source.
+    </p>
+  </div>
+);
 
 const Accounting = () => {
   const [todayRate, setTodayRate] = useState(null);
@@ -46,7 +63,7 @@ const Accounting = () => {
       </motion.div>
       
        <Tabs defaultValue="rates" className="mt-8">
-        <TabsList className="grid w-full grid-cols-4 lg:grid-cols-8 bg-slate-800/60">
+        <TabsList className="grid w-full grid-cols-3 lg:grid-cols-9 bg-slate-800/60">
             <TabsTrigger value="rates">Taux de Change</TabsTrigger>
             <TabsTrigger value="dashboard">Tableau de Bord</TabsTrigger>
             <TabsTrigger value="journal">Journaux</TabsTrigger>
@@ -54,7 +71,8 @@ const Accounting = () => {
             <TabsTrigger value="pieces">Pièces</TabsTrigger>
             <TabsTrigger value="provisions">Provisions</TabsTrigger>
             <TabsTrigger value="restitutions">Restitutions</TabsTrigger>
-            <TabsTrigger value="etats">États Financiers</TabsTrigger>
+            <TabsTrigger value="etats">États — SYSCOHADA</TabsTrigger>
+            <TabsTrigger value="etats-bidevise">États — bi-devise</TabsTrigger>
         </TabsList>
 
         <TabsContent value="rates" className="mt-6">
@@ -102,7 +120,20 @@ const Accounting = () => {
             </motion.div>
         </TabsContent>
          <TabsContent value="etats" className="mt-6">
+            <SourceGrandLivre
+                app="ledger"
+                description="plan SYSCOHADA, écritures mono-devise."
+            />
             <FinancialStatementsViewer />
+        </TabsContent>
+        <TabsContent value="etats-bidevise" className="mt-6">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                <SourceGrandLivre
+                    app="accounting"
+                    description="écritures bi-devise (FC/USD), avec consolidation au taux de clôture."
+                />
+                <EtatsComptables />
+            </motion.div>
         </TabsContent>
       </Tabs>
     </Layout>
