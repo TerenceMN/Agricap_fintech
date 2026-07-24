@@ -390,6 +390,70 @@ class EventEntryTemplateLine(models.Model):
         return f"{self.template_id} {self.ordre} {self.sens} {self.compte_racine}"
 
 
+class RegleConsommation(models.Model):
+    """Mapping « événement métier → écriture » — EN BASE, jamais en dur (principe 8).
+
+    `EventEntryTemplate` dit COMMENT s'écrit un schéma de l'annexe B ; cette table dit
+    QUEL événement métier déclenche QUEL schéma, et avec quel compte de trésorerie quand
+    l'annexe laisse le choix (501/511/53x). Sans elle, le consommateur porterait un
+    `if event_type == …` : un mapping comptable dans le code est un mapping que le
+    comptable ne peut ni lire ni corriger.
+
+    Trois modes, et un seul est « ne rien faire » :
+
+    * `PIECE` — application d'un schéma du catalogue (B10…B13) ;
+    * `CONTREPASSATION` — annulation de la pièce réellement passée pour l'événement
+      d'origine (`evenement_origine`), retrouvée par sa `journal_reference` ;
+    * `SANS_ECRITURE` — l'annexe B ne définit AUCUNE écriture pour cet événement. Il
+      reste alors NON CONSOMMÉ, donc visible dans la file et dans chaque rapport de
+      consommation, jusqu'à arbitrage. On n'invente pas une écriture pour vider une file.
+    """
+
+    class Mode(models.TextChoices):
+        PIECE = "PIECE", "Pièce nouvelle depuis un schéma du catalogue"
+        CONTREPASSATION = "CONTREPASSATION", "Contrepassation de la pièce d'origine"
+        SANS_ECRITURE = "SANS_ECRITURE", "Aucune écriture définie par l'annexe B"
+
+    source = models.CharField(
+        max_length=64, db_index=True,
+        help_text="Modèle producteur des événements (ex. « investments.InvestmentEvent »).",
+    )
+    type_evenement = models.CharField(max_length=48, db_index=True)
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.PIECE)
+    schema = models.CharField(
+        max_length=16, blank=True,
+        help_text="Code du schéma du catalogue appliqué en mode PIECE (B10, B11…).",
+    )
+    evenement_origine = models.CharField(
+        max_length=48, blank=True,
+        help_text="Mode CONTREPASSATION : type de l'événement dont la pièce est annulée.",
+    )
+    compte_tresorerie = models.CharField(
+        max_length=32, blank=True,
+        help_text="Racine du compte résolvant $TRESORERIE (501/511/53x). Un événement peut "
+                  "l'écraser via « compteTresorerie » dans son payload.",
+    )
+    note = models.TextField(blank=True)
+    actif = models.BooleanField(default=True)
+    modifie_par = models.CharField(max_length=255, blank=True)
+    modifie_le = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["source", "type_evenement"]
+        verbose_name = "règle de consommation d'événement"
+        verbose_name_plural = "règles de consommation d'événement"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source", "type_evenement"],
+                name="acc_une_regle_par_type_evenement",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        cible = self.schema or self.evenement_origine or "—"
+        return f"{self.type_evenement} → {self.mode} {cible}"
+
+
 # ===========================================================================
 #  MAKER-CHECKER SUR LE PLAN COMPTABLE
 # ===========================================================================
@@ -535,6 +599,13 @@ class ClassementCredit(models.Model):
         PieceComptable, null=True, blank=True, on_delete=models.PROTECT,
         related_name="declassements",
         help_text="Pièce B5 (413 → 416) produite par CET arrêté, le cas échéant.",
+    )
+    piece_reclassement = models.ForeignKey(
+        PieceComptable, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="reclassements",
+        help_text="Pièce B17 (416 → 413) produite par CET arrêté quand le crédit revient à "
+                  "bonne fin. Champ distinct du déclassement : les deux mouvements sont des "
+                  "événements économiques opposés, pas une correction l'un de l'autre.",
     )
     cree_par = models.CharField(max_length=255, blank=True)
     cree_le = models.DateTimeField(auto_now_add=True)

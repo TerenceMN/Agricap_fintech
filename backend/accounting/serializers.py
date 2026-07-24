@@ -354,6 +354,9 @@ def classement_credit(obj) -> dict:
         "pieceDeclassement": (
             obj.piece_declassement.reference if obj.piece_declassement_id else None
         ),
+        "pieceReclassement": (
+            obj.piece_reclassement.reference if obj.piece_reclassement_id else None
+        ),
         "creePar": obj.cree_par,
         "creeLe": horodatage(obj.cree_le),
     }
@@ -372,6 +375,18 @@ def resultat_arrete(donnees: dict) -> dict:
                 "piece": d["piece"],
             }
             for d in donnees["declassements"]
+        ],
+        "reclassements": [
+            {
+                "reference": r["loan_reference"],
+                "devise": r["devise"],
+                "encoursReclasse": montant(r["encours_reclasse"]),
+                "encoursCourant": montant(r["encours_courant"]),
+                "joursRetard": r["jours_retard"],
+                "classe": r["classe"],
+                "piece": r["piece"],
+            }
+            for r in donnees.get("reclassements", [])
         ],
         "arretes": [
             {

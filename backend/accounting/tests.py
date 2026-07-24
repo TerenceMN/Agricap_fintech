@@ -298,9 +298,13 @@ class AppendOnlyTests(SocleTestCase):
 # ---------------------------------------------------------------------- CATALOGUE
 
 class CatalogueTests(SocleTestCase):
-    def test_les_seize_schemas_sont_en_base(self):
+    def test_les_seize_schemas_de_lannexe_b_plus_b17_sont_en_base(self):
+        """Les 16 schémas de l'annexe B, plus B17 (reclassement 416 → 413) qui n'y figure
+        pas encore : l'annexe ne prévoyait que l'ALLER du déclassement, laissant tout crédit
+        revenu sain en souffrance à perpétuité au grand livre. L'extension est signalée dans
+        sa propre description et dans le rapport de livraison."""
         codes = set(EventEntryTemplate.objects.values_list("code", flat=True))
-        self.assertEqual(codes, {f"B{n}" for n in range(1, 17)})
+        self.assertEqual(codes, {f"B{n}" for n in range(1, 17)} | {"B17"})
 
     def test_b1_decaissement_credit(self):
         piece = catalogue.executer_evenement(

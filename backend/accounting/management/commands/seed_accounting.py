@@ -15,12 +15,18 @@ from decimal import Decimal
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from accounting.definitions import CATALOGUE, CLASSES_RISQUE, PLAN_COMPTABLE
+from accounting.definitions import (
+    CATALOGUE,
+    CLASSES_RISQUE,
+    PLAN_COMPTABLE,
+    REGLES_CONSOMMATION,
+)
 from accounting.models import (
     ClasseRisque,
     CompteComptable,
     EventEntryTemplate,
     EventEntryTemplateLine,
+    RegleConsommation,
 )
 
 
@@ -39,6 +45,7 @@ class Command(BaseCommand):
         crees, majs = self._charger_plan_comptable()
         templates, lignes = self._charger_catalogue()
         classes = self._charger_classes_risque()
+        regles = self._charger_regles_consommation()
         desactives = self._desactiver_comptes_obsoletes()
         supprimes = 0
         if options["purge_comptes_vierges"]:
@@ -50,7 +57,9 @@ class Command(BaseCommand):
                 f"{desactives} désactivé(s), {supprimes} supprimé(s).\n"
                 f"Catalogue : {templates} schéma(s), {lignes} ligne(s) de schéma.\n"
                 f"Classes de risque : {classes} amorcée(s) (créées uniquement si absentes — "
-                f"un taux ajusté par le comité n'est JAMAIS écrasé par un rechargement)."
+                f"un taux ajusté par le comité n'est JAMAIS écrasé par un rechargement).\n"
+                f"Règles de consommation d'événements : {regles} amorcée(s) (même règle : "
+                f"un mapping ajusté n'est jamais remis d'usine)."
             ))
 
     # ------------------------------------------------------------------ PLAN COMPTABLE
@@ -131,6 +140,30 @@ class Command(BaseCommand):
                     "taux_provision": Decimal(taux),
                     "en_souffrance": souffrance,
                     "ordre": ordre,
+                    "actif": True,
+                    "modifie_par": "seed_accounting",
+                },
+            )
+            compteur += int(cree)
+        return compteur
+
+    # ----------------------------------------------- RÈGLES DE CONSOMMATION
+    def _charger_regles_consommation(self) -> int:
+        """`get_or_create` (comme la grille PAR) : le mapping « événement → écriture » est
+        un paramétrage comptable. Une fois qu'un comptable a pointé $TRESORERIE sur le bon
+        compte, un rechargement du référentiel ne doit pas le ramener à la valeur d'usine —
+        ce serait un changement d'imputation silencieux."""
+        compteur = 0
+        for source, type_evenement, mode, schema, origine, tresorerie, note in REGLES_CONSOMMATION:
+            _, cree = RegleConsommation.objects.get_or_create(
+                source=source,
+                type_evenement=type_evenement,
+                defaults={
+                    "mode": mode,
+                    "schema": schema,
+                    "evenement_origine": origine,
+                    "compte_tresorerie": tresorerie,
+                    "note": note,
                     "actif": True,
                     "modifie_par": "seed_accounting",
                 },

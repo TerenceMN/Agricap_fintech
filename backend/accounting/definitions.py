@@ -136,6 +136,22 @@ CATALOGUE: dict[str, dict] = {
             (2, "CREDIT", "413", "OPERATION", "encours", ""),
         ],
     },
+    "B17": {
+        "libelle": "Reclassement en encours sain (retour à bonne fin)",
+        "journal": "JCR",
+        "description": "EXTENSION HORS ANNEXE B — symétrique de B5 (416 → 413). L'annexe ne "
+                       "prévoit que l'aller : un crédit revenu sain restait indéfiniment en "
+                       "souffrance au grand livre, ce qui surévalue le PAR comptable. Le "
+                       "schéma inverse est mécanique (mêmes comptes, sens permutés) et ne "
+                       "détourne PAS la contrepassation, qui corrige une erreur et non un "
+                       "événement économique. Le code « B17 » est celui pressenti par la "
+                       "dette signalée dans `tests_provisions`. À faire entrer dans l'annexe "
+                       "B lors de sa prochaine révision.",
+        "lignes": [
+            (1, "DEBIT", "413", "OPERATION", "encours", ""),
+            (2, "CREDIT", "416", "OPERATION", "encours", ""),
+        ],
+    },
     "B6": {
         "libelle": "Dotation aux provisions pour risque de crédit (clôture)",
         "journal": "JOD",
@@ -247,3 +263,72 @@ CATALOGUE: dict[str, dict] = {
         ],
     },
 }
+
+
+# ------------------------------------------------- CONSOMMATION DES ÉVÉNEMENTS MÉTIER
+#: Source des événements consommés par `accounting.consommation` (file append-only
+#: `investments.InvestmentEvent`, champs `consumed_at` / `journal_reference`).
+SOURCE_INVESTISSEMENT = "investments.InvestmentEvent"
+
+#: Compte de trésorerie par DÉFAUT des schémas B10→B13, qui laissent le choix 501/511/53x.
+#:
+#: ARBITRAGE SIGNALÉ AU FONDATEUR (cf. rapport) : l'annexe B écrit littéralement
+#: « 501/511 » pour l'encaissement d'une souscription, mais la décision « une seule
+#: porte » fait venir cet argent du PORTEFEUILLE du souscripteur (`caisses`), pas d'un
+#: versement externe. Économiquement, la contrepartie d'un encaissement de souscription
+#: est alors l'extinction d'une dette de portefeuille, pas une entrée de caisse — le
+#: cash, lui, était déjà entré au moment de l'alimentation du wallet. On retient ici le
+#: compte littéral de l'annexe (511) et on rend le choix PARAMÉTRABLE EN BASE
+#: (`RegleConsommation.compte_tresorerie`) : le corriger est une décision de
+#: paramétrage, jamais un redéploiement.
+COMPTE_TRESORERIE_DEFAUT = "511"
+
+# (source, type_evenement, mode, schema, evenement_origine, compte_tresorerie, note)
+#
+# VALEURS D'AMORCE uniquement : la table `RegleConsommation` est le paramétrage vivant,
+# et `seed_accounting` ne l'écrase JAMAIS après la première pose (même règle que la
+# grille PAR — un mapping ajusté par le comptable ne se fait pas remettre d'usine).
+REGLES_CONSOMMATION: list[tuple[str, str, str, str, str, str, str]] = [
+    (
+        SOURCE_INVESTISSEMENT, "SUBSCRIPTION_SETTLED", "PIECE", "B10", "",
+        COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B10 : l'encaissement (jamais la réservation) crédite le sous-compte de "
+        "cantonnement 419-OFF de l'offre.",
+    ),
+    (
+        SOURCE_INVESTISSEMENT, "SUBSCRIPTION_REFUNDED", "CONTREPASSATION", "",
+        "SUBSCRIPTION_SETTLED", "",
+        "Annexe C, P13 : « souscriptions remboursées (contrepassation B10) ». On "
+        "contrepasse la pièce B10 réellement passée pour CETTE souscription — jamais une "
+        "écriture inverse reconstruite à la main, qui pourrait ne pas correspondre au "
+        "montant encaissé.",
+    ),
+    (
+        SOURCE_INVESTISSEMENT, "PROJECT_DISBURSED", "PIECE", "B11", "",
+        COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B11 : le cantonnement de l'offre est débité au profit du promoteur.",
+    ),
+    (
+        SOURCE_INVESTISSEMENT, "PROJECT_RETURN_RECEIVED", "PIECE", "B12", "",
+        COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B12 : la ventilation capital / rendement est « selon l'échéancier ». Elle "
+        "n'est PAS déductible du seul montant encaissé : tant que l'événement ne la porte "
+        "pas (clés « capital_rembourse » et « rendement » de son payload), il reste en "
+        "file — une écriture fausse est pire qu'une écriture absente.",
+    ),
+    (
+        SOURCE_INVESTISSEMENT, "DISTRIBUTION_PAID", "PIECE", "B13", "",
+        COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B13 : une pièce PAR LIGNE de distribution (l'événement est émis par "
+        "bénéficiaire), ce qui rend la quote-part de chaque investisseur auditable pièce "
+        "par pièce.",
+    ),
+    (
+        SOURCE_INVESTISSEMENT, "PROJECT_DEFAULTED", "SANS_ECRITURE", "", "", "",
+        "AUCUN schéma de l'annexe B ne couvre le défaut d'un projet d'investissement : "
+        "B6/B7 provisionnent le risque de CRÉDIT (grille PAR sur `portfolio.Loan`), pas "
+        "une créance de projet. L'événement reste donc en file, visible, jusqu'à ce que "
+        "le fondateur arbitre le schéma de provisionnement des projets (base de calcul, "
+        "compte de dotation, décote). Ne rien écrire est ici la seule réponse honnête.",
+    ),
+]

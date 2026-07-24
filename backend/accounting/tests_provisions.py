@@ -389,20 +389,48 @@ class ArreteProvisionTests(ProvisionsTestCase):
         self.assertEqual(services.solde_compte("791", devise="USD"), Decimal("-544.00"))
         self.assertEqual(services.controler_integrite(), [])
 
-    def test_retour_en_classe_saine_ne_reclasse_pas_416_vers_413(self):
-        """DETTE ASSUMÉE ET SIGNALÉE : l'annexe B ne contient aucun schéma inverse de B5.
-        Un crédit qui redevient sain reste donc en 416 au grand livre. On ne détourne pas
-        la contrepassation (qui corrige une ERREUR) pour acter un événement économique :
-        il manque un schéma « B17 — reclassement 416 → 413 », à arbitrer par le fondateur.
-        Ce test verrouille le comportement actuel pour que l'écart soit visible."""
+    def test_retour_en_classe_saine_reclasse_416_vers_413(self):
+        """DETTE RÉSORBÉE : l'annexe B ne prévoyait que l'ALLER (B5), si bien qu'un crédit
+        revenu à bonne fin restait en souffrance à perpétuité et que le PAR comptable ne
+        redescendait jamais. Le schéma B17 (416 → 413) rend le retour, sans détourner la
+        contrepassation — qui corrige une ERREUR, pas un événement économique.
+
+        Le montant reclassé est celui qui avait été DÉCLASSÉ (1 100), pas l'encours courant
+        (600) : depuis le déclassement, les remboursements de capital créditent 413 (B2) et
+        non 416. Rendre 1 100 à 413 rétablit donc « 413 + 416 = encours » dès que les
+        remboursements sont eux aussi comptabilisés. Ici, le règlement de 567,50 n'a été
+        saisi que dans `portfolio` (aucun événement de crédit ne nourrit encore la compta —
+        dette signalée) : 413 affiche donc 1 100 au lieu de 600, écart que `ecart_encours`
+        expose déjà dans l'arrêté.
+        """
         provisions.arreter(date_arrete=ARRETE_1, par="chef_compta")
         _rembourser(self.loan, "567.50", date(2026, 7, 15))
-        provisions.arreter(date_arrete=ARRETE_2, par="chef_compta")
+        resultat = provisions.arreter(date_arrete=ARRETE_2, par="chef_compta")
+
         classement = ClassementCredit.objects.get(date_arrete=ARRETE_2)
         self.assertEqual(classement.classe.code, "SAIN")
         self.assertFalse(classement.en_souffrance)
-        self.assertEqual(services.solde_compte("416", devise="USD"), Decimal("1100.00"))
-        self.assertEqual(services.solde_compte("413", devise="USD"), Decimal("0.00"))
+        self.assertIsNotNone(classement.piece_reclassement)
+
+        self.assertEqual(len(resultat["reclassements"]), 1)
+        reclassement = resultat["reclassements"][0]
+        self.assertEqual(reclassement["encours_reclasse"], Decimal("1100.00"))
+        self.assertEqual(reclassement["encours_courant"], Decimal("600.00"))
+
+        self.assertEqual(services.solde_compte("416", devise="USD"), Decimal("0.00"))
+        self.assertEqual(services.solde_compte("413", devise="USD"), Decimal("1100.00"))
+        self.assertEqual(services.controler_integrite(), [])
+
+    def test_reclassement_ne_se_rejoue_pas(self):
+        """Le retour à bonne fin est une TRANSITION : un troisième arrêté sur un crédit
+        déjà revenu sain ne repasse pas une seconde pièce B17 (416 serait négatif)."""
+        provisions.arreter(date_arrete=ARRETE_1, par="chef_compta")
+        _rembourser(self.loan, "567.50", date(2026, 7, 15))
+        provisions.arreter(date_arrete=ARRETE_2, par="chef_compta")
+        resultat = provisions.arreter(date_arrete=date(2026, 8, 31), par="chef_compta")
+        self.assertEqual(resultat["reclassements"], [])
+        self.assertEqual(services.solde_compte("416", devise="USD"), Decimal("0.00"))
+        self.assertEqual(services.solde_compte("413", devise="USD"), Decimal("1100.00"))
 
     def test_arrete_deja_passe_a_la_meme_date_refuse(self):
         provisions.arreter(date_arrete=ARRETE_1, par="chef_compta")

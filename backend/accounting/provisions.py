@@ -61,6 +61,10 @@ COMPTE_PROVISION = "137"
 EVENEMENT_DECLASSEMENT = "B5"
 EVENEMENT_DOTATION = "B6"
 EVENEMENT_REPRISE = "B7"
+#: Symétrique de B5, HORS annexe B (cf. `definitions.CATALOGUE["B17"]`) : sans lui, un
+#: crédit revenu à bonne fin restait indéfiniment en souffrance au grand livre et le PAR
+#: comptable ne redescendait jamais.
+EVENEMENT_RECLASSEMENT = "B17"
 
 
 # --------------------------------------------------------------------- GRILLE PAR
@@ -416,16 +420,20 @@ def arreter(
 
     declassements = _declasser(analyse, date_arrete=date_arrete, par=par,
                               prefixe_reference=prefixe_reference)
+    reclassements = _reclasser(analyse, date_arrete=date_arrete, par=par,
+                               prefixe_reference=prefixe_reference)
     arretes = _provisionner(analyse, date_arrete=date_arrete, par=par,
                            prefixe_reference=prefixe_reference)
     _enregistrer_classements(analyse, date_arrete=date_arrete, par=par,
-                             pieces_declassement=declassements["pieces_par_credit"])
+                             pieces_declassement=declassements["pieces_par_credit"],
+                             pieces_reclassement=reclassements["pieces_par_credit"])
 
     return {
         "date_arrete": date_arrete,
         "declassements": declassements["details"],
+        "reclassements": reclassements["details"],
         "arretes": arretes,
-        "anomalies": analyse["anomalies"],
+        "anomalies": analyse["anomalies"] + reclassements["anomalies"],
     }
 
 
@@ -484,6 +492,96 @@ def _declasser(analyse: dict, *, date_arrete, par, prefixe_reference) -> dict:
             "piece": piece.reference,
         })
     return {"details": details, "pieces_par_credit": pieces_par_credit}
+
+
+def _dernier_declassement(loan_id: int, *, avant: date_cls) -> ClassementCredit | None:
+    """Dernier arrêté ayant RÉELLEMENT passé une pièce B5 pour ce crédit."""
+    return (
+        ClassementCredit.objects
+        .filter(loan_id=loan_id, date_arrete__lt=avant, piece_declassement__isnull=False)
+        .order_by("-date_arrete", "-id")
+        .first()
+    )
+
+
+def _reclasser(analyse: dict, *, date_arrete, par, prefixe_reference) -> dict:
+    """B17 — 416 → 413 pour tout crédit qui SORT de la souffrance.
+
+    Le montant reclassé est celui qui avait été DÉCLASSÉ (l'encours porté par la pièce B5),
+    et non l'encours courant. Raison : depuis le déclassement, les remboursements de capital
+    ont continué de créditer 413 (schéma B2, qui ne connaît pas le compte 416). Rendre à 413
+    exactement ce que B5 lui avait pris rétablit donc mécaniquement l'identité
+    « 413 + 416 = encours », et laisse 416 à zéro pour ce crédit — au lieu d'y abandonner un
+    résidu que plus aucune écriture n'irait chercher.
+
+    Cas chiffré (celui de `tests_provisions`) : décaissement 1 200, capital remboursé 100 →
+    413 = 1 100 ; déclassement B5 → 413 = 0, 416 = 1 100 ; retour à bonne fin → B17 de
+    1 100 → 413 = 1 100, 416 = 0. Si les remboursements postérieurs avaient été
+    comptabilisés (B2 non branché à ce jour), 413 afficherait l'encours réel.
+
+    Le déclassement ne se rejoue pas (`_declasser`) ; le reclassement non plus : il n'a lieu
+    qu'à la TRANSITION « souffrance → sain » constatée par rapport au dernier classement.
+    """
+    a_reclasser = []
+    anomalies: list[dict] = []
+    for credit in analyse["credits"]:
+        if credit["en_souffrance"]:
+            continue
+        precedent = _dernier_classement(credit["loan_id"], avant=date_arrete)
+        if precedent is None or not precedent.en_souffrance:
+            continue
+        declassement = _dernier_declassement(credit["loan_id"], avant=date_arrete)
+        if declassement is None:
+            anomalies.append({
+                "loan_reference": credit["loan_reference"],
+                "messages": [
+                    "Crédit revenu sain alors qu'aucune pièce de déclassement B5 n'est "
+                    "traçable : rien n'a été reclassé (on ne devine pas ce qui a été "
+                    "porté en 416). À instruire manuellement."
+                ],
+            })
+            continue
+        a_reclasser.append((credit, services.q2(declassement.encours)))
+
+    # Garde-fou symétrique de celui du déclassement : on ne rend jamais à 413 plus
+    # d'encours en souffrance que le grand livre n'en porte réellement.
+    par_devise: dict[str, Decimal] = {}
+    for credit, montant in a_reclasser:
+        par_devise[credit["devise"]] = par_devise.get(credit["devise"], Decimal("0.00")) + montant
+    for devise, montant in par_devise.items():
+        solde = services.solde_compte(COMPTE_ENCOURS_SOUFFRANCE, devise=devise, as_of=date_arrete)
+        if solde < montant:
+            raise ValidationFailed(
+                f"Reclassement impossible en {devise} : le compte "
+                f"{COMPTE_ENCOURS_SOUFFRANCE}{devise} porte {solde} au grand livre alors que "
+                f"{montant} doivent revenir en encours sain. Aucun reclassement n'a été passé."
+            )
+
+    pieces_par_credit: dict[int, object] = {}
+    details = []
+    for credit, montant in a_reclasser:
+        piece = catalogue.executer_evenement(
+            EVENEMENT_RECLASSEMENT,
+            {"devise": credit["devise"], "montants": {"encours": montant}},
+            reference=f"{prefixe_reference}-{date_arrete:%Y%m%d}-B17-{credit['loan_reference']}",
+            date_operation=date_arrete,
+            libelle=f"Retour à bonne fin — {credit['loan_reference']} "
+                    f"(classe {credit['classe'].code}, {credit['jours_retard']} j de retard)",
+            origine_type="portfolio.Loan",
+            origine_id=str(credit["loan_id"]),
+            par=par,
+        )
+        pieces_par_credit[credit["loan_id"]] = piece
+        details.append({
+            "loan_reference": credit["loan_reference"],
+            "devise": credit["devise"],
+            "encours_reclasse": montant,
+            "encours_courant": credit["encours"],
+            "jours_retard": credit["jours_retard"],
+            "classe": credit["classe"].code,
+            "piece": piece.reference,
+        })
+    return {"details": details, "pieces_par_credit": pieces_par_credit, "anomalies": anomalies}
 
 
 def _provisionner(analyse: dict, *, date_arrete, par, prefixe_reference) -> list[dict]:
@@ -568,9 +666,10 @@ def _provisionner(analyse: dict, *, date_arrete, par, prefixe_reference) -> list
     return resultats
 
 
-def _enregistrer_classements(analyse, *, date_arrete, par, pieces_declassement) -> None:
+def _enregistrer_classements(analyse, *, date_arrete, par, pieces_declassement,
+                             pieces_reclassement=None) -> None:
+    pieces_reclassement = pieces_reclassement or {}
     for credit in analyse["credits"]:
-        piece = pieces_declassement.get(credit["loan_id"])
         ClassementCredit.objects.create(
             date_arrete=date_arrete,
             loan_id=credit["loan_id"],
@@ -580,7 +679,8 @@ def _enregistrer_classements(analyse, *, date_arrete, par, pieces_declassement) 
             encours=credit["encours"],
             devise=credit["devise"],
             en_souffrance=credit["en_souffrance"],
-            piece_declassement=piece,
+            piece_declassement=pieces_declassement.get(credit["loan_id"]),
+            piece_reclassement=pieces_reclassement.get(credit["loan_id"]),
             cree_par=par,
         )
 

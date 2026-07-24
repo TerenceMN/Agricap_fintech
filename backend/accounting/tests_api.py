@@ -395,9 +395,9 @@ class RestitutionsApiTests(ApiComptableTestCase):
         self.assertIn("positionContreValeur", reponse.data)
         self.assertEqual(reponse.data["devisePivot"], "FC")
 
-    def test_catalogue_expose_les_seize_schemas(self):
+    def test_catalogue_expose_les_schemas_de_lannexe_b_et_lextension_b17(self):
         reponse = self.client.get(f"{BASE}/catalogue")
-        self.assertEqual(reponse.data["total_rows"], 16)
+        self.assertEqual(reponse.data["total_rows"], 17)  # 16 (annexe B) + B17
 
 
 # --------------------------------------------------------------- TAUX (LECTURE)
