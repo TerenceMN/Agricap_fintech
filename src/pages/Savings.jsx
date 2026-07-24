@@ -30,15 +30,35 @@ const AGRO_OBJECTIVES = [
     { id: 'autre', label: 'Autres', icon: User },
 ];
 
-// --- Utils ---
-const calculateCompoundInterest = (principal, rate, years, frequency = 1) => {
-  // A = P(1 + r/n)^(nt)
-  const r = rate / 100;
-  const n = frequency; // times per year
-  const t = years;
-  const amount = principal * Math.pow((1 + r/n), (n * t));
-  return amount - principal;
-};
+/*
+ * `calculateCompoundInterest` a été SUPPRIMÉ, avec les trois taux qui
+ * l'alimentaient (`RATES = {campagne: 4.5, equipement: 3.8, groupee: 5.2}`,
+ * commentés « Mock rates based on type » dans le code d'origine).
+ *
+ * Trois défauts se superposaient dans un seul chiffre :
+ *
+ * 1. **Le taux annoncé n'est pas celui que le plan portera.**
+ *    `POST /savings/plans` ne transmet aucun taux : `SavingsPlan.interest_rate`
+ *    prend sa valeur par défaut — 4,5 — pour TOUS les types de plan. Un client
+ *    qui choisissait « Équipement (3.8%) » recevait, à l'écran suivant, un plan
+ *    servi à `interestRate: 4.5`. Le libellé contredisait le serveur une seconde
+ *    plus tard, sur la même page.
+ *
+ * 2. **Les intérêts étaient capitalisés sur la MOITIÉ de l'objectif**
+ *    (`calculateCompoundInterest(objectif / 2, …)`, commenté « Approximate on
+ *    avg balance »). Une convention de solde moyen choisie au navigateur, en
+ *    intérêts COMPOSÉS, sur un objectif qui n'est même pas encore un plan.
+ *
+ * 3. **Le serveur, lui, projette SANS intérêt.** `_growth_projection`
+ *    (`backend/savings/views.py`) l'écrit : « Dépôts réguliers, sans intérêt ni
+ *    retrait — projection assumée comme telle ». L'écran client promettait donc
+ *    un gain que la projection officielle de l'institution ne contient pas.
+ *
+ * Ce qui reste ici est un ÉCHÉANCIER DE VERSEMENTS : objectif ÷ nombre de
+ * périodes. C'est de l'arithmétique sur une saisie de l'utilisateur, pas une
+ * grandeur financière servie — et c'est exactement ce que le serveur calcule de
+ * son côté (`_adjustment_metrics`, `remaining / periodic`).
+ */
 
 // --- Modals ---
 const ConfirmationModal = ({ open, onOpenChange, plan, onConfirm }) => {
@@ -76,11 +96,18 @@ const ConfirmationModal = ({ open, onOpenChange, plan, onConfirm }) => {
               <p className="text-sm text-gray-400 capitalize">Dépôt {plan.frequence}</p>
               <p className="font-bold text-lg">{plan.depotPeriodique} {plan.currency}</p>
             </div>
+            {/* « Intérêts Estimés +X » a été retiré : le montant venait d'un taux de
+                démonstration que la création de plan ne transmet pas au serveur. */}
             <div className="text-right">
-               <p className="text-sm text-gray-400">Intérêts Estimés</p>
-               <p className="font-bold text-lg text-emerald-400">+{plan.interetsEstimes} {plan.currency}</p>
+               <p className="text-sm text-gray-400">Nombre de versements</p>
+               <p className="font-bold text-lg">{plan.periodes}</p>
             </div>
           </div>
+          <p className="text-[11px] text-gray-400 leading-relaxed">
+            Aucun intérêt n'est annoncé ici : le taux de rémunération est fixé par
+            l'institution sur le plan, et il s'affiche sur la carte du plan une fois
+            celui-ci créé.
+          </p>
         </div>
         <div className="flex items-center space-x-2 mt-4">
           <Checkbox id="terms" checked={agreed} onCheckedChange={setAgreed} className="border-emerald-400" />
@@ -171,13 +198,6 @@ const SavingsCalculator = ({ onPlanCalculated }) => {
   const [result, setResult] = useState(null);
   const [manualDuree, setManualDuree] = useState(false);
 
-  // Mock rates based on type
-  const RATES = {
-    'campagne': 4.5,
-    'equipement': 3.8,
-    'groupee': 5.2
-  };
-
   const handleChange = (e) => {
     const { name, value } = e.target;
     if (name === 'duree' && value === 'manual') {
@@ -203,19 +223,15 @@ const SavingsCalculator = ({ onPlanCalculated }) => {
     else if (frequence === 'mensuel') periodes = duree;
     
     if (periodes === 0 || duree <= 0) return;
-    
-    const depotPeriodique = objectif / periodes;
-    
-    // Calculate simple interest estimate
-    const rate = RATES[type];
-    const interest = calculateCompoundInterest(objectif / 2, rate, duree / 12); // Approximate on avg balance
-    
-    const newResult = { 
-        depotPeriodique: depotPeriodique.toFixed(2),
-        interetsEstimes: interest.toFixed(2),
-        taux: rate
-    };
-    setResult(newResult);
+
+    // Échéancier de versements, rien d'autre : aucun taux, aucun intérêt.
+    // `type` reste transmis au serveur (il porte la formule d'épargne choisie),
+    // mais il ne sert plus à afficher un rendement ici.
+    setResult({
+      depotPeriodique: (objectif / periodes).toFixed(2),
+      periodes,
+      type,
+    });
   };
   
   const handleCreatePlan = () => {
@@ -239,9 +255,12 @@ const SavingsCalculator = ({ onPlanCalculated }) => {
                 <div>
                     <Label htmlFor="type">Formule Épargne</Label>
                     <select id="type" name="type" value={form.type} onChange={handleChange} className="w-full mt-1 p-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm [&>option]:bg-slate-800 [&>option]:text-white">
-                        <option value="campagne">Campagne (4.5%)</option>
-                        <option value="equipement">Équipement (3.8%)</option>
-                        <option value="groupee">Groupée (5.2%)</option>
+                        {/* Les taux qui figuraient dans ces libellés (4.5 / 3.8 / 5.2 %)
+                            n'étaient portés par aucun endpoint : le serveur crée tout plan
+                            au même taux par défaut, quel que soit le type choisi. */}
+                        <option value="campagne">Campagne</option>
+                        <option value="equipement">Équipement</option>
+                        <option value="groupee">Groupée</option>
                     </select>
                 </div>
                 <div>
@@ -295,7 +314,7 @@ const SavingsCalculator = ({ onPlanCalculated }) => {
       <AnimatePresence>
       {result && (
         <motion.div initial={{opacity:0, x:20}} animate={{opacity:1, x:0}} exit={{opacity:0, x:20}} className="glass-effect rounded-2xl p-8 bg-white/10 flex flex-col justify-center border border-emerald-500/30">
-          <h3 className="text-2xl font-bold text-white mb-6 [&>option]:bg-slate-800 [&>option]:text-white">Votre Projection</h3>
+          <h3 className="text-2xl font-bold text-white mb-6 [&>option]:bg-slate-800 [&>option]:text-white">Votre échéancier de versements</h3>
           <div className="space-y-4 text-center">
               <div className="bg-white/5 p-4 rounded-lg border border-white/5">
                 <p className="text-gray-400 text-sm capitalize">Dépôt {form.frequence} suggéré</p>
@@ -303,15 +322,24 @@ const SavingsCalculator = ({ onPlanCalculated }) => {
               </div>
               <div className="grid grid-cols-2 gap-4">
                    <div className="bg-emerald-500/10 p-4 rounded-lg border border-emerald-500/20">
-                    <p className="text-emerald-300 text-sm">Taux Annuel</p>
-                    <p className="font-bold text-2xl text-emerald-400">{result.taux}%</p>
+                    <p className="text-emerald-300 text-sm">Nombre de versements</p>
+                    <p className="font-bold text-2xl text-emerald-400">{result.periodes}</p>
                   </div>
                   <div className="bg-blue-500/10 p-4 rounded-lg border border-blue-500/20">
-                    <p className="text-blue-300 text-sm">Intérêts (Est.)</p>
-                    <p className="font-bold text-2xl text-blue-400">+{result.interetsEstimes}</p>
+                    <p className="text-blue-300 text-sm">Montant cible</p>
+                    <p className="font-bold text-2xl text-blue-400">{Number(form.objectif).toLocaleString('fr-FR')} {form.currency}</p>
                   </div>
               </div>
           </div>
+          {/* Ce bloc affichait « Taux Annuel 4.5 % » et « Intérêts (Est.) +X »,
+              tous deux issus d'un taux de démonstration que le serveur ne
+              connaît pas. */}
+          <p className="text-[11px] text-gray-400 mt-4 leading-relaxed">
+            Cet échéancier ne contient aucun intérêt : il répartit votre montant cible sur la
+            durée choisie. La rémunération de votre épargne est fixée par l'institution sur le
+            plan une fois créé — son taux et son statut apparaissent alors sur la carte du plan.
+            La projection officielle de l'institution est elle aussi calculée sans intérêt.
+          </p>
           <Button onClick={handleCreatePlan} className="w-full mt-8 bg-purple-600 hover:bg-purple-700 font-bold py-6 text-lg shadow-lg shadow-purple-900/20"><Plus className="w-5 h-5 mr-2" />Créer cet Objectif</Button>
         </motion.div>
       )}
