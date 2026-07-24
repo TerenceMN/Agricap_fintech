@@ -113,6 +113,34 @@ export function needsSheetHint(code) {
 const VALIDATION_STATUSES = [400, 409, 422];
 
 /**
+ * Refus métier BLOQUANTS qui empruntent le même statut qu'un refus de fichier.
+ *
+ * Un 422 ne dit pas toujours « votre classeur est mauvais ». Certaines règles de
+ * gouvernance refusent l'opération elle-même, quel que soit le contenu du
+ * fichier : re-téléverser ne les lèvera JAMAIS. Les afficher sous « N points à
+ * corriger dans votre fichier » envoie le client modifier un classeur
+ * irréprochable, en boucle, sans qu'aucune correction ne change quoi que ce soit.
+ *
+ * Ces codes prennent donc le cadre « ce n'est pas votre fichier », avec l'action
+ * réelle à accomplir.
+ */
+const BUSINESS_BLOCKING_CODES = new Set([
+  // Un membre du personnel ne peut pas être bénéficiaire d'un crédit : il serait
+  // juge et partie. L'action est d'assigner le dossier à un client, pas de
+  // toucher au classeur.
+  'BENEFICIAIRE_INTERNE',
+]);
+
+/** Le refus vient-il d'une règle de gouvernance plutôt que du classeur ? */
+export function isBusinessBlockingError(err) {
+  const code = err && typeof err === 'object' ? err.code : null;
+  if (code && BUSINESS_BLOCKING_CODES.has(code)) return true;
+  // Le code peut aussi arriver dans le détail d'un 422 structuré.
+  const causes = err && Array.isArray(err.errors) ? err.errors : [];
+  return causes.some((c) => c && BUSINESS_BLOCKING_CODES.has(c.code));
+}
+
+/**
  * L'échec porte-t-il sur le fichier (→ cadre « à corriger ») ou sur le
  * transport (→ cadre « réessayez, ne touchez pas à votre classeur ») ?
  *
@@ -125,6 +153,10 @@ const VALIDATION_STATUSES = [400, 409, 422];
  */
 export function isFileValidationError(err) {
   if (!err || typeof err !== 'object') return false;
+  // Une règle de gouvernance passe avant le statut : un 422 « bénéficiaire
+  // interne » n'est pas un défaut de classeur, et aucun re-téléversement ne le
+  // lèvera.
+  if (isBusinessBlockingError(err)) return false;
   if (Array.isArray(err.errors) && err.errors.length > 0) return true;
   return VALIDATION_STATUSES.includes(err.status);
 }
@@ -138,6 +170,22 @@ export function isFileValidationError(err) {
  */
 export function transportErrorMessage(err) {
   const status = err && typeof err.status === 'number' ? err.status : null;
+
+  // Refus de gouvernance : le classeur n'est pas en cause, et le dire est le
+  // seul moyen d'éviter que le client le « corrige » indéfiniment. On relaie le
+  // message du serveur, qui nomme déjà la personne et le rôle en cause.
+  if (isBusinessBlockingError(err)) {
+    const cause = (Array.isArray(err?.errors) ? err.errors : [])
+      .find((c) => c && BUSINESS_BLOCKING_CODES.has(c.code));
+    return {
+      titre: 'Ce crédit doit être assigné à un client',
+      message:
+        (cause?.message || err?.message
+          || "Un membre du personnel ne peut pas être bénéficiaire d'un crédit.")
+        + ' Votre classeur n\'est pas en cause : le modifier ou le téléverser à nouveau ne '
+        + 'changera rien. Reprenez la demande en désignant le client bénéficiaire.',
+    };
+  }
 
   // Garde-fou local : sans code de dossier utilisable, l'envoi partirait avec
   // `application_code=""`, que le backend lit comme « pas de dossier » et qui le

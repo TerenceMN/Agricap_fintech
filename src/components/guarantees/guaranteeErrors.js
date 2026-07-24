@@ -86,6 +86,10 @@ const RELAYED_CODES = new Set([
   'CLIENT_CONSENT_MISSING', 'consent_required',
   'CLIENT_CONSENT_EXPIRED', 'consent_expired',
   'ASSET_VERIFY_REFUSED', 'ASSET_REJECT_REFUSED',
+  // Refus de gouvernance : un membre du personnel ne peut pas être bénéficiaire
+  // d'un crédit. Le message serveur nomme déjà la personne et son rôle — le
+  // relayer tel quel vaut mieux que le reformuler moins précisément.
+  'BENEFICIAIRE_INTERNE',
   'WORKFLOW_ERROR', 'GUARANTEE_ERROR', 'ERREUR',
 ]);
 
