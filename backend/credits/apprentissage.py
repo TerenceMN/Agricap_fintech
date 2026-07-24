@@ -59,12 +59,18 @@ CENTIME = Decimal("0.01")
 
 #: Seuil de bascule indicatif → appris. VALEUR DE SECOURS uniquement (principe
 #: 8, « exception : les valeurs par défaut de secours, avec warning loggé ») :
-#: le seuil vit en base dans `BaremeScore(code="APPRENTISSAGE").parametres`,
-#: éditable par le comité en maker-checker comme tout autre barème.
+#: le seuil vit en base dans `AnalysisRule.thresholds`.
 N_MIN_DEFAUT = 30
 
-#: Code du jeu de règles paramétrant la boucle.
-BAREME_APPRENTISSAGE = "APPRENTISSAGE"
+#: Règle paramétrable qui porte le seuil. `AnalysisRule` plutôt que
+#: `BaremeScore` : un `BaremeScore` est une COURBE ou un jeu de règles de
+#: SCORING, servi par la machinerie de révision (golden set, prévisualisation
+#: d'impact sur les recommandations). Un seuil d'effectif n'a rien à y faire —
+#: `previsualiser_impact` n'aurait rien à prévisualiser. `AnalysisRule` est la
+#: table des seuils opérationnels, et c'est déjà celle qui porte ceux du
+#: contrôle de cohérence de la feuille de besoins (principe 6 : une seule
+#: nomenclature par concept).
+REGLE_APPRENTISSAGE = "apprentissage_referentiel"
 
 #: Provenances de ventilation qui APPRENNENT quelque chose au référentiel.
 #: `referential` en est exclu par construction (cf. docstring, finesse 1).
@@ -81,16 +87,16 @@ def seuil_n_min() -> int:
     Lu en base ; le défaut de secours est loggué chaque fois qu'il s'applique,
     pour qu'un paramètre absent ne se confonde jamais avec un paramètre choisi.
     """
-    from credits.models import BaremeScore
+    from credits.models import AnalysisRule
 
-    bareme = BaremeScore.objects.filter(code=BAREME_APPRENTISSAGE, actif=True).first()
-    valeur = (bareme.parametres or {}).get("n_min_cas_reels") if bareme else None
+    regle = AnalysisRule.objects.filter(rule_id=REGLE_APPRENTISSAGE, active=True).first()
+    valeur = (regle.thresholds or {}).get("n_min_cas_reels") if regle else None
     if valeur is None:
         logger.warning(
-            "Seuil d'apprentissage non paramétré (BaremeScore « %s ») : repli sur "
+            "Seuil d'apprentissage non paramétré (AnalysisRule « %s ») : repli sur "
             "la valeur de secours N ≥ %s. À poser en base pour que le comité "
             "puisse la déplacer sans redéploiement.",
-            BAREME_APPRENTISSAGE, N_MIN_DEFAUT,
+            REGLE_APPRENTISSAGE, N_MIN_DEFAUT,
         )
         return N_MIN_DEFAUT
     try:

@@ -435,38 +435,10 @@ def parse_needs_sheet(
         grand_total = sum(total_by_module.values())
 
     # ── Cohérence vs référentiel ──────────────────────────────────────────────
-    anomalies: list[str] = []
-    if value_chain is not None and area_ha and area_ha > 0 and grand_total > 0:
-        ref_cost = float(value_chain.cost_per_hectare_usd if currency == "USD"
-                         else value_chain.cost_per_hectare_cdf) * float(area_ha)
-        ratio = grand_total / ref_cost if ref_cost > 0 else 0
-        if ratio > 1.30:
-            anomalies.append(
-                f"Vos besoins ({grand_total:,.0f} {currency}) représentent "
-                f"{ratio:.1f}× le coût standard {value_chain.label} "
-                f"à {float(area_ha)} ha ({ref_cost:,.0f} {currency}). "
-                f"Un justificatif sera demandé à l'analyste."
-            )
-        elif ratio < 0.70:
-            anomalies.append(
-                f"Vos besoins ({grand_total:,.0f} {currency}) sont nettement inférieurs "
-                f"au coût standard {value_chain.label} "
-                f"à {float(area_ha)} ha ({ref_cost:,.0f} {currency}). "
-                f"Vérifiez l'exhaustivité du dossier."
-            )
-
-        # Cohérence des poids modulaires
-        expected_weights = value_chain.module_weights or {}
-        for mod, expected_pct in expected_weights.items():
-            actual = total_by_module.get(mod, 0)
-            if grand_total > 0:
-                actual_pct = actual / grand_total * 100
-                if expected_pct > 5 and actual_pct > (expected_pct * 1.8):
-                    anomalies.append(
-                        f"Module «{mod}» : {actual_pct:.0f} % du total "
-                        f"(standard : {expected_pct:.0f} %). "
-                        f"Vérifiez cette ligne."
-                    )
+    anomalies, anomalies_staff = _controler_coherence_referentiel(
+        value_chain=value_chain, area_ha=area_ha, currency=currency,
+        grand_total=grand_total, total_by_module=total_by_module,
+    )
 
     # ── Détection du gabarit non rempli ──────────────────────────────────────
     example_items = [i for i in all_items if i.get("_is_example")]
@@ -493,8 +465,157 @@ def parse_needs_sheet(
         "totalByModule": total_by_module,
         "grandTotal": grand_total,
         "warnings": all_warnings,
+        # Servi au CLIENT (`POST /needs-sheet/parse/`, puis persisté dans
+        # `NeedsSheet.anomalies` que `serialize_application` republie) : aucun
+        # chiffre du référentiel n'y figure.
         "anomalies": anomalies,
+        # Réservé au STAFF : les mêmes constats, avec la référence et l'écart.
+        # Non publié aujourd'hui — sa persistance demande une ligne dans
+        # `views._persist_needs_sheet`, fichier tenu par un autre périmètre
+        # (signalé au rapport). L'analyste dispose déjà de ces écarts, chiffrés
+        # et lignés, dans l'onglet Analyse (`AnalyseCredit.criteres.technique`).
+        "anomaliesStaff": anomalies_staff,
     }
+
+
+def _controler_coherence_referentiel(
+    *, value_chain, area_ha, currency: str, grand_total, total_by_module: dict,
+) -> tuple[list[str], list[dict]]:
+    """Confronte le plan au référentiel — et rend DEUX restitutions.
+
+    FUITE CORRIGÉE (principe 7). Ce contrôle renvoyait au client, dans le même
+    payload que son upload : le coût de référence par hectare de sa filière
+    (« coût standard Maïs à 3 ha : 3 600 USD »), le ratio exact de son plan à ce
+    coût, et le poids modules standard de la filière (« standard : 25 % »). Le
+    client apprenait donc, en trois uploads, la grille complète contre laquelle
+    il est scoré — et pouvait ajuster son dossier jusqu'à la borne, ce qui est
+    exactement le gaming que l'asymétrie d'information doit rendre impossible.
+    Ces mêmes chiffres viennent d'être fermés sur `reference-data/value-chains/`
+    et au diff de révision : les laisser sortir ici les aurait rouverts par la
+    porte de service.
+
+    Ce que le client garde : le FAIT sur SES propres données (son total, son
+    pourcentage par module — qu'il peut recalculer lui-même), le sens de
+    l'écart, et l'action attendue. Ce qu'il perd : la valeur de référence, le
+    ratio et le seuil. Le staff, lui, reçoit tout, en entrées structurées.
+    """
+    anomalies: list[str] = []
+    staff: list[dict] = []
+    if value_chain is None or not area_ha or area_ha <= 0 or grand_total <= 0:
+        return anomalies, staff
+
+    seuils = _seuils_coherence()
+    ref_cost = float(value_chain.cost_per_hectare_usd if currency == "USD"
+                     else value_chain.cost_per_hectare_cdf) * float(area_ha)
+    ratio = grand_total / ref_cost if ref_cost > 0 else 0
+
+    if ratio > seuils["ratio_max"]:
+        anomalies.append(
+            f"Vos besoins ({grand_total:,.0f} {currency}) sont nettement "
+            f"au-dessus de ce qui est habituellement nécessaire pour un projet "
+            f"{value_chain.label} de cette dimension. Un justificatif sera "
+            f"demandé à l'analyste."
+        )
+        staff.append({
+            "code": "TOTAL_AU_DESSUS_REFERENCE",
+            "totalPlan": round(float(grand_total), 2),
+            "totalReference": round(ref_cost, 2),
+            "ratio": round(ratio, 3),
+            "seuil": seuils["ratio_max"],
+            "devise": currency,
+        })
+    elif ratio < seuils["ratio_min"]:
+        anomalies.append(
+            f"Vos besoins ({grand_total:,.0f} {currency}) sont nettement "
+            f"en dessous de ce qui est habituellement nécessaire pour un projet "
+            f"{value_chain.label} de cette dimension. Vérifiez l'exhaustivité "
+            f"du dossier : un poste oublié se paie pendant la campagne."
+        )
+        staff.append({
+            "code": "TOTAL_SOUS_REFERENCE",
+            "totalPlan": round(float(grand_total), 2),
+            "totalReference": round(ref_cost, 2),
+            "ratio": round(ratio, 3),
+            "seuil": seuils["ratio_min"],
+            "devise": currency,
+        })
+
+    # Structure des coûts : chaque filière a sa signature (le poids modules du
+    # référentiel). Le client apprend que SON module pèse trop lourd ; il
+    # n'apprend pas combien il « devrait » peser.
+    for module, poids_attendu in (value_chain.module_weights or {}).items():
+        actual = total_by_module.get(module, 0)
+        actual_pct = actual / grand_total * 100
+        if poids_attendu <= seuils["poids_plancher_pct"]:
+            # Un module marginal du référentiel : un écart relatif y est du
+            # bruit, pas un signal.
+            continue
+        if actual_pct > poids_attendu * seuils["poids_facteur_max"]:
+            anomalies.append(
+                f"Le module «{module}» représente {actual_pct:.0f} % de votre "
+                f"budget — nettement plus que dans la structure de coûts "
+                f"habituelle de cette filière. Vérifiez cette ligne."
+            )
+            staff.append({
+                "code": "POIDS_MODULE_ATYPIQUE",
+                "module": module,
+                "poidsObservePct": round(actual_pct, 1),
+                "poidsReferencePct": round(float(poids_attendu), 1),
+                "facteur": round(actual_pct / float(poids_attendu), 2),
+                "seuilFacteur": seuils["poids_facteur_max"],
+            })
+    return anomalies, staff
+
+
+#: Seuils de secours du contrôle de cohérence (principe 8 : « exception, les
+#: valeurs par défaut de secours, avec warning loggé quand elles s'appliquent »).
+#: Ils reprennent à l'identique les valeurs qui étaient codées en dur ici —
+#: 1,30 / 0,70 / 1,8 / 5 % — pour ne déplacer aucune frontière en même temps
+#: qu'on rend le paramètre éditable.
+SEUILS_COHERENCE_DEFAUT = {
+    "ratio_max": 1.30,
+    "ratio_min": 0.70,
+    "poids_facteur_max": 1.8,
+    "poids_plancher_pct": 5.0,
+}
+
+#: Règle paramétrable qui les porte en base (`AnalysisRule.thresholds`),
+#: modifiable par le comité sans redéploiement.
+REGLE_COHERENCE = "needs_vs_referentiel"
+
+
+def _seuils_coherence() -> dict:
+    """Seuils du contrôle, lus en base — défauts de secours signalés.
+
+    Ces quatre nombres décidaient jusqu'ici, depuis le code, de ce qui est « un
+    dossier trop cher » et « un module atypique » : des seuils métier en dur,
+    que le comité ne pouvait pas déplacer sans déploiement (principe 8).
+    """
+    import logging
+
+    from credits.models import AnalysisRule
+
+    regle = AnalysisRule.objects.filter(rule_id=REGLE_COHERENCE, active=True).first()
+    seuils = dict(SEUILS_COHERENCE_DEFAUT)
+    if regle is None:
+        logging.getLogger(__name__).warning(
+            "Règle « %s » absente ou inactive : contrôle de cohérence appliqué "
+            "avec les seuils de secours %s. À poser en base pour que le comité "
+            "puisse les régler sans redéploiement.", REGLE_COHERENCE, seuils,
+        )
+        return seuils
+    for cle, defaut in SEUILS_COHERENCE_DEFAUT.items():
+        brut = (regle.thresholds or {}).get(cle)
+        if brut is None:
+            continue
+        try:
+            seuils[cle] = float(decimal.Decimal(str(brut)))
+        except (decimal.InvalidOperation, TypeError, ValueError):
+            logging.getLogger(__name__).warning(
+                "Seuil « %s » illisible dans la règle « %s » (« %s ») : repli "
+                "sur %s.", cle, REGLE_COHERENCE, brut, defaut,
+            )
+    return seuils
 
 
 def _check_suppliers(items: list[dict], warnings: list[str]) -> None:

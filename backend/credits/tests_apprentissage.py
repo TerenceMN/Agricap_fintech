@@ -26,7 +26,7 @@ from credits.apprentissage import (
     statistiques_filiere,
 )
 from credits.models import (
-    BaremeScore,
+    AnalysisRule,
     CreditApplication,
     ModuleAllocation,
     ObservationFiliere,
@@ -157,10 +157,10 @@ class AucuneSubstitutionSilencieuseTest(TestCase):
 
     def setUp(self):
         self.ref = _referentiel()
-        BaremeScore.objects.update_or_create(
-            code="APPRENTISSAGE",
-            defaults={"libelle": "Boucle d'apprentissage",
-                      "parametres": {"n_min_cas_reels": 3}, "actif": True},
+        AnalysisRule.objects.update_or_create(
+            rule_id="apprentissage_referentiel",
+            defaults={"name": "Boucle d'apprentissage — effectif minimal",
+                      "thresholds": {"n_min_cas_reels": 3}, "active": True},
         )
 
     def _clore(self, n: int):
@@ -234,9 +234,10 @@ class SeuilParametrableTest(TestCase):
     """Principe 8 : le seuil vit en base, et son absence se signale."""
 
     def test_seuil_lu_en_base(self):
-        BaremeScore.objects.update_or_create(
-            code="APPRENTISSAGE",
-            defaults={"parametres": {"n_min_cas_reels": 50}, "actif": True},
+        AnalysisRule.objects.update_or_create(
+            rule_id="apprentissage_referentiel",
+            defaults={"name": "Effectif minimal",
+                      "thresholds": {"n_min_cas_reels": 50}, "active": True},
         )
         self.assertEqual(seuil_n_min(), 50)
 

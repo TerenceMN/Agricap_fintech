@@ -20,10 +20,47 @@ import io
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from credits.models import BaremeScore, ReferentielFiliere
+from credits.apprentissage import N_MIN_DEFAUT, REGLE_APPRENTISSAGE
+from credits.models import AnalysisRule, BaremeScore, ReferentielFiliere
+from credits.needs_parser import REGLE_COHERENCE, SEUILS_COHERENCE_DEFAUT
 from credits.referentiel_loader import (
     ReferentielIntrouvable, charger_depuis_simulateur, simulateurs_disponibles,
 )
+
+#: Seuils OPÉRATIONNELS — ceux qui ne sont ni une courbe ni une règle de
+#: scoring, et qui n'ont donc rien à faire dans `BaremeScore` (dont la
+#: machinerie de révision prévisualise l'impact sur le golden set : un effectif
+#: minimal n'a aucun impact à prévisualiser). Ils vivaient en dur dans le code —
+#: 1,30 / 0,70 / 1,8 / 5 % dans le parseur, 30 dans la boucle d'apprentissage —
+#: ce que le principe 8 interdit. Les valeurs POSÉES ICI sont identiques à
+#: celles qui étaient codées : on rend le paramètre éditable sans déplacer
+#: aucune frontière.
+REGLES_SEUILS = [
+    {
+        "rule_id": REGLE_COHERENCE,
+        "name": "Cohérence de la feuille de besoins vs référentiel filière",
+        "description": (
+            "Déclenche quand le total du plan s'écarte du coût de référence de la "
+            "filière, ou quand un module pèse anormalement lourd dans le budget. "
+            "Les valeurs de référence ne sortent JAMAIS vers le client "
+            "(principe 7) : il reçoit le sens de l'écart et l'action attendue."
+        ),
+        "severity_default": "a_justifier",
+        "thresholds": {cle: str(valeur) for cle, valeur in SEUILS_COHERENCE_DEFAUT.items()},
+    },
+    {
+        "rule_id": REGLE_APPRENTISSAGE,
+        "name": "Boucle d'apprentissage — effectif minimal par filière",
+        "description": (
+            "Nombre de dossiers clos et contributifs à partir duquel une filière "
+            "devient CANDIDATE à un référentiel appris (principe 10). Franchir ce "
+            "seuil ne bascule rien : la version apprise passe par un comité, en "
+            "maker-checker."
+        ),
+        "severity_default": "info",
+        "thresholds": {"n_min_cas_reels": str(N_MIN_DEFAUT)},
+    },
+]
 
 #: Les trois barèmes de la SPEC §5, plus le barème de décision.
 #: Abscisses et ordonnées en CHAÎNES : un JSON `float` ferait rentrer le binaire
@@ -165,6 +202,27 @@ class Command(BaseCommand):
             )
             verbe = "créé" if cree else "réécrit (--force)"
             self.stdout.write(self.style.SUCCESS(f"  + {obj.code} : {verbe} v{obj.version}"))
+
+        for spec in REGLES_SEUILS:
+            existante = AnalysisRule.objects.filter(rule_id=spec["rule_id"]).first()
+            if existante and not force:
+                # Même parti pris que les barèmes : on relève une règle
+                # désactivée sans toucher aux seuils que le comité a réglés.
+                if not existante.active:
+                    existante.active = True
+                    existante.save(update_fields=["active"])
+                    self.stdout.write(
+                        f"  = {spec['rule_id']} : réactivée (seuils conservés)")
+                else:
+                    self.stdout.write(f"  = {spec['rule_id']} : déjà présente, inchangée")
+                continue
+            obj, cree = AnalysisRule.objects.update_or_create(
+                rule_id=spec["rule_id"],
+                defaults={k: v for k, v in spec.items() if k != "rule_id"},
+            )
+            verbe = "créée" if cree else "réécrite (--force)"
+            self.stdout.write(self.style.SUCCESS(
+                f"  + {obj.rule_id} : {verbe} — {obj.thresholds}"))
 
         for source in simulateurs_disponibles():
             try:
