@@ -580,3 +580,55 @@ class FusionEcheancierTests(ProvisionsTestCase):
         # L'exposition, elle, reste comptée : un paramétrage douteux ne fait pas
         # disparaître 1 200 USD décaissés du bilan.
         self.assertEqual(analyse["encours"], Decimal("1200.00"))
+
+
+class CoherenceDesBasesTests(ProvisionsTestCase):
+    """`portfolio` et `accounting` doivent compter le MÊME argent décaissé.
+
+    Les deux définitions sont volontairement identiques (`Loan.disbursed_validated` et
+    `provisions._flux_du_credit` : décaissements au statut VALIDÉ). Rien ne garantit qu'elles
+    le restent — et si elles divergent, la provision se calcule sur une base que la
+    comptabilité croit connaître et ne connaît plus. Le contrôle existe pour ça.
+    """
+
+    def test_les_deux_modules_comptent_le_meme_decaisse(self):
+        """L'invariant lui-même, vérifié sur le cas nominal ET sur un décaissement partiel
+        (le cas où deux définitions divergentes se verraient)."""
+        loan = _creer_credit(montant="1200")
+        _decaisser(loan, montant="800")
+        LoanTransaction.objects.create(
+            loan=loan, date=DEBUT, kind=LoanTransaction.Kind.DISBURSEMENT,
+            amount=Decimal("400"), currency=loan.currency,
+            status=LoanTransaction.Status.EN_ATTENTE,  # NON validé : compté par personne
+        )
+        loan.refresh_from_db()
+
+        decaisse, _ = provisions._flux_du_credit(loan)
+        self.assertEqual(decaisse, Decimal("800.00"))
+        self.assertEqual(services.q2(loan.disbursed_validated), decaisse)
+
+    def test_une_divergence_de_base_est_signalee_et_non_silencieuse(self):
+        """Le jour où les deux définitions se répondent différemment, la provision ne doit
+        pas être servie comme si de rien n'était. On simule la divergence — elle est
+        inatteignable autrement, et c'est bien le but."""
+        from unittest.mock import patch
+
+        from portfolio.services import BASE_APPROUVE, schedule_for
+
+        loan = _creer_credit()
+        _decaisser(loan)
+
+        divergent = dict(schedule_for(loan), principalSource=BASE_APPROUVE)
+        with patch("portfolio.services.schedule_for", return_value=divergent):
+            classes = provisions.verifier_couverture()
+            analyse = provisions.analyser_credit(loan, as_of=ARRETE_1, classes=classes)
+
+        self.assertTrue(any("INCOHÉRENCE" in m for m in analyse["anomalies"]),
+                        analyse["anomalies"])
+
+    def test_le_cas_nominal_ne_declenche_aucune_incoherence(self):
+        loan = _creer_credit()
+        _decaisser(loan)
+        classes = provisions.verifier_couverture()
+        analyse = provisions.analyser_credit(loan, as_of=ARRETE_1, classes=classes)
+        self.assertFalse([m for m in analyse["anomalies"] if "INCOHÉRENCE" in m])

@@ -261,7 +261,7 @@ def _echeancier_du_credit(loan, anomalies: list[str]) -> list[dict]:
     remontée dans le rapport, pas une exception : un dossier mal configuré ne doit pas
     empêcher l'arrêté de provision de tout le portefeuille.
     """
-    from portfolio.services import schedule_for
+    from portfolio.services import BASE_APPROUVE, schedule_for
 
     try:
         reponse = schedule_for(loan)
@@ -277,15 +277,29 @@ def _echeancier_du_credit(loan, anomalies: list[str]) -> list[dict]:
     # REPRISES telles quelles : elles expliquent l'échéancier sur lequel la provision est
     # calculée, et un auditeur doit les lire au même endroit que le chiffre.
     anomalies.extend(reponse.get("anomalies") or [])
-    # Littéral et non constante importée : `portfolio` GÈLE la chaîne elle-même
-    # (`BASE_APPROUVE == "montant_approuve"`, verrouillé par un test chez lui) précisément
-    # pour que cette comparaison ne puisse pas devenir silencieusement fausse — une alerte
-    # qui s'éteint sans bruit est pire qu'une exception.
-    if reponse.get("principalSource") == "montant_approuve":
+    # CONTRÔLE DE COHÉRENCE, et non information : ce test est censé ne JAMAIS être vrai ici.
+    #
+    # `analyser_credit` ne nous appelle que si elle a vu des décaissements validés, et
+    # `portfolio` n'étiquette « montant_approuve » que s'il n'en voit AUCUN — les deux
+    # définitions sont volontairement les mêmes (`Loan.disbursed_validated` le dit dans sa
+    # docstring). Si elles se répondent différemment, ce n'est donc pas un cas de figure,
+    # c'est que les deux modules ne comptent plus le même argent : la provision serait
+    # calculée sur une base que la comptabilité croit connaître et ne connaît plus.
+    #
+    # On compare la CONSTANTE de `portfolio`, jamais son littéral. Un test qui gèle la chaîne
+    # chez lui attrape « quelqu'un change la valeur » — mais pas le refactor qui arrive
+    # vraiment : renommer la valeur ET mettre le test à jour dans le même geste, ce à quoi
+    # ressemble un refactor propre. Les deux suites resteraient vertes et cette comparaison
+    # deviendrait silencieusement fausse. Un import ne peut pas être « mis à jour de bonne
+    # foi » dans le mauvais sens : la valeur suit, ou il casse. (Arbitrage rendu par l'agent
+    # `portfolio`, propriétaire de la constante.)
+    if reponse.get("principalSource") == BASE_APPROUVE:
         anomalies.append(
-            "Échéancier PRÉVISIONNEL : aucun décaissement validé, l'amortissement porte sur "
-            "le montant approuvé. Les jours de retard sont ceux d'un calendrier qui n'est "
-            "pas encore contractuel."
+            "INCOHÉRENCE : le portefeuille amortit le montant APPROUVÉ (échéancier "
+            "prévisionnel, donc aucun décaissement validé de son point de vue) alors que la "
+            "comptabilité en constate. Les deux modules ne comptent plus le même argent — "
+            "les jours de retard portent sur un calendrier qui n'est pas celui du contrat. "
+            "À instruire avant de s'appuyer sur cette provision."
         )
     return _traduire(reponse["schedule"])
 
