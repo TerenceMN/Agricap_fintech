@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from django.test import SimpleTestCase, TestCase
 
+from common.exceptions import ValidationFailed
 from common.testing import AuthedAPITestCase
 
 from . import rates
@@ -629,6 +630,324 @@ class TauxRepriseDeLAnalyseTests(TestCase):
         self.assertEqual(
             rates.valider_taux_mensuel(D("0.583333"), taux_annuel_dossier=D("7")),
             D("0.583333"))
+
+
+# =============================================================================
+# DIFFÉRÉ — ce qui est SCORÉ doit être ce qui est REMBOURSÉ.
+#
+# Le prévisionnel gère un différé (intérêts seuls / franchise totale) ; le réel
+# n'en avait aucun. Un dossier scoré avec 5 mois de différé — donc dont le DSCR
+# est mesuré APRÈS récolte — était remboursé dès le premier mois.
+# =============================================================================
+
+class DiffereConformeAuPrevisionnelTests(SimpleTestCase):
+    """À paramètres égaux, les deux moteurs décrivent le MÊME prêt, différé compris."""
+
+    CAS = [
+        # capital, taux annuel, durée, différé, mode
+        (D("1330"), D("18"), 8, 5, schedule_module.MODE_INTERETS_SEULS),
+        (D("1330"), D("18"), 8, 5, schedule_module.MODE_FRANCHISE_TOTALE),
+        (D("5000"), D("12"), 10, 4, schedule_module.MODE_INTERETS_SEULS),
+        (D("9000"), D("15"), 12, 3, schedule_module.MODE_FRANCHISE_TOTALE),
+        (D("1000"), D("12"), 6, 5, schedule_module.MODE_INTERETS_SEULS),   # 1 mois d'amortissement
+        (D("50000"), D("22.6"), 36, 6, schedule_module.MODE_FRANCHISE_TOTALE),  # taux non terminant
+        (D("7777.77"), D("6"), 12, 1, schedule_module.MODE_INTERETS_SEULS),
+        (D("1000"), D("0"), 6, 2, schedule_module.MODE_FRANCHISE_TOTALE),  # taux nul
+    ]
+
+    def test_les_codes_de_mode_sont_les_memes_des_deux_cotes(self):
+        """Deux nomenclatures pour un même concept, c'est le principe 6 qui saute."""
+        from credits import echeancier as prevu
+
+        self.assertEqual(schedule_module.MODE_INTERETS_SEULS, prevu.MODE_INTERETS_SEULS)
+        self.assertEqual(schedule_module.MODE_FRANCHISE_TOTALE, prevu.MODE_FRANCHISE_TOTALE)
+        self.assertEqual(set(schedule_module.MODES_DIFFERE), set(prevu.MODES))
+        self.assertEqual(schedule_module.PHASE_DIFFERE, prevu.PHASE_DIFFERE)
+        self.assertEqual(schedule_module.PHASE_AMORTISSEMENT, prevu.PHASE_AMORTISSEMENT)
+
+    def test_ligne_a_ligne_identique_au_previsionnel(self):
+        from credits.echeancier import construire_echeancier
+
+        for capital, taux_annuel, duree, differe, mode in self.CAS:
+            with self.subTest(capital=capital, differe=differe, mode=mode):
+                reel = build_schedule(capital, taux_annuel / D("12"), duree, "monthly",
+                                      DEBUT, "USD", deferral_months=differe,
+                                      deferral_mode=mode)
+                prevu = construire_echeancier(capital, taux_annuel, duree, differe, mode)
+                self.assertEqual(len(reel), len(prevu))
+                for row, ligne in zip(reel, prevu):
+                    self.assertEqual(row["number"], ligne["mois"])
+                    self.assertEqual(row["phase"], ligne["phase"])
+                    self.assertEqual(row["principal"], ligne["capital"])
+                    self.assertEqual(row["interest"], ligne["interets"])
+                    self.assertEqual(row["interest_capitalized"],
+                                     ligne["interets_capitalises"])
+                    self.assertEqual(row["total"], ligne["echeance"])
+                    self.assertEqual(row["balance"], ligne["crd"])
+
+    def test_totaux_identiques_au_previsionnel(self):
+        from credits.echeancier import construire_echeancier, totaux_echeancier
+
+        for capital, taux_annuel, duree, differe, mode in self.CAS:
+            with self.subTest(capital=capital, differe=differe, mode=mode):
+                rows = build_schedule(capital, taux_annuel / D("12"), duree, "monthly",
+                                      DEBUT, "USD", deferral_months=differe,
+                                      deferral_mode=mode)
+                reel = schedule_totals(rows, duree, "USD")
+                prevu = totaux_echeancier(
+                    construire_echeancier(capital, taux_annuel, duree, differe, mode))
+                self.assertEqual(reel["total_principal"], prevu["capital_rembourse"])
+                self.assertEqual(reel["total_interest"], prevu["interets_payes"])
+                self.assertEqual(reel["total_interest_capitalized"],
+                                 prevu["interets_capitalises"])
+                self.assertEqual(reel["total_payments"], prevu["service_dette"])
+                self.assertEqual(reel["final_balance"], prevu["crd_final"])
+
+
+class CasChiffreDiffereTests(SimpleTestCase):
+    """Le cas de référence A.2 : 1 330 / 18 %/an / 8 mois / différé 5.
+
+    C'est le cas cité dans CLAUDE.md §8.4 — service de la dette 1 469,65. Ce module
+    le produisait à 1 419,78 (sans différé), soit 49,87 de moins que le dossier sur
+    lequel le client a été scoré.
+    """
+
+    def _rows(self, mode=schedule_module.MODE_INTERETS_SEULS):
+        return build_schedule(D("1330"), D("18") / D("12"), 8, "monthly", DEBUT,
+                              "USD", deferral_months=5, deferral_mode=mode)
+
+    def test_interets_seuls_service_de_la_dette(self):
+        rows = self._rows()
+        self.assertEqual(len(rows), 8)
+        # 5 mois d'intérêts seuls à 19,95, puis 3 mensualités qui amortissent.
+        for row in rows[:5]:
+            self.assertEqual(row["phase"], schedule_module.PHASE_DIFFERE)
+            self.assertEqual(row["principal"], D("0.00"))
+            self.assertEqual(row["interest"], D("19.95"))
+            self.assertEqual(row["balance"], D("1330.00"))   # capital intact
+        for row in rows[5:]:
+            self.assertEqual(row["phase"], schedule_module.PHASE_AMORTISSEMENT)
+        self.assertEqual(rows[5]["principal"], D("443.33"))  # 1 330 / 3
+        self.assertEqual(rows[-1]["balance"], D("0.00"))
+        totaux = schedule_totals(rows, 8, "USD")
+        self.assertEqual(totaux["total_principal"], D("1330.00"))
+        self.assertEqual(totaux["total_payments"], D("1469.65"))   # §8.4
+
+    def test_franchise_totale_capitalise_les_interets(self):
+        rows = self._rows(schedule_module.MODE_FRANCHISE_TOTALE)
+        for row in rows[:5]:
+            self.assertEqual(row["total"], D("0.00"))         # rien n'est payé
+            self.assertEqual(row["interest"], D("0.00"))
+            self.assertGreater(row["interest_capitalized"], D("0.00"))
+        # Le capital à amortir n'est plus 1 330 mais le CRD en fin de différé.
+        self.assertEqual(rows[4]["balance"], D("1432.78"))     # annexe A.2
+        self.assertEqual(rows[5]["principal"], D("477.59"))    # 1 432,78 / 3
+        self.assertEqual(rows[-1]["balance"], D("0.00"))
+
+    def test_sans_differe_le_service_de_la_dette_est_inferieur(self):
+        """L'écart chiffré que ce lot ferme : 1 419,78 payé vs 1 469,65 scoré."""
+        sans = schedule_totals(
+            build_schedule(D("1330"), D("18") / D("12"), 8, "monthly", DEBUT, "USD"),
+            8, "USD")
+        self.assertEqual(sans["total_payments"], D("1419.78"))
+        self.assertEqual(schedule_totals(self._rows(), 8, "USD")["total_payments"]
+                         - sans["total_payments"], D("49.87"))
+
+
+class InvariantsDiffereTests(SimpleTestCase):
+    """Les invariants tiennent AUSSI avec différé — y compris celui qui change."""
+
+    CAS = DiffereConformeAuPrevisionnelTests.CAS
+
+    def test_crd_final_rigoureusement_nul(self):
+        for capital, taux, duree, differe, mode in self.CAS:
+            with self.subTest(differe=differe, mode=mode):
+                rows = build_schedule(capital, taux / D("12"), duree, "monthly", DEBUT,
+                                      "USD", deferral_months=differe, deferral_mode=mode)
+                self.assertEqual(rows[-1]["balance"], D("0.00"))
+
+    def test_somme_principal_egale_capital_plus_interets_capitalises(self):
+        """L'invariant « Σ principal = capital » devient, en franchise totale,
+        « Σ principal = capital + Σ intérêts capitalisés » — parce que ces intérêts
+        SONT devenus du capital. Même convention que `credits.echeancier`."""
+        for capital, taux, duree, differe, mode in self.CAS:
+            with self.subTest(differe=differe, mode=mode):
+                rows = build_schedule(capital, taux / D("12"), duree, "monthly", DEBUT,
+                                      "USD", deferral_months=differe, deferral_mode=mode)
+                totaux = schedule_totals(rows, duree, "USD")
+                self.assertEqual(
+                    totaux["total_principal"],
+                    (capital + totaux["total_interest_capitalized"]).quantize(D("0.01")))
+
+    def test_aucun_capital_n_est_amorti_pendant_le_differe(self):
+        for capital, taux, duree, differe, mode in self.CAS:
+            with self.subTest(differe=differe, mode=mode):
+                rows = build_schedule(capital, taux / D("12"), duree, "monthly", DEBUT,
+                                      "USD", deferral_months=differe, deferral_mode=mode)
+                for row in rows[:differe]:
+                    self.assertEqual(row["principal"], D("0.00"))
+                self.assertTrue(all(r["phase"] == schedule_module.PHASE_AMORTISSEMENT
+                                    for r in rows[differe:]))
+
+
+class DiffereRefuseTests(SimpleTestCase):
+    """Un différé inexploitable est REFUSÉ, jamais rogné en silence."""
+
+    def _build(self, **kwargs):
+        params = dict(principal=D("1000"), monthly_rate_pct=D("1"), duration_months=6,
+                      frequency="monthly", start_date=DEBUT)
+        params.update(kwargs)
+        return build_schedule(**params)
+
+    def test_differe_egal_ou_superieur_a_la_duree(self):
+        for differe in (6, 7):
+            with self.subTest(differe=differe):
+                with self.assertRaises(schedule_module.EcheancierInvalide) as ctx:
+                    self._build(deferral_months=differe)
+                self.assertIn("strictement inférieur", str(ctx.exception))
+
+    def test_differe_negatif(self):
+        with self.assertRaises(schedule_module.EcheancierInvalide):
+            self._build(deferral_months=-1)
+
+    def test_mode_inconnu(self):
+        with self.assertRaises(schedule_module.EcheancierInvalide):
+            self._build(deferral_months=2, deferral_mode="capitalisation_partielle")
+
+    def test_differe_sur_periodicite_non_mensuelle_est_refuse(self):
+        """Ni approximation ni conversion implicite : 5 mois de différé ne tombent
+        sur aucune échéance trimestrielle."""
+        for frequence in ("quarterly", "annual", "bullet"):
+            with self.subTest(frequence=frequence):
+                with self.assertRaises(schedule_module.EcheancierInvalide) as ctx:
+                    self._build(duration_months=12, frequency=frequence,
+                                deferral_months=5)
+                self.assertIn("mensuelle", str(ctx.exception))
+
+    def test_differe_nul_laisse_toutes_les_periodicites_disponibles(self):
+        for frequence in ("monthly", "quarterly", "annual", "bullet"):
+            with self.subTest(frequence=frequence):
+                self.assertTrue(self._build(duration_months=12, frequency=frequence))
+
+
+class DiffereDuDossierTests(TestCase):
+    """Le différé traverse le modèle, le service et l'API."""
+
+    def _loan(self, **kwargs) -> Loan:
+        defaults = dict(
+            reference="CRD-2026-920", operator="Coopérative Test",
+            amount_approved=D("1330"), annual_rate=D("18"), duration_months=8,
+            frequency="monthly", start_date=DEBUT, currency="USD",
+        )
+        defaults.update(kwargs)
+        return Loan.objects.create(**defaults)
+
+    def test_l_echeancier_du_dossier_applique_le_differe(self):
+        loan = self._loan(deferral_months=5)
+        data = services.schedule_for(loan)
+        self.assertEqual(data["deferralMonths"], 5)
+        self.assertEqual(data["schedule"][0]["principal"], D("0.00"))
+        self.assertEqual(data["totals"]["total_payments"], D("1469.65"))
+
+    def test_sans_differe_le_dossier_reste_a_l_identique(self):
+        loan = self._loan(reference="CRD-2026-921")
+        self.assertEqual(services.schedule_for(loan)["totals"]["total_payments"],
+                         D("1419.78"))
+
+    def test_la_configuration_refuse_un_differe_superieur_a_la_duree(self):
+        loan = self._loan(reference="CRD-2026-922")
+        with self.assertRaises(ValidationFailed):
+            services.apply_config(loan, {"deferralMonths": 8}, by="agent")
+        loan.refresh_from_db()
+        self.assertEqual(loan.deferral_months, 0)     # rien n'a été enregistré
+
+    def test_la_configuration_refuse_un_differe_sur_du_trimestriel(self):
+        loan = self._loan(reference="CRD-2026-923")
+        with self.assertRaises(ValidationFailed):
+            services.apply_config(loan, {"deferralMonths": 3, "frequency": "quarterly"},
+                                  by="agent")
+
+    def test_la_configuration_applique_un_differe_valide(self):
+        loan = self._loan(reference="CRD-2026-924")
+        sched = services.apply_config(
+            loan, {"deferralMonths": 5, "deferralMode": "franchise_totale"}, by="agent")
+        loan.refresh_from_db()
+        self.assertEqual(loan.deferral_months, 5)
+        self.assertEqual(loan.deferral_mode, "franchise_totale")
+        self.assertEqual(sched["schedule"][4]["balance"], D("1432.78"))
+
+    def test_le_differe_de_l_analyse_est_repris(self):
+        class _Analyse:
+            differe_mois = 5
+            mode_differe = "franchise_totale"
+
+        self.assertEqual(services._differe_de_l_analyse(_Analyse(), 8),
+                         {"deferral_months": 5, "deferral_mode": "franchise_totale"})
+        self.assertEqual(services._differe_de_l_analyse(None, 8), {})
+
+    def test_un_differe_d_analyse_incoherent_remonte_en_erreur(self):
+        class _Analyse:
+            differe_mois = 12
+            mode_differe = "interets_seuls"
+
+        with self.assertRaises(ValidationFailed):
+            services._differe_de_l_analyse(_Analyse(), 8)
+
+
+# =============================================================================
+# CALENDRIER — les échéances sont calées sur la DATE D'EFFET, pas sur la précédente.
+# =============================================================================
+
+class CalendrierSansDeriveTests(SimpleTestCase):
+    """Un prêt du 31 janvier ne doit pas voir TOUTES ses échéances tomber le 28."""
+
+    def _dates(self, debut, duree=6, frequence="monthly"):
+        return [r["date"] for r in
+                build_schedule(D("6000"), D("1"), duree, frequence, debut, "USD")]
+
+    def test_le_31_janvier_ne_contamine_pas_les_mois_suivants(self):
+        """L'ancrage sur la date d'effet rend le calendrier du CONTRAT.
+
+        En chaînant sur la date précédente, février bornait le jour à 28 et le 28
+        devenait la nouvelle ancre : le client payait au 28 pour toujours, y compris
+        les mois de 31 jours. Sur un prêt de 24 mois, la dernière échéance tombait
+        trois jours avant sa date contractuelle.
+        """
+        self.assertEqual(
+            self._dates(date(2026, 1, 31)),
+            ["2026-02-28", "2026-03-31", "2026-04-30", "2026-05-31",
+             "2026-06-30", "2026-07-31"],
+        )
+
+    def test_le_29_fevrier_bissextile_se_rattrape(self):
+        self.assertEqual(
+            self._dates(date(2024, 8, 29), duree=7),
+            ["2024-09-29", "2024-10-29", "2024-11-29", "2024-12-29",
+             "2025-01-29", "2025-02-28", "2025-03-29"],
+        )
+
+    def test_le_31_janvier_en_trimestriel(self):
+        self.assertEqual(
+            self._dates(date(2026, 1, 31), duree=12, frequence="quarterly"),
+            ["2026-04-30", "2026-07-31", "2026-10-31", "2027-01-31"],
+        )
+
+    def test_une_date_sans_ambiguite_est_inchangee(self):
+        """Non-régression : pour un jour ≤ 28, le calendrier ne bouge pas d'un jour."""
+        self.assertEqual(
+            self._dates(date(2026, 1, 15)),
+            ["2026-02-15", "2026-03-15", "2026-04-15", "2026-05-15",
+             "2026-06-15", "2026-07-15"],
+        )
+
+    def test_add_months_reste_inchange(self):
+        """`accounting.provisions` IMPORTE `add_months` pour calculer les jours de
+        retard : la correction porte sur l'ANCRAGE (le site d'appel), pas sur la
+        fonction — les dates de l'arrêté de provision ne bougent donc pas d'un jour.
+        """
+        self.assertEqual(schedule_module.add_months(date(2026, 1, 31), 1), date(2026, 2, 28))
+        self.assertEqual(schedule_module.add_months(date(2026, 2, 28), 1), date(2026, 3, 28))
+        self.assertEqual(schedule_module.add_months(date(2026, 1, 31), 3), date(2026, 4, 30))
 
 
 class ConversionTauxTests(SimpleTestCase):

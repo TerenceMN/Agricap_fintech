@@ -15,6 +15,7 @@ from audit.services import record as audit_record
 from common.exceptions import InsufficientFundsError, ValidationFailed
 
 from . import rates
+from . import schedule as schedule_module
 from .models import Loan, LoanConfigHistory, LoanGuarantee, LoanNote, LoanSubWallet, LoanTransaction
 from .schedule import add_months, build_schedule, schedule_totals
 
@@ -154,6 +155,24 @@ def _taux_de_l_analyse(app) -> tuple[Decimal | None, str, str]:
     return None, "", ""
 
 
+def _differe_de_l_analyse(analyse, duree_mois: int) -> dict:
+    """Différé SCORÉ du dossier, repris tel quel — ou refus explicite.
+
+    Le DSCR du dossier a été calculé sur ce différé : ne pas le reprendre revient à
+    faire rembourser dès le premier mois un client dont la capacité de remboursement
+    a été mesurée après récolte. Un différé incohérent avec la durée retenue côté
+    gestion n'est pas rogné en silence : il remonte en erreur.
+    """
+    if analyse is None:
+        return {}
+    mois = int(getattr(analyse, "differe_mois", 0) or 0)
+    if mois <= 0:
+        return {}
+    mode = getattr(analyse, "mode_differe", None) or schedule_module.MODE_INTERETS_SEULS
+    schedule_module._valider_differe(mois, int(duree_mois or 0), mode, "monthly")
+    return {"deferral_months": mois, "deferral_mode": mode}
+
+
 @transaction.atomic
 def create_from_application(app, *, by: str = ""):
     """
@@ -176,6 +195,7 @@ def create_from_application(app, *, by: str = ""):
     if analyse is not None and getattr(analyse, "duree_mois", None):
         duree = int(analyse.duree_mois)
     taux_annuel, provenance, avertissement = _taux_de_l_analyse(app)
+    differe = _differe_de_l_analyse(analyse, duree)
 
     snapshot = dict(
         operator=getattr(app.client, "full_name", None) or "—",
@@ -195,6 +215,9 @@ def create_from_application(app, *, by: str = ""):
         # une resynchronisation ne re-tarife pas un prêt déjà configuré.
         if taux_annuel is not None and not existing.annual_rate:
             _appliquer_taux_analyse(existing, taux_annuel, provenance, avertissement, by=by)
+        if differe and not existing.deferral_months:
+            for champ, valeur in differe.items():
+                setattr(existing, champ, valeur)
         existing.save()
         return existing
 
@@ -202,11 +225,18 @@ def create_from_application(app, *, by: str = ""):
         reference=app.code, application=app,
         duration_months=duree or 12,
         status=_APP_STATUS_TO_LOAN.get(app.status, Loan.Status.EN_TRAITEMENT),
-        created_by=by, **snapshot,
+        created_by=by, **snapshot, **differe,
     )
     if taux_annuel is not None:
         loan.annual_rate = taux_annuel
     loan.save()
+    if differe:
+        LoanConfigHistory.objects.create(
+            loan=loan, action="Différé repris de l'analyse", user=by or "Système",
+            details=f"{differe['deferral_months']} mois de différé "
+                    f"({differe['deferral_mode']}) — le DSCR du dossier a été "
+                    f"calculé sur ce différé.",
+        )
     if taux_annuel is not None:
         _journaliser_taux(loan, taux_annuel, provenance, avertissement, by=by)
     else:
@@ -274,9 +304,48 @@ def _lire_taux(data: dict, loan: Loan | None = None) -> dict:
     return {}
 
 
+def _lire_differe(data: dict, loan: Loan | None = None) -> dict:
+    """Extrait le différé d'un payload et le VALIDE contre la durée et la périodicité.
+
+    Le contrôle a lieu à l'écriture, pas au calcul : un dossier ne doit pas pouvoir
+    être enregistré dans un état dont l'échéancier lèverait une erreur à l'affichage.
+    """
+    fourni = {}
+    if data.get("deferralMonths") is not None or data.get("deferral_months") is not None:
+        brut = data.get("deferralMonths")
+        if brut is None:
+            brut = data.get("deferral_months")
+        fourni["deferral_months"] = max(0, _int(brut, 0))
+    mode = data.get("deferralMode") or data.get("deferral_mode")
+    if mode:
+        if mode not in schedule_module.MODES_DIFFERE:
+            raise ValidationFailed(
+                f"Mode de différé « {mode} » inconnu "
+                f"(attendu : {', '.join(schedule_module.MODES_DIFFERE)})."
+            )
+        fourni["deferral_mode"] = mode
+    if not fourni:
+        return {}
+
+    # Cohérence évaluée sur l'état RÉSULTANT (payload + valeurs déjà en base).
+    differe = fourni.get("deferral_months",
+                         getattr(loan, "deferral_months", 0) if loan else 0)
+    duree = _int(data.get("duration") or data.get("duration_months"),
+                 getattr(loan, "duration_months", 0) if loan else 0)
+    frequence = (data.get("frequency")
+                 or (getattr(loan, "frequency", "monthly") if loan else "monthly"))
+    schedule_module._valider_differe(
+        differe, duree, fourni.get("deferral_mode",
+                                   getattr(loan, "deferral_mode", None) if loan
+                                   else schedule_module.MODE_INTERETS_SEULS),
+        frequence)
+    return fourni
+
+
 @transaction.atomic
 def create_loan(data: dict, *, by: str = "") -> Loan:
     taux = _lire_taux(data)
+    differe = _lire_differe(data)
     loan = Loan(
         reference=generate_reference(),
         date=_date(data.get("date")) or timezone.localdate(),
@@ -296,7 +365,7 @@ def create_loan(data: dict, *, by: str = "") -> Loan:
         guarantee=(data.get("guarantee") or "").strip(),
         borrower_sub=(data.get("borrowerSub") or "").strip(),
         created_by=by,
-        **taux,
+        **taux, **differe,
     )
     _recompute_due_date(loan)
     loan.save()
@@ -456,6 +525,8 @@ def apply_config(loan: Loan, data: dict, *, by: str = "", action: str = "Modific
     """
     for champ, valeur in _lire_taux(data, loan).items():
         setattr(loan, champ, valeur)
+    for champ, valeur in _lire_differe(data, loan).items():
+        setattr(loan, champ, valeur)
     loan.duration_months = _int(data.get("duration") or data.get("duration_months"), loan.duration_months)
     if data.get("frequency"):
         loan.frequency = data["frequency"]
@@ -487,9 +558,13 @@ def schedule_for(loan: Loan) -> dict:
     duree = int(loan.duration_months or 0)
     start = loan.start_date or loan.date or timezone.localdate()
     rows = build_schedule(principal, loan.monthly_rate_pct, duree, loan.frequency,
-                          start, loan.currency)
+                          start, loan.currency,
+                          deferral_months=loan.deferral_months,
+                          deferral_mode=loan.deferral_mode)
     return {"schedule": rows, "totals": schedule_totals(rows, duree, loan.currency),
-            "currency": loan.currency}
+            "currency": loan.currency,
+            "deferralMonths": loan.deferral_months,
+            "deferralMode": loan.deferral_mode}
 
 
 @transaction.atomic

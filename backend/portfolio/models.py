@@ -14,6 +14,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from django.db import models
 from django.utils import timezone
 
+from . import schedule
+
 
 class Loan(models.Model):
     """Un dossier de crédit géré (un « crédit » de la table admin)."""
@@ -37,6 +39,12 @@ class Loan(models.Model):
     class Currency(models.TextChoices):
         USD = "USD", "USD"
         CDF = "CDF", "CDF"
+
+    class DeferralMode(models.TextChoices):
+        """Codes RIGOUREUSEMENT ceux de `credits.echeancier` (principe 6)."""
+
+        INTERETS_SEULS = schedule.MODE_INTERETS_SEULS, "Intérêts seuls"
+        FRANCHISE_TOTALE = schedule.MODE_FRANCHISE_TOTALE, "Franchise totale"
 
     reference = models.CharField(max_length=32, unique=True, db_index=True)  # CRD-AAAA-NNN
     date = models.DateField(default=timezone.localdate)                      # date de la demande
@@ -71,6 +79,25 @@ class Loan(models.Model):
                   "Recopié de l'analyse au rattachement du dossier.",
     )
     frequency = models.CharField(max_length=12, choices=Frequency.choices, default=Frequency.MONTHLY)
+
+    # ── Différé ───────────────────────────────────────────────────────────────
+    # Le prévisionnel qui SCORE le dossier gère un différé ; le prêt qui le
+    # REMBOURSE n'en avait aucun. Un dossier scoré avec 5 mois de différé — donc
+    # dont le DSCR est calculé sur ce différé, après récolte — était remboursé dès
+    # le premier mois. Le calendrier cultural n'était pas honoré (CLAUDE.md §4.2).
+    deferral_months = models.PositiveIntegerField(
+        default=0, verbose_name="Différé (mois)",
+        help_text="Nombre de mois de différé, INCLUS dans la durée totale. "
+                  "Périodicité mensuelle uniquement.",
+    )
+    deferral_mode = models.CharField(
+        max_length=20, choices=DeferralMode.choices, default=DeferralMode.INTERETS_SEULS,
+        verbose_name="Mode de différé",
+        help_text="Intérêts seuls : le client paie les intérêts, le capital reste "
+                  "intact. Franchise totale : rien n'est payé, les intérêts sont "
+                  "capitalisés et grossissent le capital à amortir.",
+    )
+
     start_date = models.DateField(null=True, blank=True)
     due_date = models.DateField(null=True, blank=True)
 
