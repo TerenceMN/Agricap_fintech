@@ -35,9 +35,12 @@ bugs d'arrondi — ils sont remontés au fondateur, pas masqués ici) :
      (l'unité du prévisionnel) : sur une autre périodicité il est REFUSÉ, jamais
      approximé ;
   3. ce module gère des périodicités (mensuel/trimestriel/annuel/in fine) que le
-     prévisionnel ignore (mensuel strict) ;
-  4. la base amortie est `amount_approved` (à défaut `amount_requested`), pas le
-     total réellement décaissé.
+     prévisionnel ignore (mensuel strict) — écart assumé, pas un défaut ;
+  4. RÉSOLU (cf. `services.base_amortissable`) — la base amortie était
+     `amount_approved`, jamais le décaissé réel : un décaissement partiel faisait
+     rembourser un capital jamais reçu. Elle est désormais le total des
+     décaissements VALIDÉS dès qu'il en existe un, et la réponse d'API dit
+     TOUJOURS laquelle des deux bases a servi (`principalSource`).
 Hors ces points, et à paramètres équivalents (mensuel, taux mensuel = taux annuel
 / 12, même différé), les deux moteurs produisent les MÊMES chiffres — c'est
 verrouillé par un test de non-régression croisé (`portfolio/tests.py`).

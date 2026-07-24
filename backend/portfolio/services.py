@@ -543,6 +543,68 @@ def apply_config(loan: Loan, data: dict, *, by: str = "", action: str = "Modific
     return schedule_for(loan)
 
 
+#: Bases d'amortissement possibles — la réponse dit TOUJOURS laquelle a servi.
+BASE_DECAISSE = "decaisse_valide"
+BASE_APPROUVE = "montant_approuve"
+
+
+def base_amortissable(loan: Loan) -> dict:
+    """Capital à amortir, sa provenance, et les faits qui la nuancent.
+
+    Le prêt s'amortissait sur `amount_approved`, jamais sur ce qui était réellement
+    sorti : un décaissement partiel produisait un échéancier sur un capital que le
+    client n'avait pas reçu — il remboursait de l'argent jamais versé.
+
+    Règle retenue :
+      - dès qu'un décaissement VALIDÉ existe, c'est LUI qui s'amortit ;
+      - tant que rien n'est sorti, l'échéancier reste PRÉVISIONNEL sur le montant
+        approuvé, et il le dit.
+    Aucune des deux bases n'est servie sans son étiquette : un écran ne peut pas
+    présenter un prévisionnel comme un contrat.
+    """
+    decaisse = loan.disbursed_validated
+    approuve = loan.amount_approved or loan.amount_requested or Decimal("0")
+    anomalies: list[str] = []
+
+    if decaisse > 0:
+        base, source = decaisse, BASE_DECAISSE
+        if approuve and decaisse != approuve:
+            sens = "partiel" if decaisse < approuve else "supérieur à l'approbation"
+            anomalies.append(
+                f"Décaissement {sens} : {decaisse} {loan.currency} sortis pour "
+                f"{approuve} approuvés. L'échéancier amortit le décaissé — l'écart "
+                f"de {abs(approuve - decaisse)} {loan.currency} est à instruire."
+            )
+        tranches = [t for t in loan.transactions.all()
+                    if t.kind == LoanTransaction.Kind.DISBURSEMENT
+                    and t.status == LoanTransaction.Status.VALIDE and t.amount]
+        jours = {t.date for t in tranches if t.date}
+        if len(jours) > 1:
+            anomalies.append(
+                f"{len(tranches)} décaissements étalés sur {len(jours)} dates : "
+                f"l'échéancier amortit leur TOTAL depuis la date d'effet du prêt. "
+                f"Un amortissement tranche par tranche (intérêts courus depuis la "
+                f"date de chaque versement) est une décision de méthode qui n'a pas "
+                f"été arbitrée — signalé, jamais tranché en silence."
+            )
+    else:
+        base, source = approuve, BASE_APPROUVE
+
+    return {"principal": base, "source": source, "anomalies": anomalies,
+            "approuve": approuve, "decaisse": decaisse}
+
+
+def date_d_effet(loan: Loan):
+    """Date d'effet de l'échéancier — jamais antérieure à la sortie des fonds.
+
+    À défaut de `start_date` saisie, on prend la date du PREMIER décaissement validé
+    plutôt que `loan.date` (la date de la DEMANDE) : faire courir les intérêts depuis
+    une demande, c'est facturer un argent qui n'était pas encore sorti.
+    """
+    return (loan.start_date or loan.first_disbursement_date or loan.date
+            or timezone.localdate())
+
+
 def schedule_for(loan: Loan) -> dict:
     """Échéancier réel du dossier — 100 % `Decimal` de bout en bout (principe 4).
 
@@ -554,17 +616,23 @@ def schedule_for(loan: Loan) -> dict:
     pas la colonne `rate` arrondie : c'est la condition pour que le calendrier PAYÉ
     tombe au centime sur le calendrier SCORÉ.
     """
-    principal = loan.amount_approved or loan.amount_requested or Decimal("0")
+    base = base_amortissable(loan)
     duree = int(loan.duration_months or 0)
-    start = loan.start_date or loan.date or timezone.localdate()
-    rows = build_schedule(principal, loan.monthly_rate_pct, duree, loan.frequency,
-                          start, loan.currency,
+    start = date_d_effet(loan)
+    rows = build_schedule(base["principal"], loan.monthly_rate_pct, duree,
+                          loan.frequency, start, loan.currency,
                           deferral_months=loan.deferral_months,
                           deferral_mode=loan.deferral_mode)
     return {"schedule": rows, "totals": schedule_totals(rows, duree, loan.currency),
             "currency": loan.currency,
             "deferralMonths": loan.deferral_months,
-            "deferralMode": loan.deferral_mode}
+            "deferralMode": loan.deferral_mode,
+            # Le capital amorti et SA PROVENANCE : sans elles, l'écran ne peut pas
+            # distinguer un échéancier contractuel d'une projection.
+            "principal": base["principal"],
+            "principalSource": base["source"],
+            "startDate": start.isoformat() if start else "",
+            "anomalies": base["anomalies"]}
 
 
 @transaction.atomic

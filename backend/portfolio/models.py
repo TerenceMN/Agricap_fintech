@@ -237,6 +237,31 @@ class Loan(models.Model):
         return total
 
     @property
+    def disbursed_validated(self) -> Decimal:
+        """Décaissé effectivement SORTI = décaissements au statut « Validé ».
+
+        Distinct de `disbursed`, qui additionne aussi les mouvements « en attente ».
+        C'est cette base-là qui s'amortit : on ne fait pas rembourser un capital
+        dont on n'est pas sûr qu'il ait quitté la caisse. Même définition que
+        `accounting.provisions._flux_du_credit`, pour que l'encours comptable et
+        l'échéancier client parlent du même argent.
+        """
+        return sum(
+            (t.amount for t in self.transactions.all()
+             if t.kind == LoanTransaction.Kind.DISBURSEMENT
+             and t.status == LoanTransaction.Status.VALIDE and t.amount),
+            Decimal("0"),
+        )
+
+    @property
+    def first_disbursement_date(self):
+        """Date du premier décaissement validé — le jour où l'argent est sorti."""
+        dates = [t.date for t in self.transactions.all()
+                 if t.kind == LoanTransaction.Kind.DISBURSEMENT
+                 and t.status == LoanTransaction.Status.VALIDE and t.amount and t.date]
+        return min(dates) if dates else None
+
+    @property
     def repaid(self) -> Decimal:
         """Total remboursé (montant positif) = somme des remboursements."""
         total = sum(((-t.amount) for t in self.transactions.all()

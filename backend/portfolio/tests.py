@@ -895,6 +895,95 @@ class DiffereDuDossierTests(TestCase):
 
 
 # =============================================================================
+# BASE AMORTIE — on rembourse l'argent REÇU, pas l'argent approuvé.
+# =============================================================================
+
+class BaseAmortissableTests(TestCase):
+    """Un décaissement partiel produisait un échéancier sur un capital jamais reçu."""
+
+    def _loan(self, **kwargs) -> Loan:
+        defaults = dict(
+            reference="CRD-2026-930", operator="Coopérative Test",
+            amount_approved=D("1330"), annual_rate=D("18"), duration_months=8,
+            frequency="monthly", start_date=DEBUT, currency="USD",
+        )
+        defaults.update(kwargs)
+        return Loan.objects.create(**defaults)
+
+    def _decaisser(self, loan, montant, jour=DEBUT, statut="VALIDE"):
+        return loan.transactions.create(
+            kind="DISBURSEMENT", amount=D(montant), currency=loan.currency,
+            date=jour, status=statut)
+
+    def test_sans_decaissement_l_echeancier_reste_previsionnel_et_le_dit(self):
+        data = services.schedule_for(self._loan())
+        self.assertEqual(data["principalSource"], services.BASE_APPROUVE)
+        self.assertEqual(data["principal"], D("1330"))
+        self.assertEqual(data["anomalies"], [])
+
+    def test_le_decaissement_valide_devient_la_base_amortie(self):
+        loan = self._loan(reference="CRD-2026-931")
+        self._decaisser(loan, "1330")
+        data = services.schedule_for(loan)
+        self.assertEqual(data["principalSource"], services.BASE_DECAISSE)
+        self.assertEqual(data["totals"]["total_principal"], D("1330.00"))
+        self.assertEqual(data["anomalies"], [])
+
+    def test_un_decaissement_partiel_n_amortit_que_ce_qui_est_sorti(self):
+        """800 sortis sur 1 330 approuvés : le client remboursait 1 330."""
+        loan = self._loan(reference="CRD-2026-932")
+        self._decaisser(loan, "800")
+        data = services.schedule_for(loan)
+        self.assertEqual(data["principal"], D("800"))
+        self.assertEqual(data["totals"]["total_principal"], D("800.00"))
+        # 530 USD de capital jamais versé disparaissent de l'échéancier, et
+        # l'écart est DIT, pas absorbé.
+        self.assertEqual(len(data["anomalies"]), 1)
+        self.assertIn("530", data["anomalies"][0])
+        self.assertIn("partiel", data["anomalies"][0])
+
+    def test_un_decaissement_en_attente_ne_compte_pas(self):
+        """L'argent pas encore sorti ne s'amortit pas (même règle qu'`accounting`)."""
+        loan = self._loan(reference="CRD-2026-933")
+        self._decaisser(loan, "800", statut="EN_ATTENTE")
+        data = services.schedule_for(loan)
+        self.assertEqual(data["principalSource"], services.BASE_APPROUVE)
+        self.assertEqual(loan.disbursed_validated, D("0"))
+        self.assertEqual(loan.disbursed, D("800"))     # `disbursed` les compte, lui
+
+    def test_des_tranches_etalees_sont_signalees_et_non_arbitrees(self):
+        loan = self._loan(reference="CRD-2026-934")
+        self._decaisser(loan, "700", jour=DEBUT)
+        self._decaisser(loan, "630", jour=date(2026, 3, 15))
+        data = services.schedule_for(loan)
+        self.assertEqual(data["principal"], D("1330"))
+        self.assertEqual(len(data["anomalies"]), 1)
+        self.assertIn("tranche par tranche", data["anomalies"][0])
+
+    def test_un_surdecaissement_est_signale(self):
+        loan = self._loan(reference="CRD-2026-935")
+        self._decaisser(loan, "1500")
+        data = services.schedule_for(loan)
+        self.assertEqual(data["principal"], D("1500"))
+        self.assertIn("supérieur à l'approbation", data["anomalies"][0])
+
+    def test_la_date_d_effet_ne_precede_jamais_la_sortie_des_fonds(self):
+        """Sans date d'effet saisie, l'échéancier partait de la date de DEMANDE :
+        les intérêts couraient sur un argent pas encore versé."""
+        loan = self._loan(reference="CRD-2026-936", start_date=None,
+                          date=date(2026, 1, 5))
+        self._decaisser(loan, "1330", jour=date(2026, 2, 20))
+        data = services.schedule_for(loan)
+        self.assertEqual(data["startDate"], "2026-02-20")
+        self.assertEqual(data["schedule"][0]["date"], "2026-03-20")
+
+    def test_sans_rien_l_echeancier_retombe_sur_la_date_du_dossier(self):
+        loan = self._loan(reference="CRD-2026-937", start_date=None,
+                          date=date(2026, 1, 5))
+        self.assertEqual(services.schedule_for(loan)["startDate"], "2026-01-05")
+
+
+# =============================================================================
 # CALENDRIER — les échéances sont calées sur la DATE D'EFFET, pas sur la précédente.
 # =============================================================================
 
