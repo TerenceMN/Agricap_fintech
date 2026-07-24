@@ -197,6 +197,24 @@ def imputer(echeances: list[dict], total_regle: Decimal) -> dict:
 
     Retourne le capital effectivement remboursé et la date de la plus ancienne échéance
     non intégralement réglée (`None` si tout est à jour).
+
+    DETTE CONNUE — CETTE FONCTION EST UN DOUBLON EN SURSIS (signalée par l'agent
+    `portfolio`, et il a raison). `portfolio.repayment` applique la même règle pour
+    ventiler les remboursements en événements B2/B3 : l'imputation est une propriété de
+    l'ÉCHÉANCIER, que `portfolio` produit et dont ce module dépend déjà depuis la fusion
+    (`_echeancier_du_credit`). C'est donc CETTE copie-ci qui doit partir, exactement comme
+    la 4ᵉ réimplémentation d'échéancier avant elle — et pas l'inverse : un module métier ne
+    peut pas dépendre de la comptabilité pour appliquer sa propre règle.
+
+    Ce qui manque pour la retirer, demandé au producteur : une fonction PUBLIQUE (la sienne
+    est `_imputer`, donc privée — consommer un souligné, c'est signer pour une rupture sans
+    préavis) qui rende AUSSI `premiere_echeance_impayee`. C'est le seul champ que sa version
+    ne calcule pas, et c'est celui dont dépendent les jours de retard, donc la provision.
+
+    En attendant, la divergence est impossible sans bruit : `portfolio.tests`
+    (`ImputationUniqueTests`) verrouille l'égalité des deux implémentations au centime sur
+    huit montants, y compris la date du premier impayé. C'est un filet, pas une
+    architecture — il ne dispense pas du retrait, il le rend sûr.
     """
     reste = services.q2(total_regle)
     capital_rembourse = Decimal("0.00")
