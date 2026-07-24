@@ -984,6 +984,77 @@ class BaseAmortissableTests(TestCase):
 
 
 # =============================================================================
+# CONTRAT DE SORTIE — `accounting.provisions` consomme CET échéancier.
+#
+# Depuis la fusion (accounting 9194208), `provisions._echeancier_du_credit`
+# appelle `portfolio.services.schedule_for(loan)` et traduit ses clés : il
+# n'existe plus qu'UN échéancier par prêt. Le prix de cette convergence est que
+# la FORME de ces lignes est devenue une interface publique — un renommage
+# innocent ici casse 206 tests comptables et, en production, le calcul des
+# provisions. On le fige donc ici, du côté du producteur.
+# =============================================================================
+
+class ContratDeSortieEcheancierTests(TestCase):
+    """Ce que `accounting.provisions` est en droit d'attendre de nous."""
+
+    #: Clés lues par `accounting.provisions._traduire`. Retirer ou renommer l'une
+    #: d'elles est un changement de contrat, pas un détail de nommage.
+    CLES_CONSOMMEES = {"date", "principal", "interest", "total", "balance"}
+
+    def _loan(self, **kwargs) -> Loan:
+        defaults = dict(
+            reference="CRD-2026-940", operator="Coopérative Test",
+            amount_approved=D("1330"), annual_rate=D("18"), duration_months=8,
+            frequency="monthly", start_date=DEBUT, currency="USD",
+        )
+        defaults.update(kwargs)
+        return Loan.objects.create(**defaults)
+
+    def test_chaque_ligne_porte_les_cles_consommees_par_la_comptabilite(self):
+        for differe, mode in ((0, schedule_module.MODE_INTERETS_SEULS),
+                              (5, schedule_module.MODE_INTERETS_SEULS),
+                              (5, schedule_module.MODE_FRANCHISE_TOTALE)):
+            with self.subTest(differe=differe, mode=mode):
+                loan = self._loan(reference=f"CRD-2026-94{differe}{mode[:3]}",
+                                  deferral_months=differe, deferral_mode=mode)
+                rows = services.schedule_for(loan)["schedule"]
+                for row in rows:
+                    self.assertTrue(self.CLES_CONSOMMEES <= set(row))
+                    # `date` est une chaîne ISO : `provisions` fait
+                    # `date.fromisoformat(...)` dessus.
+                    self.assertEqual(row["date"], date.fromisoformat(row["date"]).isoformat())
+                    for cle in ("principal", "interest", "total", "balance"):
+                        self.assertIsInstance(row[cle], Decimal)
+
+    def test_rien_n_est_exigible_pendant_une_franchise_totale(self):
+        """L'invariant dont dépend le provisionnement.
+
+        `accounting` ignore délibérément `interest_capitalized` : en franchise
+        totale ces intérêts ne sont pas exigibles, et les compter comme dus
+        fabriquerait un impayé donc une provision sur un client à jour. Cela n'est
+        vrai que si nos lignes de franchise portent `total` = 0 — c'est ce qui est
+        figé ici, du côté qui les produit.
+        """
+        loan = self._loan(reference="CRD-2026-945", deferral_months=5,
+                          deferral_mode=schedule_module.MODE_FRANCHISE_TOTALE)
+        rows = services.schedule_for(loan)["schedule"]
+        for row in rows[:5]:
+            self.assertEqual(row["total"], D("0.00"))
+            self.assertEqual(row["principal"], D("0.00"))
+            self.assertEqual(row["interest"], D("0.00"))
+            self.assertGreater(row["interest_capitalized"], D("0.00"))
+        self.assertGreater(rows[5]["total"], D("0.00"))   # exigible dès la sortie
+
+    def test_un_parametrage_refuse_leve_et_ne_rend_pas_un_echeancier_partiel(self):
+        """`accounting` absorbe le refus en anomalie de rapport : il faut donc que
+        nous levions franchement, jamais que nous rendions un tableau tronqué."""
+        loan = self._loan(reference="CRD-2026-946", frequency="quarterly")
+        Loan.objects.filter(pk=loan.pk).update(deferral_months=5)
+        with self.assertRaises(schedule_module.EcheancierInvalide):
+            services.schedule_for(Loan.objects.get(pk=loan.pk))
+
+
+# =============================================================================
 # CALENDRIER — les échéances sont calées sur la DATE D'EFFET, pas sur la précédente.
 # =============================================================================
 
