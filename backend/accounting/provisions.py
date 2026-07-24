@@ -15,12 +15,21 @@ Chaîne complète, sans aucun geste manuel :
 
 Trois choix de conception, explicités parce qu'ils engagent des chiffres :
 
-1. **L'échéancier est recalculé ici en `Decimal`.** `portfolio.schedule.build_schedule`
-   travaille en `float` (principe 4 violé côté portefeuille — dette signalée, hors périmètre
-   de ce lot). On reprend RIGOUREUSEMENT ses règles (intérêt simple sur le solde, capital
-   constant, « bullet » in fine, base = montant approuvé) et son calendrier
-   (`portfolio.schedule.add_months`, importé et non recopié) pour que les deux échéanciers
-   décrivent le même prêt — mais en arithmétique exacte, avec un CRD final rigoureusement nul.
+1. **L'échéancier n'est PAS recalculé ici.** Il l'a été : ce module portait sa propre
+   version en `Decimal` — la quatrième du projet — écrite parce que
+   `portfolio.schedule.build_schedule` travaillait alors en `float`, ce que le principe 4
+   interdit sur un chemin qui décide d'une provision.
+
+   Cette raison a disparu (`portfolio/schedule.py` est passé en `Decimal`, commit 459e17b),
+   et avec elle la seule justification d'un deuxième calcul. On délègue donc désormais au
+   calendrier que le CLIENT REMBOURSE (`portfolio.services.schedule_for`), traduit dans le
+   vocabulaire comptable et rien de plus. Ce n'est pas qu'une déduplication : provisionner
+   sur un calendrier qui n'est pas celui du contrat, c'est compter des jours de retard que
+   le client ne doit pas. La délégation fait entrer d'un coup trois corrections que la
+   réimplémentation ne connaissait pas — le DIFFÉRÉ (un prêt à 5 mois de différé était
+   compté en retard dès le premier mois, donc provisionné à tort), le taux de calcul en
+   pleine précision (`annual_rate / 12` plutôt que la colonne `rate` arrondie), et l'ancrage
+   des échéances sur la date d'effet (un prêt démarré un 31 ne dérive plus au 28).
 
 2. **Les jours de retard se lisent sur la plus ancienne échéance non intégralement réglée**,
    après imputation des règlements dans l'ordre des échéances (intérêts d'abord, puis
@@ -34,7 +43,6 @@ from __future__ import annotations
 
 from datetime import date as date_cls
 from decimal import Decimal, ROUND_HALF_UP
-from math import ceil
 
 from django.db import transaction
 
@@ -51,8 +59,6 @@ from .models import (
 
 #: `portfolio` nomme le franc congolais « CDF », l'annexe A le nomme « FC ».
 DEVISE_PORTEFEUILLE: dict[str, str] = {"CDF": Devise.FC, "USD": Devise.USD, "FC": Devise.FC}
-
-FREQUENCE_EN_MOIS = {"monthly": 1, "quarterly": 3, "annual": 12}
 
 COMPTE_ENCOURS_SAIN = "413"
 COMPTE_ENCOURS_SOUFFRANCE = "416"
@@ -124,6 +130,32 @@ def classer(jours_retard: int, classes: list[ClasseRisque]) -> ClasseRisque:
 
 # ------------------------------------------------------------------- ÉCHÉANCIER
 
+def _traduire(lignes: list[dict]) -> list[dict]:
+    """Traduit les lignes de `portfolio.schedule` dans le vocabulaire comptable.
+
+    C'est TOUT ce qui reste de l'ancienne réimplémentation : une correspondance de noms et
+    un `date.fromisoformat`. Aucune arithmétique — s'il en réapparaissait une ici, la dette
+    serait reconstituée.
+
+    `interest_capitalized` n'est délibérément PAS additionné aux intérêts : en franchise
+    totale, les intérêts capitalisés ne sont pas EXIGIBLES à l'échéance (ils grossissent le
+    capital). Les compter comme dus ferait naître un impayé — donc un retard, donc une
+    provision — sur une échéance que le contrat dit non payable.
+    """
+    return [
+        {
+            "numero": ligne["number"],
+            "date": date_cls.fromisoformat(ligne["date"]),
+            "capital": services.q2(ligne["principal"]),
+            "interets": services.q2(ligne["interest"]),
+            "total": services.q2(ligne["total"]),
+            "crd": services.q2(ligne["balance"]),
+            "phase": ligne.get("phase", ""),
+        }
+        for ligne in lignes
+    ]
+
+
 def echeancier(
     *,
     principal,
@@ -131,46 +163,33 @@ def echeancier(
     duree_mois: int,
     frequence: str,
     date_debut: date_cls,
+    differe_mois: int = 0,
+    mode_differe: str = "",
 ) -> list[dict]:
-    """Échéancier en `Decimal`, mêmes règles que `portfolio.schedule.build_schedule`.
+    """Échéancier du prêt, EMPRUNTÉ à `portfolio` et traduit — jamais recalculé.
 
-    Invariant : Σ capital = principal, et le CRD après la dernière échéance est
-    rigoureusement nul (le résidu d'arrondi est absorbé par la dernière échéance).
+    Invariants (garantis par `portfolio.schedule`, verrouillés par les tests des deux
+    côtés) : Σ capital = principal, et le CRD après la dernière échéance est rigoureusement
+    nul — le résidu d'arrondi est absorbé par la dernière échéance.
     """
-    from portfolio.schedule import add_months  # calendrier partagé, pas de recopie
+    from portfolio import schedule as echeancier_portefeuille
 
-    principal = services.q2(principal)
-    taux = services.to_decimal(taux_mensuel_pct)
-    duree_mois = int(duree_mois or 0)
-    if principal <= 0 or duree_mois <= 0:
+    if services.q2(principal) <= 0 or int(duree_mois or 0) <= 0:
         return []
 
-    pas = duree_mois if frequence == "bullet" else FREQUENCE_EN_MOIS.get(frequence, 1)
-    pas = pas or 1
-    nombre = max(1, ceil(duree_mois / pas))
-
-    lignes: list[dict] = []
-    solde = principal
-    courant = date_debut
-    for numero in range(1, nombre + 1):
-        courant = add_months(courant, pas)
-        interets = services.q2(solde * taux / Decimal("100") * Decimal(pas))
-        if frequence == "bullet":
-            capital = principal if numero == nombre else Decimal("0.00")
-        else:
-            capital = services.q2(principal / Decimal(nombre))
-            if numero == nombre:
-                capital = solde  # solde exact : CRD final = 0
-        solde = services.q2(solde - capital)
-        lignes.append({
-            "numero": numero,
-            "date": courant,
-            "capital": capital,
-            "interets": interets,
-            "total": services.q2(capital + interets),
-            "crd": solde,
-        })
-    return lignes
+    options = {}
+    if differe_mois:
+        options["deferral_months"] = int(differe_mois)
+        if mode_differe:
+            options["deferral_mode"] = mode_differe
+    return _traduire(echeancier_portefeuille.build_schedule(
+        services.q2(principal),
+        services.to_decimal(taux_mensuel_pct),
+        int(duree_mois or 0),
+        frequence,
+        date_debut,
+        **options,
+    ))
 
 
 def imputer(echeances: list[dict], total_regle: Decimal) -> dict:
@@ -226,6 +245,32 @@ def _flux_du_credit(loan) -> tuple[Decimal, Decimal]:
     return services.q2(decaisse), services.q2(regle)
 
 
+def _echeancier_du_credit(loan, anomalies: list[str]) -> list[dict]:
+    """Le calendrier que CE client rembourse — celui de `portfolio`, pas un jumeau.
+
+    On passe par `portfolio.services.schedule_for` plutôt que de rassembler nous-mêmes les
+    paramètres du prêt : c'est la seule façon d'être certain que la provision est calculée
+    sur le MÊME échéancier que celui affiché au client et opposé au dossier. Reconstituer
+    les arguments à l'identique aurait suffi aujourd'hui, et aurait divergé au premier
+    paramètre ajouté au contrat de prêt (le différé vient d'en être la démonstration).
+
+    Un échéancier inexploitable (paramètres refusés par `portfolio`) devient une ANOMALIE
+    remontée dans le rapport, pas une exception : un dossier mal configuré ne doit pas
+    empêcher l'arrêté de provision de tout le portefeuille.
+    """
+    from portfolio.services import schedule_for
+
+    try:
+        return _traduire(schedule_for(loan)["schedule"])
+    except Exception as exc:  # noqa: BLE001 - un refus de `portfolio` est une DONNÉE
+        anomalies.append(
+            f"Échéancier refusé par le portefeuille ({type(exc).__name__} : {exc}) — "
+            "retard non calculable, crédit classé sur 0 jour de retard. Le paramétrage du "
+            "prêt est à corriger à la source."
+        )
+        return []
+
+
 def analyser_credit(loan, *, as_of: date_cls, classes: list[ClasseRisque]) -> dict | None:
     """Classification d'UN crédit à une date. `None` = hors périmètre du risque."""
     from portfolio.models import Loan
@@ -254,19 +299,14 @@ def analyser_credit(loan, *, as_of: date_cls, classes: list[ClasseRisque]) -> di
             "sur le décaissé."
         )
 
-    debut = loan.start_date or loan.date
-    echeances = echeancier(
-        principal=base,
-        taux_mensuel_pct=loan.rate,
-        duree_mois=loan.duration_months,
-        frequence=loan.frequency,
-        date_debut=debut,
-    )
+    signalees = len(anomalies)
+    echeances = _echeancier_du_credit(loan, anomalies)
     if not echeances:
-        anomalies.append(
-            "Échéancier vide (durée ou montant nul) : retard non calculable, crédit classé "
-            "sur 0 jour de retard."
-        )
+        if len(anomalies) == signalees:  # échéancier vide, et non refusé (déjà signalé)
+            anomalies.append(
+                "Échéancier vide (durée ou montant nul) : retard non calculable, crédit "
+                "classé sur 0 jour de retard."
+            )
         imputation = {
             "capital_rembourse": min(regle, decaisse),
             "interets_regles": Decimal("0.00"),

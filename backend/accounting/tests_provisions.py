@@ -488,3 +488,95 @@ class DeclassementSansEncoursComptableTests(ProvisionsTestCase):
         self.assertEqual(PieceComptable.objects.count(), 0,
                          "Un refus doit tout annuler : aucune pièce ne doit subsister.")
         self.assertEqual(ArreteProvision.objects.count(), 0)
+
+
+# ============================================================================
+#  FUSION DE LA 4ᵉ IMPLÉMENTATION D'ÉCHÉANCIER (dette signalée par `portfolio`)
+# ============================================================================
+#
+# `provisions` portait sa PROPRE version de l'échéancier, écrite quand `portfolio` était
+# en `float`. `portfolio` est passé en `Decimal` (459e17b) : la raison a disparu, le double
+# calcul aussi. Ces tests verrouillent la fusion — ils tomberaient si quelqu'un
+# réintroduisait une arithmétique locale ici.
+
+
+class FusionEcheancierTests(ProvisionsTestCase):
+    def test_la_provision_se_calcule_sur_lecheancier_que_le_client_rembourse(self):
+        """Il n'existe plus qu'UN échéancier par prêt. Provisionner sur un jumeau, c'est
+        compter des jours de retard que le contrat ne prévoit pas."""
+        from portfolio.services import schedule_for
+
+        loan = _creer_credit()
+        _decaisser(loan)
+
+        comptable = provisions._echeancier_du_credit(loan, [])
+        contractuel = schedule_for(loan)["schedule"]
+
+        self.assertEqual(len(comptable), len(contractuel))
+        for ligne, attendue in zip(comptable, contractuel):
+            self.assertEqual(ligne["date"], date.fromisoformat(attendue["date"]))
+            self.assertEqual(ligne["capital"], attendue["principal"])
+            self.assertEqual(ligne["interets"], attendue["interest"])
+            self.assertEqual(ligne["crd"], attendue["balance"])
+
+    def test_le_differe_du_pret_nest_plus_compte_en_retard(self):
+        """LA correction que la fusion fait entrer.
+
+        Un prêt à 5 mois de FRANCHISE TOTALE ne doit RIEN pendant ces cinq mois. L'ancienne
+        réimplémentation ignorait le différé : elle attendait une échéance dès le 1er
+        février, ne la voyait pas payée, et comptait 103 jours de retard au 15 mai — donc
+        PAR90, déclassement 413 → 416 et provision à 50 % sur un client parfaitement à jour.
+
+        Avec l'échéancier réel, la première échéance EXIGIBLE est la 6ᵉ (01/07/2026) : elle
+        est à venir, donc elle ne porte aucun retard.
+        """
+        loan = _creer_credit(reference="CRD-DIFFERE")
+        loan.deferral_months = 5
+        loan.deferral_mode = Loan.DeferralMode.FRANCHISE_TOTALE
+        loan.save(update_fields=["deferral_months", "deferral_mode"])
+        _decaisser(loan)
+
+        classes = provisions.verifier_couverture()
+        analyse = provisions.analyser_credit(loan, as_of=date(2026, 5, 15), classes=classes)
+
+        self.assertEqual(analyse["jours_retard"], 0, analyse["anomalies"])
+        self.assertEqual(analyse["classe"].code, "SAIN")
+        self.assertEqual(analyse["premiere_echeance_impayee"], date(2026, 7, 1))
+
+    def test_le_differe_ne_masque_pas_un_impaye_apres_son_terme(self):
+        """Le différé décale l'exigibilité, il ne l'efface pas : passé son terme, la
+        première échéance non réglée compte ses jours comme n'importe quelle autre."""
+        loan = _creer_credit(reference="CRD-DIFFERE-2")
+        loan.deferral_months = 5
+        loan.deferral_mode = Loan.DeferralMode.FRANCHISE_TOTALE
+        loan.save(update_fields=["deferral_months", "deferral_mode"])
+        _decaisser(loan)
+
+        classes = provisions.verifier_couverture()
+        analyse = provisions.analyser_credit(loan, as_of=date(2026, 9, 30), classes=classes)
+
+        # 1re échéance EXIGIBLE au 01/07/2026 (les 5 premières sont en franchise) → 91 j.
+        self.assertEqual(analyse["premiere_echeance_impayee"], date(2026, 7, 1))
+        self.assertEqual(analyse["jours_retard"], 91)
+        self.assertEqual(analyse["classe"].code, "PAR90")
+        self.assertTrue(analyse["en_souffrance"])
+
+    def test_un_echeancier_refuse_par_le_portefeuille_devient_une_anomalie(self):
+        """Un dossier mal paramétré (différé sur un prêt trimestriel, refusé par
+        `portfolio`) ne doit pas faire échouer l'arrêté de TOUT le portefeuille : il
+        ressort en anomalie, classé sur 0 jour de retard."""
+        loan = _creer_credit(reference="CRD-INCOHERENT")
+        loan.frequency = Loan.Frequency.QUARTERLY
+        loan.deferral_months = 5
+        loan.save(update_fields=["frequency", "deferral_months"])
+        _decaisser(loan)
+
+        classes = provisions.verifier_couverture()
+        analyse = provisions.analyser_credit(loan, as_of=ARRETE_1, classes=classes)
+
+        self.assertEqual(analyse["jours_retard"], 0)
+        self.assertTrue(any("refusé par le portefeuille" in m for m in analyse["anomalies"]),
+                        analyse["anomalies"])
+        # L'exposition, elle, reste comptée : un paramétrage douteux ne fait pas
+        # disparaître 1 200 USD décaissés du bilan.
+        self.assertEqual(analyse["encours"], Decimal("1200.00"))
