@@ -157,7 +157,6 @@ def GroupeSelonMethode(*, messages: dict[str, str] | None = None, **par_methode)
 PeutDecider = MembreDuGroupe(CAN_DECIDE)
 PeutDemanderUnDecaissement = MembreDuGroupe(CAN_REQUEST_DISBURSEMENT)
 PeutConfirmerUnDecaissement = MembreDuGroupe(CAN_CONFIRM_DISBURSEMENT)
-EstMembreDuComite = MembreDuGroupe(COMMITTEE_ROLES)
 
 
 def _roles(request: Request) -> list[str]:
@@ -805,6 +804,7 @@ def _simulate_from_source(request: Request, application_code: str, data) -> Resp
 # ── 5. Re-scoring d'un dossier existant ───────────────────────────────────────
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
 def score_application(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/score/
@@ -816,9 +816,6 @@ def score_application(request: Request, code: str) -> Response:
     de la feuille de besoins ; le rapport conserve `needs_source_id + revision +
     sha256` — une analyse est rejouable à l'identique des mois plus tard.
     """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     from credits.models import CreditApplication
     from credits.scoring import CreditScoringEngine
 
@@ -1156,11 +1153,9 @@ def submit_application(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
 def start_analysis(request: Request, code: str) -> Response:
     """POST /api/credits/applications/<code>/start-analysis/"""
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1176,14 +1171,16 @@ def start_analysis(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, PeutDecider])
 def approve_application(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/approve/
     Corps JSON : { amount_approved, comment? }
-    """
-    if not _require_group(request, CAN_DECIDE):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    `PeutDecider` (= `CAN_DECIDE`) n'est que le droit d'ENTRÉE. Le plafond de
+    délégation et le maker ≠ checker restent tranchés par `workflow.approve` :
+    ils dépendent du montant et de qui a soumis, pas du rôle seul.
+    """
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1216,14 +1213,12 @@ def approve_application(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, PeutDecider])
 def reject_application(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/reject/
     Corps JSON : { reason_code, comment? }
     """
-    if not _require_group(request, CAN_DECIDE):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1247,14 +1242,12 @@ def reject_application(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
 def adjourn_application(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/adjourn/
     Corps JSON : { comment }
     """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1271,11 +1264,9 @@ def adjourn_application(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
 def reopen_analysis(request: Request, code: str) -> Response:
     """POST /api/credits/applications/<code>/reopen-analysis/"""
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1326,6 +1317,11 @@ def client_consent(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    CAN_INSTRUCT,
+    message=("Seule l'équipe d'instruction peut relancer une demande de "
+             "confirmation client."),
+    code="PERMISSION_REFUSEE")])
 def renew_client_consent(request: Request, code: str) -> Response:
     """POST /api/credits/applications/<code>/renew-consent/
 
@@ -1334,13 +1330,6 @@ def renew_client_consent(request: Request, code: str) -> Response:
     réponse et recontacte le client. Le client, lui, confirme via
     `client-consent/`.
     """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response(
-            {"detail": "Seule l'équipe d'instruction peut relancer une demande "
-                       "de confirmation client.", "code": "PERMISSION_REFUSEE"},
-            status=403,
-        )
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1386,14 +1375,13 @@ def list_guarantees(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
 def place_savings_guarantee(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/guarantees/savings/
 
     Corps JSON : { savings_plan_id, amount, notes? }
     """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Permission refusée."}, status=403)
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1435,6 +1423,7 @@ def place_savings_guarantee(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
 def register_moral_guarantee(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/guarantees/moral/
@@ -1450,8 +1439,6 @@ def register_moral_guarantee(request: Request, code: str) -> Response:
     n'appartient pas au backend — cf. le rapport de lot. Le mécanisme fonctionne
     des deux côtés ; seul ce garde-fou tranche aujourd'hui.
     """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Permission refusée."}, status=403)
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1732,6 +1719,7 @@ def place_asset_guarantee_view(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, CanInstructCredit])
 def release_guarantee(request: Request, code: str, guarantee_id: int) -> Response:
     """
     POST /api/credits/applications/<code>/guarantees/<id>/release/
@@ -1739,8 +1727,6 @@ def release_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
     Libère une garantie épargne (rejet ou annulation du dossier).
     Réservé aux agents.
     """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Permission refusée."}, status=403)
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1803,14 +1789,12 @@ def disbursement_detail(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, PeutDemanderUnDecaissement])
 def request_disbursement_view(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/disbursement/request/
     Transition : APPROVED → PENDING_DISBURSEMENT (maker)
     """
-    if not _require_group(request, CAN_REQUEST_DISBURSEMENT):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1831,14 +1815,15 @@ def request_disbursement_view(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, PeutConfirmerUnDecaissement])
 def confirm_disbursement_view(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/disbursement/confirm/
     Transition : PENDING_DISBURSEMENT → ACTIVE (checker, maker≠checker)
-    """
-    if not _require_group(request, CAN_CONFIRM_DISBURSEMENT):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Le groupe donne l'entrée ; `maker ≠ checker` (le demandeur ne confirme pas)
+    dépend de la demande elle-même et reste dans `disbursement.confirm_disbursement`.
+    """
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1856,14 +1841,12 @@ def confirm_disbursement_view(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated, PeutDemanderUnDecaissement])
 def cancel_disbursement_view(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/disbursement/cancel/
     Annule la demande PENDING (retour à APPROVED).
     """
-    if not _require_group(request, CAN_REQUEST_DISBURSEMENT):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1909,6 +1892,9 @@ def credits_dashboard(request: Request) -> Response:
 # ── Partie H : Rapport d'analyse documentaire ────────────────────────────────
 
 @api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated, GroupeSelonMethode(
+    GET=None, POST=CAN_INSTRUCT,
+    messages={"POST": "Seul un analyste peut mettre à jour un finding."})])
 def analysis_report(request: Request, code: str) -> Response:
     """
     GET  /api/credits/applications/<code>/analysis-report/
@@ -1917,10 +1903,18 @@ def analysis_report(request: Request, code: str) -> Response:
     POST /api/credits/applications/<code>/analysis-report/
          → Décision analyste sur un finding : {finding_id, status, comment}
            status : justifie | corrige | confirme_anomalie
-    """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Deux publics sur une route : le titulaire LIT son rapport, seul l'instructeur
+    ÉCRIT une décision d'analyste. La matrice est sur le décorateur plutôt que
+    dans un `if request.method` de corps — c'est précisément la forme de garde
+    qu'un lecteur de la vue ne voyait pas. L'étanchéité par dossier, elle, reste
+    dans le corps : elle porte sur l'objet.
+
+    Effet de bord assumé : l'écriture refusée répond désormais 403 AVANT le 404
+    du dossier absent (la permission s'exécute dans `initial()`). Le refus est
+    ainsi identique que le dossier existe ou non — l'ordre inverse renseignait
+    sur l'existence d'un code.
+    """
     try:
         from credits.models import CreditApplication
         app = CreditApplication.objects.get(code=code)
@@ -1940,12 +1934,12 @@ def analysis_report(request: Request, code: str) -> Response:
         from credits.analysis import serialize_analysis_report
         return Response(serialize_analysis_report(ns))
 
-    # POST : décision analyste sur un finding
-    # Ancienne garde : role in ("analyste", "admin", "superviseur") — trois libellés
-    # français qui n'existaient dans aucun registre, donc seul "admin" passait.
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response({"detail": "Seul un analyste peut mettre à jour un finding."}, status=403)
-
+    # POST : décision analyste sur un finding.
+    # Le garde `CAN_INSTRUCT` est monté sur le décorateur (`GroupeSelonMethode`).
+    # Historique : la garde d'origine testait `role in ("analyste", "admin",
+    # "superviseur")` — trois libellés français absents de tout registre, donc
+    # seul "admin" passait. C'est cette classe de bug que la nomenclature unique
+    # de `credits.roles` a supprimée.
     data = request.data
     finding_id = data.get("finding_id")
     new_status = data.get("status", "").strip()
@@ -2056,21 +2050,21 @@ def _parametres_analyse(app, data: dict):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    STAFF_ROLES,
+    message="L'analyse détaillée est réservée au personnel d'instruction.",
+    code="STAFF_REQUIS")])
 def analyse_detail(request: Request, code: str) -> Response:
     """GET /api/credits/applications/<code>/analyse/ — dernière analyse, vue STAFF.
 
     Réservée au staff : cette réponse expose les barèmes appliqués, les plages du
     référentiel et les tolérances par module (principe 7). Un client authentifié
     et propriétaire du dossier n'y a PAS accès — il a `analyse-resume`.
-    """
-    if not _require_group(request, STAFF_ROLES):
-        return Response(
-            {"detail": "L'analyse détaillée est réservée au personnel d'instruction.",
-             "code": "STAFF_REQUIS"},
-            status=403,
-        )
 
+    `STAFF_ROLES` de `credits.roles`, et non `accounts.permissions.IsStaff` :
+    ce dernier lit le TYPE du rôle au registre et ouvrirait la vue à
+    `gest_agents` et `support`, absents du groupe. Le garde est l'appartenance.
+    """
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -2088,7 +2082,10 @@ def analyse_detail(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    CAN_INSTRUCT,
+    message="Seul un agent instructeur peut justifier un indicateur.",
+    code="INSTRUCTION_REQUISE")])
 def analyse_justifier(request: Request, code: str) -> Response:
     """POST /api/credits/applications/<code>/analyse/justifier/
 
@@ -2096,13 +2093,6 @@ def analyse_justifier(request: Request, code: str) -> Response:
     Ajoute une justification à la DERNIÈRE analyse — append only, journalisée.
     Retourne l'analyse complète mise à jour (contrat `api.ts`).
     """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response(
-            {"detail": "Seul un agent instructeur peut justifier un indicateur.",
-             "code": "INSTRUCTION_REQUISE"},
-            status=403,
-        )
-
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -2135,7 +2125,10 @@ def analyse_justifier(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    CAN_INSTRUCT,
+    message="Seul un agent instructeur peut lancer une analyse.",
+    code="INSTRUCTION_REQUISE")])
 def reanalyser(request: Request, code: str) -> Response:
     """POST /api/credits/applications/<code>/reanalyser/
 
@@ -2145,14 +2138,11 @@ def reanalyser(request: Request, code: str) -> Response:
     C'est le simulateur de l'analyste : faire varier la maturité et relancer.
     Cette route ne déplace JAMAIS le dossier dans la machine à états : le moteur
     recommande, l'humain décide (principe 2).
-    """
-    if not _require_group(request, CAN_INSTRUCT):
-        return Response(
-            {"detail": "Seul un agent instructeur peut lancer une analyse.",
-             "code": "INSTRUCTION_REQUISE"},
-            status=403,
-        )
 
+    Interdit à l'audit, qui lit sans exécuter : `AUDIT_ROLES` est dans
+    `STAFF_ROLES` mais hors de `CAN_INSTRUCT` — la nuance est portée par le
+    groupe, et c'est pour elle que le garde n'est pas « staff ».
+    """
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -2220,17 +2210,15 @@ def _committee_error(exc) -> Response:
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    COMMITTEE_ROLES | CAN_AUDIT,
+    message="Vue comité réservée à la direction et à l'audit.")])
 def committee_votes(request: Request, code: str) -> Response:
     """GET /api/credits/applications/<code>/committee-votes/
 
     Procès-verbal du comité : quorum, votes nominatifs, décompte, résolution.
     Réservé au comité et aux auditeurs (lecture) — jamais au client (§7).
     """
-    if not _require_group(request, COMMITTEE_ROLES | CAN_AUDIT):
-        return Response({"detail": "Vue comité réservée à la direction et à l'audit."},
-                        status=403)
-
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -2240,17 +2228,18 @@ def committee_votes(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    COMMITTEE_ROLES,
+    message="Seul un membre du comité de crédit peut voter.")])
 def committee_vote(request: Request, code: str) -> Response:
     """POST /api/credits/applications/<code>/committee-vote/
 
     Corps : `{ decision: "approve"|"reject", comment, conditions? }`.
     Un vote par membre (append-only). Quorum atteint → transition via `workflow`.
-    """
-    if not _require_group(request, COMMITTEE_ROLES):
-        return Response({"detail": "Seul un membre du comité de crédit peut voter."},
-                        status=403)
 
+    L'audit LIT le procès-verbal (`committee-votes/`) mais ne vote pas : deux
+    groupes distincts sur deux routes, et c'est le décorateur qui le dit.
+    """
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -2282,16 +2271,14 @@ def _bareme_error(exc) -> Response:
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    STAFF_ROLES, message="Barèmes réservés au personnel.")])
 def list_baremes(request: Request) -> Response:
     """GET /api/credits/baremes/ — courbes par critère + historique (staff seul).
 
     Anti-gaming (principe 7) : les barèmes, seuils et tolérances ne transitent
     JAMAIS vers un client. Réservé au staff.
     """
-    if not _require_group(request, STAFF_ROLES):
-        return Response({"detail": "Barèmes réservés au personnel."}, status=403)
-
     from credits.baremes import serialize_bareme
     from credits.models import BaremeScore
 
@@ -2301,7 +2288,10 @@ def list_baremes(request: Request) -> Response:
 
 
 @api_view(["GET", "POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, GroupeSelonMethode(
+    GET=STAFF_ROLES, POST=COMMITTEE_ROLES,
+    messages={"GET": "Barèmes réservés au personnel.",
+              "POST": "Seul le comité de crédit édite les barèmes."})])
 def bareme_detail(request: Request, code: str) -> Response:
     """GET  /api/credits/baremes/<code>/  — un barème + son historique (staff).
     POST /api/credits/baremes/<code>/  — proposition d'édition (comité, maker).
@@ -2309,6 +2299,10 @@ def bareme_detail(request: Request, code: str) -> Response:
     La proposition calcule et FIGE l'impact sur le golden set AVANT toute
     activation (principe 8) ; elle n'active rien (maker ≠ checker, l'activation
     est un second acte).
+
+    Lire un barème et le RÉÉCRIRE n'ouvrent pas au même public : c'est
+    exactement le cas que `GroupeSelonMethode` existe pour rendre lisible sur le
+    décorateur, au lieu de le laisser dans un `if request.method` de corps.
     """
     from credits.baremes import (
         BaremeError, serialize_bareme, proposer_revision, serialize_revision,
@@ -2316,8 +2310,6 @@ def bareme_detail(request: Request, code: str) -> Response:
     from credits.models import BaremeScore
 
     if request.method == "GET":
-        if not _require_group(request, STAFF_ROLES):
-            return Response({"detail": "Barèmes réservés au personnel."}, status=403)
         try:
             bareme = BaremeScore.objects.prefetch_related("revisions").get(code=code)
         except BaremeScore.DoesNotExist:
@@ -2325,11 +2317,7 @@ def bareme_detail(request: Request, code: str) -> Response:
                              "code": "BAREME_INTROUVABLE"}, status=404)
         return Response(serialize_bareme(bareme, include_history=True))
 
-    # POST — proposition (comité)
-    if not _require_group(request, COMMITTEE_ROLES):
-        return Response({"detail": "Seul le comité de crédit édite les barèmes."},
-                        status=403)
-
+    # POST — proposition (comité) ; garde porté par `GroupeSelonMethode`.
     data = request.data or {}
     try:
         revision = proposer_revision(
@@ -2346,15 +2334,13 @@ def bareme_detail(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    COMMITTEE_ROLES,
+    message="Seul le comité de crédit prévisualise les barèmes.")])
 def bareme_preview(request: Request, code: str) -> Response:
     """POST /api/credits/baremes/<code>/preview/ — impact sur le golden set,
     SANS créer de révision (aide à la décision avant proposition). Comité seul.
     """
-    if not _require_group(request, COMMITTEE_ROLES):
-        return Response({"detail": "Seul le comité de crédit prévisualise les barèmes."},
-                        status=403)
-
     from credits.baremes import BaremeError, previsualiser_impact, valider_contenu
     from credits.models import BaremeScore
 
@@ -2377,17 +2363,17 @@ def bareme_preview(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, MembreDuGroupe(
+    COMMITTEE_ROLES, message="Seul le comité de crédit active un barème.")])
 def bareme_activate(request: Request, revision_id: int) -> Response:
     """POST /api/credits/baremes/revisions/<revision_id>/activate/
 
     Active une révision brouillon (checker ≠ maker) : bascule le barème actif et
     archive le précédent. Journalisé.
-    """
-    if not _require_group(request, COMMITTEE_ROLES):
-        return Response({"detail": "Seul le comité de crédit active un barème."},
-                        status=403)
 
+    Le groupe donne l'entrée ; `checker ≠ maker` porte sur la révision visée et
+    reste dans `baremes.activer_revision`.
+    """
     from credits.baremes import BaremeError, activer_revision, serialize_revision
     try:
         revision = activer_revision(

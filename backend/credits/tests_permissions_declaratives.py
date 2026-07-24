@@ -184,3 +184,208 @@ class EntreeAuthentifieeTests(AuthedAPITestCase):
                 self.assertEqual(
                     CreditApplication.objects.get(code=reponse.data["code"]).client_id,
                     f"sub-depot-{role}")
+
+
+class GardeDeGroupeTests(AuthedAPITestCase):
+    """Les vues dont le garde d'entrée était `_require_group(<groupe>)`.
+
+    Une par une : le rôle admis passe, le rôle exclu est refusé **avec le même
+    statut et le même `code` qu'avant la migration**. La matrice ci-dessous EST
+    la spécification d'accès du module — ce qu'un auditeur devait auparavant
+    reconstituer en dépliant vingt corps de vue.
+
+    Le rôle exclu de chaque ligne n'est pas pris au hasard : c'est le voisin le
+    plus proche du groupe, celui qu'une migration approximative aurait laissé
+    passer (`aud_fin` lit tout mais n'exécute rien ; `agent_terrain` instruit
+    mais ne décide pas ; `gest_credit` décide mais ne siège pas au comité ; le
+    maker et le checker d'un décaissement ne sont pas le même groupe).
+    """
+
+    def setUp(self):
+        self.titulaire = _make_user("sub-client-groupe")
+        self.app = _make_app("sub-client-groupe", "sub-client-groupe",
+                             status="in_analysis", amount=Decimal("2500"))
+        self.caution = CreditGuarantee.objects.create(
+            application=self.app,
+            guarantee_type=CreditGuarantee.GuaranteeType.EPARGNE,
+            status=CreditGuarantee.Status.ACTIVE,
+            covered_amount=Decimal("500"),
+        )
+
+    def _matrice(self) -> list[tuple]:
+        """(méthode, url, rôle admis, rôle exclu, code de refus attendu)."""
+        c = self.app.code
+        return [
+            # ── Instruction (`CAN_INSTRUCT`) ─────────────────────────────────
+            ("post", f"{APPS}/{c}/score/", "gest_credit", "aud_fin", None),
+            ("post", f"{APPS}/{c}/start-analysis/", "gest_credit", "aud_fin", None),
+            ("post", f"{APPS}/{c}/adjourn/", "gest_credit", "aud_fin", None),
+            ("post", f"{APPS}/{c}/reopen-analysis/", "gest_credit", "aud_fin", None),
+            ("post", f"{APPS}/{c}/renew-consent/", "gest_credit", "aud_fin",
+             "PERMISSION_REFUSEE"),
+            ("post", f"{APPS}/{c}/guarantees/savings/", "agent_terrain", "aud_fin", None),
+            ("post", f"{APPS}/{c}/guarantees/moral/", "agent_terrain", "aud_fin", None),
+            ("post", f"{APPS}/{c}/guarantees/{self.caution.pk}/release/",
+             "agent_terrain", "aud_fin", None),
+            ("post", f"{APPS}/{c}/analyse/justifier/", "gest_credit", "aud_fin",
+             "INSTRUCTION_REQUISE"),
+            ("post", f"{APPS}/{c}/reanalyser/", "gest_credit", "aud_fin",
+             "INSTRUCTION_REQUISE"),
+            ("post", f"{APPS}/{c}/analysis-report/", "gest_credit", "aud_fin", None),
+            # ── Décision (`CAN_DECIDE`) : l'agent de terrain instruit, il ne
+            #    décide pas — la frontière la plus facile à effacer par mégarde.
+            ("post", f"{APPS}/{c}/approve/", "gest_credit", "agent_terrain", None),
+            ("post", f"{APPS}/{c}/reject/", "gest_credit", "agent_terrain", None),
+            # ── Décaissement : maker et checker sont deux groupes DISTINCTS ──
+            ("post", f"{APPS}/{c}/disbursement/request/", "agent_terrain",
+             "gest_caisse", None),
+            ("post", f"{APPS}/{c}/disbursement/cancel/", "agent_terrain",
+             "gest_caisse", None),
+            ("post", f"{APPS}/{c}/disbursement/confirm/", "gest_caisse",
+             "gest_credit", None),
+            # ── Comité et audit ──────────────────────────────────────────────
+            ("get", f"{APPS}/{c}/committee-votes/", "aud_fin", "gest_credit", None),
+            ("post", f"{APPS}/{c}/committee-vote/", "dg", "gest_credit", None),
+            # ── Barèmes : lecture staff, écriture comité (principes 7 et 8) ──
+            ("get", f"{BASE}/baremes/", "gest_credit", "client", None),
+            ("get", f"{BASE}/baremes/DSCR/", "gest_credit", "client", None),
+            ("post", f"{BASE}/baremes/DSCR/", "dg", "gest_credit", None),
+            ("post", f"{BASE}/baremes/DSCR/preview/", "dg", "gest_credit", None),
+            ("post", f"{BASE}/baremes/revisions/1/activate/", "dg", "gest_credit", None),
+            # ── Analyse staff (`STAFF_ROLES`) ────────────────────────────────
+            ("get", f"{APPS}/{c}/analyse/", "gest_credit", "client", "STAFF_REQUIS"),
+        ]
+
+    def test_le_role_exclu_est_refuse_en_403_avec_son_code_d_origine(self):
+        for methode, url, _admis, exclu, code in self._matrice():
+            with self.subTest(url=url, role=exclu):
+                self.login(role=exclu, sub=f"sub-exclu-{exclu}")
+                reponse = getattr(self.client, methode)(url, {}, format="json")
+                self.assertEqual(reponse.status_code, 403, f"{url} → {reponse.data}")
+                if code is not None:
+                    self.assertEqual(reponse.data.get("code"), code, url)
+
+    def test_le_role_admis_franchit_le_garde(self):
+        """« Franchir » ≠ « réussir » : plusieurs de ces routes répondent ensuite
+        400 (payload vide), 404 (analyse ou barème absents) ou 409 (statut
+        incompatible). Seul compte qu'aucune ne rende 401/403 — les deux seuls
+        statuts que `permission_classes` sait produire."""
+        for methode, url, admis, _exclu, _code in self._matrice():
+            with self.subTest(url=url, role=admis):
+                self.login(role=admis, sub=f"sub-admis-{admis}")
+                reponse = getattr(self.client, methode)(url, {}, format="json")
+                self.assertNotIn(reponse.status_code, (401, 403),
+                                 f"{url} → {reponse.data}")
+
+    def test_sans_jeton_le_garde_de_groupe_repond_401_et_non_403(self):
+        """`IsAuthenticated` est déclaré AVANT le garde de groupe : un appel sans
+        jeton produit le 401 sur lequel le SPA rafraîchit, jamais le 403 du
+        groupe — qui laisserait croire le jeton valide et le rôle insuffisant."""
+        for methode, url, _admis, _exclu, _code in self._matrice():
+            with self.subTest(url=url):
+                self.assertEqual(
+                    getattr(self.client, methode)(url, {}, format="json").status_code,
+                    401, url)
+
+    def test_un_profil_staff_suspendu_perd_le_groupe(self):
+        """Non-régression d'une garantie qui vivait dans `_require_group` via
+        `roles_of` : suspendre un membre depuis Users.jsx doit le sortir du
+        groupe immédiatement. La migration ne devait pas la perdre en route."""
+        from rbac.models import StaffProfile
+
+        url = f"{APPS}/{self.app.code}/start-analysis/"
+        self.login(role="gest_credit", sub="sub-suspendu")
+        self.assertNotEqual(self.client.post(url, {}, format="json").status_code, 403)
+
+        StaffProfile.objects.filter(user_id="sub-suspendu").update(locked=True)
+        self.assertEqual(self.client.post(url, {}, format="json").status_code, 403)
+
+    def test_l_audit_lit_le_proces_verbal_mais_ne_vote_pas(self):
+        """La distinction qu'un garde « staff » unique aurait effacée."""
+        self.login(role="aud_fin", sub="sub-auditeur-pv")
+        c = self.app.code
+        self.assertEqual(self.client.get(f"{APPS}/{c}/committee-votes/").status_code, 200)
+        self.assertEqual(
+            self.client.post(f"{APPS}/{c}/committee-vote/", {"decision": "approve"},
+                             format="json").status_code, 403)
+
+    def test_le_lecteur_de_bareme_n_en_est_pas_l_editeur(self):
+        """Une seule route, deux publics : `GroupeSelonMethode` porte la matrice
+        sur le décorateur au lieu d'un `if request.method` de corps."""
+        self.login(role="gest_credit", sub="sub-gest-bareme")
+        self.assertNotEqual(self.client.get(f"{BASE}/baremes/DSCR/").status_code, 403)
+        self.assertEqual(
+            self.client.post(f"{BASE}/baremes/DSCR/", {}, format="json").status_code, 403)
+
+
+def _nom_de_decorateur(noeud) -> str:
+    """`@api_view(["GET"])` comme `@api_view` → « api_view »."""
+    import ast
+
+    cible = noeud.func if isinstance(noeud, ast.Call) else noeud
+    return getattr(cible, "id", "") or getattr(cible, "attr", "")
+
+
+class ToutesLesVuesSontDeclarativesTests(AuthedAPITestCase):
+    """Le test qui rend §5 AUDITABLE, et non plus seulement respectée.
+
+    C'est la raison d'être du lot. Une garde posée dans un corps ne se vérifie
+    qu'en relisant vingt fonctions, et rien ne signale celle qu'on a oubliée : le
+    contrôle est une propriété du texte, pas de la structure. Une garde
+    déclarative, elle, se LIT — y compris par une machine.
+
+    Ce test lit donc `credits/views.py` en AST et exige un `@permission_classes`
+    sur toute fonction portant `@api_view`. Comparer les CLASSES déclarées au
+    défaut global ne dirait rien d'utile : `[IsAuthenticated]` est identique au
+    défaut et reste pourtant une décision explicite. Ce qui distingue la décision
+    de l'oubli, c'est la présence du décorateur — c'est exactement ce qu'on
+    mesure.
+
+    Une vue ajoutée demain sans décorateur fait tomber la suite : c'est le seul
+    mécanisme qui empêche la dette de se réinstaller vue par vue.
+    """
+
+    def test_toute_vue_de_credits_declare_ses_permissions(self):
+        import ast
+        import inspect
+
+        from credits import views
+
+        arbre = ast.parse(inspect.getsource(views))
+        manquantes = []
+        for noeud in arbre.body:
+            if not isinstance(noeud, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorateurs = {_nom_de_decorateur(d) for d in noeud.decorator_list}
+            if "api_view" not in decorateurs:
+                continue          # helper de module, pas un endpoint
+            if "permission_classes" not in decorateurs:
+                manquantes.append(noeud.name)
+
+        self.assertEqual(
+            manquantes, [],
+            "Vues `@api_view` sans `@permission_classes` : leur règle d'accès "
+            "n'est lisible ni sur la signature ni pour un audit — « toute vue "
+            "sans permission explicite est un bug » (CLAUDE.md §5). En cause : "
+            + ", ".join(manquantes))
+
+    def test_l_audit_statique_couvre_bien_toutes_les_routes_servies(self):
+        """L'audit AST ne vaut que s'il voit tout ce qui est servi : une vue
+        déclarée hors de `credits/views.py` et routée par `credits/urls.py`
+        échapperait au test précédent sans que rien ne le dise."""
+        from credits import urls as credits_urls, views
+
+        connues = {id(getattr(views, nom)) for nom in dir(views)}
+        for route in credits_urls.urlpatterns:
+            with self.subTest(route=str(route.pattern)):
+                self.assertIn(id(route.callback), connues)
+
+    def test_la_route_publique_l_est_explicitement(self):
+        """Une liste vide est une DÉCISION ; une absence de décorateur est un
+        oubli. Le test refuse qu'on confonde les deux."""
+        from credits import views
+
+        self.assertEqual(views.download_needs_sheet_template.cls.permission_classes, [])
+        self.assertEqual(
+            self.client.get(f"{BASE}/needs-sheet-template/").status_code, 503,
+            "sans template actif : 503 TEMPLATE_NOT_CONFIGURED, jamais 401")
