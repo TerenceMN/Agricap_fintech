@@ -101,6 +101,10 @@ def bilan(*, devise: str, as_of: date_cls | None = None) -> dict:
         "total_passif_et_resultat": total_passif_et_resultat,
         "ecart_bouclage": services.q2(total_actif - total_passif_et_resultat),
         "boucle": services.q2(total_actif - total_passif_et_resultat) == 0,
+        # Un bilan qui BOUCLE n'est pas pour autant COMPLET : il peut boucler parfaitement
+        # en ignorant des faits qui n'ont pas encore de schéma. Les deux informations
+        # voyagent donc ensemble, sans quoi « boucle: true » se lirait comme un quitus.
+        "avertissements": _avertissements(as_of),
     }
 
 
@@ -185,9 +189,38 @@ def etats_consolides(*, as_of: date_cls, taux: TauxChange | None = None) -> dict
     }
 
 
+def evenements_non_comptabilises(as_of: date_cls | None = None) -> dict[str, Decimal]:
+    """Montants de faits monétaires SURVENUS mais pas encore au grand livre, par devise.
+
+    Un état financier qui ignore cette somme se présente comme complet alors qu'il ne l'est
+    pas. Le cas vivant : les schémas B8/B9 de l'épargne attendent l'ouverture d'un compte de
+    dette de portefeuille à l'annexe A ; tant qu'il n'existe pas, la dette d'épargne des
+    membres n'apparaît nulle part au passif, et le montant exact de cette absence est la
+    somme des événements en attente. On l'affiche plutôt que de la taire — une omission
+    déclarée se corrige, une omission silencieuse se découvre à l'audit.
+
+    L'import est différé et l'échec absorbé : un contrôle qui informe un état ne doit jamais
+    empêcher cet état de s'afficher.
+    """
+    try:
+        from . import consommation
+
+        return consommation.montants_en_attente(jusqu_au=as_of)
+    except Exception:  # noqa: BLE001 - pragma: no cover
+        return {}
+
+
 def _avertissements(as_of: date_cls | None, *, taux: TauxChange | None = None) -> list[str]:
     """Ce qu'un état ne doit jamais taire."""
     messages = []
+    for devise, montant in evenements_non_comptabilises(as_of).items():
+        if montant:
+            messages.append(
+                f"{montant} {devise} de faits monétaires survenus ne sont PAS au grand "
+                "livre : leur file d'événements attend un schéma ou un compte du plan "
+                "comptable (détail dans le rapport de consommation). Les états ci-dessus "
+                "sont incomplets de ce montant — l'écart est connu et chiffré, pas estimé."
+            )
     anomalies = services.controler_integrite(as_of=as_of)
     if anomalies:
         messages.append(

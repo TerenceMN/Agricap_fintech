@@ -277,6 +277,10 @@ def _echeancier_du_credit(loan, anomalies: list[str]) -> list[dict]:
     # REPRISES telles quelles : elles expliquent l'échéancier sur lequel la provision est
     # calculée, et un auditeur doit les lire au même endroit que le chiffre.
     anomalies.extend(reponse.get("anomalies") or [])
+    # Littéral et non constante importée : `portfolio` GÈLE la chaîne elle-même
+    # (`BASE_APPROUVE == "montant_approuve"`, verrouillé par un test chez lui) précisément
+    # pour que cette comparaison ne puisse pas devenir silencieusement fausse — une alerte
+    # qui s'éteint sans bruit est pire qu'une exception.
     if reponse.get("principalSource") == "montant_approuve":
         anomalies.append(
             "Échéancier PRÉVISIONNEL : aucun décaissement validé, l'amortissement porte sur "

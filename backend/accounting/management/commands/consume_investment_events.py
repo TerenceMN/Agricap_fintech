@@ -133,6 +133,14 @@ class Command(BaseCommand):
         self._afficher_ecarts(rapport)
 
     def _afficher_ecarts(self, rapport: dict) -> None:
+        attente = rapport.get("montants_en_attente") or {}
+        if any(attente.values()):
+            chiffre = ", ".join(f"{m} {d}" for d, m in attente.items() if m)
+            self.stdout.write(self.style.WARNING(
+                f"\nÉCART CONNU DES ÉTATS FINANCIERS : {chiffre}.\n"
+                "  C'est le montant des faits monétaires survenus qui ne sont PAS au grand "
+                "livre. Une omission chiffrée — donc arbitrable — et non une approximation."
+            ))
         if rapport["sans_ecriture"]:
             self.stdout.write(self.style.WARNING(
                 "\nSANS ÉCRITURE DÉFINIE — ces événements RESTENT en file (on n'invente "

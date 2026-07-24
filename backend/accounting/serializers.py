@@ -432,6 +432,7 @@ def bilan(donnees: dict) -> dict:
         "totalPassifEtResultat": montant(donnees["total_passif_et_resultat"]),
         "ecartBouclage": montant(donnees["ecart_bouclage"]),
         "boucle": donnees["boucle"],
+        "avertissements": donnees["avertissements"],
     }
 
 

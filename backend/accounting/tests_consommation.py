@@ -913,3 +913,95 @@ class DeclarationDesSourcesTests(ConsommationTestCase):
         with self.assertRaises(CommandError):
             call_command("parametrer_consommation", "source", "--code", "x.Y",
                          "--prefixe", "X", verbosity=0)
+
+
+# ======================================================================
+#  L'ÉCART CONNU — ce que le grand livre ne dit pas encore, CHIFFRÉ
+# ======================================================================
+#
+# Refuser d'écrire une écriture fausse a un COÛT : le fait monétaire reste hors du bilan.
+# Le choix est bon (une omission déclarée se corrige, une écriture fausse contamine) mais
+# il n'est pas neutre, et il ne doit pas être présenté comme tel. La somme des événements
+# en attente est exactement la mesure de cette incomplétude — c'est elle qui rend
+# l'arbitrage urgent au lieu d'abstrait.
+
+
+class EcartConnuDesEtatsTests(ConsommationTestCase):
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        from accounts.models import FintechUser
+        from savings.models import SavingsPlan
+
+        user = FintechUser.objects.create(sub="epargnant-2", email="e2@agricap.cd")
+        cls.plan = SavingsPlan.objects.create(user=user, name="Équipement", currency="USD")
+
+    def depot(self, montant, *, minutes=0):
+        from savings.models import SavingsEvent
+
+        return SavingsEvent.objects.create(
+            event_type="SAVINGS_DEPOSITED", plan=self.plan, amount=Decimal(montant),
+            currency="USD", occurred_at=_horodatage(minutes=minutes), actor_sub="agent-1",
+        )
+
+    def test_le_montant_en_attente_agrege_toutes_les_files_par_devise(self):
+        self.depot("2000")
+        self.depot("1500", minutes=1)
+        self.evenement("SUBSCRIPTION_SETTLED", montant="700", minutes=2)      # USD
+        self.evenement("PROJECT_DEFAULTED", montant="300000", devise="CDF", minutes=3)
+
+        attente = consommation.montants_en_attente()
+        # 2 000 + 1 500 (épargne) + 700 (souscription) = 4 200 USD ; CDF traduit en FC.
+        self.assertEqual(attente["USD"], Decimal("4200.00"))
+        self.assertEqual(attente["FC"], Decimal("300000.00"))
+
+    def test_ce_qui_est_comptabilise_sort_de_lecart(self):
+        """L'écart est un RESTE À FAIRE : il fond à mesure que la file se vide."""
+        self.evenement("SUBSCRIPTION_SETTLED", montant="700")
+        self.depot("2000", minutes=1)
+
+        self.assertEqual(consommation.montants_en_attente()["USD"], Decimal("2700.00"))
+        consommation.consommer_lot(par="cron:compta")  # l'investissement s'écrit
+        # Seule l'épargne reste : son compte de contrepartie n'existe pas encore.
+        self.assertEqual(consommation.montants_en_attente()["USD"], Decimal("2000.00"))
+
+    def test_le_rapport_de_consommation_porte_le_montant_pas_seulement_le_compte(self):
+        """« 2 événements en attente » ne se compare à rien ; « 2 000 USD » se compare au
+        bilan."""
+        self.depot("2000")
+        rapport = consommation.consommer_lot(par="cron:compta", source="savings.SavingsEvent")
+
+        self.assertEqual(rapport["restant_en_file"], 1)
+        self.assertEqual(rapport["montants_en_attente"]["USD"], Decimal("2000.00"))
+
+    def test_le_bilan_declare_de_combien_il_est_incomplet(self):
+        """Un bilan qui BOUCLE n'est pas pour autant COMPLET. Tant que la dette d'épargne
+        n'a pas de compte de contrepartie, elle n'est nulle part au passif — et l'état doit
+        le dire, chiffre à l'appui, au lieu de se présenter comme un quitus."""
+        from . import etats
+
+        self.depot("2000")
+        bilan = etats.bilan(devise="USD")
+
+        self.assertTrue(bilan["boucle"])  # il boucle…
+        self.assertTrue(bilan["avertissements"])  # … et il n'est pas complet pour autant
+        avertissement = " ".join(bilan["avertissements"])
+        self.assertIn("2000.00 USD", avertissement)
+        self.assertIn("PAS au grand livre", avertissement)
+
+    def test_un_bilan_sans_file_en_attente_ne_crie_pas_au_loup(self):
+        from . import etats
+
+        self.assertEqual(etats.bilan(devise="USD")["avertissements"], [])
+
+    def test_la_commande_affiche_lecart_connu(self):
+        from io import StringIO
+
+        self.depot("2000")
+        sortie = StringIO()
+        call_command("consume_investment_events", "--par", "cron:compta",
+                     "--source", "savings.SavingsEvent", stdout=sortie)
+
+        texte = sortie.getvalue()
+        self.assertIn("ÉCART CONNU DES ÉTATS FINANCIERS", texte)
+        self.assertIn("2000.00 USD", texte)

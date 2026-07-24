@@ -175,6 +175,38 @@ def _modele_evenement(source: str = SOURCE_INVESTISSEMENT):
     return modele
 
 
+def montants_en_attente(
+    *, source: str = "", jusqu_au: date_cls | None = None,
+) -> dict[str, Decimal]:
+    """Σ des montants NON consommés, par devise du plan comptable.
+
+    C'est le CHIFFRE de ce que le grand livre ne dit pas encore. Un compteur d'événements
+    ne suffit pas : « 412 événements en attente » ne se compare à rien, « 128 400 USD en
+    attente » se compare au bilan. Tant qu'un schéma manque (B8/B9 : le compte de dette de
+    portefeuille n'existe pas à l'annexe A), cette somme EST l'écart connu des états
+    financiers — une omission chiffrée, donc arbitrable, au lieu d'une omission abstraite.
+
+    Sans `source`, toutes les files déclarées ET actives sont additionnées. Une file dont le
+    modèle est introuvable est ignorée plutôt que fatale : ce contrôle sert à informer un
+    état financier, il ne doit jamais l'empêcher de s'afficher.
+    """
+    codes = [source] if source else list(
+        SourceEvenements.objects.filter(actif=True).values_list("code", flat=True)
+    )
+    totaux: dict[str, Decimal] = {}
+    for code in codes:
+        try:
+            qs = evenements_en_attente(source=code, jusqu_au=jusqu_au)
+        except EvenementNonConsommable:
+            continue
+        for devise_brute, montant in qs.values_list("currency", "amount"):
+            devise = DEVISE_EVENEMENT.get((devise_brute or "").upper())
+            if devise is None or montant is None:
+                continue
+            totaux[devise] = totaux.get(devise, Decimal("0.00")) + services.q2(montant)
+    return {devise: services.q2(total) for devise, total in sorted(totaux.items())}
+
+
 def evenements_en_attente(
     *,
     jusqu_au: date_cls | None = None,
@@ -770,6 +802,9 @@ def consommer_lot(
         # compteur qui se rétrécirait avec le périmètre demandé donnerait l'illusion d'une
         # file vide.
         "restant_en_file": evenements_en_attente(source=source).count(),
+        # Le MONTANT de ce qui reste : c'est lui, et non le compte, qui dit de combien les
+        # états financiers sont incomplets.
+        "montants_en_attente": montants_en_attente(source=source),
     }
 
 
@@ -823,4 +858,5 @@ def simuler_lot(
         "plans": plans,
         "sans_ecriture": sans_ecriture,
         "echecs": echecs,
+        "montants_en_attente": montants_en_attente(source=source),
     }
