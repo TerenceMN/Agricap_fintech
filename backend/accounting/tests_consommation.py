@@ -714,8 +714,17 @@ class FileCreditTests(ConsommationTestCase):
 
 
 class FileEpargneTests(ConsommationTestCase):
-    """B8/B9 — l'épargne des membres entre au passif (412), et sa contrepartie dit la
-    vérité : le franc ne vient pas de la caisse, il vient du portefeuille du membre."""
+    """B8/B9 — le branchement est FAIT, l'écriture ne l'est pas : il manque un COMPTE.
+
+    L'argent d'un dépôt vient du portefeuille électronique du membre. Sa contrepartie est
+    donc l'extinction d'une dette (passif → passif), et l'annexe A n'a pas de compte pour
+    elle. Les deux échappatoires sont fausses, chacune à sa façon : une caisse compterait
+    deux fois le même franc, et le transitoire 581 — un compte d'ACTIF — gonflerait le
+    total du bilan des deux côtés d'un actif qui n'existe pas.
+
+    Ces tests verrouillent donc les DEUX moitiés de la réponse : on refuse d'écrire tant
+    que le compte manque, et tout le reste de la chaîne est prêt à écrire dès qu'il existe.
+    """
 
     @classmethod
     def setUpTestData(cls):
@@ -744,42 +753,76 @@ class FileEpargneTests(ConsommationTestCase):
 
         return consommation.consommer_lot(par="cron:compta", source=SOURCE_EPARGNE)
 
-    def test_depot_depargne_cree_la_dette_412(self):
-        evenement = self.evenement_epargne("SAVINGS_DEPOSITED", montant="200")
+    def ouvrir_le_compte_de_dette_de_portefeuille(self) -> str:
+        """Simule la décision du fondateur : le compte manquant est ouvert, et les deux
+        règles sont rebranchées PAR COMMANDE — sans toucher une ligne de code."""
+        from .models import CompteComptable
+
+        for devise in ("FC", "USD"):
+            CompteComptable.objects.create(
+                code=f"418{devise}", racine="418", devise=devise, classe=4, nature="PASSIF",
+                intitule="Monnaie électronique due aux clients (portefeuilles)",
+            )
+        for type_evenement, schema in (("SAVINGS_DEPOSITED", "B8"),
+                                       ("SAVINGS_WITHDRAWN", "B9")):
+            call_command(
+                "parametrer_consommation", "regle", "--source", "savings.SavingsEvent",
+                "--type", type_evenement, "--mode", "PIECE", "--schema", schema,
+                "--tresorerie", "418", "--par", "dg", verbosity=0,
+            )
+        return "418"
+
+    def test_sans_compte_de_contrepartie_aucune_ecriture_nest_passee(self):
+        """La moitié « on refuse » : le dépôt reste en file, visible, avec un motif qui dit
+        CE QUI MANQUE — pas une panne, une dette de plan comptable."""
+        depot = self.evenement_epargne("SAVINGS_DEPOSITED", montant="200")
         rapport = self.consommer()
 
-        self.assertEqual(len(rapport["consommes"]), 1, rapport)
-        piece = PieceComptable.objects.get(evenement="B8")
-        self.assertEqual(piece.journal, "JEP")
-        self.assertEqual(piece.lignes.get(compte__code="412USD").credit, Decimal("200.00"))
-        self.assertEqual(piece.reference, f"EPA-20260721-B8-{evenement.pk}")
-        self.assertEqual(services.controler_integrite(), [])
+        self.assertEqual(rapport["consommes"], [])
+        self.assertEqual(len(rapport["sans_ecriture"]), 1)
+        motif = rapport["sans_ecriture"][0]["motif"]
+        self.assertIn("classe 4", motif)
+        self.assertIn("PASSIF", motif)
+        self.assertEqual(PieceComptable.objects.count(), 0)
 
-    def test_la_contrepartie_dun_flux_interne_nest_pas_une_entree_de_caisse(self):
-        """Débiter 501/511 pour un dépôt alimenté depuis le WALLET compterait le même franc
-        deux fois en trésorerie. La contrepartie va au transitoire d'opérations internes
-        (581), dont le solde non nul est le signal VISIBLE que l'arbitrage du fondateur sur
-        le compte de dette de portefeuille reste à rendre."""
+        depot.refresh_from_db()
+        self.assertIsNone(depot.consumed_at)
+        # Et il reste visible au passage suivant : la dette ne s'efface pas d'elle-même.
+        self.assertEqual(len(self.consommer()["sans_ecriture"]), 1)
+
+    def test_aucune_ecriture_dattente_ne_gonfle_le_bilan(self):
+        """Le piège écarté : imputer la contrepartie au transitoire 581 aurait « fait
+        entrer l'épargne au grand livre » — au prix d'un ACTIF inexistant, gonflant le
+        total du bilan des deux côtés et faussant tout ratio qui s'y adosse."""
         self.evenement_epargne("SAVINGS_DEPOSITED", montant="200")
         self.consommer()
 
-        piece = PieceComptable.objects.get(evenement="B8")
-        self.assertEqual(piece.lignes.get(compte__code="581").debit, Decimal("200.00"))
-        self.assertFalse(piece.lignes.filter(compte__code__startswith="501").exists())
-        self.assertFalse(piece.lignes.filter(compte__code__startswith="511").exists())
+        self.assertEqual(services.solde_compte("581", devise="USD"), Decimal("0.00"))
+        self.assertEqual(services.solde_compte("412", devise="USD"), Decimal("0.00"))
+        self.assertEqual(services.solde_compte("511", devise="USD"), Decimal("0.00"))
 
-    def test_retrait_eteint_la_dette_sans_montant_negatif(self):
-        """Le retrait s'émet POSITIF ; c'est le schéma B9 qui porte le sens."""
-        self.evenement_epargne("SAVINGS_DEPOSITED", montant="500", minutes=1)
+    def test_le_compte_ouvert_debloque_les_deux_sens_sans_toucher_au_code(self):
+        """La moitié « tout le reste est prêt » : dès que le compte existe, la même file,
+        les mêmes schémas et le même consommateur produisent les écritures attendues."""
+        compte = self.ouvrir_le_compte_de_dette_de_portefeuille()
+        depot = self.evenement_epargne("SAVINGS_DEPOSITED", montant="500", minutes=1)
         self.evenement_epargne("SAVINGS_WITHDRAWN", montant="120", minutes=2)
         rapport = self.consommer()
 
         self.assertEqual([c["schema"] for c in rapport["consommes"]], ["B8", "B9"])
+        piece = PieceComptable.objects.get(evenement="B8")
+        self.assertEqual(piece.journal, "JEP")
+        self.assertEqual(piece.reference, f"EPA-20260721-B8-{depot.pk}")
+        self.assertEqual(piece.lignes.get(compte__code="412USD").credit, Decimal("500.00"))
+
         retrait = PieceComptable.objects.get(evenement="B9")
         self.assertEqual(retrait.lignes.get(compte__code="412USD").debit, Decimal("120.00"))
         # 412 est un PASSIF : la dette résiduelle de 380 apparaît au crédit (donc en solde
         # négatif dans la convention « débit − crédit » de `solde_compte`).
         self.assertEqual(services.solde_compte("412", devise="USD"), Decimal("-380.00"))
+        # La contrepartie est bien un PASSIF qui s'éteint, et aucun actif n'a été fabriqué.
+        self.assertEqual(services.solde_compte(compte, devise="USD"), Decimal("380.00"))
+        self.assertEqual(services.solde_compte("581", devise="USD"), Decimal("0.00"))
         self.assertEqual(services.controler_integrite(), [])
 
 

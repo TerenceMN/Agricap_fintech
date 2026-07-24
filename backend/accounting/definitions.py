@@ -319,20 +319,35 @@ SOURCES_EVENEMENTS: list[tuple[str, str, str, str, str]] = [
 #: paramétrage, jamais un redéploiement.
 COMPTE_TRESORERIE_DEFAUT = "511"
 
-#: Contrepartie d'amorce des flux INTERNES — ceux dont le producteur affirme, preuve à
-#: l'appui, qu'AUCUN cash ne bouge (décision « une seule porte » : un dépôt d'épargne
-#: débite le PORTEFEUILLE du membre, dont l'argent était entré plus tôt).
+#: TROU DU PLAN COMPTABLE, signalé au fondateur — il bloque B8/B9 et concerne B10.
 #:
-#: Débiter 501/511/53x pour un tel flux compterait deux fois le même franc en trésorerie et
-#: fausserait le rapprochement mobile money dans les deux sens. L'annexe A ne porte pas
-#: encore de compte « dette de portefeuille client » : en attendant l'arbitrage du
-#: fondateur, la contrepartie va au TRANSITOIRE d'opérations internes (581), dont le solde
-#: est censé tendre vers zéro — un 581 qui gonfle est exactement le signal visible qu'il
-#: faut, au lieu d'une fausse entrée de caisse invisible.
+#: La décision « une seule porte » fait venir l'argent d'un dépôt d'épargne (et d'une
+#: souscription) du PORTEFEUILLE électronique du membre, où il était entré plus tôt. La
+#: contrepartie économique du dépôt est donc l'extinction d'une DETTE de portefeuille : une
+#: écriture PASSIF → PASSIF, qui ne crée aucun actif et ne déplace aucun cash.
 #:
-#: La dette 412 (épargne des membres), elle, est enregistrée JUSTE : c'est le côté qui
-#: compte pour le bilan et pour le membre. Ne rien écrire du tout serait pire.
-COMPTE_CONTREPARTIE_INTERNE = "581"
+#: Or l'annexe A ne porte aucun compte pour cette dette. Aucune des deux échappatoires ne
+#: tient, et il faut le dire précisément :
+#:
+#: * 501/511/53x compterait DEUX FOIS le même franc en trésorerie (il dort déjà dans ces
+#:   comptes depuis l'alimentation du wallet) et fausserait le rapprochement mobile money ;
+#: * 581 (transitoire d'opérations internes) est un compte d'ACTIF : chaque dépôt gonflerait
+#:   le total du bilan des DEUX côtés — +581 à l'actif, +412 au passif — pour un actif qui
+#:   n'existe pas, faussant tout ratio assis sur le total de bilan. Et son solde croîtrait
+#:   structurellement avec l'encours d'épargne au lieu de tendre vers zéro : le compte
+#:   perdrait sa fonction d'alerte à mesure qu'il grossit, un vrai transitoire non imputé
+#:   devenant indiscernable du structurel. (Objection soulevée par l'agent `savings` et
+#:   retenue : ce module avait d'abord retenu 581.)
+#:
+#: CE QU'IL FAUT CRÉER (maker-checker, cf. annexe A) : un compte de CLASSE 4, nature
+#: PASSIF, dédoublé FC + USD — la monnaie électronique due au client. Tant qu'il n'existe
+#: pas, AUCUNE écriture de dépôt d'épargne n'est juste, et les événements restent en file,
+#: visibles (principe : une écriture fausse est pire qu'une écriture absente).
+#:
+#: Le jour où le compte existe, rebrancher est une commande, pas un déploiement :
+#:     manage.py parametrer_consommation regle --source savings.SavingsEvent \
+#:         --type SAVINGS_DEPOSITED --mode PIECE --schema B8 --tresorerie <compte> --par "dg"
+COMPTE_DETTE_PORTEFEUILLE = ""  # à créer à l'annexe A — cf. ci-dessus
 
 # (source, type_evenement, mode, schema, evenement_origine, compte_tresorerie, note)
 #
@@ -413,22 +428,31 @@ REGLES_CONSOMMATION: list[tuple[str, str, str, str, str, str, str]] = [
     ),
     # ----------------------------------------------------------------- ÉPARGNE (B8/B9)
     #
-    # ARBITRAGE SIGNALÉ AU FONDATEUR — la contrepartie va au transitoire interne 581, pas à
-    # 501/511/53x (cf. COMPTE_CONTREPARTIE_INTERNE). C'est la MÊME question que celle déjà
-    # signalée pour B10 (encaissement de souscription), laissée à 511 par fidélité littérale
-    # à l'annexe : les deux devraient être tranchées ENSEMBLE, et le jour où elles le seront,
-    # c'est une commande, pas un déploiement :
-    #     manage.py parametrer_consommation regle --source investments.InvestmentEvent \
-    #         --type SUBSCRIPTION_SETTLED --tresorerie <compte> --par "dg"
+    # NON CONSOMMÉS — et ce n'est pas un oubli, c'est le seul choix honnête.
+    #
+    # Les schémas B8/B9 existent, la file existe, le branchement est fait et testé : ce qui
+    # manque est un COMPTE au plan comptable (cf. COMPTE_DETTE_PORTEFEUILLE). L'argent d'un
+    # dépôt vient du portefeuille du membre ; sa contrepartie est l'extinction d'une dette,
+    # et l'annexe A n'a pas de compte pour elle. Écrire quand même — en caisse ou en
+    # transitoire d'actif — fabriquerait respectivement un double comptage de trésorerie ou
+    # un actif inexistant au bilan. Les événements restent donc en file, VISIBLES dans
+    # chaque rapport de consommation, jusqu'à l'ouverture du compte.
+    #
+    # B10 (encaissement de souscription) pose EXACTEMENT la même question et reste, lui,
+    # sur le 511 littéral de l'annexe — décision antérieure, laissée en place pour ne pas
+    # changer une imputation en service par effet de bord. Les deux se tranchent ensemble.
     (
-        SOURCE_EPARGNE, "SAVINGS_DEPOSITED", "PIECE", "B8", "", COMPTE_CONTREPARTIE_INTERNE,
-        "Annexe B8 : l'épargne du membre est une DETTE de l'institution (412 au crédit) — "
-        "c'est le côté qui compte, et il est juste. La contrepartie est le portefeuille du "
-        "membre (flux interne), faute de compte dédié à l'annexe A : 581 la rend visible.",
+        SOURCE_EPARGNE, "SAVINGS_DEPOSITED", "SANS_ECRITURE", "", "", "",
+        "Le schéma B8 est prêt (412 au crédit) mais sa CONTREPARTIE n'a pas de compte : "
+        "l'argent vient du portefeuille électronique du membre, pas d'une caisse. Il faut "
+        "ouvrir à l'annexe A un compte de classe 4, nature PASSIF, dédoublé FC/USD (dette "
+        "de monnaie électronique envers le client). Ensuite : « parametrer_consommation "
+        "regle --source savings.SavingsEvent --type SAVINGS_DEPOSITED --mode PIECE "
+        "--schema B8 --tresorerie <compte> --par … ».",
     ),
     (
-        SOURCE_EPARGNE, "SAVINGS_WITHDRAWN", "PIECE", "B9", "", COMPTE_CONTREPARTIE_INTERNE,
-        "Annexe B9 : extinction partielle de la dette d'épargne. Le montant est POSITIF ; "
-        "le sens vient du schéma, jamais du signe.",
+        SOURCE_EPARGNE, "SAVINGS_WITHDRAWN", "SANS_ECRITURE", "", "", "",
+        "Même blocage que le dépôt, en sens inverse (B9 : 412 au débit). Le montant est "
+        "POSITIF ; le sens viendra du schéma, jamais du signe.",
     ),
 ]
