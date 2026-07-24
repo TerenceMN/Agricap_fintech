@@ -190,21 +190,53 @@ def montants_en_attente(
     modèle est introuvable est ignorée plutôt que fatale : ce contrôle sert à informer un
     état financier, il ne doit jamais l'empêcher de s'afficher.
     """
+    totaux, _ = _attente_par_devise(source=source, jusqu_au=jusqu_au)
+    return totaux
+
+
+def montants_en_devise_inconnue(
+    *, source: str = "", jusqu_au: date_cls | None = None,
+) -> dict[str, Decimal]:
+    """Montants en attente dont la devise n'est PAS traduisible en plan comptable.
+
+    Ils ne peuvent pas entrer dans l'écart chiffré — on ne sait pas dans quelle colonne les
+    additionner — mais les écarter en silence les rendrait invisibles deux fois : absents du
+    grand livre ET absents de la mesure de ce qui manque au grand livre. Ils sortent donc
+    séparément, sous leur code brut, pour que l'avertissement puisse les nommer.
+
+    Un tel événement ne se consommera jamais tout seul : il faut corriger la devise à la
+    source. C'est un incident, pas une file qui attend son tour.
+    """
+    _, inconnues = _attente_par_devise(source=source, jusqu_au=jusqu_au)
+    return inconnues
+
+
+def _attente_par_devise(
+    *, source: str = "", jusqu_au: date_cls | None = None,
+) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+    """(montants traduisibles par devise comptable, montants par devise NON traduisible)."""
     codes = [source] if source else list(
         SourceEvenements.objects.filter(actif=True).values_list("code", flat=True)
     )
     totaux: dict[str, Decimal] = {}
+    inconnues: dict[str, Decimal] = {}
     for code in codes:
         try:
             qs = evenements_en_attente(source=code, jusqu_au=jusqu_au)
         except EvenementNonConsommable:
             continue
         for devise_brute, montant in qs.values_list("currency", "amount"):
-            devise = DEVISE_EVENEMENT.get((devise_brute or "").upper())
-            if devise is None or montant is None:
+            if montant is None:
                 continue
-            totaux[devise] = totaux.get(devise, Decimal("0.00")) + services.q2(montant)
-    return {devise: services.q2(total) for devise, total in sorted(totaux.items())}
+            brute = (devise_brute or "").upper()
+            devise = DEVISE_EVENEMENT.get(brute)
+            cible = totaux if devise is not None else inconnues
+            cle = devise if devise is not None else (brute or "(vide)")
+            cible[cle] = cible.get(cle, Decimal("0.00")) + services.q2(montant)
+    return (
+        {d: services.q2(t) for d, t in sorted(totaux.items())},
+        {d: services.q2(t) for d, t in sorted(inconnues.items())},
+    )
 
 
 def evenements_en_attente(

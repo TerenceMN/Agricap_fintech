@@ -210,6 +210,22 @@ def evenements_non_comptabilises(as_of: date_cls | None = None) -> dict[str, Dec
         return {}
 
 
+def evenements_en_devise_inconnue(as_of: date_cls | None = None) -> dict[str, Decimal]:
+    """Faits monétaires en attente dont la devise n'est pas au plan comptable.
+
+    Ils ne peuvent pas être chiffrés DANS l'écart (dans quelle colonne les additionner ?),
+    mais les taire les rendrait invisibles deux fois. Et contrairement au reste de la file,
+    ceux-là n'attendent pas un arbitrage : ils attendent une CORRECTION à la source, sans
+    quoi l'écart ne redescendra jamais complètement.
+    """
+    try:
+        from . import consommation
+
+        return consommation.montants_en_devise_inconnue(jusqu_au=as_of)
+    except Exception:  # noqa: BLE001 - pragma: no cover
+        return {}
+
+
 def _avertissements(as_of: date_cls | None, *, taux: TauxChange | None = None) -> list[str]:
     """Ce qu'un état ne doit jamais taire."""
     messages = []
@@ -220,6 +236,13 @@ def _avertissements(as_of: date_cls | None, *, taux: TauxChange | None = None) -
                 "livre : leur file d'événements attend un schéma ou un compte du plan "
                 "comptable (détail dans le rapport de consommation). Les états ci-dessus "
                 "sont incomplets de ce montant — l'écart est connu et chiffré, pas estimé."
+            )
+    for devise, montant in evenements_en_devise_inconnue(as_of).items():
+        if montant:
+            messages.append(
+                f"{montant} en devise « {devise} », inconnue du plan comptable : ces faits "
+                "ne peuvent même pas être chiffrés dans l'écart ci-dessus, et leur file ne "
+                "se videra JAMAIS d'elle-même. La devise est à corriger à la source."
             )
     anomalies = services.controler_integrite(as_of=as_of)
     if anomalies:

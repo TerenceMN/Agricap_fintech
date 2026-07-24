@@ -1005,3 +1005,40 @@ class EcartConnuDesEtatsTests(ConsommationTestCase):
         texte = sortie.getvalue()
         self.assertIn("ÉCART CONNU DES ÉTATS FINANCIERS", texte)
         self.assertIn("2000.00 USD", texte)
+
+
+class DeviseNonNommableTests(ConsommationTestCase):
+    """Un événement dans une devise que le plan comptable ne connaît pas ne peut pas entrer
+    dans l'écart chiffré — mais l'écarter en silence le rendrait invisible DEUX fois :
+    absent du grand livre, et absent de la mesure de ce qui manque au grand livre.
+
+    Il ne s'agit pas d'un cas d'école : tant qu'une devise non nommable traîne en file,
+    l'écart ne peut plus redescendre à zéro, et il cesse de se lire comme un reste à faire.
+    """
+
+    def test_une_devise_inconnue_ne_disparait_pas_de_la_mesure(self):
+        self.evenement("SUBSCRIPTION_SETTLED", montant="700")
+        self.evenement("SUBSCRIPTION_SETTLED", montant="450", devise="XYZ", minutes=1)
+
+        self.assertEqual(consommation.montants_en_attente(), {"USD": Decimal("700.00")})
+        self.assertEqual(
+            consommation.montants_en_devise_inconnue(), {"XYZ": Decimal("450.00")},
+        )
+
+    def test_le_bilan_nomme_la_devise_quil_ne_sait_pas_additionner(self):
+        from . import etats
+
+        self.evenement("SUBSCRIPTION_SETTLED", montant="450", devise="XYZ")
+        avertissements = " ".join(etats.bilan(devise="USD")["avertissements"])
+
+        self.assertIn("XYZ", avertissements)
+        self.assertIn("JAMAIS", avertissements)
+
+    def test_le_cas_sain_ne_produit_aucun_avertissement_de_devise(self):
+        from . import etats
+
+        self.evenement("SUBSCRIPTION_SETTLED", montant="700")
+        avertissements = " ".join(etats.bilan(devise="USD")["avertissements"])
+
+        self.assertIn("700.00 USD", avertissements)
+        self.assertNotIn("inconnue du plan comptable", avertissements)
