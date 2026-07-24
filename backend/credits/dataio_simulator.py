@@ -45,32 +45,20 @@ logger = logging.getLogger(__name__)
 
 
 # ── Mapping rubrique Excel → code module Python ──────────────────────────────
-_RUBRIQUE_TO_MODULE: list[tuple[str, str]] = [
-    ("semences",           "semences"),
-    ("intrants",           "semences"),
-    ("mécanis",            "mecanisation"),
-    ("mécanis",            "mecanisation"),
-    ("mécani",             "mecanisation"),
-    ("main",               "maindoeuvre"),
-    ("équipement",         "equipements"),
-    ("equipement",         "equipements"),
-    ("matériel",           "equipements"),
-    ("récolte",            "postrecolte"),
-    ("recolte",            "postrecolte"),
-    ("post",               "postrecolte"),
-    ("logistique",         "logistique"),
-    ("commercialisation",  "commercialisation"),
-    ("réserve",            "reserve"),
-    ("reserve",            "reserve"),
-]
-
-
+#
+# UNE SEULE TABLE (principe 6). Il en existait TROIS, recopiées à la main dans
+# `needs_sheet`, `needs_parser` et ici, avec des fragments différents — donc des
+# classements différents pour la même rubrique selon le chemin de lecture. Un
+# libellé complété dans l'une restait inconnu des deux autres : c'est ce qui a
+# laissé « Alimentation » hors de la référence avicole alors même que le mapping
+# était corrigeable en une ligne.
+#
+# La table canonique vit dans `credits.needs_sheet` (elle sert la validation du
+# classeur client, qui fait foi) ; les deux autres chemins la réutilisent.
 def _rubrique_to_module(rubrique: str) -> str | None:
-    low = rubrique.lower()
-    for fragment, code in _RUBRIQUE_TO_MODULE:
-        if fragment in low:
-            return code
-    return None
+    from credits.needs_sheet import rubrique_to_module
+
+    return rubrique_to_module(rubrique)
 
 
 # ── Financement par module (contrat §1) ───────────────────────────────────────

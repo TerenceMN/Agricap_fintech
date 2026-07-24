@@ -255,7 +255,15 @@ class IngestionSimulateursTests(TestCase):
                 brut = rec.values.get("Total rubrique")
                 if brut in (None, ""):
                     continue
-                totaux_module[module] = Decimal(str(brut).replace(",", "."))
+                # SOMME et non affectation : un classeur peut porter plusieurs
+                # rubriques d'un même module (un cycle avicole a « Poussins &
+                # produits vétérinaires » ET « Alimentation », deux intrants).
+                # L'affectation directe gardait la dernière — l'attendu du test
+                # reproduisait alors exactement le défaut du code qu'il vérifie.
+                totaux_module[module] = (
+                    totaux_module.get(module, Decimal(0))
+                    + Decimal(str(brut).replace(",", "."))
+                )
 
             self.assertEqual(
                 set(spec["couts_modules"]), set(totaux_module),

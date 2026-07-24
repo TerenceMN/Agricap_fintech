@@ -83,29 +83,109 @@ class NeedsSheetValidationError(Exception):
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
 
+#: Ligatures que la décomposition Unicode NFD ne défait PAS : « œ » et « æ » sont
+#: des lettres à part entière, pas des lettres accentuées. Sans ce repli, la
+#: rubrique « Main d'œuvre » des classeurs ne contenait PAS la chaîne « oeuvre »
+#: — le fragment de mapping prévu pour elle ne servait à rien, et c'est le
+#: fragment « main » qui la rattrapait… en attrapant aussi « Maintenance ».
+_LIGATURES = {"œ": "oe", "Œ": "oe", "æ": "ae", "Æ": "ae"}
+
+
 def normalize(text) -> str:
-    """Minuscule, sans accent, espaces compactés — base de toute comparaison."""
+    """Minuscule, sans accent NI ligature, espaces compactés — base de toute
+    comparaison de libellés."""
     if text is None:
         return ""
-    s = unicodedata.normalize("NFD", str(text))
+    s = str(text)
+    for ligature, remplacement in _LIGATURES.items():
+        s = s.replace(ligature, remplacement)
+    s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
     return " ".join(s.lower().split())
 
 
 #: Fragment de rubrique (normalisé) → code module. Premier fragment trouvé gagne,
-#: d'où l'ordre : « equipement » avant « materiel », « mecanis » avant « operation ».
+#: d'où l'ordre : « equipement » avant « materiel », « mecanis » avant
+#: « operation », « commercialisation » avant « conditionnement ».
+#:
+#: POURQUOI CETTE TABLE S'EST ALLONGÉE (défaut mesuré, juillet 2026)
+#: -----------------------------------------------------------------
+#: Les classeurs du client suivent le template officiel : leurs 8 rubriques se
+#: mappent toutes. Les simulateurs INSTITUTIONNELS, eux, renomment librement les
+#: rubriques selon la filière (« Alimentation » pour du poulet, « Substrat &
+#: blanc de champignon » pour des pleurotes). Sept simulateurs sur quatorze
+#: portaient ainsi des libellés qu'aucun fragment ne reconnaissait — et
+#: `referentiel_loader` les ignorait EN SILENCE.
+#:
+#: L'effet n'est pas une perte symétrique : c'est une ASYMÉTRIE. Le plan du
+#: demandeur était lu en entier, la référence de sa filière amputée. Sur le
+#: poulet de chair, « Alimentation » (2 920 USD, le premier poste d'un cycle
+#: avicole) n'entrait pas dans la référence : 77,8 % des coûts manquaient d'un
+#: seul côté de la comparaison, et tout demandeur de la filière paraissait
+#: massivement surcoté. Un faux refus systématique, invisible.
+#:
+#: Les fragments ajoutés le sont sur un raisonnement SÉMANTIQUE, jamais
+#: positionnel : les classeurs ont bien 8 rubriques dans le même ordre, mais
+#: leurs auteurs ont réutilisé les emplacements librement (l'alimentation d'un
+#: élevage occupe la place des « opérations mécanisées » d'une culture). Se fier
+#: au rang aurait rangé de l'aliment dans la mécanisation.
 _RUBRIQUE_FRAGMENTS: tuple[tuple[str, str], ...] = (
+    # ── Intrants (module « Semences & Intrants ») ─────────────────────────────
     ("semence", "semences"),
     ("intrant", "semences"),
+    #: Alimentation animale : premier poste d'un cycle d'élevage, et un INTRANT
+    #: au sens plein. ARBITRAGE SIGNALÉ AU FONDATEUR : le module s'appelle
+    #: « Semences & Intrants », libellé pensé pour les cultures. Si
+    #: l'institution veut suivre l'aliment à part, cela demande un 9e module au
+    #: référentiel — décision de nomenclature, pas de code (principe 6).
+    ("alimentation", "semences"),
+    ("poussin", "semences"),        # jeunes sujets = cheptel de départ
+    ("alevin", "semences"),
+    ("geniteur", "semences"),
+    ("colonie", "semences"),        # colonies d'abeilles peuplant les ruches
+    ("substrat", "semences"),       # substrat + blanc de champignon = la « semence »
+    ("plants", "semences"),         # plants forestiers / agroforestiers
+    ("consommable", "semences"),
+    # ── Opérations de production (module « Opérations mécanisées ») ───────────
     ("mecanis", "mecanisation"),
-    ("main", "maindoeuvre"),
+    ("operation", "mecanisation"),
+    ("conduite", "mecanisation"),       # conduite du rucher / de production
+    ("fonctionnement", "mecanisation"),  # fonctionnement du moulin
+    ("preparation", "mecanisation"),
+    ("sterilisation", "mecanisation"),
+    # ── Main-d'œuvre ─────────────────────────────────────────────────────────
+    #: « oeuvre » et non « main » : le fragment « main » attrapait « Maintenance
+    #: & pièces » et comptait 360 USD d'entretien en salaires. Un poste MAL
+    #: classé fausse le poids du module autant qu'un poste absent — et il est
+    #: plus difficile à voir, puisque rien ne manque.
     ("oeuvre", "maindoeuvre"),
+    # ── Équipement ───────────────────────────────────────────────────────────
     ("equipement", "equipements"),
     ("materiel", "equipements"),
+    # ── Récolte et aval de production ────────────────────────────────────────
     ("recolte", "postrecolte"),
+    ("peche", "postrecolte"),        # pêche & conditionnement (aquaculture)
+    ("extraction", "postrecolte"),   # extraction du miel
+    ("transformation", "postrecolte"),
+    # ── Aval commercial ──────────────────────────────────────────────────────
     ("logistique", "logistique"),
     ("commercialisation", "commercialisation"),
     ("reserve", "reserve"),
+)
+
+#: Rubriques dont le rattachement est RÉELLEMENT ambigu, et qu'on refuse de
+#: ranger arbitrairement. Elles restent non classées — donc signalées — jusqu'à
+#: arbitrage. Les nommer ici ne les excuse pas : cela permet à un test de
+#: distinguer une ambiguïté connue et arbitrée d'un libellé NOUVEAU qui, lui,
+#: doit faire échouer le garde-fou.
+#:
+#:   « Maintenance & pièces » (simulateur 14, moulin à maïs, 360 USD) —
+#:   entre `equipements` (des pièces sont du petit matériel) et `mecanisation`
+#:   (l'entretien fait partie du fonctionnement de la machine). Recommandation
+#:   au fondateur : `equipements`. Tant qu'il n'a pas tranché, ces 360 USD
+#:   restent HORS référence et le disent, plutôt que d'être rangés au hasard.
+RUBRIQUES_AMBIGUES: tuple[str, ...] = (
+    "maintenance",
 )
 
 
@@ -118,6 +198,76 @@ def rubrique_to_module(rubrique) -> str | None:
         if fragment in low:
             return code
     return None
+
+
+def est_ambigue(rubrique) -> bool:
+    """La rubrique fait-elle partie des ambiguïtés connues et assumées ?"""
+    low = normalize(rubrique)
+    return any(fragment in low for fragment in RUBRIQUES_AMBIGUES)
+
+
+def analyser_couverture_rubriques(paires, *, origine: str = "") -> dict:
+    """Ce que le mapping a classé, et ce qu'il a laissé tomber — à voix haute.
+
+    `paires` : itérable de `(libellé de rubrique, montant `Decimal` ou None)`.
+
+    Un coût qu'on ne sait pas classer est une INFORMATION, pas un zéro. Cette
+    fonction est le contraire du `continue` silencieux qui a coûté 77,8 % de la
+    référence avicole : elle mesure la part non reconnue, la journalise en
+    warning, et la rend exploitable par l'appelant (rapport d'ingestion, rapport
+    d'analyse, test de non-régression).
+
+    Elle ne décide rien et ne lève rien : la lecture d'un référentiel ne doit pas
+    échouer parce qu'une rubrique est inconnue — elle doit le DIRE.
+    """
+    import logging
+
+    total = Decimal("0")
+    total_classe = Decimal("0")
+    non_reconnues: list[dict] = []
+
+    for libelle, montant in paires:
+        if libelle is None or not str(libelle).strip():
+            continue
+        if is_total_row(libelle):
+            continue
+        valeur = montant if isinstance(montant, Decimal) else to_decimal(montant)
+        if valeur is None:
+            continue
+        total += valeur
+        if rubrique_to_module(libelle) is None:
+            non_reconnues.append({
+                "rubrique": str(libelle).strip(),
+                "montant": str(_q(valeur)),
+                "arbitrageEnAttente": est_ambigue(libelle),
+            })
+        else:
+            total_classe += valeur
+
+    non_reconnu = total - total_classe
+    part = (
+        (non_reconnu / total * Decimal(100)).quantize(CENT)
+        if total > 0 else Decimal("0.00")
+    )
+
+    if non_reconnues:
+        logging.getLogger(__name__).warning(
+            "Rubriques non classées%s : %s USD sur %s (%s %%) — %s. "
+            "Ces coûts n'entrent dans AUCUN module : la référence de la filière "
+            "est amputée d'autant, et tout dossier comparé à elle paraîtra "
+            "surcoté. Compléter le mapping (`_RUBRIQUE_FRAGMENTS`) ou arbitrer "
+            "le rattachement.",
+            f" ({origine})" if origine else "", _q(non_reconnu), _q(total), part,
+            ", ".join(f"« {e['rubrique']} » {e['montant']}" for e in non_reconnues),
+        )
+
+    return {
+        "total": _q(total),
+        "totalClasse": _q(total_classe),
+        "totalNonReconnu": _q(non_reconnu),
+        "partNonReconnuePct": part,
+        "nonReconnues": non_reconnues,
+    }
 
 
 def is_total_row(rubrique) -> bool:

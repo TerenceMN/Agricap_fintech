@@ -47,7 +47,9 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 
-from credits.needs_sheet import normalize, rubrique_to_module
+from credits.needs_sheet import (
+    analyser_couverture_rubriques, normalize, rubrique_to_module,
+)
 
 #: `AGRICAP_FIN_SIM_01_Cereales_Mais.xlsx` → ("01", "Cereales", "Mais")
 _NOM_SIMULATEUR = re.compile(
@@ -212,9 +214,35 @@ def charger_depuis_simulateur(source) -> dict:
     quantite, unite, libelle_dimension = dimension
 
     # ── Coûts par module, ramenés à l'unité de référence de la filière ───────
-    couts: dict[str, dict[str, str]] = {}
+    #
+    # Ce que ce bloc taisait : `rubrique_to_module` rend `None` aussi bien pour
+    # la ligne TOTAL (à sauter, légitimement) que pour une rubrique QU'IL NE
+    # SAIT PAS CLASSER. Les deux tombaient dans le même `continue`, et les
+    # secondes disparaissaient de la référence sans laisser de trace. Sur les
+    # simulateurs à libellés locaux — « Alimentation », « Substrat & blanc de
+    # champignon », « Fonctionnement du moulin » — cela retirait jusqu'à 77,8 %
+    # des coûts d'une filière, d'un seul côté de la comparaison.
+    #
+    # La couverture est donc mesurée AVANT, journalisée, et publiée dans le
+    # lignage : un référentiel amputé reste chargeable — refuser bloquerait
+    # l'instruction de toute une filière — mais il ne peut plus l'être en
+    # silence.
+    lignes_synthese = list(_lignes(source, "5_Synthese_Besoins"))
+    couverture = analyser_couverture_rubriques(
+        ((ligne.get("Rubrique"), ligne.get("Total rubrique")) for ligne in lignes_synthese),
+        origine=source.original_name or f"DataSource#{source.pk}",
+    )
+
+    # Somme PAR MODULE, et non affectation : plusieurs rubriques d'un même
+    # classeur peuvent relever du même module (un cycle avicole porte
+    # « Poussins & produits vétérinaires » ET « Alimentation », deux intrants).
+    # L'écriture directe `couts[module] = …` gardait la DERNIÈRE et perdait les
+    # précédentes — une seconde amputation silencieuse, invisible tant qu'aucun
+    # classeur n'avait deux rubriques par module. Elle serait apparue au premier
+    # mapping complété : elle est corrigée avec lui.
+    montants: dict[str, Decimal] = {}
     total_lu = Decimal(0)
-    for ligne in _lignes(source, "5_Synthese_Besoins"):
+    for ligne in lignes_synthese:
         module = rubrique_to_module(ligne.get("Rubrique"))
         if module is None:          # ligne TOTAL, ou rubrique non reconnue
             continue
@@ -222,10 +250,15 @@ def charger_depuis_simulateur(source) -> dict:
         if montant is None:
             continue
         total_lu += montant
-        couts[module] = {
+        montants[module] = montants.get(module, Decimal(0)) + montant
+
+    couts: dict[str, dict[str, str]] = {
+        module: {
             "ref": str((montant / quantite).quantize(Decimal("0.01"))),
             **TOLERANCES_PAR_MODULE.get(module, TOLERANCE_DEFAUT),
         }
+        for module, montant in montants.items()
+    }
 
     if not couts:
         raise ReferentielIntrouvable(
@@ -278,6 +311,12 @@ def charger_depuis_simulateur(source) -> dict:
             "libelleDimension": libelle_dimension,
             "superficieReference": str(quantite),
             "totalCycleLu": str(total_lu),
+            # Part des coûts du classeur qui n'est entrée dans AUCUN module, et
+            # les libellés en cause. Publiée dans le lignage plutôt que dans un
+            # log seul : la commande d'ingestion l'affiche, le test de
+            # non-régression l'assère, et un référentiel amputé se voit dans sa
+            # propre trace d'audit.
+            "couvertureRubriques": couverture,
         },
     }
 

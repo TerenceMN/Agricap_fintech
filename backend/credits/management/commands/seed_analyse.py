@@ -249,6 +249,27 @@ class Command(BaseCommand):
                 f"{lignage['totalCycleLu']} USD sur {lignage['quantiteReference']} "
                 f"{lignage['uniteReference']} "
                 f"(source dataio #{lignage['dataSourceId']} rev {lignage['revision']})"))
+            self._alerter_couverture(lignage)
+
+    def _alerter_couverture(self, lignage: dict) -> None:
+        """Une référence amputée se dit à l'écran, pas seulement dans un log.
+
+        Le référentiel est écrit quand même — bloquer priverait toute une
+        filière d'instruction — mais l'opérateur qui lance l'amorçage voit
+        immédiatement quels coûts n'ont trouvé aucun module, et combien.
+        """
+        couverture = (lignage or {}).get("couvertureRubriques") or {}
+        non_reconnues = couverture.get("nonReconnues") or []
+        if not non_reconnues:
+            return
+        self.stdout.write(self.style.WARNING(
+            f"    ! {couverture['totalNonReconnu']} USD non classés "
+            f"({couverture['partNonReconnuePct']} % du classeur) — "
+            f"la référence de cette filière en est amputée :"))
+        for entree in non_reconnues:
+            attente = " [arbitrage en attente]" if entree.get("arbitrageEnAttente") else ""
+            self.stdout.write(self.style.WARNING(
+                f"        · « {entree['rubrique']} » {entree['montant']} USD{attente}"))
 
         self.stdout.write(self.style.SUCCESS(
             f"Moteur d'analyse : {BaremeScore.objects.filter(actif=True).count()} barème(s) "

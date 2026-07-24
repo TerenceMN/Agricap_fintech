@@ -16,34 +16,17 @@ from typing import Any
 import openpyxl
 
 # ── Mapping rubrique (Synthèse) → code module Python ─────────────────────────
-_SYNTH_RUBRIQUE_MAP: list[tuple[str, str]] = [
-    ("semences",          "semences"),
-    ("intrants",          "semences"),
-    ("mécanis",           "mecanisation"),
-    ("mecanis",           "mecanisation"),
-    ("mécani",            "mecanisation"),
-    ("main",              "maindoeuvre"),
-    ("équipement",        "equipements"),
-    ("equipement",        "equipements"),
-    ("matériel",          "equipements"),
-    ("récolte",           "postrecolte"),
-    ("recolte",           "postrecolte"),
-    ("post",              "postrecolte"),
-    ("logistique",        "logistique"),
-    ("commercialisation", "commercialisation"),
-    ("réserve",           "reserve"),
-    ("reserve",           "reserve"),
-]
-
-
+#
+# UNE SEULE TABLE (principe 6) : elle vit dans `credits.needs_sheet`, qui sert
+# la validation du classeur client et fait donc foi. Ce module en portait une
+# copie manuelle, `dataio_simulator` une troisième — trois tables aux fragments
+# divergents, donc trois classements possibles pour la même rubrique selon le
+# chemin de lecture, et un libellé complété dans l'une qui restait inconnu des
+# deux autres.
 def _rubrique_to_module(rubrique: str) -> str | None:
-    import unicodedata
-    nfkd = unicodedata.normalize("NFD", rubrique.lower())
-    low = "".join(c for c in nfkd if not unicodedata.combining(c))
-    for fragment, code in _SYNTH_RUBRIQUE_MAP:
-        if fragment in low:
-            return code
-    return None
+    from credits.needs_sheet import rubrique_to_module
+
+    return rubrique_to_module(rubrique)
 
 
 def _find_synthese_sheet(wb):

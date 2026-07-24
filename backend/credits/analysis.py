@@ -159,7 +159,22 @@ class DocumentReasoningEngine:
                 unite = row.get("Unité", "") or row.get("Unite", "") or ""
                 if not desc or unit_price is None:
                     continue
-                mod = _rubrique_to_module(rubrique) or "reserve"
+                mod = _rubrique_to_module(rubrique)
+                if mod is None:
+                    # Repli historique : la ligne de référence est conservée
+                    # (la perdre priverait la comparaison de prix d'un article
+                    # réel), mais elle atterrit dans « réserve » — un module qui
+                    # n'est pas le sien. Un poste MAL classé fausse le poids du
+                    # module autant qu'un poste absent, et il est plus difficile
+                    # à voir puisque rien ne manque : on le dit.
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Rubrique de référence « %s » non classée (%s) : rangée "
+                        "par défaut en « réserve ». Compléter le mapping "
+                        "`credits.needs_sheet._RUBRIQUE_FRAGMENTS`.",
+                        rubrique, self._ref_version,
+                    )
+                    mod = "reserve"
                 self._ref_items.append({
                     "desc": desc,
                     "tokens": _tok(desc),
