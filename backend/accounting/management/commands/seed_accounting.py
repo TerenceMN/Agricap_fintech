@@ -20,6 +20,7 @@ from accounting.definitions import (
     CLASSES_RISQUE,
     PLAN_COMPTABLE,
     REGLES_CONSOMMATION,
+    SOURCES_EVENEMENTS,
 )
 from accounting.models import (
     ClasseRisque,
@@ -27,6 +28,7 @@ from accounting.models import (
     EventEntryTemplate,
     EventEntryTemplateLine,
     RegleConsommation,
+    SourceEvenements,
 )
 
 
@@ -45,6 +47,7 @@ class Command(BaseCommand):
         crees, majs = self._charger_plan_comptable()
         templates, lignes = self._charger_catalogue()
         classes = self._charger_classes_risque()
+        sources = self._charger_sources_evenements()
         regles = self._charger_regles_consommation()
         desactives = self._desactiver_comptes_obsoletes()
         supprimes = 0
@@ -58,6 +61,7 @@ class Command(BaseCommand):
                 f"Catalogue : {templates} schéma(s), {lignes} ligne(s) de schéma.\n"
                 f"Classes de risque : {classes} amorcée(s) (créées uniquement si absentes — "
                 f"un taux ajusté par le comité n'est JAMAIS écrasé par un rechargement).\n"
+                f"Sources d'événements : {sources} amorcée(s).\n"
                 f"Règles de consommation d'événements : {regles} amorcée(s) (même règle : "
                 f"un mapping ajusté n'est jamais remis d'usine)."
             ))
@@ -140,6 +144,28 @@ class Command(BaseCommand):
                     "taux_provision": Decimal(taux),
                     "en_souffrance": souffrance,
                     "ordre": ordre,
+                    "actif": True,
+                    "modifie_par": "seed_accounting",
+                },
+            )
+            compteur += int(cree)
+        return compteur
+
+    # -------------------------------------------------- SOURCES D'ÉVÉNEMENTS
+    def _charger_sources_evenements(self) -> int:
+        """`get_or_create` : déclarer une file est une décision d'exploitation. Un préfixe
+        de référence ajusté après coup ne doit surtout pas revenir d'usine — les pièces
+        déjà émises portent l'ancien, et deux conventions de référence pour une même file
+        rendraient la reprise après incident illisible."""
+        compteur = 0
+        for code, modele, libelle, prefixe, note in SOURCES_EVENEMENTS:
+            _, cree = SourceEvenements.objects.get_or_create(
+                code=code,
+                defaults={
+                    "modele": modele,
+                    "libelle": libelle,
+                    "prefixe_reference": prefixe,
+                    "note": note,
                     "actif": True,
                     "modifie_par": "seed_accounting",
                 },

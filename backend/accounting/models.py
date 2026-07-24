@@ -390,6 +390,67 @@ class EventEntryTemplateLine(models.Model):
         return f"{self.template_id} {self.ordre} {self.sens} {self.compte_racine}"
 
 
+class SourceEvenements(models.Model):
+    """Une FILE d'événements métier que la comptabilité lit — déclarée en base.
+
+    `investments` a été la première (`InvestmentEvent`) ; `credits` (B1→B4) et `savings`
+    (B8/B9) suivent. Sans cette table, le consommateur porterait le nom de la file
+    d'`investments` en dur et brancher une deuxième file serait un déploiement — alors que
+    c'est une décision d'exploitation.
+
+    Ce qu'une file doit exposer pour être lisible (le CONTRAT, minimal et suffisant) :
+
+    * `event_type` — le type métier, clé du mapping `RegleConsommation` ;
+    * `amount` — le montant du FAIT, strictement positif et JAMAIS signé : le sens d'une
+      écriture est porté par le schéma de l'annexe B, jamais par le signe d'un montant ;
+    * `currency`, `occurred_at` (aware — c'est la date COMPTABLE), `payload` (JSON) ;
+    * `consumed_at` / `journal_reference` — écrits par le consommateur, par personne d'autre.
+
+    Tout le reste est facultatif et n'est lu QUE si le schéma appliqué le réclame : une file
+    de crédit n'a pas de compte de cantonnement d'offre à porter, et on ne doit pas lui en
+    demander un.
+    """
+
+    code = models.CharField(
+        max_length=64, unique=True, db_index=True,
+        help_text="Identifiant de la file, tel qu'écrit dans « RegleConsommation.source » "
+                  "(convention : « app_label.ModelName »).",
+    )
+    modele = models.CharField(
+        max_length=64, blank=True,
+        help_text="Modèle Django réellement lu (« app_label.ModelName »). Vide = le code "
+                  "fait foi. Distinct du code pour qu'une file puisse être renommée, ou "
+                  "qu'un banc d'essai pointe une file existante sans usurper son identité.",
+    )
+    libelle = models.CharField(max_length=200, blank=True)
+    prefixe_reference = models.CharField(
+        max_length=8,
+        help_text="Préfixe des références de pièce produites depuis cette file (INV, CRE…). "
+                  "Il rend la référence unique entre files : deux événements de deux files "
+                  "peuvent porter le même identifiant.",
+    )
+    note = models.TextField(blank=True)
+    actif = models.BooleanField(
+        default=True,
+        help_text="Désactivée, la file cesse d'être consommée et ses événements "
+                  "s'accumulent — ils ne se perdent pas et ne s'écrivent pas de travers.",
+    )
+    modifie_par = models.CharField(max_length=255, blank=True)
+    modifie_le = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["code"]
+        verbose_name = "source d'événements métier"
+        verbose_name_plural = "sources d'événements métier"
+
+    def __str__(self) -> str:
+        return f"{self.code} → {self.prefixe_reference}"
+
+    @property
+    def chemin_modele(self) -> str:
+        return self.modele or self.code
+
+
 class RegleConsommation(models.Model):
     """Mapping « événement métier → écriture » — EN BASE, jamais en dur (principe 8).
 

@@ -37,10 +37,18 @@ Quatre règles de conduite, qui expliquent la forme du code :
    pas (B12 : capital / rendement « selon l'échéancier »), reste en file et ressort dans
    le rapport. Une écriture comptable fausse est bien pire qu'une écriture absente.
 
-4. **Le code exécute, le paramétrage décide.** Aucun `if event_type == "…"` ici : le
-   mapping vit dans `RegleConsommation`, et les montants attendus se DÉDUISENT des
-   `montant_ref` du schéma en base. Ajouter un événement au catalogue est un geste de
-   paramétrage.
+4. **Le code exécute, le paramétrage décide.** Aucun `if event_type == "…"` ni
+   `if source == "…"` ici : la file à lire vit dans `SourceEvenements`, le mapping
+   « événement → schéma » dans `RegleConsommation`, et TOUT ce qu'un schéma réclame — ses
+   montants (`montant_ref`) comme ses comptes à trancher (`$TRESORERIE`, `$CANTONNEMENT`)
+   — se lit sur le schéma en base. Brancher une nouvelle file métier est un geste de
+   paramétrage, pas un déploiement.
+
+Ce que le consommateur exige d'une file productrice (le CONTRAT, et rien de plus) :
+`event_type`, `amount` (> 0, jamais signé — le sens vient du schéma), `currency`,
+`occurred_at` (aware), `payload`, `consumed_at`, `journal_reference`. Les champs
+supplémentaires (`segregation_account`, `offer`, `subscription`) ne sont lus QUE si le
+schéma appliqué les réclame : une file crédit ou épargne n'a pas à les porter.
 
 Le consommateur s'expose en commande de management (`manage.py consume_investment_events`),
 jamais en signal : une écriture comptable doit être déclenchée à une heure connue, par un
@@ -62,17 +70,18 @@ from .definitions import (
     PLACEHOLDER_TRESORERIE,
     SOURCE_INVESTISSEMENT,
 )
-from .models import Devise, EventEntryTemplate, PieceComptable, RegleConsommation
+from .models import (
+    Devise,
+    EventEntryTemplate,
+    EventEntryTemplateLine,
+    PieceComptable,
+    RegleConsommation,
+    SourceEvenements,
+)
 
 #: `investments` cote en « USD » ; `portfolio` dit « CDF » là où l'annexe A dit « FC ».
 #: La traduction est explicite et centralisée — jamais devinée ligne à ligne.
 DEVISE_EVENEMENT: dict[str, str] = {"USD": Devise.USD, "FC": Devise.FC, "CDF": Devise.FC}
-
-#: Préfixe des références de pièce produites par le consommateur. La référence est
-#: DÉTERMINISTE (`INV-<date>-<schéma>-<id événement>`) : deux exécutions ne peuvent pas
-#: produire deux pièces pour le même événement, la contrainte d'unicité de
-#: `PieceComptable.reference` le refuse au niveau base.
-PREFIXE_REFERENCE = "INV"
 
 #: Convention de nommage des sous-comptes de cantonnement (annexe A).
 PREFIXE_CANTONNEMENT = "419-OFF-"
@@ -105,22 +114,79 @@ class DejaConsomme(EvenementNonConsommable):
 
 # --------------------------------------------------------------------------- FILE
 
-def _modele_evenement():
-    """Import différé : `accounting` ne dépend pas d'`investments` au chargement (et
-    n'écrit dans ses modèles que les deux champs de file `consumed_at` /
-    `journal_reference`, que `investments` déclare explicitement comme étant les nôtres)."""
-    from investments.models import InvestmentEvent
+#: Champs qu'une file productrice DOIT exposer. Contrôlés à la résolution de la source,
+#: une fois, avec un message qui nomme ce qui manque — plutôt qu'un `AttributeError` au
+#: milieu d'un lot, sur le premier événement venu.
+CONTRAT_FILE = (
+    "event_type", "amount", "currency", "occurred_at", "payload",
+    "consumed_at", "journal_reference",
+)
 
-    return InvestmentEvent
+
+def source_de(source: str) -> SourceEvenements:
+    """Déclaration en base de la file à lire — jamais un nom de modèle en dur.
+
+    Une file inconnue n'est pas une panne du consommateur : c'est un paramétrage qui reste
+    à poser. Le message le dit, et dit comment.
+    """
+    declaration = SourceEvenements.objects.filter(code=source).first()
+    if declaration is None:
+        raise SansEcritureDefinie(
+            f"La file « {source} » n'est pas déclarée en comptabilité : aucun événement n'en "
+            "est lu. Déclarez-la (`manage.py parametrer_consommation source --code "
+            f"{source} --prefixe …`) — le consommateur ne devine pas quelle table lire."
+        )
+    if not declaration.actif:
+        raise SansEcritureDefinie(
+            f"La file « {source} » est désactivée : ses événements s'accumulent, "
+            "aucun n'est écrit."
+        )
+    return declaration
 
 
-def evenements_en_attente(*, jusqu_au: date_cls | None = None, types: list[str] | None = None):
+def _modele_evenement(source: str = SOURCE_INVESTISSEMENT):
+    """Modèle de file, résolu depuis sa DÉCLARATION en base.
+
+    Import différé et résolution par nom : `accounting` ne dépend au chargement d'aucune app
+    productrice (et n'écrit dans leurs modèles que les deux champs de file `consumed_at` /
+    `journal_reference`, que chaque producteur déclare explicitement comme étant les nôtres).
+    """
+    from django.apps import apps
+
+    chemin = source_de(source).chemin_modele
+    try:
+        modele = apps.get_model(chemin)
+    except (LookupError, ValueError) as exc:
+        raise SansEcritureDefinie(
+            f"La file « {source} » désigne le modèle « {chemin} », que Django ne connaît "
+            "pas. Corrigez la déclaration (`SourceEvenements.modele`) : la comptabilité ne "
+            "lit que des files qui existent."
+        ) from exc
+
+    champs = {champ.name for champ in modele._meta.get_fields()}
+    absents = [nom for nom in CONTRAT_FILE if nom not in champs]
+    if absents:
+        raise SansEcritureDefinie(
+            f"La file « {chemin} » ne respecte pas le contrat de consommation : "
+            f"{', '.join(absents)} manque(nt). Une file lisible porte {', '.join(CONTRAT_FILE)} "
+            "— « consumed_at » et « journal_reference » étant écrits par la comptabilité et "
+            "par elle seule."
+        )
+    return modele
+
+
+def evenements_en_attente(
+    *,
+    jusqu_au: date_cls | None = None,
+    types: list[str] | None = None,
+    source: str = SOURCE_INVESTISSEMENT,
+):
     """File des événements non consommés, dans l'ordre où ils se sont produits.
 
     L'ordre chronologique n'est pas cosmétique : la contrepassation d'un remboursement de
     souscription suppose que l'encaissement correspondant ait DÉJÀ été consommé.
     """
-    qs = _modele_evenement().objects.filter(consumed_at__isnull=True)
+    qs = _modele_evenement(source).objects.filter(consumed_at__isnull=True)
     if jusqu_au:
         qs = qs.filter(occurred_at__date__lte=jusqu_au)
     if types:
@@ -179,9 +245,13 @@ def _cantonnement(evenement) -> str:
     pas le plan comptable, il en décline mécaniquement le compte 419 par offre. C'est
     l'invariant de ségrégation du principe 9 — prouver que l'argent de l'offre X n'a pas
     financé le projet Y.
+
+    Les deux champs lus (`segregation_account`, `offer`) ne font PAS partie du contrat de
+    file : ils ne sont demandés qu'aux événements dont le schéma réclame `$CANTONNEMENT`
+    (B10→B13). Une file crédit ou épargne n'en porte pas, et n'a pas à en porter.
     """
-    reference = (evenement.segregation_account or "").strip()
-    if not reference and evenement.offer_id:
+    reference = (getattr(evenement, "segregation_account", "") or "").strip()
+    if not reference and getattr(evenement, "offer_id", None):
         reference = f"{PREFIXE_CANTONNEMENT}{evenement.offer.code}"
     if not reference:
         raise EvenementNonConsommable(
@@ -198,11 +268,12 @@ def _cantonnement(evenement) -> str:
     return reference
 
 
-def _references_de_montant(code_schema: str) -> list[str]:
-    """Montants attendus par un schéma, LUS EN BASE (ordre du schéma, sans doublon).
+def _lignes_de_schema(code_schema: str) -> list[EventEntryTemplateLine]:
+    """Lignes INCONDITIONNELLES d'un schéma, lues en base.
 
-    C'est ce qui évite un dictionnaire `{"B10": "souscription", …}` en dur : ajouter un
-    schéma au catalogue suffit à le rendre consommable, sans toucher ce fichier.
+    Les lignes conditionnelles (B16 : GAIN / PERTE) sont écartées : elles décrivent des
+    variantes exclusives, dont une seule s'applique — les compter dans l'équation
+    d'équilibre du schéma n'aurait pas de sens.
     """
     template = EventEntryTemplate.objects.filter(code=code_schema, actif=True).first()
     if template is None:
@@ -210,13 +281,87 @@ def _references_de_montant(code_schema: str) -> list[str]:
             f"Schéma « {code_schema} » introuvable ou inactif : la règle de consommation "
             "désigne un schéma que le catalogue ne contient pas."
         )
+    lignes = list(template.lignes.filter(condition=""))
+    if not lignes:
+        raise NotFoundError(f"Le schéma « {code_schema} » ne porte aucune ligne applicable.")
+    return lignes
+
+
+def _references_de_montant(code_schema: str) -> list[str]:
+    """Montants attendus par un schéma, LUS EN BASE (ordre du schéma, sans doublon).
+
+    C'est ce qui évite un dictionnaire `{"B10": "souscription", …}` en dur : ajouter un
+    schéma au catalogue suffit à le rendre consommable, sans toucher ce fichier.
+    """
     references: list[str] = []
-    for ligne in template.lignes.filter(condition=""):
+    for ligne in _lignes_de_schema(code_schema):
         if ligne.montant_ref not in references:
             references.append(ligne.montant_ref)
-    if not references:
-        raise NotFoundError(f"Le schéma « {code_schema} » ne porte aucune ligne applicable.")
     return references
+
+
+def placeholders_de(code_schema: str) -> list[str]:
+    """Placeholders de compte (`$…`) que CE schéma exige, lus en base.
+
+    C'est ce qui rend le consommateur agnostique du schéma appliqué : B10→B13 réclament un
+    cantonnement d'offre, B1→B4 (crédit) et B8/B9 (épargne) n'en réclament aucun. Résoudre
+    systématiquement `$CANTONNEMENT` reviendrait à exiger une offre d'investissement d'un
+    remboursement de crédit — le mapping en base ne servirait plus à rien.
+    """
+    references: list[str] = []
+    for ligne in _lignes_de_schema(code_schema):
+        if ligne.compte_racine.startswith("$") and ligne.compte_racine not in references:
+            references.append(ligne.compte_racine)
+    return references
+
+
+def _deduire_montant_manquant(
+    code_schema: str, connus: dict[str, Decimal], manquants: list[str],
+) -> Decimal | None:
+    """Valeur FORCÉE d'un montant absent du payload, par l'équation d'équilibre du schéma.
+
+    Ce n'est pas une ventilation devinée, c'est de l'arithmétique : dans B12
+    (débit `retour_total` = crédit `capital_rembourse` + crédit `rendement`), connaître deux
+    des trois termes détermine le troisième au centime. Le résultat est ensuite CONFRONTÉ au
+    montant réel de l'événement par `_controler_montant` — une déduction fausse ne peut donc
+    pas entrer au grand livre.
+
+    Trois garde-fous, et ils sont la raison d'être de cette fonction :
+
+    * **un seul inconnu** — deux inconnus (le cas « je connais le total, pas la ventilation »)
+      restent un refus : c'est précisément la répartition capital / rendement qu'on ne devine
+      jamais, sous peine de fabriquer un produit financier 719 qui n'a pas existé ;
+    * **l'inconnu n'apparaît qu'une fois** dans le schéma — sinon l'équation est ambiguë ;
+    * **le résultat est strictement positif** — un montant nul ou négatif signale une
+      ventilation incohérente, pas une écriture à passer.
+    """
+    if len(manquants) != 1:
+        return None
+    inconnu = manquants[0]
+
+    lignes = _lignes_de_schema(code_schema)
+    if sum(1 for ligne in lignes if ligne.montant_ref == inconnu) != 1:
+        return None
+
+    au_debit = None
+    somme = {EventEntryTemplateLine.Sens.DEBIT: Decimal("0.00"),
+             EventEntryTemplateLine.Sens.CREDIT: Decimal("0.00")}
+    for ligne in lignes:
+        if ligne.montant_ref == inconnu:
+            au_debit = ligne.sens == EventEntryTemplateLine.Sens.DEBIT
+            continue
+        somme[ligne.sens] += connus[ligne.montant_ref]
+    if au_debit is None:  # pragma: no cover - garanti par la construction de `manquants`
+        return None
+
+    autre_cote = somme[
+        EventEntryTemplateLine.Sens.CREDIT if au_debit else EventEntryTemplateLine.Sens.DEBIT
+    ]
+    meme_cote = somme[
+        EventEntryTemplateLine.Sens.DEBIT if au_debit else EventEntryTemplateLine.Sens.CREDIT
+    ]
+    valeur = services.q2(autre_cote - meme_cote)
+    return valeur if valeur > 0 else None
 
 
 def _valeur_de_payload(payload: dict, reference: str):
@@ -235,9 +380,14 @@ def montants_de(evenement, code_schema: str) -> dict[str, Decimal]:
 
     * Un seul montant attendu → c'est le montant de l'événement, sans ambiguïté.
     * Plusieurs montants attendus (B12 : `retour_total` / `capital_rembourse` /
-      `rendement`) → ils doivent TOUS venir du payload de l'événement. La ventilation
-      « selon l'échéancier » ne se déduit pas d'un total : la répartir au jugé
-      fabriquerait un produit financier (719) qui n'a jamais existé.
+      `rendement`) → ils viennent du payload de l'événement. La ventilation « selon
+      l'échéancier » ne se déduit pas d'un total : la répartir au jugé fabriquerait un
+      produit financier (719) qui n'a jamais existé.
+
+      Un SEUL terme peut manquer, et seulement s'il est déterminé au centime par
+      l'équation d'équilibre du schéma (cf. `_deduire_montant_manquant`) : c'est le cas du
+      total redondant `retour_total`, que le producteur n'a aucune raison de recalculer.
+      Deux termes manquants restent un refus.
     """
     montant = services.q2(evenement.amount)
     if montant <= 0:
@@ -260,12 +410,15 @@ def montants_de(evenement, code_schema: str) -> dict[str, Decimal]:
         else:
             valeurs[reference] = services.q2(brute)
     if manquants:
-        raise SansEcritureDefinie(
-            f"Le schéma {code_schema} attend une ventilation que l'événement ne porte pas "
-            f"(absent(s) de son payload : {', '.join(manquants)}). L'événement reste en "
-            "file : la répartition capital / rendement d'un encaissement ne se devine pas "
-            "depuis son total."
-        )
+        deduit = _deduire_montant_manquant(code_schema, valeurs, manquants)
+        if deduit is None:
+            raise SansEcritureDefinie(
+                f"Le schéma {code_schema} attend une ventilation que l'événement ne porte "
+                f"pas (absent(s) de son payload : {', '.join(manquants)}). L'événement reste "
+                "en file : la répartition capital / rendement d'un encaissement ne se devine "
+                "pas depuis son total."
+            )
+        valeurs[manquants[0]] = deduit
     return valeurs
 
 
@@ -276,6 +429,7 @@ def planifier(evenement, *, source: str = SOURCE_INVESTISSEMENT) -> dict:
     lire le plan de consommation avant de le déclencher, exactement comme
     `provisions.analyser_portefeuille` précède `provisions.arreter`.
     """
+    prefixe = source_de(source).prefixe_reference
     regle = regle_pour(evenement.event_type, source=source)
     devise = devise_de(evenement)
     date_operation = date_operation_de(evenement)
@@ -288,8 +442,8 @@ def planifier(evenement, *, source: str = SOURCE_INVESTISSEMENT) -> dict:
             "devise": devise,
             "date_operation": date_operation,
             "montant": services.q2(evenement.amount),
-            "reference": f"{PREFIXE_REFERENCE}-{date_operation:%Y%m%d}-CP-{evenement.pk}",
-            "piece_origine": _piece_a_contrepasser(evenement, regle),
+            "reference": f"{prefixe}-{date_operation:%Y%m%d}-CP-{evenement.pk}",
+            "piece_origine": _piece_a_contrepasser(evenement, regle, source=source),
         }
 
     if not regle.schema:
@@ -298,19 +452,7 @@ def planifier(evenement, *, source: str = SOURCE_INVESTISSEMENT) -> dict:
             "rien à appliquer."
         )
 
-    comptes = {
-        PLACEHOLDER_TRESORERIE: (
-            (evenement.payload or {}).get(CLE_TRESORERIE) or regle.compte_tresorerie
-        ),
-        PLACEHOLDER_CANTONNEMENT: _cantonnement(evenement),
-    }
-    if not comptes[PLACEHOLDER_TRESORERIE]:
-        raise EvenementNonConsommable(
-            f"Aucun compte de trésorerie pour « {evenement.event_type} » : l'annexe B "
-            "laisse le choix 501/511/53x, il doit être tranché en base "
-            "(`RegleConsommation.compte_tresorerie`)."
-        )
-
+    comptes = _comptes_du_schema(evenement, regle)
     montants = montants_de(evenement, regle.schema)
     return {
         "regle": regle,
@@ -322,27 +464,84 @@ def planifier(evenement, *, source: str = SOURCE_INVESTISSEMENT) -> dict:
         "montants": montants,
         "comptes": comptes,
         "reference": (
-            f"{PREFIXE_REFERENCE}-{date_operation:%Y%m%d}-{regle.schema}-{evenement.pk}"
+            f"{prefixe}-{date_operation:%Y%m%d}-{regle.schema}-{evenement.pk}"
         ),
         "contexte": {"devise": devise, "montants": montants, "comptes": comptes},
     }
 
 
-def _piece_a_contrepasser(evenement, regle: RegleConsommation) -> PieceComptable:
+#: Comment se résout chaque placeholder de compte que l'annexe B laisse ouvert. Un
+#: placeholder inconnu de cette table est un schéma qu'on ne sait pas exécuter — et on le
+#: dit, plutôt que de passer une écriture amputée d'une contrepartie.
+RESOLVEURS_DE_COMPTE = {
+    PLACEHOLDER_TRESORERIE: lambda evenement, regle: (
+        (evenement.payload or {}).get(CLE_TRESORERIE) or regle.compte_tresorerie
+    ),
+    PLACEHOLDER_CANTONNEMENT: lambda evenement, regle: _cantonnement(evenement),
+}
+
+
+def _comptes_du_schema(evenement, regle: RegleConsommation) -> dict[str, str]:
+    """Résout LES SEULS placeholders que le schéma réclame — lus sur le schéma en base.
+
+    C'est ce qui rend une file crédit ou épargne consommable sans rien changer ici : B2
+    (« remboursement — capital ») ne demande qu'un compte de trésorerie, et exiger de lui
+    un cantonnement d'offre — comme le faisait la version « investissement » de ce
+    consommateur — condamnait toute autre file avant même son premier événement.
+    """
+    comptes: dict[str, str] = {}
+    for placeholder in placeholders_de(regle.schema):
+        resolveur = RESOLVEURS_DE_COMPTE.get(placeholder)
+        if resolveur is None:
+            raise SansEcritureDefinie(
+                f"Le schéma {regle.schema} réclame le compte {placeholder}, que le "
+                "consommateur ne sait pas résoudre depuis un événement métier. Aucune "
+                "écriture n'est passée sur une contrepartie inconnue."
+            )
+        resolu = resolveur(evenement, regle)
+        if not resolu:
+            raise EvenementNonConsommable(
+                f"Aucun compte {placeholder} pour « {evenement.event_type} » : l'annexe B "
+                "laisse le choix (501/511/53x), il doit être tranché en base "
+                "(`RegleConsommation.compte_tresorerie`) ou porté par l'événement "
+                f"(« {CLE_TRESORERIE} » dans son payload)."
+            )
+        comptes[placeholder] = resolu
+    return comptes
+
+
+#: Champ par lequel une contrepassation retrouve l'événement d'origine, essayé dans cet
+#: ordre : deux événements qui portent le MÊME rattachement métier décrivent le même
+#: engagement (une souscription encaissée puis remboursée, un crédit décaissé puis annulé).
+#: Aucune file ne doit tous les porter — la première clé présente fait foi.
+CLES_DE_RATTACHEMENT = ("subscription_id", "loan_id", "account_id", "contract_id")
+
+
+def _rattachement(evenement) -> tuple[str, object]:
+    for cle in CLES_DE_RATTACHEMENT:
+        valeur = getattr(evenement, cle, None)
+        if valeur:
+            return cle, valeur
+    raise EvenementNonConsommable(
+        "Contrepassation sans rattachement métier : impossible d'identifier la pièce à "
+        f"annuler (aucun de {', '.join(CLES_DE_RATTACHEMENT)} n'est renseigné). On "
+        "n'annule pas au hasard."
+    )
+
+
+def _piece_a_contrepasser(
+    evenement, regle: RegleConsommation, *, source: str = SOURCE_INVESTISSEMENT,
+) -> PieceComptable:
     """Retrouve la pièce RÉELLEMENT passée pour l'événement d'origine de la souscription.
 
     On ne reconstruit pas une écriture inverse à la main : on contrepasse la pièce qui
     existe, ce qui garantit que le remboursement annule exactement ce qui avait été
     encaissé, au centime et au compte près (annexe C, P13).
     """
-    if not evenement.subscription_id:
-        raise EvenementNonConsommable(
-            "Remboursement sans souscription rattachée : impossible d'identifier la pièce "
-            "d'encaissement à contrepasser."
-        )
+    cle, valeur = _rattachement(evenement)
     origine = (
-        _modele_evenement().objects
-        .filter(event_type=regle.evenement_origine, subscription_id=evenement.subscription_id)
+        _modele_evenement(source).objects
+        .filter(**{"event_type": regle.evenement_origine, cle: valeur})
         .exclude(journal_reference="")
         .order_by("occurred_at", "id")
         .first()
@@ -404,7 +603,7 @@ def consommer_evenement(evenement, *, par: str = "", source: str = SOURCE_INVEST
     cette transaction. Si le marquage échoue (consommation concurrente), la pièce est
     annulée avec lui.
     """
-    modele = _modele_evenement()
+    modele = _modele_evenement(source)
     evenement = modele.objects.select_for_update().get(pk=evenement.pk)
     if evenement.consumed_at is not None:
         raise DejaConsomme(
@@ -419,7 +618,8 @@ def consommer_evenement(evenement, *, par: str = "", source: str = SOURCE_INVEST
         piece, _ = services.contrepasser_piece(
             plan["piece_origine"],
             motif=(
-                f"Remboursement de souscription — événement {source}#{evenement.pk}. "
+                f"Annulation de « {plan['regle'].evenement_origine} » — événement "
+                f"{source}#{evenement.pk}. "
                 f"{(evenement.payload or {}).get('reason', '')}".strip()
             ),
             par=par,
@@ -529,7 +729,9 @@ def consommer_lot(
     laisse SON événement en file et n'empêche pas les autres d'entrer au grand livre —
     sans quoi un seul événement bancal gèlerait toute la comptabilité.
     """
-    evenements = list(evenements_en_attente(jusqu_au=jusqu_au, types=types)[: max(0, int(limite))])
+    evenements = list(
+        evenements_en_attente(jusqu_au=jusqu_au, types=types, source=source)[: max(0, int(limite))]
+    )
 
     consommes: list[dict] = []
     sans_ecriture: list[dict] = []
@@ -563,10 +765,11 @@ def consommer_lot(
         "consommes": consommes,
         "sans_ecriture": sans_ecriture,
         "echecs": echecs,
-        # File ENTIÈRE, sans le filtre du lot : un événement écarté par `--jusqu-au` ou par
-        # `--limite` reste un événement en attente d'écriture. Un compteur qui se
-        # rétrécirait avec le périmètre demandé donnerait l'illusion d'une file vide.
-        "restant_en_file": evenements_en_attente().count(),
+        # File ENTIÈRE de CETTE source, sans le filtre du lot : un événement écarté par
+        # `--jusqu-au` ou par `--limite` reste un événement en attente d'écriture. Un
+        # compteur qui se rétrécirait avec le périmètre demandé donnerait l'illusion d'une
+        # file vide.
+        "restant_en_file": evenements_en_attente(source=source).count(),
     }
 
 
@@ -586,7 +789,9 @@ def simuler_lot(
     plans: list[dict] = []
     sans_ecriture: list[dict] = []
     echecs: list[dict] = []
-    evenements = list(evenements_en_attente(jusqu_au=jusqu_au, types=types)[: max(0, int(limite))])
+    evenements = list(
+        evenements_en_attente(jusqu_au=jusqu_au, types=types, source=source)[: max(0, int(limite))]
+    )
 
     for evenement in evenements:
         entree = {

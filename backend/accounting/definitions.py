@@ -270,6 +270,42 @@ CATALOGUE: dict[str, dict] = {
 #: `investments.InvestmentEvent`, champs `consumed_at` / `journal_reference`).
 SOURCE_INVESTISSEMENT = "investments.InvestmentEvent"
 
+#: File du CRÉDIT (B1→B4). Ce littéral duplique volontairement
+#: `credits.events.SOURCE_CREDIT` : importer l'app productrice ICI créerait une dépendance
+#: au CHARGEMENT de la comptabilité sur une app qui, elle, ne doit rien savoir de nous.
+#: La synchronisation des deux constantes est verrouillée par un test
+#: (`tests_consommation.ContratDesFilesProductricesTests`), pas par un import.
+SOURCE_CREDIT = "credits.CreditEvent"
+
+#: File de l'ÉPARGNE (B8/B9). Même parti pris que ci-dessus : duplication assumée de
+#: `savings.events.SOURCE_EPARGNE`, synchronisation verrouillée par un test.
+SOURCE_EPARGNE = "savings.SavingsEvent"
+
+# (code, modele, libellé, préfixe de référence, note)
+#
+# Les FILES d'événements métier que la comptabilité lit. Amorce uniquement : la table
+# `SourceEvenements` est le paramétrage vivant, et déclarer une nouvelle file est un geste
+# d'exploitation (`manage.py parametrer_consommation source …`), pas un déploiement.
+#
+SOURCES_EVENEMENTS: list[tuple[str, str, str, str, str]] = [
+    (
+        SOURCE_INVESTISSEMENT, "", "File des événements d'investissement (B10→B13)", "INV",
+        "File append-only produite par `investments.funding`. La comptabilité y écrit "
+        "« consumed_at » et « journal_reference », et rien d'autre.",
+    ),
+    (
+        SOURCE_CREDIT, "", "File des événements de crédit (B1→B4)", "CRE",
+        "File append-only produite par `credits.events`. Un fait = un événement = UN "
+        "montant : une échéance encaissée produit deux lignes de file (capital B2, "
+        "intérêts B3), jamais un total à ventiler.",
+    ),
+    (
+        SOURCE_EPARGNE, "", "File des événements d'épargne (B8/B9)", "EPA",
+        "File append-only produite par `savings.events`. Deux types distincts pour les deux "
+        "sens : un retrait s'émet avec un montant POSITIF, le sens vient du schéma B9.",
+    ),
+]
+
 #: Compte de trésorerie par DÉFAUT des schémas B10→B13, qui laissent le choix 501/511/53x.
 #:
 #: ARBITRAGE SIGNALÉ AU FONDATEUR (cf. rapport) : l'annexe B écrit littéralement
@@ -282,6 +318,21 @@ SOURCE_INVESTISSEMENT = "investments.InvestmentEvent"
 #: (`RegleConsommation.compte_tresorerie`) : le corriger est une décision de
 #: paramétrage, jamais un redéploiement.
 COMPTE_TRESORERIE_DEFAUT = "511"
+
+#: Contrepartie d'amorce des flux INTERNES — ceux dont le producteur affirme, preuve à
+#: l'appui, qu'AUCUN cash ne bouge (décision « une seule porte » : un dépôt d'épargne
+#: débite le PORTEFEUILLE du membre, dont l'argent était entré plus tôt).
+#:
+#: Débiter 501/511/53x pour un tel flux compterait deux fois le même franc en trésorerie et
+#: fausserait le rapprochement mobile money dans les deux sens. L'annexe A ne porte pas
+#: encore de compte « dette de portefeuille client » : en attendant l'arbitrage du
+#: fondateur, la contrepartie va au TRANSITOIRE d'opérations internes (581), dont le solde
+#: est censé tendre vers zéro — un 581 qui gonfle est exactement le signal visible qu'il
+#: faut, au lieu d'une fausse entrée de caisse invisible.
+#:
+#: La dette 412 (épargne des membres), elle, est enregistrée JUSTE : c'est le côté qui
+#: compte pour le bilan et pour le membre. Ne rien écrire du tout serait pire.
+COMPTE_CONTREPARTIE_INTERNE = "581"
 
 # (source, type_evenement, mode, schema, evenement_origine, compte_tresorerie, note)
 #
@@ -330,5 +381,54 @@ REGLES_CONSOMMATION: list[tuple[str, str, str, str, str, str, str]] = [
         "une créance de projet. L'événement reste donc en file, visible, jusqu'à ce que "
         "le fondateur arbitre le schéma de provisionnement des projets (base de calcul, "
         "compte de dotation, décote). Ne rien écrire est ici la seule réponse honnête.",
+    ),
+    # ------------------------------------------------------------------ CRÉDIT (B1→B4)
+    #
+    # Compte de trésorerie d'amorce : 511 (Banque). Ce n'est PAS un choix par défaut de
+    # confort — c'est celui que l'autre grand livre du projet applique déjà au décaissement
+    # (`credits.disbursement` porte DR 4121 / CR 5211, « banque principale »). Prendre un
+    # compte différent ici ferait diverger deux comptabilités sur le MÊME fait, ce qui est
+    # exactement l'incident de données que le principe 11 interdit. Le jour où les
+    # décaissements passeront par la caisse (501) ou le mobile money (53x), le corriger est
+    # un geste de paramétrage — ou l'événement portera « compteTresorerie » lui-même.
+    (
+        SOURCE_CREDIT, "CREDIT_DISBURSED", "PIECE", "B1", "", COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B1 : l'encours sain (413) naît au débit à la mise à disposition des fonds. "
+        "Sans cet événement au grand livre, 413 restait muet et `provisions._declasser` "
+        "refusait — à juste titre — de déclasser un encours qu'il ne voyait pas.",
+    ),
+    (
+        SOURCE_CREDIT, "CREDIT_PRINCIPAL_REPAID", "PIECE", "B2", "", COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B2 : quote-part CAPITAL d'une échéance. Événement distinct de B3 — les deux "
+        "ne mouvementent ni les mêmes comptes ni les mêmes classes, et un total « échéance "
+        "encaissée » ne se ventile pas après coup.",
+    ),
+    (
+        SOURCE_CREDIT, "CREDIT_INTEREST_COLLECTED", "PIECE", "B3", "", COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B3 : quote-part INTÉRÊTS d'une échéance, produit du compte 701.",
+    ),
+    (
+        SOURCE_CREDIT, "CREDIT_COMMISSION_COLLECTED", "PIECE", "B4", "", COMPTE_TRESORERIE_DEFAUT,
+        "Annexe B4 : commission de dossier ou de service, produit du compte 702.",
+    ),
+    # ----------------------------------------------------------------- ÉPARGNE (B8/B9)
+    #
+    # ARBITRAGE SIGNALÉ AU FONDATEUR — la contrepartie va au transitoire interne 581, pas à
+    # 501/511/53x (cf. COMPTE_CONTREPARTIE_INTERNE). C'est la MÊME question que celle déjà
+    # signalée pour B10 (encaissement de souscription), laissée à 511 par fidélité littérale
+    # à l'annexe : les deux devraient être tranchées ENSEMBLE, et le jour où elles le seront,
+    # c'est une commande, pas un déploiement :
+    #     manage.py parametrer_consommation regle --source investments.InvestmentEvent \
+    #         --type SUBSCRIPTION_SETTLED --tresorerie <compte> --par "dg"
+    (
+        SOURCE_EPARGNE, "SAVINGS_DEPOSITED", "PIECE", "B8", "", COMPTE_CONTREPARTIE_INTERNE,
+        "Annexe B8 : l'épargne du membre est une DETTE de l'institution (412 au crédit) — "
+        "c'est le côté qui compte, et il est juste. La contrepartie est le portefeuille du "
+        "membre (flux interne), faute de compte dédié à l'annexe A : 581 la rend visible.",
+    ),
+    (
+        SOURCE_EPARGNE, "SAVINGS_WITHDRAWN", "PIECE", "B9", "", COMPTE_CONTREPARTIE_INTERNE,
+        "Annexe B9 : extinction partielle de la dette d'épargne. Le montant est POSITIF ; "
+        "le sens vient du schéma, jamais du signe.",
     ),
 ]

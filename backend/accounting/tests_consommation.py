@@ -6,7 +6,10 @@ Ce que ces tests verrouillent, dans l'ordre d'importance :
 2. **le rejeu ne produit AUCUNE écriture en double** (c'est tout l'objet de `consumed_at`) ;
 3. **un échec isolé n'interrompt pas le lot** — un événement bancal ne gèle pas la compta ;
 4. **un événement sans écriture définie reste NON consommé** — on ne vide pas une file en
-   inventant une écriture.
+   inventant une écriture ;
+5. **le consommateur ne connaît aucune file en particulier** — crédit (B1→B4), épargne
+   (B8/B9) et investissement (B10→B13) empruntent le MÊME code ; ce qui les distingue vit
+   entièrement en base.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from . import consommation, services
+from .definitions import SOURCE_INVESTISSEMENT
 from .models import (
     Devise,
     LigneEcriture,
@@ -378,6 +382,38 @@ class SansEcritureDefinieTests(ConsommationTestCase):
         retour.refresh_from_db()
         self.assertIsNone(retour.consumed_at)
 
+    def test_retour_de_projet_sans_total_redondant_est_consomme(self):
+        """Le producteur n'a aucune raison de recalculer un total que le schéma détermine.
+
+        `capital_rembourse` + `rendement` suffisent : `retour_total` est FORCÉ par
+        l'équation d'équilibre de B12, et la valeur déduite est confrontée au montant réel
+        de l'événement avant tout enregistrement. Rien n'est deviné — c'est le cas inverse
+        (total connu, ventilation inconnue) qui reste un refus, et il l'est."""
+        self.encaisser(montant="10000")
+        self.evenement(
+            "PROJECT_RETURN_RECEIVED", montant="1200", minutes=10,
+            payload={"capitalRembourse": "1000", "rendement": "200"},
+        )
+        rapport = consommation.consommer_lot(par="cron:compta")
+
+        self.assertEqual(len(rapport["consommes"]), 1, rapport)
+        piece = PieceComptable.objects.get(evenement="B12")
+        self.assertEqual(piece.lignes.get(compte__code="511USD").debit, Decimal("1200.00"))
+        self.assertEqual(piece.lignes.get(compte__code="719USD").credit, Decimal("200.00"))
+        self.assertEqual(services.controler_integrite(), [])
+
+    def test_ventilation_deduite_qui_contredit_le_fait_est_refusee(self):
+        """La déduction ne dispense de rien : 1 000 + 150 ≠ 1 200 encaissés, donc la pièce
+        ne décrit pas le même fait et n'est pas enregistrée."""
+        self.encaisser(montant="10000")
+        self.evenement(
+            "PROJECT_RETURN_RECEIVED", montant="1200", minutes=10,
+            payload={"capital_rembourse": "1000", "rendement": "150"},
+        )
+        rapport = consommation.consommer_lot(par="cron:compta")
+        self.assertEqual(len(rapport["echecs"]), 1)
+        self.assertFalse(PieceComptable.objects.filter(evenement="B12").exists())
+
     def test_retour_de_projet_ventile_par_investments_est_consomme(self):
         """Le jour où `investments` porte la ventilation dans son payload, le même
         événement devient consommable SANS toucher au code : le contrat est la donnée."""
@@ -518,3 +554,319 @@ class JournalisationTests(ConsommationTestCase):
         self.assertEqual(trace.details["piece"], piece.reference)
         self.assertEqual(trace.details["schema"], "B10")
         self.assertEqual(trace.details["montant"], "1500.00")
+
+
+# ======================================================================
+#  PLURI-SOURCES — le consommateur ne connaît aucune file en particulier
+# ======================================================================
+#
+# Ces tests sont la preuve que « brancher une file est un geste de paramétrage » n'est pas
+# une intention de docstring : crédit (B1→B4) et épargne (B8/B9) empruntent EXACTEMENT le
+# même code que l'investissement, et rien dans `consommation.py` ne les nomme.
+
+
+class ContratDesFilesProductricesTests(ConsommationTestCase):
+    """Le contrat entre une app productrice et la comptabilité est vérifié ICI, une fois,
+    plutôt que découvert en production sur le premier événement d'un lot."""
+
+    def test_les_constantes_de_source_ne_divergent_pas_des_producteurs(self):
+        """`accounting` duplique volontairement le nom de chaque file plutôt que d'importer
+        l'app productrice au chargement. Le prix de ce choix est ce test : si un producteur
+        renomme sa file, il casse ici — pas six mois plus tard, sur une file muette."""
+        from credits.events import SOURCE_CREDIT
+        from savings.events import SOURCE_EPARGNE
+
+        from .definitions import SOURCE_CREDIT as CREDIT_COMPTA
+        from .definitions import SOURCE_EPARGNE as EPARGNE_COMPTA
+
+        self.assertEqual(SOURCE_CREDIT, CREDIT_COMPTA)
+        self.assertEqual(SOURCE_EPARGNE, EPARGNE_COMPTA)
+
+    def test_chaque_file_declaree_respecte_le_contrat_de_consommation(self):
+        from .models import SourceEvenements
+
+        declarees = list(SourceEvenements.objects.filter(actif=True))
+        self.assertTrue(declarees, "Aucune file déclarée : la comptabilité serait aveugle.")
+        for declaration in declarees:
+            with self.subTest(source=declaration.code):
+                modele = consommation._modele_evenement(declaration.code)
+                champs = {champ.name for champ in modele._meta.get_fields()}
+                for nom in consommation.CONTRAT_FILE:
+                    self.assertIn(nom, champs)
+
+    def test_aucun_type_devenement_produit_nest_orphelin_de_regle(self):
+        """Un type qu'un producteur peut émettre et que la comptabilité ne mappe pas est un
+        fait monétaire qui n'atteindrait JAMAIS le grand livre. Le seul cas toléré est une
+        règle explicitement `SANS_ECRITURE` — un choix, pas un oubli."""
+        from credits.models import CreditEvent
+        from investments.models import InvestmentEvent
+        from savings.models import SavingsEvent
+
+        from .definitions import SOURCE_CREDIT, SOURCE_EPARGNE
+
+        for source, modele in (
+            (SOURCE_INVESTISSEMENT, InvestmentEvent),
+            (SOURCE_CREDIT, CreditEvent),
+            (SOURCE_EPARGNE, SavingsEvent),
+        ):
+            mappes = set(
+                RegleConsommation.objects.filter(source=source)
+                .values_list("type_evenement", flat=True)
+            )
+            for valeur in modele.Type.values:
+                with self.subTest(source=source, type=valeur):
+                    self.assertIn(valeur, mappes)
+
+
+class FileCreditTests(ConsommationTestCase):
+    """B1→B4 — le métier principal entre enfin au grand livre.
+
+    Aucun de ces événements ne porte de cantonnement d'offre, et c'est tout l'enjeu : la
+    version « investissement » du consommateur résolvait `$CANTONNEMENT` pour TOUS les
+    schémas, et aurait bloqué 100 % de cette file avant son premier événement.
+    """
+
+    def evenement_credit(self, type_evenement, *, montant="1000", devise="USD",
+                         minutes=0, payload=None):
+        from credits.models import CreditEvent
+
+        return CreditEvent.objects.create(
+            event_type=type_evenement,
+            amount=Decimal(montant),
+            currency=devise,
+            occurred_at=_horodatage(minutes=minutes),
+            actor_sub="agent-1",
+            payload=payload or {},
+        )
+
+    def consommer(self):
+        from .definitions import SOURCE_CREDIT
+
+        return consommation.consommer_lot(par="cron:compta", source=SOURCE_CREDIT)
+
+    def test_decaissement_de_credit_fait_naitre_lencours_413(self):
+        evenement = self.evenement_credit("CREDIT_DISBURSED", montant="2500")
+        rapport = self.consommer()
+
+        self.assertEqual(len(rapport["consommes"]), 1, rapport)
+        piece = PieceComptable.objects.get(evenement="B1")
+        self.assertEqual(piece.journal, "JCR")
+        self.assertEqual(piece.lignes.get(compte__code="413USD").debit, Decimal("2500.00"))
+        self.assertEqual(piece.lignes.get(compte__code="511USD").credit, Decimal("2500.00"))
+        # La référence porte le préfixe de SA file : deux files peuvent numéroter pareil.
+        self.assertEqual(piece.reference, f"CRE-20260721-B1-{evenement.pk}")
+        evenement.refresh_from_db()
+        self.assertEqual(evenement.journal_reference, piece.reference)
+        self.assertEqual(services.controler_integrite(), [])
+
+    def test_une_echeance_encaissee_produit_deux_pieces_distinctes(self):
+        """Capital et intérêts ne mouvementent ni les mêmes comptes ni les mêmes classes :
+        le producteur émet DEUX événements, la comptabilité passe DEUX pièces."""
+        self.evenement_credit("CREDIT_PRINCIPAL_REPAID", montant="100", minutes=1)
+        self.evenement_credit("CREDIT_INTEREST_COLLECTED", montant="18", minutes=2)
+        rapport = self.consommer()
+
+        self.assertEqual([c["schema"] for c in rapport["consommes"]], ["B2", "B3"])
+        capital = PieceComptable.objects.get(evenement="B2")
+        self.assertEqual(capital.lignes.get(compte__code="413USD").credit, Decimal("100.00"))
+        interets = PieceComptable.objects.get(evenement="B3")
+        self.assertEqual(interets.lignes.get(compte__code="701USD").credit, Decimal("18.00"))
+        self.assertEqual(services.solde_compte("511", devise="USD"), Decimal("118.00"))
+        self.assertEqual(services.controler_integrite(), [])
+
+    def test_commission_encaissee_alimente_le_702(self):
+        self.evenement_credit("CREDIT_COMMISSION_COLLECTED", montant="45")
+        self.consommer()
+        piece = PieceComptable.objects.get(evenement="B4")
+        self.assertEqual(piece.lignes.get(compte__code="702USD").credit, Decimal("45.00"))
+
+    def test_le_franc_congolais_du_portefeuille_est_traduit(self):
+        """`portfolio` et `credits` disent « CDF », l'annexe A dit « FC » : la traduction
+        est centralisée, jamais devinée ligne à ligne."""
+        self.evenement_credit("CREDIT_DISBURSED", montant="500000", devise="CDF")
+        self.consommer()
+        piece = PieceComptable.objects.get(evenement="B1")
+        self.assertEqual(piece.lignes.get(compte__code="413FC").debit, Decimal("500000.00"))
+
+    def test_le_canal_reel_de_lencaissement_lemporte_sur_le_defaut(self):
+        """Un remboursement encaissé par Airtel Money ne doit pas atterrir en banque parce
+        que c'est le défaut de la règle."""
+        self.evenement_credit("CREDIT_PRINCIPAL_REPAID", montant="60000", devise="CDF",
+                              payload={"compteTresorerie": "531"})
+        self.consommer()
+        piece = PieceComptable.objects.get(evenement="B2")
+        self.assertEqual(piece.lignes.get(compte__code="531FC").debit, Decimal("60000.00"))
+
+    def test_une_file_ne_consomme_pas_les_evenements_dune_autre(self):
+        """Chaque file a son lot, son compteur et son préfixe. Un passage sur le crédit ne
+        doit ni consommer ni comptabiliser les événements d'investissement en attente."""
+        self.evenement("SUBSCRIPTION_SETTLED", montant="4000")
+        self.evenement_credit("CREDIT_DISBURSED", montant="2500", minutes=5)
+
+        rapport = self.consommer()
+        self.assertEqual(rapport["examines"], 1)
+        self.assertEqual(rapport["restant_en_file"], 0)
+        self.assertEqual(PieceComptable.objects.count(), 1)
+
+        rapport = consommation.consommer_lot(par="cron:compta")  # file investissement
+        self.assertEqual(rapport["examines"], 1)
+        self.assertEqual(PieceComptable.objects.count(), 2)
+
+
+class FileEpargneTests(ConsommationTestCase):
+    """B8/B9 — l'épargne des membres entre au passif (412), et sa contrepartie dit la
+    vérité : le franc ne vient pas de la caisse, il vient du portefeuille du membre."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        from accounts.models import FintechUser
+        from savings.models import SavingsPlan
+
+        user = FintechUser.objects.create(sub="epargnant-1", email="e1@agricap.cd")
+        cls.plan = SavingsPlan.objects.create(user=user, name="Campagne maïs", currency="USD")
+
+    def evenement_epargne(self, type_evenement, *, montant="200", minutes=0):
+        from savings.models import SavingsEvent
+
+        return SavingsEvent.objects.create(
+            event_type=type_evenement,
+            plan=self.plan,
+            amount=Decimal(montant),
+            currency=self.plan.currency,
+            occurred_at=_horodatage(minutes=minutes),
+            actor_sub="agent-1",
+            payload={"flux": "INTERNE", "contrepartieReelle": "WALLET_CLIENT"},
+        )
+
+    def consommer(self):
+        from .definitions import SOURCE_EPARGNE
+
+        return consommation.consommer_lot(par="cron:compta", source=SOURCE_EPARGNE)
+
+    def test_depot_depargne_cree_la_dette_412(self):
+        evenement = self.evenement_epargne("SAVINGS_DEPOSITED", montant="200")
+        rapport = self.consommer()
+
+        self.assertEqual(len(rapport["consommes"]), 1, rapport)
+        piece = PieceComptable.objects.get(evenement="B8")
+        self.assertEqual(piece.journal, "JEP")
+        self.assertEqual(piece.lignes.get(compte__code="412USD").credit, Decimal("200.00"))
+        self.assertEqual(piece.reference, f"EPA-20260721-B8-{evenement.pk}")
+        self.assertEqual(services.controler_integrite(), [])
+
+    def test_la_contrepartie_dun_flux_interne_nest_pas_une_entree_de_caisse(self):
+        """Débiter 501/511 pour un dépôt alimenté depuis le WALLET compterait le même franc
+        deux fois en trésorerie. La contrepartie va au transitoire d'opérations internes
+        (581), dont le solde non nul est le signal VISIBLE que l'arbitrage du fondateur sur
+        le compte de dette de portefeuille reste à rendre."""
+        self.evenement_epargne("SAVINGS_DEPOSITED", montant="200")
+        self.consommer()
+
+        piece = PieceComptable.objects.get(evenement="B8")
+        self.assertEqual(piece.lignes.get(compte__code="581").debit, Decimal("200.00"))
+        self.assertFalse(piece.lignes.filter(compte__code__startswith="501").exists())
+        self.assertFalse(piece.lignes.filter(compte__code__startswith="511").exists())
+
+    def test_retrait_eteint_la_dette_sans_montant_negatif(self):
+        """Le retrait s'émet POSITIF ; c'est le schéma B9 qui porte le sens."""
+        self.evenement_epargne("SAVINGS_DEPOSITED", montant="500", minutes=1)
+        self.evenement_epargne("SAVINGS_WITHDRAWN", montant="120", minutes=2)
+        rapport = self.consommer()
+
+        self.assertEqual([c["schema"] for c in rapport["consommes"]], ["B8", "B9"])
+        retrait = PieceComptable.objects.get(evenement="B9")
+        self.assertEqual(retrait.lignes.get(compte__code="412USD").debit, Decimal("120.00"))
+        # 412 est un PASSIF : la dette résiduelle de 380 apparaît au crédit (donc en solde
+        # négatif dans la convention « débit − crédit » de `solde_compte`).
+        self.assertEqual(services.solde_compte("412", devise="USD"), Decimal("-380.00"))
+        self.assertEqual(services.controler_integrite(), [])
+
+
+class DeclarationDesSourcesTests(ConsommationTestCase):
+    def test_une_file_non_declaree_ne_se_lit_pas(self):
+        with self.assertRaises(consommation.SansEcritureDefinie) as ctx:
+            consommation.consommer_lot(par="cron:compta", source="inconnue.Machin")
+        self.assertIn("n'est pas déclarée", str(ctx.exception))
+
+    def test_une_file_desactivee_suspend_toute_lecture(self):
+        from .models import SourceEvenements
+
+        self.evenement("SUBSCRIPTION_SETTLED", montant="100")
+        SourceEvenements.objects.filter(code=SOURCE_INVESTISSEMENT).update(actif=False)
+        with self.assertRaises(consommation.SansEcritureDefinie):
+            consommation.consommer_lot(par="cron:compta")
+        self.assertEqual(PieceComptable.objects.count(), 0)
+
+    def test_une_file_qui_designe_un_modele_absent_le_dit(self):
+        from .models import SourceEvenements
+
+        SourceEvenements.objects.create(
+            code="banc.Essai", modele="nulle_part.Fantome", prefixe_reference="TST",
+        )
+        with self.assertRaises(consommation.SansEcritureDefinie) as ctx:
+            consommation.consommer_lot(par="cron:compta", source="banc.Essai")
+        self.assertIn("Django ne connaît pas", str(ctx.exception))
+
+    def test_le_prefixe_de_reference_se_change_en_base(self):
+        from .models import SourceEvenements
+
+        SourceEvenements.objects.filter(code=SOURCE_INVESTISSEMENT).update(
+            prefixe_reference="SOUS",
+        )
+        _, piece = self.encaisser(montant="100")
+        self.assertTrue(piece.reference.startswith("SOUS-"), piece.reference)
+
+    def test_la_commande_de_parametrage_pose_source_et_regle(self):
+        """« Brancher une file est un geste de configuration » : sans chemin pour écrire ces
+        deux lignes hors déploiement, la promesse serait creuse."""
+        from io import StringIO
+
+        from .models import SourceEvenements
+
+        sortie = StringIO()
+        call_command("parametrer_consommation", "source", "--code", "banc.File",
+                     "--modele", "investments.InvestmentEvent", "--prefixe", "BAN",
+                     "--par", "dg", stdout=sortie)
+        call_command("parametrer_consommation", "regle", "--source", "banc.File",
+                     "--type", "SUBSCRIPTION_SETTLED", "--schema", "B10",
+                     "--tresorerie", "501", "--par", "dg", stdout=sortie)
+
+        self.assertEqual(SourceEvenements.objects.get(code="banc.File").prefixe_reference, "BAN")
+        evenement = self.evenement("SUBSCRIPTION_SETTLED", montant="700")
+        rapport = consommation.consommer_lot(par="cron:compta", source="banc.File")
+        self.assertEqual(len(rapport["consommes"]), 1, rapport)
+        piece = PieceComptable.objects.get(reference=f"BAN-20260721-B10-{evenement.pk}")
+        self.assertEqual(piece.lignes.get(compte__code="501USD").debit, Decimal("700.00"))
+
+    def test_letat_du_parametrage_signale_une_regle_sans_file(self):
+        from io import StringIO
+
+        RegleConsommation.objects.create(
+            source="fantome.File", type_evenement="X", schema="B10",
+        )
+        sortie = StringIO()
+        call_command("parametrer_consommation", "etat", stdout=sortie)
+        self.assertIn("RÈGLES SANS FILE DÉCLARÉE", sortie.getvalue())
+
+    def test_la_commande_refuse_une_regle_sur_une_file_non_declaree(self):
+        from django.core.management.base import CommandError
+
+        with self.assertRaises(CommandError):
+            call_command("parametrer_consommation", "regle", "--source", "banc.Absente",
+                         "--type", "X", "--schema", "B10", "--par", "dg", verbosity=0)
+
+    def test_la_commande_refuse_un_schema_absent_du_catalogue(self):
+        from django.core.management.base import CommandError
+
+        with self.assertRaises(CommandError) as ctx:
+            call_command("parametrer_consommation", "regle", "--source", SOURCE_INVESTISSEMENT,
+                         "--type", "X", "--schema", "B99", "--par", "dg", verbosity=0)
+        self.assertIn("B99", str(ctx.exception))
+
+    def test_la_commande_de_parametrage_exige_une_identite(self):
+        from django.core.management.base import CommandError
+
+        with self.assertRaises(CommandError):
+            call_command("parametrer_consommation", "source", "--code", "x.Y",
+                         "--prefixe", "X", verbosity=0)
