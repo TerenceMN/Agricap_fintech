@@ -87,6 +87,84 @@ class SavingsDeposit(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class SavingsWithdrawal(models.Model):
+    """Retrait d'épargne — symétrique de `SavingsDeposit`, et son miroir monétaire :
+    l'argent quitte le plan et rejoint le PORTEFEUILLE du titulaire (« une seule porte » :
+    le wallet est le seul point de contact avec l'extérieur ; sortir de l'épargne, c'est
+    rentrer dans le wallet, pas sortir de l'institution).
+
+    Un modèle distinct plutôt qu'un champ `sens` sur `SavingsDeposit` : un dépôt et un
+    retrait ne portent pas les mêmes contrôles (solde du plan vs solde du wallet) et le
+    signe d'un montant n'a jamais à porter le sens d'une opération financière — c'est
+    exactement le défaut qu'un `amount` de `-500` exploitait sur l'endpoint de dépôt.
+    """
+
+    plan = models.ForeignKey(SavingsPlan, on_delete=models.CASCADE, related_name="withdrawals")
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    channel = models.CharField(max_length=14, choices=SavingsPlan.Channel.choices,
+                               default=SavingsPlan.Channel.AGENT)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+
+class SavingsEvent(models.Model):
+    """Événement métier append-only — le SEUL contrat entre `savings` et la comptabilité.
+
+    Construit sur le modèle d'`investments.InvestmentEvent` (même forme, même discipline) :
+    ce module ne passe AUCUNE écriture. Il déclare qu'un fait monétaire s'est produit — un
+    dépôt d'épargne, un retrait d'épargne — avec son montant `Decimal`, sa devise, sa date
+    de survenance et ses références métier. Le moteur d'écritures consomme la file
+    (`consumed_at` / `journal_reference`) et applique l'annexe B (B8 / B9). Aucun
+    consommateur n'est requis pour que l'épargne fonctionne : l'événement est produit,
+    qu'il soit lu ou non.
+
+    **Invariant de naissance** : l'événement naît dans la MÊME transaction que l'acte
+    métier (mouvement de wallet + inscription au plan). Un dépôt qui existerait sans son
+    événement serait un écart comptable invisible ; un événement sans dépôt serait une
+    écriture sans fait. Les deux sont exclus par construction.
+
+    **Note de lecture pour le consommateur comptable** : contrairement à `InvestmentEvent`,
+    cet événement ne porte NI offre NI compte de cantonnement — l'épargne d'un membre n'est
+    pas cantonnée par offre, elle alimente le compte collectif 412[DEV] du plan comptable.
+    Les schémas B8/B9 ne référencent d'ailleurs que `$TRESORERIE`.
+
+    `on_delete=PROTECT` sur le plan : un plan qui a produit des événements comptables ne
+    peut plus disparaître en silence (§9 — on n'efface pas une donnée financière). Les
+    `SavingsDeposit`/`SavingsWithdrawal` restent en CASCADE : ce sont des détails
+    applicatifs, l'événement est la pièce probante.
+    """
+
+    class Type(models.TextChoices):
+        #: B8 — dépôt d'épargne : $TRESORERIE → 412[DEV].
+        SAVINGS_DEPOSITED = "SAVINGS_DEPOSITED", "Dépôt d'épargne (B8)"
+        #: B9 — retrait d'épargne : 412[DEV] → $TRESORERIE.
+        SAVINGS_WITHDRAWN = "SAVINGS_WITHDRAWN", "Retrait d'épargne (B9)"
+
+    event_type = models.CharField(max_length=32, choices=Type.choices, db_index=True)
+    plan = models.ForeignKey(SavingsPlan, on_delete=models.PROTECT, related_name="accounting_events")
+    amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    currency = models.CharField(max_length=3, default="USD")
+    occurred_at = models.DateTimeField(db_index=True)
+    actor_sub = models.CharField(max_length=255, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    #: Renseignés par le consommateur comptable — jamais par ce module.
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    journal_reference = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["occurred_at", "id"]
+        indexes = [
+            models.Index(fields=["event_type", "occurred_at"]),
+            models.Index(fields=["consumed_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.event_type} {self.amount} {self.currency}"
+
+
 class SavingsGroup(models.Model):
     class GroupType(models.TextChoices):
         AVEC = "AVEC", "AVEC"

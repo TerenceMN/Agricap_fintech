@@ -5,8 +5,8 @@ from decimal import Decimal
 from common.testing import AuthedAPITestCase
 
 from .models import (
-    SavingsAdjustment, SavingsDeposit, SavingsGroup, SavingsGroupMember, SavingsPlan,
-    SavingsRateChange,
+    SavingsAdjustment, SavingsDeposit, SavingsEvent, SavingsGroup, SavingsGroupMember,
+    SavingsPlan, SavingsRateChange, SavingsWithdrawal,
 )
 
 
@@ -511,3 +511,269 @@ class CloisonnementEpargneTests(AuthedAPITestCase):
         self.login(role="client", sub="membre-epargne")
         self.assertEqual(self.client.get("/api/savings/groups/mine").status_code, 200)
         self.assertEqual(self.client.get("/api/savings/plans/mine").status_code, 200)
+
+
+class SavingsAccountingEventsTests(AuthedAPITestCase):
+    """La file d'événements comptables de l'épargne (B8 / B9).
+
+    L'audit du branchement comptable a relevé que « `savings` n'émet rien : B8/B9 sont
+    orphelins » — un dépôt d'épargne existait en base sans jamais atteindre le grand livre.
+    Ces tests verrouillent l'invariant qui répare ce trou : **l'événement naît avec l'acte
+    métier, dans la même transaction, ou ne naît pas**.
+    """
+
+    def _plan(self, sub: str, **body) -> int:
+        self.login(role="client", sub=sub)
+        payload = {"name": "Plan", **body}
+        return self.client.post("/api/savings/plans/mine", payload, format="json").data["id"]
+
+    # ─────────────────────────────── Dépôt (B8) ───────────────────────────────
+
+    def test_un_depot_produit_son_evenement_comptable(self):
+        plan_id = self._plan("ev-depot")
+        _fund_wallet("ev-depot", "1000")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/deposit",
+                               {"amount": "150.50", "channel": "mobile_money"}, format="json")
+        self.assertEqual(res.status_code, 200)
+
+        evenement = SavingsEvent.objects.get(plan_id=plan_id)
+        self.assertEqual(evenement.event_type, SavingsEvent.Type.SAVINGS_DEPOSITED)
+        self.assertEqual(evenement.amount, Decimal("150.50"))
+        self.assertEqual(evenement.currency, "USD")
+        self.assertEqual(evenement.actor_sub, "ev-depot")
+        # Non consommé : la comptabilité seule renseigne ces deux champs.
+        self.assertIsNone(evenement.consumed_at)
+        self.assertEqual(evenement.journal_reference, "")
+
+    def test_l_evenement_porte_les_references_du_fait(self):
+        """Un auditeur doit pouvoir remonter de la pièce au mouvement de wallet."""
+        from caisses.models import WalletMovement
+
+        plan_id = self._plan("ev-ref")
+        _fund_wallet("ev-ref", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit",
+                         {"amount": "40", "channel": "mobile_money"}, format="json")
+
+        evenement = SavingsEvent.objects.get(plan_id=plan_id)
+        mouvement = WalletMovement.objects.get(wallet__user_id="ev-ref")
+        depot = SavingsDeposit.objects.get(plan_id=plan_id)
+        self.assertEqual(evenement.payload["walletMovementId"], mouvement.pk)
+        self.assertEqual(evenement.payload["depositId"], depot.pk)
+        self.assertEqual(evenement.payload["holderSub"], "ev-ref")
+        self.assertEqual(evenement.payload["canalDeclare"], "mobile_money")
+
+    def test_l_evenement_declare_un_flux_interne_et_ne_choisit_aucun_compte(self):
+        """« Une seule porte » : le dépôt d'épargne DÉBITE le wallet, ce n'est pas une
+        entrée de caisse. L'événement le DIT (`flux: INTERNE`) et ne tranche AUCUN compte
+        de contrepartie — `compteTresorerie` est absent du payload, l'arbitrage vit en base
+        côté `accounting` (`RegleConsommation.compte_tresorerie`)."""
+        plan_id = self._plan("ev-flux")
+        _fund_wallet("ev-flux", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "10"}, format="json")
+
+        payload = SavingsEvent.objects.get(plan_id=plan_id).payload
+        self.assertEqual(payload["flux"], "INTERNE")
+        self.assertEqual(payload["contrepartieReelle"], "WALLET_CLIENT")
+        self.assertNotIn("compteTresorerie", payload)
+
+    def test_l_evenement_suit_la_devise_du_plan(self):
+        plan_id = self._plan("ev-devise", currency="CDF")
+        _fund_wallet("ev-devise", "500000", currency="CDF")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "120000"},
+                               format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(SavingsEvent.objects.get(plan_id=plan_id).currency, "CDF")
+
+    # ────────────────────────────── Retrait (B9) ──────────────────────────────
+
+    def test_un_retrait_produit_son_evenement_comptable(self):
+        plan_id = self._plan("ev-retrait")
+        _fund_wallet("ev-retrait", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "300"}, format="json")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/withdraw", {"amount": "120"},
+                               format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["balance"], 180.0)
+
+        retrait = SavingsEvent.objects.get(plan_id=plan_id,
+                                           event_type=SavingsEvent.Type.SAVINGS_WITHDRAWN)
+        # Le montant est POSITIF : le sens est porté par le type (B9), jamais par le signe.
+        self.assertEqual(retrait.amount, Decimal("120.00"))
+        self.assertGreater(retrait.amount, Decimal("0"))
+        self.assertIsNone(retrait.consumed_at)
+
+    def test_le_retrait_credite_le_portefeuille_du_meme_montant(self):
+        """Conservation : ce qui sort du plan entre dans le wallet, au centime près."""
+        plan_id = self._plan("ev-conserve")
+        _fund_wallet("ev-conserve", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "400"}, format="json")
+        self.assertEqual(_wallet_balance("ev-conserve"), Decimal("600"))
+        self.client.post(f"/api/savings/plans/{plan_id}/withdraw", {"amount": "250"}, format="json")
+        self.assertEqual(_wallet_balance("ev-conserve"), Decimal("850"))
+        plan = self.client.get("/api/savings/plans/mine").data[0]
+        self.assertEqual(_wallet_balance("ev-conserve") + Decimal(str(plan["balance"])),
+                         Decimal("1000"))
+
+    def test_retrait_refuse_si_le_solde_du_plan_est_insuffisant(self):
+        """Échec métier → NI mouvement, NI événement, NI solde entamé."""
+        from caisses.models import WalletMovement
+
+        plan_id = self._plan("ev-decouvert")
+        _fund_wallet("ev-decouvert", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "100"}, format="json")
+        mouvements_avant = WalletMovement.objects.filter(wallet__user_id="ev-decouvert").count()
+
+        res = self.client.post(f"/api/savings/plans/{plan_id}/withdraw", {"amount": "500"},
+                               format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["errors"][0]["code"], "SAVINGS_INSUFFICIENT_BALANCE")
+        self.assertEqual(
+            SavingsEvent.objects.filter(plan_id=plan_id,
+                                        event_type=SavingsEvent.Type.SAVINGS_WITHDRAWN).count(), 0)
+        self.assertEqual(SavingsWithdrawal.objects.filter(plan_id=plan_id).count(), 0)
+        self.assertEqual(WalletMovement.objects.filter(wallet__user_id="ev-decouvert").count(),
+                         mouvements_avant)
+        self.assertEqual(self.client.get("/api/savings/plans/mine").data[0]["balance"], 100.0)
+        self.assertEqual(_wallet_balance("ev-decouvert"), Decimal("900"))
+
+    def test_retrait_refuse_un_montant_non_positif_ou_illisible(self):
+        plan_id = self._plan("ev-signe")
+        _fund_wallet("ev-signe", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "100"}, format="json")
+        for montant in ("-50", "0", "abc", ""):
+            res = self.client.post(f"/api/savings/plans/{plan_id}/withdraw",
+                                   {"amount": montant}, format="json")
+            self.assertEqual(res.status_code, 422, montant)
+            self.assertEqual(res.data["errors"][0]["code"], "AMOUNT_INVALID")
+        self.assertEqual(self.client.get("/api/savings/plans/mine").data[0]["balance"], 100.0)
+
+    def test_retrait_refuse_un_canal_inconnu(self):
+        plan_id = self._plan("ev-canal")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/withdraw",
+                               {"amount": "10", "channel": "crypto"}, format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.data["errors"][0]["code"], "CHANNEL_UNKNOWN")
+
+    def test_retrait_sur_le_plan_d_autrui_est_introuvable(self):
+        plan_id = self._plan("ev-proprio")
+        _fund_wallet("ev-proprio", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "100"}, format="json")
+        self.login(role="client", sub="ev-intrus")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/withdraw", {"amount": "10"},
+                               format="json")
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(
+            SavingsEvent.objects.filter(event_type=SavingsEvent.Type.SAVINGS_WITHDRAWN).count(), 0)
+
+    def test_retrait_possible_sur_un_plan_cloture(self):
+        """Un plan clôturé n'accepte plus d'argent, mais l'argent qu'il détient doit
+        pouvoir revenir à son titulaire — refuser piégerait les fonds."""
+        plan_id = self._plan("ev-clos")
+        _fund_wallet("ev-clos", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "200"}, format="json")
+        SavingsPlan.objects.filter(pk=plan_id).update(status=SavingsPlan.Status.CLOTURE)
+        res = self.client.post(f"/api/savings/plans/{plan_id}/withdraw", {"amount": "200"},
+                               format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["balance"], 0.0)
+
+    def test_retrait_idempotent_ne_credite_pas_deux_fois(self):
+        plan_id = self._plan("ev-idem")
+        _fund_wallet("ev-idem", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "300"}, format="json")
+        corps = {"amount": "80", "idempotencyKey": "ret-1"}
+        premier = self.client.post(f"/api/savings/plans/{plan_id}/withdraw", corps, format="json")
+        second = self.client.post(f"/api/savings/plans/{plan_id}/withdraw", corps, format="json")
+        self.assertEqual(premier.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(SavingsWithdrawal.objects.filter(plan_id=plan_id).count(), 1)
+        self.assertEqual(
+            SavingsEvent.objects.filter(plan_id=plan_id,
+                                        event_type=SavingsEvent.Type.SAVINGS_WITHDRAWN).count(), 1)
+        self.assertEqual(second.data["balance"], 220.0)
+        self.assertEqual(_wallet_balance("ev-idem"), Decimal("780"))
+
+    # ────────────────────── Invariants transverses de la file ──────────────────────
+
+    def test_un_echec_de_depot_ne_laisse_ni_mouvement_ni_evenement(self):
+        """Solde de wallet insuffisant : le débit échoue, et la transaction emporte
+        l'inscription au plan ET l'événement avec elle."""
+        from caisses.models import WalletMovement
+
+        plan_id = self._plan("ev-echec")
+        _fund_wallet("ev-echec", "30")
+        res = self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "50"},
+                               format="json")
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(SavingsEvent.objects.filter(plan_id=plan_id).count(), 0)
+        self.assertEqual(SavingsDeposit.objects.filter(plan_id=plan_id).count(), 0)
+        self.assertEqual(WalletMovement.objects.filter(wallet__user_id="ev-echec").count(), 0)
+        self.assertEqual(_wallet_balance("ev-echec"), Decimal("30"))
+
+    def test_l_evenement_est_annule_avec_l_acte_metier(self):
+        """Preuve directe de l'atomicité : on fait échouer l'écriture qui SUIT l'émission
+        de l'événement (l'audit). Si l'événement vivait hors de la transaction de l'acte,
+        il survivrait au rollback — et la comptabilité enregistrerait un dépôt qui n'a
+        jamais eu lieu."""
+        from unittest.mock import patch
+
+        from caisses.models import WalletMovement
+
+        plan_id = self._plan("ev-atomic")
+        _fund_wallet("ev-atomic", "1000")
+        with patch("savings.views.audit_record", side_effect=RuntimeError("panne d'audit")):
+            try:
+                # Selon le gestionnaire d'exceptions, la panne remonte ou devient un 500 —
+                # ce qui compte ici est l'état de la base après elle, pas sa forme HTTP.
+                self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "60"},
+                                 format="json")
+            except RuntimeError:
+                pass
+        self.assertEqual(SavingsEvent.objects.filter(plan_id=plan_id).count(), 0)
+        self.assertEqual(SavingsDeposit.objects.filter(plan_id=plan_id).count(), 0)
+        self.assertEqual(WalletMovement.objects.filter(wallet__user_id="ev-atomic").count(), 0)
+        self.assertEqual(_wallet_balance("ev-atomic"), Decimal("1000"))
+
+    def test_la_file_est_append_only_et_chronologique(self):
+        """Deux dépôts + un retrait : trois lignes distinctes, dans l'ordre des faits.
+        Aucune n'est modifiée par l'opération suivante."""
+        plan_id = self._plan("ev-file")
+        _fund_wallet("ev-file", "1000")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "100"}, format="json")
+        self.client.post(f"/api/savings/plans/{plan_id}/deposit", {"amount": "50"}, format="json")
+        self.client.post(f"/api/savings/plans/{plan_id}/withdraw", {"amount": "30"}, format="json")
+        file_ = list(SavingsEvent.objects.filter(plan_id=plan_id))
+        self.assertEqual([e.event_type for e in file_], [
+            SavingsEvent.Type.SAVINGS_DEPOSITED,
+            SavingsEvent.Type.SAVINGS_DEPOSITED,
+            SavingsEvent.Type.SAVINGS_WITHDRAWN,
+        ])
+        self.assertEqual([e.amount for e in file_],
+                         [Decimal("100.00"), Decimal("50.00"), Decimal("30.00")])
+        self.assertTrue(all(e.consumed_at is None for e in file_))
+
+    def test_les_actes_sans_mouvement_d_argent_n_emettent_rien(self):
+        """Ajustement de modalités et changement de taux ne déplacent AUCUN franc : aucun
+        événement comptable ne doit naître d'eux (une écriture fausse est pire qu'une
+        écriture absente)."""
+        plan_id = self._plan("ev-sansargent")
+        self.login(role="admin", sub="admin-ev")
+        self.client.post(f"/api/savings/plans/{plan_id}/adjustment",
+                         {"targetAmount": "5000", "periodicDeposit": "100"}, format="json")
+        self.client.post(f"/api/savings/plans/{plan_id}/rate-config",
+                         {"action": "rate_update", "annualRate": "5"}, format="json")
+        self.assertEqual(SavingsEvent.objects.filter(plan_id=plan_id).count(), 0)
+
+    def test_emettre_refuse_un_montant_negatif(self):
+        """Garde-fou du producteur lui-même : le signe ne porte jamais le sens."""
+        from common.exceptions import ValidationFailed
+
+        from . import events as savings_events
+
+        plan_id = self._plan("ev-garde")
+        plan = SavingsPlan.objects.get(pk=plan_id)
+        for montant in (Decimal("-10"), Decimal("0")):
+            with self.assertRaises(ValidationFailed):
+                savings_events.emettre(SavingsEvent.Type.SAVINGS_DEPOSITED, plan=plan,
+                                       amount=montant)
+        self.assertEqual(SavingsEvent.objects.count(), 0)

@@ -32,13 +32,14 @@ from rest_framework.response import Response
 from accounts.permissions import IsStaff
 from audit.services import record as audit_record
 from common import idempotency
-from common.exceptions import InsufficientFundsError
+from common.exceptions import InsufficientFundsError, ValidationFailed
 from common.parsing import to_date, to_decimal
 from rbac.permissions import CapaciteSelonMethode, HasCapability
 
+from . import events
 from .models import (
-    GroupIntegrationRequest, SavingsAdjustment, SavingsDeposit, SavingsGroup,
-    SavingsGroupMember, SavingsPlan, SavingsRateChange,
+    GroupIntegrationRequest, SavingsAdjustment, SavingsDeposit, SavingsEvent, SavingsGroup,
+    SavingsGroupMember, SavingsPlan, SavingsRateChange, SavingsWithdrawal,
 )
 
 #: Plafond de taux annuel — le seul seuil métier de ce module. Vécu côté serveur (les
@@ -193,8 +194,17 @@ def plan_deposit(request, plan_id):
             movement = caisses_withdraw(wallet_id=wallet.pk, amount=amount,
                                          idempotency_key=debit_key,
                                          by=getattr(request.user, "sub", ""))
-            SavingsDeposit.objects.create(plan=plan, amount=amount, channel=channel)
+            deposit = SavingsDeposit.objects.create(plan=plan, amount=amount, channel=channel)
             SavingsPlan.objects.filter(pk=plan.pk).update(balance=F("balance") + amount)
+            # L'événement comptable (B8) naît ICI, dans la transaction de l'acte : le débit
+            # du wallet, l'inscription au plan et l'événement committent ensemble ou pas du
+            # tout. Un dépôt sans son événement serait un écart comptable invisible.
+            events.emettre(
+                SavingsEvent.Type.SAVINGS_DEPOSITED, plan=plan, amount=amount,
+                actor_sub=getattr(request.user, "sub", ""),
+                depositId=deposit.pk, walletMovementId=movement.pk,
+                walletId=wallet.pk, canalDeclare=channel,
+            )
             audit_record(actor=getattr(request.user, "sub", ""), action="savings.plan.deposit",
                          entity_type="SavingsPlan", entity_id=str(plan.pk),
                          details={"amount": str(amount), "channel": channel,
@@ -212,6 +222,120 @@ def plan_deposit(request, plan_id):
              "errors": [{"code": "WALLET_INSUFFICIENT_FUNDS",
                          "message": f"Solde insuffisant ({wallet.balance} {plan.currency}) "
                                     f"pour un dépôt de {amount} {plan.currency}."}]},
+            status=422,
+        )
+    plan.refresh_from_db()
+    return Response(_plan_row(plan))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def plan_withdraw(request, plan_id):
+    """Retrait d'épargne — CRÉDITE le portefeuille du client (flux interne, miroir du dépôt).
+
+    Symétrique exact de `plan_deposit` sous la règle « une seule porte » : sortir de
+    l'épargne, ce n'est pas sortir de l'institution, c'est revenir au portefeuille. Le
+    crédit passe par le SEUL service de crédit du système (`caisses.services.deposit`),
+    jamais par une écriture directe dans les modèles de `caisses` (principe 6).
+
+    L'endpoint n'existait pas : l'épargne était une porte à sens unique — l'argent entrait
+    dans un plan et aucun chemin ne l'en faisait ressortir. Le retrait est ce chemin, et il
+    est ce qui rend l'écriture B9 possible : sans acte métier, pas d'événement (« ne devine
+    aucune écriture »).
+
+    Deux contrôles portent le risque :
+
+    * **Le solde du plan**, relu SOUS VERROU (`select_for_update`) dans la transaction —
+      sans quoi deux retraits concurrents de 60 sur un solde de 100 passeraient tous deux
+      leur contrôle avant que l'un ne débite, et le plan finirait négatif.
+    * **Le plafond de solde KYC du portefeuille** (`caisses.services.deposit`) : un retrait
+      qui ferait dépasser le plafond du wallet est refusé en entier, jamais tronqué.
+
+    Le statut du plan n'est PAS un motif de refus, contrairement au dépôt : un plan clôturé
+    n'accepte plus d'argent, mais l'argent qu'il détient doit toujours pouvoir revenir à son
+    titulaire. Refuser serait piéger les fonds.
+    """
+    plan = SavingsPlan.objects.filter(pk=plan_id, user=request.user).first()
+    if not plan:
+        return Response({"detail": "Plan introuvable.", "code": "PLAN_NOT_FOUND"}, status=404)
+
+    data = request.data or {}
+    errors: list[dict] = []
+
+    amount = to_decimal(data.get("amount"), default="-1")  # -1 = sentinelle « illisible »
+    if amount <= 0:
+        errors.append({
+            "code": "AMOUNT_INVALID",
+            "message": "Le montant du retrait doit être un nombre strictement positif.",
+        })
+    else:
+        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    channel = data.get("channel", SavingsPlan.Channel.AGENT)
+    if channel not in SavingsPlan.Channel.values:
+        errors.append({
+            "code": "CHANNEL_UNKNOWN",
+            "message": f"Canal de retrait inconnu : {channel}.",
+        })
+
+    if errors:
+        return Response({"detail": errors[0]["message"], "errors": errors}, status=422)
+
+    from caisses.models import ClientWallet
+    from caisses.services import deposit as caisses_deposit
+
+    # Aucune création implicite de portefeuille : un plan dont le solde est positif a
+    # forcément été alimenté depuis un wallet de cette devise, qui existe donc.
+    wallet = ClientWallet.objects.filter(user=request.user, currency=plan.currency).first()
+    if wallet is None:
+        return Response(
+            {"detail": f"Aucun portefeuille {plan.currency} pour recevoir ce retrait.",
+             "errors": [{"code": "WALLET_MISSING",
+                         "message": f"Aucun portefeuille {plan.currency} sur ce compte."}]},
+            status=422,
+        )
+
+    key = (data.get("idempotencyKey") or "").strip() or uuid.uuid4().hex
+    credit_key = f"savings-withdraw:{plan.pk}:{key}"
+    actor = getattr(request.user, "sub", "")
+    try:
+        with transaction.atomic():
+            verrou = SavingsPlan.objects.select_for_update().get(pk=plan.pk)
+            if verrou.balance < amount:
+                raise InsufficientFundsError(
+                    f"Solde d'épargne insuffisant : {verrou.balance} {plan.currency} "
+                    f"disponibles pour un retrait de {amount} {plan.currency}.",
+                )
+            movement = caisses_deposit(wallet_id=wallet.pk, amount=amount, channel=channel,
+                                        idempotency_key=credit_key, by=actor)
+            withdrawal = SavingsWithdrawal.objects.create(plan=plan, amount=amount, channel=channel)
+            SavingsPlan.objects.filter(pk=plan.pk).update(balance=F("balance") - amount)
+            # Événement comptable (B9) — même transaction que le mouvement et l'inscription.
+            events.emettre(
+                SavingsEvent.Type.SAVINGS_WITHDRAWN, plan=plan, amount=amount, actor_sub=actor,
+                withdrawalId=withdrawal.pk, walletMovementId=movement.pk,
+                walletId=wallet.pk, canalDeclare=channel,
+            )
+            audit_record(actor=actor, action="savings.plan.withdraw",
+                         entity_type="SavingsPlan", entity_id=str(plan.pk),
+                         details={"amount": str(amount), "channel": channel,
+                                  "walletMovementId": movement.pk,
+                                  "currency": plan.currency})
+    except idempotency.IdempotentReplay:
+        plan.refresh_from_db()
+        return Response(_plan_row(plan))
+    except InsufficientFundsError as exc:
+        return Response(
+            {"detail": f"{exc} Aucun retrait effectué.",
+             "errors": [{"code": "SAVINGS_INSUFFICIENT_BALANCE", "message": str(exc)}]},
+            status=422,
+        )
+    except ValidationFailed as exc:
+        # Plafond de solde KYC du portefeuille (`caisses.services.deposit`) : le retrait est
+        # refusé en entier — on ne rend jamais une partie d'un retrait demandé.
+        return Response(
+            {"detail": f"{exc} Aucun retrait effectué.",
+             "errors": [{"code": "WALLET_CAP_EXCEEDED", "message": str(exc)}]},
             status=422,
         )
     plan.refresh_from_db()
