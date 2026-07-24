@@ -12,34 +12,20 @@ Deux règles, posées ici une fois pour toutes plutôt que répétées dans chaq
    `POST /taux` est un acte. `CapaciteSelonMethode` rend la matrice explicite dans la
    déclaration de la vue, au lieu de la cacher dans un `if request.method` du corps —
    « toute vue sans permission explicite est un bug » (CLAUDE.md §5).
+
+Ce garde-là n'a RIEN de comptable : il ne parle que de méthodes HTTP et de capacités RBAC.
+Il vivait ici parce que le socle comptable en a eu besoin le premier, et il s'y est retrouvé
+dupliqué mot pour mot dans `rbac.permissions` — deux implémentations du même concept, soit
+le principe 6 en défaut. `rbac` est la bonne maison (aucune app ne doit dépendre de
+`accounting` pour un garde générique) : ce module n'en garde qu'un **ré-export**, pour que
+les vues comptables continuent d'importer leurs gardes depuis un seul endroit.
 """
 from __future__ import annotations
 
-from rest_framework.permissions import BasePermission
-
 from accounts.permissions import IsStaff
-from rbac.permissions import HasCapability
+from rbac.permissions import CapaciteSelonMethode, HasCapability
 
-
-def CapaciteSelonMethode(**par_methode: str):
-    """Fabrique une permission qui exige une capacité DIFFÉRENTE selon la méthode HTTP.
-
-    Usage : `CapaciteSelonMethode(GET="read", POST="create")`. Une méthode absente de la
-    table est REFUSÉE — le défaut est fermé, jamais ouvert.
-    """
-    table = {methode.upper(): capacite for methode, capacite in par_methode.items()}
-
-    class _CapaciteSelonMethode(BasePermission):
-        message = "Capacité insuffisante pour cette méthode."
-
-        def has_permission(self, request, view) -> bool:
-            capacite = table.get((request.method or "").upper())
-            if capacite is None:
-                return False
-            self.message = f"Capacité requise : {capacite}."
-            return HasCapability(capacite)().has_permission(request, view)
-
-    return _CapaciteSelonMethode
+__all__ = ["CapaciteSelonMethode", "LIRE", "SAISIR", "VALIDER", "PARAMETRER"]
 
 
 #: Combinaisons prêtes à l'emploi (toujours cumulées avec `IsStaff`).

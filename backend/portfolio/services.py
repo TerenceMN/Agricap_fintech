@@ -14,6 +14,7 @@ from django.utils import timezone
 from audit.services import record as audit_record
 from common.exceptions import InsufficientFundsError, ValidationFailed
 
+from . import rates
 from .models import Loan, LoanConfigHistory, LoanGuarantee, LoanNote, LoanSubWallet, LoanTransaction
 from .schedule import add_months, build_schedule, schedule_totals
 
@@ -99,17 +100,82 @@ _APP_STATUS_TO_LOAN = {
 }
 
 
+def derniere_analyse(app):
+    """Dernière `AnalyseCredit` du dossier d'instruction, ou `None`.
+
+    Import différé et défensif : le portefeuille reste autonome (un dossier peut
+    être saisi manuellement, sans analyse).
+    """
+    if app is None:
+        return None
+    try:
+        from credits.scoring import derniere_analyse as _derniere
+
+        return _derniere(app)
+    except Exception:  # noqa: BLE001 — absence d'analyse = cas nominal, pas une erreur
+        return None
+
+
+def taux_annuel_du_dossier(loan: Loan):
+    """Taux ANNUEL sur lequel le dossier a été SCORÉ, ou `None`.
+
+    C'est la référence qui permet de reconnaître un report du taux annuel dans le
+    champ mensuel (cf. `portfolio.rates.valider_taux_mensuel`).
+    """
+    if not loan or not loan.application_id:
+        return None
+    analyse = derniere_analyse(loan.application)
+    return getattr(analyse, "taux_annuel", None) if analyse else None
+
+
+def _taux_de_l_analyse(app) -> tuple[Decimal | None, str, str]:
+    """(taux ANNUEL à appliquer, provenance, avertissement) depuis l'analyse.
+
+    Le taux SERVI est `taux_propose` (grille de tarification unique) quand l'analyse
+    en porte un ; à défaut, `taux_annuel`, celui avec lequel l'échéancier et le DSCR
+    ont été calculés. Quand les deux diffèrent, le dossier a été scoré à un prix et
+    facturé à un autre : le fait est journalisé, jamais absorbé.
+    """
+    analyse = derniere_analyse(app)
+    if analyse is None:
+        return None, "", ""
+    scoré = getattr(analyse, "taux_annuel", None)
+    servi = getattr(analyse, "taux_propose", None)
+    if servi is not None:
+        avertissement = ""
+        if scoré is not None and Decimal(servi) != Decimal(scoré):
+            avertissement = (
+                f"Taux servi {servi} %/an ≠ taux d'analyse {scoré} %/an : "
+                f"le DSCR du dossier a été calculé à {scoré} %/an."
+            )
+        return Decimal(servi), f"analyse #{analyse.pk} (taux proposé)", avertissement
+    if scoré is not None:
+        return Decimal(scoré), f"analyse #{analyse.pk} (taux d'analyse)", ""
+    return None, "", ""
+
+
 @transaction.atomic
 def create_from_application(app, *, by: str = ""):
     """
     Crée (ou resynchronise) un dossier de GESTION à partir d'une CreditApplication
     (nouveau module credits). Les montants et le score viennent directement des champs
-    du modèle ; les champs de gestion déjà édités (gestionnaire, taux, dates) sont préservés.
+    du modèle ; les champs de gestion déjà édités (gestionnaire, dates) sont préservés.
+
+    Le TAUX est recopié de l'analyse, en ANNUEL et sans conversion manuelle : c'est
+    le seul moyen de garantir que le prêt facture ce qui a été scoré. Il ne restait
+    auparavant aucune trace du taux dans le dossier de gestion (`rate` = 0 jusqu'à
+    saisie), ce qui obligeait le gestionnaire à le retaper — depuis un écran qui
+    l'affiche en ANNUEL, dans un champ qui l'attend en MENSUEL.
     """
     sr = app.score_result or {}
     score = sr.get("score") or 0
     schedule = sr.get("scheduleDraft") or []
     duree = len(schedule) if schedule else 12
+
+    analyse = derniere_analyse(app)
+    if analyse is not None and getattr(analyse, "duree_mois", None):
+        duree = int(analyse.duree_mois)
+    taux_annuel, provenance, avertissement = _taux_de_l_analyse(app)
 
     snapshot = dict(
         operator=getattr(app.client, "full_name", None) or "—",
@@ -125,16 +191,50 @@ def create_from_application(app, *, by: str = ""):
     if existing:
         for key, val in snapshot.items():
             setattr(existing, key, val)
+        # Le taux n'écrase une saisie de gestion que s'il n'y en a jamais eu :
+        # une resynchronisation ne re-tarife pas un prêt déjà configuré.
+        if taux_annuel is not None and not existing.annual_rate:
+            _appliquer_taux_analyse(existing, taux_annuel, provenance, avertissement, by=by)
         existing.save()
         return existing
 
-    loan = Loan.objects.create(
+    loan = Loan(
         reference=app.code, application=app,
         duration_months=duree or 12,
         status=_APP_STATUS_TO_LOAN.get(app.status, Loan.Status.EN_TRAITEMENT),
         created_by=by, **snapshot,
     )
+    if taux_annuel is not None:
+        loan.annual_rate = taux_annuel
+    loan.save()
+    if taux_annuel is not None:
+        _journaliser_taux(loan, taux_annuel, provenance, avertissement, by=by)
+    else:
+        LoanConfigHistory.objects.create(
+            loan=loan, action="Taux non repris", user=by or "Système",
+            details="Aucune analyse ne porte de taux : le taux du prêt reste à "
+                    "configurer explicitement (aucune valeur devinée).",
+        )
     return loan
+
+
+def _appliquer_taux_analyse(loan: Loan, taux_annuel: Decimal, provenance: str,
+                            avertissement: str, *, by: str) -> None:
+    loan.annual_rate = taux_annuel
+    _journaliser_taux(loan, taux_annuel, provenance, avertissement, by=by)
+
+
+def _journaliser_taux(loan: Loan, taux_annuel: Decimal, provenance: str,
+                      avertissement: str, *, by: str) -> None:
+    """Trace la provenance du taux : un chiffre financier sans auteur n'existe pas."""
+    details = (f"Taux repris de l'{provenance} : {taux_annuel} %/an "
+               f"= {rates.mensuel_stocke(taux_annuel)} %/mois")
+    if avertissement:
+        details = f"{details}. {avertissement}"
+    LoanConfigHistory.objects.create(
+        loan=loan, action="Taux repris de l'analyse", user=by or "Système",
+        details=details[:255],
+    )
 
 
 def sync_from_applications(*, by: str = "") -> int:
@@ -154,8 +254,29 @@ def _recompute_due_date(loan: Loan) -> None:
         loan.due_date = add_months(loan.start_date, int(loan.duration_months))
 
 
+def _lire_taux(data: dict, loan: Loan | None = None) -> dict:
+    """Extrait le taux d'un payload d'API, en NOMMANT son unité.
+
+    Deux clés distinctes, jamais interchangeables :
+      - `annualRate` / `annual_rate` : taux ANNUEL (celui des écrans d'analyse) ;
+      - `rate` : taux MENSUEL (l'unité historique du champ).
+    Le taux mensuel est confronté au taux annuel du dossier scoré quand il existe :
+    une saisie égale à ce taux annuel est le report fautif, et elle est refusée.
+    """
+    if data.get("annualRate") not in (None, "") or data.get("annual_rate") not in (None, ""):
+        annuel = data.get("annualRate") if data.get("annualRate") not in (None, "") \
+            else data.get("annual_rate")
+        return {"annual_rate": rates.valider_taux_annuel(annuel)}
+    if "rate" in data and data.get("rate") not in (None, ""):
+        mensuel = rates.valider_taux_mensuel(
+            data.get("rate"), taux_annuel_dossier=taux_annuel_du_dossier(loan))
+        return {"rate": mensuel, "annual_rate": rates.annuel_depuis_mensuel(mensuel)}
+    return {}
+
+
 @transaction.atomic
 def create_loan(data: dict, *, by: str = "") -> Loan:
+    taux = _lire_taux(data)
     loan = Loan(
         reference=generate_reference(),
         date=_date(data.get("date")) or timezone.localdate(),
@@ -165,7 +286,6 @@ def create_loan(data: dict, *, by: str = "") -> Loan:
         amount_approved=_dec(data.get("amountApproved") or data.get("amount_approved")),
         currency=(data.get("currency") or "USD").upper()[:3],
         duration_months=_int(data.get("duration") or data.get("duration_months"), 12),
-        rate=_dec(data.get("rate")),
         frequency=(data.get("frequency") or "monthly"),
         start_date=_date(data.get("startDate") or data.get("start_date")),
         manager=(data.get("manager") or "").strip(),
@@ -176,6 +296,7 @@ def create_loan(data: dict, *, by: str = "") -> Loan:
         guarantee=(data.get("guarantee") or "").strip(),
         borrower_sub=(data.get("borrowerSub") or "").strip(),
         created_by=by,
+        **taux,
     )
     _recompute_due_date(loan)
     loan.save()
@@ -311,6 +432,8 @@ def update_loan(loan: Loan, data: dict) -> Loan:
         loan.amount_approved = _dec(data.get("amountApproved") or data.get("amount_approved"))
     if "score" in data:
         loan.score = _int(data.get("score"), loan.score)
+    for champ, valeur in _lire_taux(data, loan).items():
+        setattr(loan, champ, valeur)
     if "status" in data:
         loan.status = status_code(data.get("status"), loan.status)
     if "startDate" in data or "start_date" in data:
@@ -327,8 +450,12 @@ def apply_config(loan: Loan, data: dict, *, by: str = "", action: str = "Modific
     """
     Applique taux/durée/fréquence/statut/date d'effet + enregistre une entrée d'audit.
     Renvoie l'échéancier recalculé.
+
+    Le taux passe par `_lire_taux` : c'est l'écran « Taux & maturité », donc le point
+    d'entrée exact où la confusion mensuel/annuel se commettait.
     """
-    loan.rate = _dec(data.get("rate"), str(loan.rate))
+    for champ, valeur in _lire_taux(data, loan).items():
+        setattr(loan, champ, valeur)
     loan.duration_months = _int(data.get("duration") or data.get("duration_months"), loan.duration_months)
     if data.get("frequency"):
         loan.frequency = data["frequency"]
@@ -339,7 +466,8 @@ def apply_config(loan: Loan, data: dict, *, by: str = "", action: str = "Modific
     _recompute_due_date(loan)
     loan.save()
 
-    details = f"Taux: {loan.rate}%/mois, Durée: {loan.duration_months} mois, Statut: {loan.get_status_display()}"
+    details = (f"Taux: {loan.rate}%/mois (= {loan.annual_rate}%/an), "
+               f"Durée: {loan.duration_months} mois, Statut: {loan.get_status_display()}")
     LoanConfigHistory.objects.create(loan=loan, action=action, user=by or "Système", details=details)
     return schedule_for(loan)
 
@@ -350,11 +478,16 @@ def schedule_for(loan: Loan) -> dict:
     Les champs du modèle sont déjà des `DecimalField` : on les transmet TELS QUELS,
     sans passer par `float()`. `build_schedule` refuse d'ailleurs un `float`, ce qui
     verrouille le chemin par une erreur bruyante plutôt que par un centime silencieux.
+
+    Le taux transmis est `monthly_rate_pct` (= taux annuel ÷ 12 en pleine précision),
+    pas la colonne `rate` arrondie : c'est la condition pour que le calendrier PAYÉ
+    tombe au centime sur le calendrier SCORÉ.
     """
     principal = loan.amount_approved or loan.amount_requested or Decimal("0")
     duree = int(loan.duration_months or 0)
     start = loan.start_date or loan.date or timezone.localdate()
-    rows = build_schedule(principal, loan.rate, duree, loan.frequency, start, loan.currency)
+    rows = build_schedule(principal, loan.monthly_rate_pct, duree, loan.frequency,
+                          start, loan.currency)
     return {"schedule": rows, "totals": schedule_totals(rows, duree, loan.currency),
             "currency": loan.currency}
 

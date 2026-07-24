@@ -26,7 +26,12 @@ def loan_row(loan: Loan) -> dict:
         "amountDisbursed": _f(loan.disbursed),
         "currency": loan.currency,
         "duration": loan.duration_months,
+        # Les DEUX unités sont servies, chacune nommée : l'écran ne peut plus
+        # afficher un taux annuel dans une case libellée « %/mois » (ni l'inverse).
         "rate": _f(loan.rate),
+        "rateUnit": "percent_per_month",
+        "annualRate": _f(loan.annual_rate) if loan.annual_rate is not None else None,
+        "annualRateUnit": "percent_per_year",
         "dueDate": loan.due_date.isoformat() if loan.due_date else "",
         "manager": loan.manager,
         "investor": loan.investor,
@@ -84,6 +89,9 @@ def config_payload(loan: Loan) -> dict:
     return {
         "currentConfig": {
             "rate": _f(loan.rate),
+            "rateUnit": "percent_per_month",
+            "annualRate": _f(loan.annual_rate) if loan.annual_rate is not None else None,
+            "annualRateUnit": "percent_per_year",
             "duration": loan.duration_months,
             "frequency": loan.frequency,
             "status": loan.get_status_display(),

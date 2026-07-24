@@ -24,10 +24,11 @@ from django.http import HttpResponse
 from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import MultiPartParser
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
+from common.exceptions import PermissionDeniedError
 from credits.permissions import CanInstructCredit, IsDesignatedGuarantor
 
 from credits.needs_parser import NeedsSheetParseError, parse_needs_sheet
@@ -50,6 +51,115 @@ from credits.view_context import ViewContextService
 logger = logging.getLogger(__name__)
 
 
+# ── Socle des permissions déclaratives ────────────────────────────────────────
+#
+# §5 du prompt système : « `permission_classes` déclaratives sur CHAQUE vue
+# (jamais de contrôle uniquement dans le corps) ; toute vue sans permission
+# explicite est un bug ». Le module crédit y dérogeait par `_require_read()` et
+# `_require_group()` appelés en première ligne de corps. La règle FONCTIONNAIT —
+# mais elle était invisible depuis la signature de la vue, elle ne s'auditait pas
+# mécaniquement (aucun outil ne lit un `if` de corps comme une politique d'accès)
+# et une seule ligne oubliée à la création d'une vue suffisait à ouvrir un
+# endpoint sans que rien ne le signale.
+#
+# Ce lot rend la règle déclarative SANS la changer : chaque vue conserve
+# exactement le même public et le même statut de refus. Ce qui reste dans le
+# corps est ce qui ne peut structurellement pas monter sur le décorateur —
+# les contrôles qui dépendent de l'OBJET (« ce dossier est-il le sien ? »,
+# « est-il le garant de CETTE caution ? ») ou du PAYLOAD (« crée-t-il un dossier
+# pour un tiers ? ») : une permission de vue ne connaît ni l'objet ni le corps de
+# la requête. Ces contrôles-là sont désormais les SEULS restants dans les corps,
+# et chacun est signalé comme tel.
+
+
+def MembreDuGroupe(groupe, *, message: str = "Permission refusée.",
+                   code: str | None = None):
+    """Fabrique la permission « appartenir à ce groupe fonctionnel de `credits.roles` ».
+
+    Équivalent déclaratif strict de `_require_group(request, groupe)` : même
+    prédicat (authentifié ET `in_group`), même statut de refus (403), même corps
+    de réponse. `message` reprend mot pour mot celui que la vue renvoyait.
+
+    `code` n'est passé que pour les vues dont le refus en portait un
+    (`STAFF_REQUIS`, `INSTRUCTION_REQUISE`, `PERMISSION_REFUSEE`) : le `message`
+    de DRF ne produit qu'un `{"detail": …}`, alors que le front branche sur
+    `code`. On lève alors `PermissionDeniedError`, que
+    `config.exceptions.agricap_exception_handler` rend en `{"detail", "code"}` à
+    403 — la forme exacte que la vue construisait à la main.
+
+    Pourquoi pas `rbac.permissions.HasCapability` : `client`, `agri_op`,
+    `investor` et `partner` portent tous `read=True` au registre RBAC — une
+    capacité ne dit JAMAIS « interne ». Pourquoi pas
+    `accounts.permissions.IsStaff` là où le garde était `STAFF_ROLES` : `IsStaff`
+    lit le TYPE du rôle au registre, donc couvre aussi `gest_agents` et
+    `support`, absents de `credits.roles.STAFF_ROLES` — le substituer élargirait
+    l'accès. Le garde reste l'appartenance au groupe, à l'identique.
+    """
+    groupe = frozenset(groupe)
+
+    class _MembreDuGroupe(BasePermission):
+        def has_permission(self, request, view) -> bool:
+            user = getattr(request, "user", None)
+            if not user or not getattr(user, "is_authenticated", False):
+                # `IsAuthenticated`, toujours déclaré en premier, produit le 401
+                # attendu par le SPA (qui rafraîchit son jeton dessus).
+                return False
+            if in_group(request, groupe):
+                return True
+            if code is not None:
+                raise PermissionDeniedError(message, code=code)
+            return False
+
+    _MembreDuGroupe.message = message
+    return _MembreDuGroupe
+
+
+def GroupeSelonMethode(*, messages: dict[str, str] | None = None, **par_methode):
+    """Groupe fonctionnel exigé, DIFFÉRENT selon la méthode HTTP.
+
+    Jumelle assumée de `rbac.permissions.CapaciteSelonMethode`, dont elle reprend
+    le contrat au mot près : table explicite sur le décorateur, et **méthode
+    absente de la table = REFUSÉE** (le défaut est fermé, jamais ouvert). Elle
+    existe parce que le module crédit sépare ses publics par GROUPE FONCTIONNEL
+    (`credits.roles`) et non par capacité : sur `analysis-report/`, la lecture est
+    ouverte au titulaire du dossier et l'écriture réservée à `CAN_INSTRUCT` —
+    aucune paire de capacités ne décrit ce couple, `create` n'étant porté ni par
+    `client` ni par `agri_op` ni par `partner`, qui déposent pourtant leurs
+    dossiers.
+
+    Valeur `None` = aucun groupe requis, l'authentification suffit : c'est le
+    `_require_read` d'origine. Le cloisonnement par dossier reste alors dans le
+    corps, car il porte sur l'objet et non sur la vue.
+    """
+    table = {methode.upper(): groupe for methode, groupe in par_methode.items()}
+    libelles = {methode.upper(): texte for methode, texte in (messages or {}).items()}
+
+    class _GroupeSelonMethode(BasePermission):
+        message = "Permission refusée."
+
+        def has_permission(self, request, view) -> bool:
+            user = getattr(request, "user", None)
+            if not user or not getattr(user, "is_authenticated", False):
+                return False
+            methode = (request.method or "").upper()
+            if methode not in table:
+                return False
+            self.message = libelles.get(methode, "Permission refusée.")
+            groupe = table[methode]
+            return True if groupe is None else in_group(request, groupe)
+
+    return _GroupeSelonMethode
+
+
+#: Groupes utilisés par plus d'une vue — nommés ici pour qu'on lise « qui peut
+#: quoi » sans dérouler le fichier. Les gardes à message ou à `code` propres sont
+#: déclarés sur leur vue, au plus près de l'endpoint qu'ils protègent.
+PeutDecider = MembreDuGroupe(CAN_DECIDE)
+PeutDemanderUnDecaissement = MembreDuGroupe(CAN_REQUEST_DISBURSEMENT)
+PeutConfirmerUnDecaissement = MembreDuGroupe(CAN_CONFIRM_DISBURSEMENT)
+EstMembreDuComite = MembreDuGroupe(COMMITTEE_ROLES)
+
+
 def _roles(request: Request) -> list[str]:
     """Rôles canoniques de la requête — remplace `request.roles`, jamais posé.
 
@@ -70,10 +180,16 @@ def _vcs(request: Request) -> ViewContextService:
 def _require_read(request: Request) -> bool:
     """Tout utilisateur authentifié — les données sont filtrées par ViewContextService.
 
-    ⚠️ Ce garde n'autorise QUE l'entrée dans la vue. Il ne dit rien du dossier demandé :
-    dès qu'une vue résout un dossier par son `code`, elle DOIT enchaîner sur
-    `_assert_can_read_app()`. Le code est prévisible (`CRED-AAAAMMJJ-NNNN`) — sans ce
-    second contrôle, `_require_read` + `_get_application(code)` est un IDOR complet.
+    ⚠️ N'est PLUS un garde de vue : c'est désormais `permission_classes` qui porte
+    l'entrée dans la vue (`IsAuthenticated`, dont ce prédicat est l'exact
+    équivalent — `sub` est la clé primaire de `FintechUser`, donc présente sur tout
+    utilisateur authentifié). Il ne subsiste que comme brique de `_require_group`,
+    lui-même réduit aux contrôles dépendant de l'objet ou du payload.
+
+    Il n'a jamais rien dit du dossier demandé : dès qu'une vue résout un dossier
+    par son `code`, elle DOIT enchaîner sur `_assert_can_read_app()`. Le code est
+    prévisible (`CRED-AAAAMMJJ-NNNN`) — sans ce second contrôle,
+    « authentifié » + `_get_application(code)` est un IDOR complet.
     """
     return bool(request.user and hasattr(request.user, "sub"))
 
@@ -113,7 +229,16 @@ def _workflow_error(exc) -> Response:
 
 
 def _require_group(request: Request, group) -> bool:
-    """Vérifie l'appartenance à un groupe fonctionnel de `credits.roles`.
+    """Appartenance à un groupe fonctionnel de `credits.roles`, en cours de vue.
+
+    ⚠️ N'est plus un garde d'ENTRÉE : tout garde de vue est monté sur
+    `permission_classes` (`MembreDuGroupe`). Les appels restants sont les seuls
+    qui ne peuvent pas y monter — ils dépendent de l'objet ou du payload et se
+    lisent tous « X, OU un agent instructeur » :
+
+      - créer / simuler / téléverser POUR UN TIERS (`client_sub` du payload) ;
+      - agir sur un dossier dont on n'est pas le titulaire ;
+      - confirmer un gage d'actif plutôt qu'une caution morale (type de l'objet).
 
     Remplace l'ancien `_require_permission(request, "agent"|"analyst")`, qui
     comparait `user.role` à des libellés (« agent », « analyst ») n'existant
@@ -145,16 +270,18 @@ def _to_decimal(value) -> "decimal.Decimal":
 # ── 1. Préremplissage ────────────────────────────────────────────────────────
 
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def prefill_application(request: Request) -> Response:
     """
     GET /api/credits/application/prefill/?client_sub=<sub>
 
     Retourne les données préremplies pour un nouveau dossier de crédit.
     Si client_sub est omis, utilise le sub du demandeur lui-même.
-    """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Entrée : tout membre authentifié — il prépare SON dossier. Le garde de rôle
+    ne se déclenche que sur le `client_sub` du payload (créer au nom d'un tiers),
+    donnée qu'une permission de vue ne peut pas connaître : il reste dans le corps.
+    """
     requester_sub: str = getattr(request.user, "sub", "") or ""
     client_sub: str = request.query_params.get("client_sub", requester_sub)
 
@@ -179,6 +306,7 @@ def prefill_application(request: Request) -> Response:
 # ── 2. Parse Feuille de Besoins ──────────────────────────────────────────────
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser])
 def parse_needs_sheet_view(request: Request) -> Response:
     """
@@ -195,10 +323,11 @@ def parse_needs_sheet_view(request: Request) -> Response:
 
     Sans `application_code` (parcours client avant création du dossier) : parsing
     en mémoire hérité, conservé pour ne pas casser l'étape 2 du simulateur.
-    """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Entrée : tout membre authentifié — le client téléverse SA feuille. Le
+    rattachement à un dossier passe par `_ingest_needs_sheet`, qui vérifie le
+    titulaire (contrôle d'objet, donc dans le corps).
+    """
     file = request.FILES.get("file")
     if not file:
         return Response({"detail": "Fichier manquant (champ 'file' requis)."}, status=400)
@@ -440,6 +569,7 @@ def download_needs_sheet_template(request: Request) -> HttpResponse:
 # ── 4. Simulation scoring ────────────────────────────────────────────────────
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def simulate_scoring(request: Request) -> Response:
     """
     POST /api/credits/simulate/
@@ -456,10 +586,11 @@ def simulate_scoring(request: Request) -> Response:
       area_ha            (float, optionnel)
       amount_requested   (float, optionnel)
       currency           (str, "USD"|"CDF", défaut "USD")
-    """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Entrée : tout membre authentifié — un client simule pour lui-même. Simuler
+    pour un tiers (`client_sub` ≠ le sien) exige `CAN_INSTRUCT` ; ce garde-là
+    dépend du payload et reste donc dans le corps.
+    """
     data = request.data
     if (application_code := (data.get("application_code") or "").strip()):
         return _simulate_from_source(request, application_code, data)
@@ -714,6 +845,7 @@ def score_application(request: Request, code: str) -> Response:
 # ── Dossiers : liste et détail ────────────────────────────────────────────────
 
 @api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
 def list_applications(request: Request) -> Response:
     """
     GET  /api/credits/applications/           → liste (filtrée par rôle)
@@ -723,10 +855,14 @@ def list_applications(request: Request) -> Response:
     `agency` (staff — code d'agence, ou `none` pour les dossiers sans agence).
     AUCUN filtre ne s'applique par défaut : un dossier sans agence reste servi
     tant que `?agency=` n'est pas demandé explicitement.
-    """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Les DEUX méthodes s'arrêtent à l'authentification, et c'est délibéré : la
+    lecture est cloisonnée par `ViewContextService.filter_qs` (un client ne voit
+    que ses dossiers), et la création est l'acte normal d'un demandeur.
+    `CapaciteSelonMethode(GET="read", POST="create")` aurait paru plus fin mais
+    aurait FERMÉ le dépôt de dossier à `client`, `agri_op` et `partner`, qui ne
+    portent pas `create` au registre RBAC — un durcissement déguisé en migration.
+    """
     from credits.models import CreditApplication
     from credits.workflow import serialize_application
 
@@ -946,11 +1082,13 @@ def _create_application(request: Request) -> Response:
 
 
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def application_detail(request: Request, code: str) -> Response:
-    """GET /api/credits/applications/<code>/"""
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
+    """GET /api/credits/applications/<code>/
 
+    Entrée authentifiée ; le cloisonnement par dossier (`can_read_app`) porte sur
+    l'objet et reste dans le corps.
+    """
     from credits.models import CreditApplication
     from credits.workflow import serialize_application
 
@@ -986,11 +1124,14 @@ def _load_app(code: str, select_related: list[str] | None = None):
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def submit_application(request: Request, code: str) -> Response:
-    """POST /api/credits/applications/<code>/submit/"""
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
+    """POST /api/credits/applications/<code>/submit/
 
+    Deux acteurs légitimes — le TITULAIRE et l'agent instructeur : la condition
+    porte sur le dossier, donc elle reste dans le corps. Le décorateur porte ce
+    qui est vrai de la vue elle-même : il faut être authentifié.
+    """
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1150,14 +1291,17 @@ def reopen_analysis(request: Request, code: str) -> Response:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def client_consent(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/client-consent/
     Corps JSON : { method? } — "app" | "sms" | "ussd"
-    """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Le consentement est l'acte du titulaire : aucun rôle ne l'ouvre ni ne le
+    ferme, seul le lien au dossier compte. Le garde est donc entièrement
+    d'objet (`_assert_can_read_app`, en 404), et le décorateur ne porte que
+    l'authentification.
+    """
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1222,6 +1366,7 @@ def _get_application(code: str):
 
 
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def list_guarantees(request: Request, code: str) -> Response:
     """GET /api/credits/applications/<code>/guarantees/
 
@@ -1231,8 +1376,6 @@ def list_guarantees(request: Request, code: str) -> Response:
     module crédit. Elle n'était protégée que par `_require_read`, c'est-à-dire par rien —
     tout membre authentifié pouvait la lire sur n'importe quel `code`.
     """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1460,6 +1603,7 @@ def _client_ip(request: Request) -> str | None:
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Response:
     """
     POST /api/credits/applications/<code>/guarantees/<id>/confirm/
@@ -1472,9 +1616,11 @@ def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
     membre authentifié pouvait rendre opposable — au nom d'autrui — la caution d'un
     dossier qui ne le concernait pas. C'est l'inverse exact de ce que le consentement
     établit (cf. `IsDesignatedGuarantor`).
+
+    Le décorateur s'arrête à l'authentification : les deux acteurs admis se
+    définissent PAR RAPPORT À LA CAUTION VISÉE (« le garant désigné de
+    celle-ci ») — ce que seule la vue, qui l'a chargée, peut trancher.
     """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1541,6 +1687,7 @@ def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
 
 
 @api_view(["POST"])
+@permission_classes([IsAuthenticated])
 def place_asset_guarantee_view(request: Request, code: str) -> Response:
     """
     POST /api/credits/applications/<code>/guarantees/asset/
@@ -1548,9 +1695,10 @@ def place_asset_guarantee_view(request: Request, code: str) -> Response:
 
     Propose un actif vérifié du client en garantie. L'actif n'est effectivement
     nanti qu'à la confirmation par un agent.
+
+    Entrée authentifiée : proposer est l'acte du propriétaire du dossier, ou de
+    l'agent qui l'instruit — condition d'objet, donc dans le corps.
     """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1630,6 +1778,7 @@ _DISBURSEMENT_STAFF_FIELDS = ("requestedBySub", "confirmedBySub", "journalEntryI
 
 
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def disbursement_detail(request: Request, code: str) -> Response:
     """GET /api/credits/applications/<code>/disbursement/
 
@@ -1639,8 +1788,6 @@ def disbursement_detail(request: Request, code: str) -> Response:
     demandeur et celle du confirmateur — donc la paire maker/checker d'un décaissement
     réel — plus sa référence d'écriture comptable.
     """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
@@ -1735,16 +1882,18 @@ def cancel_disbursement_view(request: Request, code: str) -> Response:
 # ── Tableau de bord — Étape 7 ─────────────────────────────────────────────────
 
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def credits_dashboard(request: Request) -> Response:
     """
     GET /api/credits/dashboard/
 
     Retourne des KPIs adaptés au rôle du demandeur.
     Chaque rôle reçoit une vue agrégée différente.
-    """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
 
+    Entrée authentifiée : le tri par rôle est le SUJET de la vue, pas son garde —
+    `get_dashboard` choisit la lentille et lève `PermissionError` (403) sur une
+    `?view=` que le rôle ne peut pas demander.
+    """
     from credits.dashboard import get_dashboard
 
     sub: str = getattr(request.user, "sub", "") or ""
@@ -2041,9 +2190,6 @@ def analyse_resume(request: Request, code: str) -> Response:
     que le client voit — c'est le seul moyen de vérifier l'écran client depuis le
     backoffice sans se connecter au compte d'un membre.
     """
-    if not _require_read(request):
-        return Response({"detail": "Permission refusée."}, status=403)
-
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)

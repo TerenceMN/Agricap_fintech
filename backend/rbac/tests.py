@@ -225,3 +225,54 @@ class RbacSupervisorsTests(AuthedAPITestCase):
         subs = {u["sub"] for u in res.data}
         self.assertIn("u-13", subs)
         self.assertNotIn("u-12", subs)
+
+
+class NomenclatureUniqueDuGardeParMethodeTests(TestCase):
+    """Principe 6 : le garde « une capacité par méthode HTTP » n'a qu'UNE définition.
+
+    Il en a eu trois — `rbac.CapaciteSelonMethode`, son jumeau
+    `accounting.CapaciteSelonMethode` et `fx.CapabilityByMethod`. Ces tests verrouillent
+    la résorption : que quelqu'un réécrive une classe locale dans `accounting` ou `fx` et
+    ils tombent, au lieu de laisser la divergence s'installer en silence.
+    """
+
+    def test_accounting_reexporte_le_garde_de_rbac_sans_le_redefinir(self):
+        from accounting import permissions as comptable
+        from rbac.permissions import CapaciteSelonMethode
+
+        self.assertIs(comptable.CapaciteSelonMethode, CapaciteSelonMethode)
+
+    def test_fx_delegue_au_garde_de_rbac(self):
+        """`CapabilityByMethod` garde son nom (importé par `fx/views.py`) mais plus son
+        implémentation : la classe produite doit être celle fabriquée par `rbac`."""
+        from fx.permissions import CapabilityByMethod
+        from rbac.permissions import CapaciteSelonMethode
+
+        temoin = CapaciteSelonMethode(GET="read")
+        self.assertEqual(
+            CapabilityByMethod(safe="read", unsafe="config").__name__, temoin.__name__
+        )
+
+    def test_fx_conserve_la_matrice_safe_unsafe_dattache(self):
+        """Traduction fidèle : lecture DRF (`SAFE_METHODS`) → `safe`, écriture → `unsafe`,
+        et tout autre verbe refusé (défaut fermé de `rbac`)."""
+        from rest_framework.permissions import SAFE_METHODS
+
+        from fx.permissions import CapabilityByMethod
+
+        garde = CapabilityByMethod(safe="read", unsafe="config")()
+
+        class _Requete:
+            def __init__(self, methode):
+                self.method = methode
+                self.user = None  # non authentifié : on n'observe que le routage
+
+        for methode in SAFE_METHODS:
+            with self.subTest(methode=methode):
+                garde.has_permission(_Requete(methode), None)
+                self.assertEqual(garde.message, "Capacité requise : read.")
+        for methode in ("POST", "PUT", "PATCH", "DELETE"):
+            with self.subTest(methode=methode):
+                garde.has_permission(_Requete(methode), None)
+                self.assertEqual(garde.message, "Capacité requise : config.")
+        self.assertFalse(garde.has_permission(_Requete("TRACE"), None))

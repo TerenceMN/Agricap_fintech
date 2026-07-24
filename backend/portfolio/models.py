@@ -48,7 +48,28 @@ class Loan(models.Model):
     currency = models.CharField(max_length=3, choices=Currency.choices, default=Currency.USD)
 
     duration_months = models.IntegerField(default=12)
-    rate = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("0"))  # taux MENSUEL %
+
+    # ── Taux : DEUX champs, UNE vérité ────────────────────────────────────────
+    # `rate` est MENSUEL, `annual_rate` est ANNUEL, et `_accorder_les_taux()` les
+    # maintient rigoureusement cohérents à chaque écriture. L'unité est nommée
+    # dans le schéma parce qu'elle ne l'était nulle part ailleurs : un « 18 % »
+    # de dossier scoré (annuel) reporté dans `rate` créait un prêt à 216 %/an.
+    rate = models.DecimalField(
+        max_digits=9, decimal_places=6, default=Decimal("0"),
+        verbose_name="Taux MENSUEL (%/mois)",
+        help_text="Taux MENSUEL en points de % (1.5 = 1,5 %/mois = 18 %/an). "
+                  "Pour saisir un taux annuel, utilisez « Taux annuel ».",
+    )
+    #: Taux nominal ANNUEL en % — même unité et même précision que
+    #: `credits.AnalyseCredit.taux_annuel`, dont il est la recopie au décaissement.
+    #: Source canonique du calcul quand il est renseigné (cf. `monthly_rate_pct`) :
+    #: la division par 12 se fait en pleine précision, pas sur `rate` arrondi.
+    annual_rate = models.DecimalField(
+        max_digits=6, decimal_places=3, null=True, blank=True,
+        verbose_name="Taux ANNUEL (%/an)",
+        help_text="Taux nominal ANNUEL en points de % (18 = 18 %/an). "
+                  "Recopié de l'analyse au rattachement du dossier.",
+    )
     frequency = models.CharField(max_length=12, choices=Frequency.choices, default=Frequency.MONTHLY)
     start_date = models.DateField(null=True, blank=True)
     due_date = models.DateField(null=True, blank=True)
@@ -81,6 +102,104 @@ class Loan(models.Model):
 
     def __str__(self) -> str:
         return f"{self.reference} — {self.operator} [{self.get_status_display()}]"
+
+    # --- Taux : cohérence mensuel ↔ annuel, imposée à l'écriture --------------
+    #: Champs dont la cohérence est maintenue par `_accorder_les_taux()`.
+    RATE_FIELDS = ("rate", "annual_rate")
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        """Mémorise les taux CHARGÉS pour savoir, au `save()`, lesquels ont bougé.
+
+        Sans cette photo, on ne peut pas distinguer « on écrit un taux » de « on
+        sauvegarde une ligne dont le taux n'a pas changé » — et le garde-fou de
+        plausibilité bloquerait la clôture d'un dossier hérité au lieu de bloquer
+        la saisie fautive.
+        """
+        instance = super().from_db(db, field_names, values)
+        instance._photographier_les_taux(
+            [nom for nom in cls.RATE_FIELDS if nom in field_names])
+        return instance
+
+    def _photographier_les_taux(self, champs=None) -> None:
+        """Fige l'état PERSISTÉ des taux — la référence du prochain `save()`."""
+        self._taux_charges = {
+            nom: getattr(self, nom) for nom in (champs or self.RATE_FIELDS)
+        }
+
+    def _accorder_les_taux(self) -> set[str]:
+        """Valide le taux ÉCRIT et aligne son pendant. Renvoie les champs touchés.
+
+        Règles :
+          - le taux ANNUEL prime quand il est (re)saisi : c'est la valeur que porte
+            l'analyse, donc la seule qui se compare à un dossier scoré ;
+          - sinon le taux MENSUEL saisi est validé (plafond de plausibilité) et
+            projeté en annuel ;
+          - une ligne héritée (créée avant `annual_rate`) est complétée sans être
+            jugée : on ne requalifie pas rétroactivement un taux déjà appliqué,
+            on le rend seulement lisible.
+        """
+        from . import rates
+
+        charges = getattr(self, "_taux_charges", None) or {}
+        # Aucune photo = objet jamais persisté : les deux champs sont « écrits »,
+        # et l'ANNUEL prime (c'est l'unité de l'analyse, donc du dossier scoré).
+        neuf = not charges
+        annuel_modifie = neuf or (
+            "annual_rate" in charges and self.annual_rate != charges["annual_rate"])
+        mensuel_modifie = neuf or (
+            "rate" in charges and self.rate != charges["rate"])
+
+        if self.annual_rate is not None and annuel_modifie:
+            self.annual_rate = rates.valider_taux_annuel(self.annual_rate)
+            self.rate = rates.mensuel_stocke(self.annual_rate)
+            return set(self.RATE_FIELDS)
+        if mensuel_modifie:
+            self.rate = rates.valider_taux_mensuel(self.rate)
+            self.annual_rate = rates.annuel_depuis_mensuel(self.rate)
+            return set(self.RATE_FIELDS)
+        if self.annual_rate is None and self.rate is not None and "rate" in charges:
+            self.annual_rate = rates.annuel_depuis_mensuel(self.rate)
+            return {"annual_rate"}
+        return set()
+
+    def clean(self):
+        """Contrôle de l'admin Django (qui appelle `full_clean`) — même règle."""
+        super().clean()
+        self._accorder_les_taux()
+
+    def save(self, *args, **kwargs):
+        touches = self._accorder_les_taux()
+        update_fields = kwargs.get("update_fields")
+        ecrit = update_fields is None
+        if touches and update_fields is not None:
+            champs = set(update_fields)
+            # Un `save(update_fields=["rate"])` doit persister l'annuel recalculé,
+            # sinon les deux champs se contrediraient en base.
+            if champs & touches:
+                kwargs["update_fields"] = sorted(champs | touches)
+                ecrit = True
+        resultat = super().save(*args, **kwargs)
+        if ecrit:
+            # La photo suit ce qui est RÉELLEMENT en base : sans elle, une seconde
+            # écriture sur l'objet en mémoire ne saurait plus quel champ a bougé et
+            # écraserait silencieusement une saisie mensuelle par l'ancien annuel.
+            self._photographier_les_taux()
+        return resultat
+
+    @property
+    def monthly_rate_pct(self) -> Decimal:
+        """Taux MENSUEL de CALCUL — `annual_rate / 12` en pleine précision.
+
+        `rate` n'est que la projection arrondie à 6 décimales : amortir sur elle
+        ferait diverger l'échéancier payé de l'échéancier scoré dès que le douzième
+        du taux annuel n'est pas décimal fini (22,6 %/an → 1,88333…%/mois).
+        """
+        from . import rates
+
+        if self.annual_rate is not None:
+            return rates.mensuel_exact(self.annual_rate)
+        return Decimal(self.rate or 0)
 
     # --- Agrégats dérivés du journal ------------------------------------------
     @property

@@ -10,6 +10,7 @@ from django.test import SimpleTestCase, TestCase
 
 from common.testing import AuthedAPITestCase
 
+from . import rates
 from . import schedule as schedule_module
 from . import services
 from .models import Loan
@@ -437,3 +438,213 @@ class ScheduleForDecimalTests(TestCase):
         loan = self._loan(reference="CRD-2026-903", amount_approved=D("1000"))
         loan.transactions.create(kind="REPAYMENT", amount=D("-505"), currency="USD")
         self.assertEqual(loan.progress, 51)
+
+
+# =============================================================================
+# UNITÉ DU TAUX — le garde-fou du facteur 12.
+#
+# `Loan.rate` est MENSUEL, `credits/echeancier.py` raisonne en ANNUEL, et rien ne
+# le disait : un « 18 % » de dossier scoré reporté tel quel produisait un prêt à
+# 216 %/an, sans erreur, sans alerte, sans trace. Ces tests figent le refus.
+# =============================================================================
+
+TAUX_USURAIRE_MENSUEL = D("18")     # « 18 % » du dossier scoré, saisi en mensuel
+TAUX_ANNUEL_DOSSIER = D("18")       # le même 18, dans sa vraie unité
+
+
+class TauxUsuraireRefuseTests(TestCase):
+    """Un taux annuel saisi tel quel dans le champ mensuel ne passe JAMAIS."""
+
+    def _loan(self, **kwargs) -> Loan:
+        defaults = dict(
+            reference="CRD-2026-910", operator="Coopérative Test",
+            amount_approved=D("1330"), duration_months=8, currency="USD",
+        )
+        defaults.update(kwargs)
+        return Loan.objects.create(**defaults)
+
+    def test_le_modele_refuse_un_taux_mensuel_usuraire(self):
+        with self.assertRaises(rates.TauxMensuelImplausible) as ctx:
+            self._loan(rate=TAUX_USURAIRE_MENSUEL)
+        message = str(ctx.exception)
+        self.assertIn("MENSUEL", message)
+        self.assertIn("216", message)          # l'annualisation est dite en clair
+        self.assertIn("annualRate", message)   # et la voie correcte est donnée
+        self.assertFalse(Loan.objects.filter(reference="CRD-2026-910").exists())
+
+    def test_le_service_de_configuration_refuse_un_taux_mensuel_usuraire(self):
+        loan = self._loan(reference="CRD-2026-911", rate=D("1.5"))
+        with self.assertRaises(rates.TauxMensuelImplausible):
+            services.apply_config(loan, {"rate": "18"}, by="agent")
+        loan.refresh_from_db()
+        self.assertEqual(loan.rate, D("1.500000"))     # rien n'a bougé
+        self.assertEqual(loan.annual_rate, D("18.000"))
+
+    def test_la_creation_manuelle_refuse_un_taux_mensuel_usuraire(self):
+        with self.assertRaises(rates.TauxMensuelImplausible):
+            services.create_loan({"operator": "X", "amountApproved": "1000",
+                                  "rate": "18"}, by="agent")
+
+    def test_l_echeancier_usuraire_n_existe_pas(self):
+        """Preuve chiffrée de ce qui était produit avant : 12 × les intérêts."""
+        legitime = build_schedule(D("1330"), D("1.5"), 8, "monthly", DEBUT, "USD")
+        usuraire = build_schedule(D("1330"), D("18"), 8, "monthly", DEBUT, "USD")
+        self.assertEqual(schedule_totals(legitime, 8, "USD")["total_interest"], D("89.78"))
+        self.assertEqual(schedule_totals(usuraire, 8, "USD")["total_interest"], D("1077.32"))
+        # 1 077,32 d'intérêts sur 1 330 de capital en 8 mois : c'est ce qu'aucun
+        # contrôle n'empêchait d'enregistrer.
+        with self.assertRaises(rates.TauxMensuelImplausible):
+            self._loan(reference="CRD-2026-912", rate=D("18"))
+
+    def test_un_taux_annuel_est_accepte_dans_le_champ_annuel(self):
+        loan = services.create_loan({"operator": "X", "amountApproved": "1330",
+                                     "annualRate": "18", "duration": 8,
+                                     "startDate": DEBUT.isoformat()}, by="agent")
+        self.assertEqual(loan.annual_rate, D("18.000"))
+        self.assertEqual(loan.rate, D("1.500000"))
+        self.assertEqual(services.schedule_for(loan)["totals"]["total_interest"], D("89.78"))
+
+    def test_le_plafond_laisse_passer_toute_tarification_plausible(self):
+        """25 %/an — le haut de la grille AGRICAP — passe sans friction."""
+        loan = services.create_loan({"operator": "X", "amountApproved": "1000",
+                                     "annualRate": "25"}, by="agent")
+        self.assertEqual(loan.annual_rate, D("25.000"))
+        loan2 = services.create_loan({"operator": "Y", "amountApproved": "1000",
+                                      "rate": "2.5"}, by="agent")   # 30 %/an
+        self.assertEqual(loan2.annual_rate, D("30.000"))
+
+    def test_un_taux_negatif_est_refuse(self):
+        with self.assertRaises(rates.TauxInvalide):
+            self._loan(reference="CRD-2026-913", rate=D("-1"))
+
+    def test_les_deux_champs_ne_peuvent_pas_se_contredire(self):
+        loan = self._loan(reference="CRD-2026-914", annual_rate=D("22.6"))
+        self.assertEqual(loan.rate, D("1.883333"))      # projection d'affichage
+        loan.rate = D("3")                               # saisie mensuelle directe
+        loan.save()
+        loan.refresh_from_db()
+        self.assertEqual(loan.annual_rate, D("36.000"))  # l'annuel a suivi
+
+    def test_le_taux_annuel_pilote_le_calcul_en_pleine_precision(self):
+        """22,6 %/an : le douzième n'est pas décimal fini — l'échéancier PAYÉ doit
+        malgré tout tomber au centime sur l'échéancier SCORÉ."""
+        from credits.echeancier import construire_echeancier
+
+        loan = self._loan(reference="CRD-2026-915", annual_rate=D("22.6"),
+                          amount_approved=D("50000"), duration_months=36,
+                          start_date=DEBUT)
+        reel = services.schedule_for(loan)["schedule"]
+        prevu = construire_echeancier(D("50000"), D("22.6"), 36, 0)
+        self.assertEqual(len(reel), len(prevu))
+        for ligne_reelle, ligne_prevue in zip(reel, prevu):
+            self.assertEqual(ligne_reelle["interest"], ligne_prevue["interets"])
+            self.assertEqual(ligne_reelle["balance"], ligne_prevue["crd"])
+
+    def test_un_dossier_herite_reste_sauvegardable(self):
+        """Un taux déjà en base n'est pas requalifié rétroactivement : on ne bloque
+        pas la clôture d'un dossier existant, on bloque la SAISIE d'un nouveau."""
+        loan = self._loan(reference="CRD-2026-916", rate=D("1.5"))
+        Loan.objects.filter(pk=loan.pk).update(rate=D("18"), annual_rate=None)
+        herite = Loan.objects.get(pk=loan.pk)
+        herite.status = Loan.Status.CLOTURE
+        herite.save()                                    # ne lève pas
+        herite.refresh_from_db()
+        self.assertEqual(herite.status, Loan.Status.CLOTURE)
+        self.assertEqual(herite.annual_rate, D("216.000"))   # rendu VISIBLE
+
+
+class TauxRepriseDeLAnalyseTests(TestCase):
+    """Le taux ne se retape pas : il se recopie, dans son unité d'origine."""
+
+    def _application(self, *, taux_annuel=D("18"), taux_propose=None, duree=8):
+        """Dossier d'instruction minimal porteur d'une analyse.
+
+        L'`AnalyseCredit` réelle exige un lignage complet (`needs_source`,
+        `referentiel`) ; ce test n'a besoin que du contrat de lecture — un objet
+        qui porte les mêmes attributs le fournit sans dupliquer tout le module
+        `credits` (dont ce lot n'est pas propriétaire).
+        """
+        class _Analyse:
+            pk = 42
+            duree_mois = duree
+            differe_mois = 0
+            mode_differe = "interets_seuls"
+
+        analyse = _Analyse()
+        analyse.taux_annuel = taux_annuel
+        analyse.taux_propose = taux_propose
+
+        class _App:
+            code = "APP-2026-001"
+            status = "approved"
+            amount_requested = D("1500")
+            amount_approved = D("1330")
+            guarantee_type = "morale"
+            score_result = {"score": 72}
+            client = type("C", (), {"full_name": "Coopérative KIVU"})()
+            value_chain = type("V", (), {"label": "Maïs"})()
+            id = None
+
+        app = _App()
+        app._analyse = analyse
+        return app, analyse
+
+    def _patch(self, app, analyse):
+        """Branche `derniere_analyse` sur l'analyse du dossier factice."""
+        original = services.derniere_analyse
+        services.derniere_analyse = lambda a: analyse if a is app else None
+        self.addCleanup(lambda: setattr(services, "derniere_analyse", original))
+
+    def test_le_taux_annuel_de_l_analyse_est_recopie_en_annuel(self):
+        app, analyse = self._application(taux_annuel=D("18"))
+        self._patch(app, analyse)
+        taux, provenance, avertissement = services._taux_de_l_analyse(app)
+        self.assertEqual(taux, D("18"))
+        self.assertIn("taux d'analyse", provenance)
+        self.assertEqual(avertissement, "")
+
+    def test_le_taux_propose_prime_et_l_ecart_est_signale(self):
+        app, analyse = self._application(taux_annuel=D("18"), taux_propose=D("21"))
+        self._patch(app, analyse)
+        taux, provenance, avertissement = services._taux_de_l_analyse(app)
+        self.assertEqual(taux, D("21"))
+        self.assertIn("taux proposé", provenance)
+        self.assertIn("DSCR", avertissement)     # le dossier a été scoré à 18
+
+    def test_sans_analyse_aucun_taux_n_est_devine(self):
+        taux, provenance, avertissement = services._taux_de_l_analyse(None)
+        self.assertIsNone(taux)
+        self.assertEqual(provenance, "")
+
+    def test_le_report_du_taux_annuel_dans_le_champ_mensuel_est_reconnu(self):
+        """Le contrôle qui attrape AUSSI les petits taux : 7 %/an saisi 7 %/mois
+        (= 84 %/an) passerait sous n'importe quel plafond de plausibilité."""
+        with self.assertRaises(rates.TauxAnnuelSaisiCommeMensuel) as ctx:
+            rates.valider_taux_mensuel(D("7"), taux_annuel_dossier=D("7"))
+        message = str(ctx.exception)
+        self.assertIn("douze fois", message)
+        self.assertIn("0.583333", message)       # l'équivalent mensuel est donné
+
+    def test_le_meme_taux_dans_la_bonne_unite_passe(self):
+        self.assertEqual(
+            rates.valider_taux_mensuel(D("0.583333"), taux_annuel_dossier=D("7")),
+            D("0.583333"))
+
+
+class ConversionTauxTests(SimpleTestCase):
+    """Les conversions, isolées : c'est le seul endroit où le 12 a le droit d'exister."""
+
+    def test_mensuel_exact_ne_quantize_pas(self):
+        self.assertEqual(rates.mensuel_exact(D("22.6")) * D("12"), D("22.6"))
+        self.assertEqual(rates.mensuel_exact(D("18")), D("1.5"))
+
+    def test_aller_retour_stable_sur_un_taux_mensuel_a_six_decimales(self):
+        for mensuel in (D("1.5"), D("0.75"), D("2.083333"), D("0")):
+            with self.subTest(mensuel=mensuel):
+                annuel = rates.annuel_depuis_mensuel(mensuel)
+                self.assertEqual(rates.mensuel_stocke(annuel), rates.q6(mensuel))
+
+    def test_les_conversions_ne_passent_jamais_par_un_float(self):
+        source = inspect.getsource(rates)
+        fautes = _sources_interdites(ast.parse(source))
+        self.assertEqual(fautes, [], f"portfolio/rates.py : {fautes}")

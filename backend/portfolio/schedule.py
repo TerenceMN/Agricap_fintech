@@ -22,8 +22,12 @@ Règles non négociables (principe 4), alignées mot pour mot sur `credits/echea
 
 Écarts de MÉTHODE assumés avec `credits/echeancier.py` (faits à connaître, pas des
 bugs d'arrondi — ils sont remontés au fondateur, pas masqués ici) :
-  1. unité du taux : MENSUEL ici (`Loan.rate`), ANNUEL dans le prévisionnel ;
-     à échéancier identique il faut `Loan.rate = taux_annuel / 12` ;
+  1. RÉSOLU (cf. `portfolio/rates.py`) — l'unité du taux était MENSUELLE ici et
+     ANNUELLE dans le prévisionnel, sans que rien ne le dise : `Loan` porte désormais
+     les deux champs (`rate` mensuel, `annual_rate` annuel), maintenus cohérents à
+     l'écriture, un taux mensuel implausible est refusé, et `services.schedule_for`
+     transmet `annual_rate / 12` en pleine précision. Ce module reste, lui, en
+     taux MENSUEL : c'est son unité d'entrée, et elle est nommée dans la signature ;
   2. le prévisionnel gère un DIFFÉRÉ (intérêts seuls / franchise totale) ; ce module
      n'en a aucun — un dossier scoré avec 5 mois de différé est remboursé sans
      différé une fois décaissé ;

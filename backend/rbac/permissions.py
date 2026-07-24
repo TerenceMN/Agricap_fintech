@@ -59,13 +59,13 @@ def CapaciteSelonMethode(**par_methode: str):
     la matrice explicite sur le décorateur, plutôt que dans un `if request.method` du
     corps, applique « toute vue sans permission explicite est un bug » (CLAUDE.md §5).
 
-    Dette croisée à résorber : `accounting.permissions.CapaciteSelonMethode` est une
-    définition JUMELLE, écrite avant celle-ci pour le seul socle comptable. Deux
-    implémentations du même concept = principe 6 en défaut. `rbac` est la bonne maison
-    (aucune app ne doit dépendre de `accounting` pour un garde générique) ; la ligne à
-    écrire côté comptable est un simple ré-export :
-    `from rbac.permissions import CapaciteSelonMethode`. Non fait ici : `accounting/`
-    appartient à un autre lot.
+    **Définition faisant autorité** (principe 6, dette résorbée). Le mécanisme a existé en
+    trois exemplaires : ici, dans `accounting.permissions.CapaciteSelonMethode` (jumeau mot
+    pour mot, écrit d'abord pour le seul socle comptable) et dans
+    `fx.permissions.CapabilityByMethod` (même chose sous une signature safe/unsafe). `rbac`
+    est la bonne maison — aucune app ne doit dépendre de `accounting` pour un garde
+    générique. Les deux autres ne sont plus qu'un ré-export et un adaptateur pointant ici ;
+    toute évolution de la règle se fait donc dans cette fonction et nulle part ailleurs.
     """
     table = {methode.upper(): capacite for methode, capacite in par_methode.items()}
 
