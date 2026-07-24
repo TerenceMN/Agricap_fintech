@@ -11,9 +11,30 @@ import {
 import { PROJECT_STATUS_LABELS } from '@/components/admin-console/AgricapComponents';
 import { formatCurrency } from '@/lib/investorSpaceUtils';
 import { api } from '@/services/api';
+import {
+  asPortfolioMetrics, buildInstitutionCards, scopeNote,
+} from '@/lib/adminInvestmentMetrics';
 
+/**
+ * « Taux de Défaut » valait ici `projets P12 ÷ nombre de projets`, tandis que
+ * `admin-console/AdminDashboard` affichait sous le MÊME libellé
+ * `montant DEFAULTED ÷ montant investi`. Deux définitions du même mot, sur deux
+ * écrans du même back-office, toutes deux calculées en React.
+ *
+ * Le serveur sert LES DEUX taux (`defaultRates.byValue` et `.byCount`), chacun
+ * avec sa base, et son commentaire dit pourquoi il refuse d'en choisir un :
+ * « Un seul projet en défaut sur trente pèse peu en nombre et peut peser
+ * énormément en valeur ». Les deux dashboards lisent désormais la même fonction,
+ * `lib/adminInvestmentMetrics.ts`.
+ *
+ * « Coupon moyen » (`Σ couponRate ÷ offres`) disparaît avec lui : moyenne non
+ * pondérée de promesses, il est remplacé par le `weightedIrr` servi — un TRI sur
+ * les flux datés réels. Le coupon moyen PONDÉRÉ n'est pas servi à l'échelle
+ * institution : c'est `AVERAGE_COUPON_GAP`, pas un calcul à refaire ici.
+ */
 const AdminInvestmentDashboard = ({ projects, offers, investors, subscriptions, onNavigateTab }) => {
   const [metrics, setMetrics] = useState(null);
+  const [portfolio, setPortfolio] = useState(null);
   const [recentActivity, setRecentActivity] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -22,9 +43,11 @@ const AdminInvestmentDashboard = ({ projects, offers, investors, subscriptions, 
     Promise.all([
       api.investments.dashboardMetrics(),
       api.audit.entries().catch(() => []),
-    ]).then(([dashboardMetrics, entries]) => {
+      api.investments.metrics.portfolio().catch(() => null),
+    ]).then(([dashboardMetrics, entries, portfolioMetrics]) => {
       setMetrics(dashboardMetrics);
       setRecentActivity(entries.slice(0, 10));
+      setPortfolio(asPortfolioMetrics(portfolioMetrics));
     }).finally(() => setLoading(false));
   }, []);
 
@@ -40,12 +63,10 @@ const AdminInvestmentDashboard = ({ projects, offers, investors, subscriptions, 
   const totalTarget = projects.reduce((sum, p) => sum + (p.fundingTarget || 0), 0);
   const fundedPercentage = totalTarget > 0 ? (metrics.totalInvested / totalTarget) * 100 : 0;
 
-  const defaultedProjects = projects.filter(p => p.status === 'P12').length;
-  const defaultRate = projects.length > 0 ? (defaultedProjects / projects.length) * 100 : 0;
-
-  const avgReturn = offers.length > 0
-    ? offers.reduce((sum, o) => sum + (o.couponRate || 0), 0) / offers.length
-    : 0;
+  // `defaultRate` et `avgReturn`, calculés ici, ont été supprimés : ils sont
+  // servis (`defaultRates.byValue` / `.byCount`, `weightedIrr`) et lus par le
+  // module partagé avec l'autre back-office.
+  const mesures = buildInstitutionCards(portfolio);
 
   const distMap = {};
   projects.forEach(p => { distMap[p.status] = (distMap[p.status] || 0) + 1; });
@@ -95,14 +116,48 @@ const AdminInvestmentDashboard = ({ projects, offers, investors, subscriptions, 
         <Card className="bg-slate-900 border-slate-800">
           <CardContent className="p-6">
             <div className="flex items-center justify-between mb-4">
-              <div className="p-3 bg-red-500/20 rounded-lg"><AlertTriangle className="w-6 h-6 text-red-400"/></div>
-              <span className="text-xs font-bold text-slate-400">Coupon moyen : {avgReturn.toFixed(1)}%</span>
+              <div className="p-3 bg-slate-500/20 rounded-lg"><Clock className="w-6 h-6 text-slate-400"/></div>
             </div>
-            <p className="text-sm text-slate-400">Taux de Défaut</p>
-            <h3 className="text-3xl font-bold text-white">{defaultRate.toFixed(1)}%</h3>
+            <p className="text-sm text-slate-400">Souscriptions financées</p>
+            <h3 className="text-3xl font-bold text-white">{portfolio?.subscriptionsCount ?? '—'}</h3>
           </CardContent>
         </Card>
       </div>
+
+      {/* Mesures INSTITUTION servies — les deux taux de défaut ET le TRI pondéré,
+          chacun avec sa base et sa définition. Aucun n'est calculé ici. */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {mesures.map((m) => (
+          <Card key={m.key} className={`bg-slate-900 ${m.alert ? 'border-amber-500/50' : 'border-slate-800'}`}>
+            <CardContent className="p-6">
+              <div className="flex items-center justify-between mb-3">
+                <div className={`p-2 rounded-lg ${m.alert ? 'bg-amber-500/20' : 'bg-slate-500/20'}`}>
+                  {m.key === 'weightedIrr'
+                    ? <TrendingUp className={`w-5 h-5 ${m.alert ? 'text-amber-400' : 'text-emerald-400'}`}/>
+                    : <AlertTriangle className={`w-5 h-5 ${m.alert ? 'text-amber-400' : 'text-slate-400'}`}/>}
+                </div>
+                {m.alert && <span className="text-[10px] font-bold text-amber-400 uppercase">Seuil serveur dépassé</span>}
+              </div>
+              <p className="text-sm text-slate-400">{m.label}</p>
+              {m.value === null ? (
+                <>
+                  <h3 className="text-lg font-semibold text-slate-500">Non disponible</h3>
+                  <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">{m.unavailableReason}</p>
+                </>
+              ) : (
+                <>
+                  <h3 className="text-3xl font-bold text-white">{m.value}</h3>
+                  <p className="text-xs text-slate-400 mt-1">{m.basis}</p>
+                </>
+              )}
+              <p className="text-[11px] text-slate-500 mt-2 pt-2 border-t border-slate-800 leading-relaxed">
+                {m.definition}
+              </p>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+      <p className="text-[11px] text-slate-500">{scopeNote(portfolio)}</p>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Pipeline Chart */}
