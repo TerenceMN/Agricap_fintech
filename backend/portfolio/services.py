@@ -6,7 +6,7 @@ de statut (actions du menu), et agrégats du tableau de bord (résumé + alertes
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from django.db import transaction
 from django.utils import timezone
@@ -29,9 +29,14 @@ def _dec(value, default="0") -> Decimal:
 
 
 def _int(value, default=0) -> int:
+    """Entier tolérant (« 12 », « 12,0 ») — SANS passer par `float`.
+
+    `int(float("12.0"))` marchait, mais faisait transiter par un binaire flottant une
+    durée qui détermine le nombre d'échéances du client (principe 4).
+    """
     try:
-        return int(float(str(value).replace(",", ".")))
-    except (TypeError, ValueError):
+        return int(Decimal(str(value).replace(",", ".").replace(" ", "")))
+    except (TypeError, ValueError, InvalidOperation):
         return default
 
 
@@ -340,10 +345,17 @@ def apply_config(loan: Loan, data: dict, *, by: str = "", action: str = "Modific
 
 
 def schedule_for(loan: Loan) -> dict:
-    principal = float(loan.amount_approved or loan.amount_requested or 0)
+    """Échéancier réel du dossier — 100 % `Decimal` de bout en bout (principe 4).
+
+    Les champs du modèle sont déjà des `DecimalField` : on les transmet TELS QUELS,
+    sans passer par `float()`. `build_schedule` refuse d'ailleurs un `float`, ce qui
+    verrouille le chemin par une erreur bruyante plutôt que par un centime silencieux.
+    """
+    principal = loan.amount_approved or loan.amount_requested or Decimal("0")
+    duree = int(loan.duration_months or 0)
     start = loan.start_date or loan.date or timezone.localdate()
-    rows = build_schedule(principal, float(loan.rate), int(loan.duration_months), loan.frequency, start)
-    return {"schedule": rows, "totals": schedule_totals(rows, int(loan.duration_months)),
+    rows = build_schedule(principal, loan.rate, duree, loan.frequency, start, loan.currency)
+    return {"schedule": rows, "totals": schedule_totals(rows, duree, loan.currency),
             "currency": loan.currency}
 
 
@@ -487,14 +499,19 @@ def summary() -> list[dict]:
     qs = Loan.objects.all()
     total = qs.count()
     approved = qs.filter(status__in=[Loan.Status.APPROUVE, Loan.Status.EN_COURS])
-    disbursed_total = sum(float(l.disbursed) for l in qs)
-    outstanding_total = sum(float(l.outstanding) for l in qs)
+    # Agrégats monétaires en `Decimal` : un cumul de portefeuille en `float` dérive
+    # d'autant plus qu'il y a de dossiers (principe 4).
+    disbursed_total = sum((l.disbursed for l in qs), Decimal("0"))
+    outstanding_total = sum((l.outstanding for l in qs), Decimal("0"))
     en_defaut = qs.filter(status=Loan.Status.DEFAUT).count()
     en_traitement = qs.filter(status=Loan.Status.EN_TRAITEMENT).count()
     clotures = qs.filter(status=Loan.Status.CLOTURE).count()
 
-    def money(v):
-        return f"${v:,.0f}".replace(",", " ")
+    def money(v: Decimal) -> str:
+        # Arrondi d'AFFICHAGE explicite : le formatage `Decimal` par défaut applique
+        # l'arrondi bancaire du contexte, pas la règle du centime du module.
+        entier = Decimal(v).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return f"${entier:,}".replace(",", " ")
 
     return [
         {"title": "Dossiers", "value": str(total), "icon": "BarChart"},

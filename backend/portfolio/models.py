@@ -9,7 +9,7 @@ mais reste autonome : un dossier peut être saisi manuellement (« Ajouter »).
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.db import models
 from django.utils import timezone
@@ -104,11 +104,18 @@ class Loan(models.Model):
 
     @property
     def progress(self) -> int:
-        """Progression de remboursement (%) sur le montant approuvé."""
+        """Progression de remboursement (%) sur le montant approuvé.
+
+        En `Decimal` avec `ROUND_HALF_UP` (principe 4) : `round()` sur un `float`
+        faisait de l'arrondi bancaire — 50,5 % s'affichait 50 % et 51,5 % s'affichait
+        52 %, deux dossiers à mi-parcours ne se lisant pas de la même façon.
+        """
         base = self.amount_approved or self.amount_requested
         if not base:
             return 0
-        return max(0, min(100, round(float(self.repaid) / float(base) * 100)))
+        pourcent = (self.repaid / base * Decimal("100")).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP)
+        return max(0, min(100, int(pourcent)))
 
 
 class LoanTransaction(models.Model):
