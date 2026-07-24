@@ -252,7 +252,10 @@ def _echeancier_du_credit(loan, anomalies: list[str]) -> list[dict]:
     paramètres du prêt : c'est la seule façon d'être certain que la provision est calculée
     sur le MÊME échéancier que celui affiché au client et opposé au dossier. Reconstituer
     les arguments à l'identique aurait suffi aujourd'hui, et aurait divergé au premier
-    paramètre ajouté au contrat de prêt (le différé vient d'en être la démonstration).
+    paramètre ajouté au contrat de prêt (le différé vient d'en être la démonstration ; la
+    bascule de la base amortie du montant APPROUVÉ vers le total DÉCAISSÉ VALIDÉ, arrivée
+    dans la foulée, en est la seconde — l'ancienne anomalie « approuvé ≠ décaissé » que ce
+    module signalait n'a plus d'objet, les deux parlent désormais du même argent).
 
     Un échéancier inexploitable (paramètres refusés par `portfolio`) devient une ANOMALIE
     remontée dans le rapport, pas une exception : un dossier mal configuré ne doit pas
@@ -261,7 +264,7 @@ def _echeancier_du_credit(loan, anomalies: list[str]) -> list[dict]:
     from portfolio.services import schedule_for
 
     try:
-        return _traduire(schedule_for(loan)["schedule"])
+        reponse = schedule_for(loan)
     except Exception as exc:  # noqa: BLE001 - un refus de `portfolio` est une DONNÉE
         anomalies.append(
             f"Échéancier refusé par le portefeuille ({type(exc).__name__} : {exc}) — "
@@ -269,6 +272,18 @@ def _echeancier_du_credit(loan, anomalies: list[str]) -> list[dict]:
             "prêt est à corriger à la source."
         )
         return []
+
+    # Les anomalies du portefeuille (décaissements étalés, date d'effet déduite…) sont
+    # REPRISES telles quelles : elles expliquent l'échéancier sur lequel la provision est
+    # calculée, et un auditeur doit les lire au même endroit que le chiffre.
+    anomalies.extend(reponse.get("anomalies") or [])
+    if reponse.get("principalSource") == "montant_approuve":
+        anomalies.append(
+            "Échéancier PRÉVISIONNEL : aucun décaissement validé, l'amortissement porte sur "
+            "le montant approuvé. Les jours de retard sont ceux d'un calendrier qui n'est "
+            "pas encore contractuel."
+        )
+    return _traduire(reponse["schedule"])
 
 
 def analyser_credit(loan, *, as_of: date_cls, classes: list[ClasseRisque]) -> dict | None:
@@ -289,14 +304,6 @@ def analyser_credit(loan, *, as_of: date_cls, classes: list[ClasseRisque]) -> di
         anomalies.append(
             f"Devise « {loan.currency} » inconnue du plan comptable — rattachée à FC par "
             "défaut ; à corriger à la source."
-        )
-
-    base = services.q2(loan.amount_approved or loan.amount_requested or decaisse)
-    if base != decaisse:
-        anomalies.append(
-            f"Montant approuvé ({base}) ≠ décaissé validé ({decaisse}) : l'échéancier est "
-            "construit sur le montant approuvé (même base que `portfolio`), l'exposition "
-            "sur le décaissé."
         )
 
     signalees = len(anomalies)
