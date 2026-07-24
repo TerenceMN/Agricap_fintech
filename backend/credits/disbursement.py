@@ -197,6 +197,16 @@ def confirm_disbursement(
     # ── 2. Portfolio.Loan ─────────────────────────────────────────────────
     loan = _create_portfolio_loan(app, amount, currency, disbursed_date, confirmer_sub)
 
+    # ── 2 bis. Événement comptable B1 ─────────────────────────────────────
+    # DANS la transaction du décaissement : un franc sorti sans son événement
+    # serait un encours invisible au grand livre (413 muet), et le
+    # provisionnement refuserait ensuite de déclasser un encours qu'il ne voit
+    # pas. L'événement naît donc avec le prêt, ou aucun des deux n'existe.
+    credit_event = _emit_disbursement_event(
+        app=app, loan=loan, amount=amount, currency=currency,
+        occurred_at=disbursed_at, by=confirmer_sub,
+    )
+
     # ── 3. ModuleAllocations ──────────────────────────────────────────────
     allocations = _create_module_allocations(app, amount)
 
@@ -227,6 +237,7 @@ def confirm_disbursement(
         demandePar=dr.requested_by_sub, confirmePar=confirmer_sub,
         loanReference=loan.reference,
         journalEntryId=(journal_entry.pk if journal_entry else None),
+        creditEventId=(credit_event.pk if credit_event else None),
     )
 
     # ── 7. SMS client ─────────────────────────────────────────────────────
@@ -243,6 +254,7 @@ def confirm_disbursement(
         "disbursedAt": disbursed_at.isoformat(),
         "loanReference": loan.reference,
         "journalEntryId": journal_entry.pk if journal_entry else None,
+        "creditEventId": credit_event.pk if credit_event else None,
         "moduleAllocations": allocations,
         "supplierInstructions": supplier_instructions,
     }
@@ -305,6 +317,40 @@ def _post_disbursement_entry(app, amount: Decimal, currency: str, date, by: str)
             f"Écriture comptable décaissement {app.code} échouée : {exc}"
         )
         return None
+
+
+def _emit_disbursement_event(*, app, loan, amount: Decimal, currency: str, occurred_at, by: str):
+    """Écrit le décaissement dans la file comptable du crédit (annexe B1).
+
+    À la différence de `_post_disbursement_entry` — qui pousse une écriture dans
+    l'app `ledger` sur des comptes (4121/5211) absents du plan comptable de
+    l'annexe A, et l'avale en cas d'échec — cette émission est NON best-effort :
+    elle vit dans la transaction du décaissement. La file est un fait métier, pas
+    un canal secondaire ; si elle échoue, le décaissement n'a pas lieu.
+
+    DETTE CROISÉE SIGNALÉE (rapport) : deux comptabilités cohabitent — `ledger`
+    (4121/5211, SYSCOHADA large, alimenté ici) et `accounting` (413/501/511,
+    annexe A, alimenté par cette file). Elles ne doivent pas être consolidées
+    ensemble sans arbitrage, sous peine de compter deux fois chaque
+    décaissement. L'arbitrage appartient au fondateur ; le signaler vaut mieux
+    que de débrancher unilatéralement un journal existant.
+    """
+    from credits.events import emettre_decaissement
+
+    return emettre_decaissement(
+        app,
+        amount=amount,
+        currency=currency,
+        # Même référence d'acte que la pièce `ledger` : un auditeur rapproche les
+        # deux journaux sans table de correspondance.
+        reference=f"DEC-{app.code}",
+        loan_id=loan.pk,
+        loan_reference=loan.reference,
+        occurred_at=occurred_at,
+        actor_sub=by,
+        applicationCode=app.code,
+        valueChain=(app.value_chain.code if app.value_chain_id else ""),
+    )
 
 
 def _create_portfolio_loan(app, amount: Decimal, currency: str, disbursed_date, by: str):

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import copy
 import uuid
+from decimal import Decimal
 
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 
 
@@ -1275,3 +1277,149 @@ class GuaranteeProposal(models.Model):
     def is_open(self) -> bool:
         """Proposition en attente d'une décision d'agent — celles que le quota compte."""
         return self.status == self.Status.PROPOSED
+
+
+# ── File d'événements comptables du crédit (annexe B, B1→B4) ──────────────────
+
+class ImmutableCreditEvent(Exception):
+    """Tentative de réécriture d'un événement comptable déjà émis (principe 3)."""
+
+
+class CreditEvent(models.Model):
+    """Événement métier append-only — le SEUL contrat entre `credits` et la
+    comptabilité (`accounting`).
+
+    Constat à l'origine de ce modèle : la comptabilité consommait déjà les
+    `investments.InvestmentEvent` (B10→B13) mais restait **aveugle au métier
+    principal**. B1→B4 — décaissement, remboursement de capital, intérêts,
+    commission — n'avaient AUCUN producteur : le compte 413 ne bougeait jamais,
+    `provisions._declasser` refusait de déclasser faute d'encours au grand livre,
+    et l'encours comptable divergeait de `portfolio`.
+
+    Ce module ne passe aucune écriture. Il DÉCLARE qu'un fait s'est produit —
+    avec son type, son montant `Decimal`, sa devise, sa référence d'acte et sa
+    date — et laisse la comptabilité décider ce qu'elle en écrit. Aucun
+    consommateur n'est requis pour que le crédit fonctionne : l'événement est
+    produit, qu'il soit lu ou non.
+
+    Trois règles de forme, qui sont le contrat :
+
+    1. **Un fait = un événement, un montant.** Une échéance encaissée produit
+       DEUX événements (capital B2, intérêts B3), jamais un « remboursement »
+       global : les schémas B2 et B3 ne mouvementent ni les mêmes comptes ni les
+       mêmes classes, et la ventilation capital / intérêts ne se devine pas
+       depuis un total. Le consommateur refuse (à juste titre) de la deviner.
+
+    2. **`consumed_at` et `journal_reference` appartiennent à la comptabilité.**
+       Ce module ne les écrit jamais ; ils sont exclus de l'immuabilité pour
+       cette seule raison.
+
+    3. **`reference` identifie l'ACTE métier**, pas l'événement : elle rend
+       l'émission idempotente (contrainte d'unicité par type). Un décaissement
+       rejoué ne crée pas un second événement — donc pas une seconde écriture.
+    """
+
+    class Type(models.TextChoices):
+        #: B1 — décaissement : 413[DEV] → 501/511/53x[DEV], montant = capital.
+        DISBURSED = "CREDIT_DISBURSED", "Décaissement de crédit (B1)"
+        #: B2 — quote-part CAPITAL d'une échéance : 501/53x[DEV] → 413[DEV].
+        PRINCIPAL_REPAID = "CREDIT_PRINCIPAL_REPAID", "Remboursement — capital (B2)"
+        #: B3 — quote-part INTÉRÊTS d'une échéance : 501/53x[DEV] → 701[DEV].
+        INTEREST_COLLECTED = "CREDIT_INTEREST_COLLECTED", "Remboursement — intérêts (B3)"
+        #: B4 — commission de dossier ou de service : 501/53x[DEV] → 702[DEV].
+        COMMISSION_COLLECTED = "CREDIT_COMMISSION_COLLECTED", "Commission (B4)"
+
+    event_type = models.CharField(max_length=40, choices=Type.choices, db_index=True)
+
+    #: Dossier d'instruction. PROTECT — un dossier dont un franc est entré au
+    #: grand livre ne s'efface pas (principe 3).
+    application = models.ForeignKey(
+        CreditApplication, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="accounting_events",
+    )
+    #: Prêt du portefeuille, désigné par sa clé et sa référence humaine plutôt
+    #: que par une `ForeignKey` : `credits` ne dépend pas du schéma de
+    #: `portfolio` (même parti pris que `DisbursementRequest.loan_id`), et
+    #: `portfolio` peut émettre ses remboursements sans que `credits` ait à
+    #: connaître la forme de ses tables.
+    loan_id = models.IntegerField(null=True, blank=True, db_index=True)
+    loan_reference = models.CharField(max_length=64, blank=True, db_index=True)
+
+    #: Référence de l'ACTE métier (« DEC-CRED-… », « ECH-PRT-…-03 »). Unique par
+    #: type d'événement : c'est le verrou d'idempotence de l'émission.
+    reference = models.CharField(max_length=64, blank=True, db_index=True)
+
+    amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    currency = models.CharField(max_length=3, default="USD")
+    occurred_at = models.DateTimeField(db_index=True)
+    actor_sub = models.CharField(max_length=255, blank=True)
+
+    #: Contexte non comptable de l'événement (code dossier, n° d'échéance, canal
+    #: d'encaissement, compte de trésorerie réel…). Le consommateur y lit
+    #: `compteTresorerie` quand l'acte connaît sa caisse ; sinon la règle en base
+    #: tranche. Il n'y a JAMAIS de ventilation à y chercher (cf. règle 1).
+    payload = models.JSONField(default=dict, blank=True)
+
+    #: Renseignés par le consommateur comptable — jamais par ce module.
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    journal_reference = models.CharField(max_length=64, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["occurred_at", "id"]
+        indexes = [
+            models.Index(fields=["event_type", "occurred_at"]),
+            models.Index(fields=["consumed_at"]),
+        ]
+        constraints = [
+            # Idempotence de l'émission : deux appels pour le MÊME acte métier
+            # ne produisent qu'un événement, donc qu'une écriture. La condition
+            # laisse passer les références vides (reprises historiques) plutôt
+            # que de les faire toutes entrer en collision.
+            models.UniqueConstraint(
+                fields=["event_type", "reference"],
+                condition=~Q(reference=""),
+                name="credits_un_evenement_par_acte",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.event_type} {self.amount} {self.currency}"
+
+    # ── Immuabilité (principe 3) ─────────────────────────────────────────────
+
+    #: Les deux seuls champs qu'un événement émis accepte de voir évoluer — et
+    #: ils appartiennent au consommateur comptable, pas à ce module.
+    MUTABLE_FIELDS = ("consumed_at", "journal_reference")
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._db_snapshot = {
+            name: copy.deepcopy(getattr(instance, name))
+            for name in field_names
+            if name not in cls.MUTABLE_FIELDS and name != "id"
+        }
+        return instance
+
+    def save(self, *args, **kwargs):
+        snapshot = getattr(self, "_db_snapshot", None)
+        if snapshot is not None:
+            modifies = [
+                name for name, ancien in snapshot.items()
+                if getattr(self, name) != ancien
+            ]
+            if modifies:
+                raise ImmutableCreditEvent(
+                    "Un événement comptable est immuable : il décrit un fait qui "
+                    "a eu lieu. Si le fait était faux, on en émet la "
+                    "contrepassation — on ne le réécrit pas. Champs modifiés : "
+                    f"{', '.join(sorted(modifies))}."
+                )
+        super().save(*args, **kwargs)
+        self._db_snapshot = {
+            f.attname: copy.deepcopy(getattr(self, f.attname))
+            for f in self._meta.concrete_fields
+            if f.attname not in self.MUTABLE_FIELDS and f.attname != "id"
+        }
