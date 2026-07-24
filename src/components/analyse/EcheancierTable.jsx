@@ -79,8 +79,13 @@ const EcheancierTable = ({ lignes = [], currency = '', totaux = null }) => {
               {formatMontant(totaux.totalCapital, currency)}
             </p>
           </div>
+          {/* « Coût du crédit » était un libellé trop fort pour la valeur servie :
+              `totalInterets` ne porte QUE les intérêts. Les commissions ne sont pas
+              au contrat du moteur (cf. en-tête), donc ce chiffre ne peut pas prétendre
+              au coût total supporté par l'emprunteur. Le libellé dit maintenant ce
+              qu'il additionne, et l'écran nomme ce qui manque. */}
           <div className="bg-slate-900/50 rounded-lg p-3">
-            <p className="text-[11px] uppercase tracking-wide text-slate-500">Coût du crédit</p>
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">Intérêts totaux</p>
             <p className="font-bold text-amber-300 text-sm mt-0.5">
               {formatMontant(totaux.totalInterets, currency)}
             </p>
@@ -90,6 +95,9 @@ const EcheancierTable = ({ lignes = [], currency = '', totaux = null }) => {
                 dont {formatMontant(totaux.totalInteretsCapitalises, currency)} capitalisés
               </p>
             )}
+            <p className="text-[11px] text-slate-500 mt-1">
+              hors commissions et frais de dossier
+            </p>
           </div>
           <div className="bg-slate-900/50 rounded-lg p-3">
             <p className="text-[11px] uppercase tracking-wide text-slate-500">Service de la dette</p>
