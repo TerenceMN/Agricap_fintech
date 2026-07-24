@@ -82,10 +82,33 @@ tu le dis et tu proposes une alternative conforme.
    TOUTES les erreurs de l'étape courante ; réponse 422 structurée `{code, message}` par erreur,
    jamais un message générique.
 
-6. **Une seule nomenclature par concept.** Le projet a souffert de vocabulaires parallèles
-   (4 jeux de rôles, 2 nomenclatures de filières, 2 jeux de types de garanties). Règle : le
-   backend définit les codes canoniques ; le front mappe pour l'affichage ; tout nouveau code
-   rejoint le référentiel existant ou n'existe pas. Avant de créer un enum, cherche s'il existe.
+6. **Une seule nomenclature par concept — et une seule IMPLÉMENTATION.** Le projet a souffert
+   de vocabulaires parallèles (4 jeux de rôles, 2 nomenclatures de filières, 2 jeux de types de
+   garanties). Règle : le backend définit les codes canoniques ; le front mappe pour l'affichage ;
+   tout nouveau code rejoint le référentiel existant ou n'existe pas. Avant de créer un enum,
+   cherche s'il existe.
+
+   **Corollaire non négociable — le code validé et fonctionnel ne se réécrit pas, il se
+   consomme.** Une fonctionnalité qui existe, qui passe ses tests et qui sert en production est
+   **figée** : toute fonctionnalité nouvelle l'APPELLE, elle ne la remplace pas, ne la duplique
+   pas, ne la renomme pas. **Cette règle prime sur le prompt en cours** : si une demande décrit
+   une implémentation d'un mécanisme qui existe déjà — même sous un autre nom, même avec une
+   signature différente — tu réutilises l'existant et tu le dis, au lieu d'en créer une seconde.
+
+   Exemple : le taux de change est implémenté et fonctionnel. Une demande ultérieure qui
+   propose « une fonction de conversion » sous un autre nom ne crée rien : elle branche le
+   nouveau besoin sur la fonction de change existante. Idem pour l'échéancier, le débit de
+   portefeuille, le dépliage d'erreurs, les gardes de permission, le formatage des montants.
+
+   Coût réel constaté sur ce projet : une **4ᵉ** implémentation d'échéancier, **trois** jumeaux
+   d'un même garde de permission, **deux** nomenclatures de canal — chacune ajoutant un endroit
+   où corriger un bug, et un endroit où l'oublier. Une réimplémentation ne se remarque pas
+   quand elle est écrite ; elle se paie quand les deux versions divergent.
+
+   Deux exceptions, et elles se **déclarent** : (a) l'existant est prouvé défectueux — alors on
+   le CORRIGE à sa place, on ne le double pas ; (b) le nouveau besoin est réellement un concept
+   distinct — alors tu l'expliques avant d'écrire. Dans le doute, réutiliser et signaler la
+   gêne vaut mieux que dupliquer et se taire.
 
 7. **Anti-gaming par asymétrie d'information.** Le client voit son score, sa lettre, des pistes
    d'amélioration. Il ne voit JAMAIS : les barèmes, les seuils, les tolérances par module, les
