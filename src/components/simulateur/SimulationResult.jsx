@@ -27,9 +27,15 @@
  */
 import React from 'react';
 import { motion } from 'framer-motion';
-import { Lock } from 'lucide-react';
+import { AlertTriangle, Building2, CheckCircle2, Info, Lock } from 'lucide-react';
 import { formatMontant } from '@/components/guarantees/format';
+// Blocs d'état déjà en service ailleurs (backoffice, instruction) : on les
+// APPELLE plutôt que d'en écrire une variante. `toFieldErrors` déplie en prime
+// un 422 structuré en une erreur par cause (principe 5), ce qu'une simple
+// chaîne d'erreur ne saurait pas faire.
+import { Empty, ErrorPanel, Loading, toFieldErrors } from '@/components/backoffice/States';
 import { moduleConfig } from './modules';
+import { construireRapport, syntheseNonEvalues } from './rapportCriteres';
 
 /**
  * Grille de classement du score — **une seule échelle** pour ce module.
@@ -97,6 +103,20 @@ export const DonutChartScore = ({ score }) => {
   );
 };
 
+/** Cadre commun du panneau — mêmes bordures pour le rapport, l'attente, l'erreur
+ *  et le vide : un état dégradé qui change de forme se lit comme un bug. */
+const CadreCriteres = ({ children }) => (
+  <div className="glass-effect p-5 rounded-2xl space-y-3">
+    <div className="flex items-baseline justify-between gap-3 flex-wrap">
+      <h4 className="font-bold text-white">Ce que votre dossier fait examiner</h4>
+      <span className="text-xs text-gray-500 flex items-center gap-1">
+        <Lock className="w-3 h-3" aria-hidden="true" /> détail du calcul réservé à l'analyste
+      </span>
+    </div>
+    {children}
+  </div>
+);
+
 /**
  * Critères examinés — restitution CLIENT (principe 7, anti-gaming).
  *
@@ -112,48 +132,181 @@ export const DonutChartScore = ({ score }) => {
  * rentable. Le détail chiffré vit désormais sur `/credit/dossiers/<code>/scoring`,
  * réservé au personnel.
  *
- * CE QUI RESTE, et qui est légitime : la LISTE des critères examinés. Savoir que
- * son dossier est jugé sur la cohérence technique, la capacité de remboursement,
- * la résilience, l'historique et les garanties aide le demandeur à préparer son
- * dossier ; cela ne lui dit ni combien vaut chaque critère, ni où se trouve la
- * barre. Un critère non calculable est signalé, parce que c'est actionnable.
+ * CE QUI A ÉTÉ AJOUTÉ, ET POURQUOI. Ce panneau se contentait auparavant de
+ * marquer « — non évalué à ce stade » puis concluait : « votre agent AGRICAP
+ * peut vous dire ce qui manque ». Il CONSTATAIT un vide et s'en déchargeait sur
+ * un humain, sans jamais nommer ce qui manquait — le demandeur ne savait ni
+ * quoi corriger, ni quoi fournir. Chaque critère porte désormais son rapport
+ * (`rapportCriteres.construireRapport`) : évalué → sur quelles informations de
+ * SON dossier ; non évalué → le fait, la cause et l'action (CLAUDE.md §4.6).
+ * Et la liste de ce qui manque a remplacé le renvoi à l'agent, avec la
+ * distinction qui compte : ce que le demandeur doit fournir, et ce qui relève
+ * d'une configuration AGRICAP sur laquelle il n'a aucune prise.
  *
  * ⚠ Ne pas réintroduire `points`, `weight`, `maxPoints`, `detail`, `refData`,
  * `tarification` ni `proposedRate` ici : `detail` porte des phrases d'analyste
  * (« Écart moyen de 42 % au référentiel MAIS-v3 »), et `tarification` porte la
  * grille de taux. Ces trois blocs sont servis par le backend au même endpoint,
- * mais ils ne sont pas destinés à cet écran.
+ * mais ils ne sont pas destinés à cet écran. Les motifs affichés sont RÉDIGÉS
+ * dans `rapportCriteres.ts` à partir d'un code : aucune phrase du serveur ne
+ * traverse cette frontière.
+ *
+ * `loading`, `error` et `onRetry` sont OPTIONNELS, et le typage le dit : les
+ * appelants historiques ne passent que `simResult`. `onRetry` en particulier
+ * n'est pas rendu obligatoire — un écran qui n'affiche jamais d'erreur n'a pas
+ * à fournir un rappel factice, et un `onRetry={() => {}}` recopié partout
+ * reproduirait exactement le cul-de-sac qu'une prop obligatoire prétendrait
+ * interdire. Le bouton n'apparaît donc que lorsqu'une issue existe vraiment.
+ *
+ * @param {{
+ *   simResult?: any,
+ *   loading?: boolean,
+ *   error?: unknown,
+ *   onRetry?: (() => void) | null,
+ * }} props
  */
-export const CriteresClient = ({ simResult }) => {
-  if (!simResult?.breakdown?.length) return null;
-  const nonCalculables = simResult.breakdown.filter(c => c.calculable === false);
+export const CriteresClient = ({ simResult, loading = false, error = null, onRetry = null }) => {
+  if (loading) {
+    return (
+      <CadreCriteres>
+        <Loading label="Analyse de votre dossier en cours…" />
+      </CadreCriteres>
+    );
+  }
+
+  if (error) {
+    return (
+      <CadreCriteres>
+        <ErrorPanel
+          errors={toFieldErrors(error)}
+          title="Le détail par critère n'a pas pu être chargé"
+        />
+        <p className="text-xs text-gray-500">
+          Aucun critère n'est affiché plutôt qu'un rapport partiel — qui vous ferait corriger
+          le mauvais point.
+        </p>
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="text-xs text-emerald-300 underline underline-offset-2"
+          >
+            Relancer la simulation
+          </button>
+        )}
+      </CadreCriteres>
+    );
+  }
+
+  if (!simResult) return null;
+
+  const rapport = construireRapport(simResult);
+  if (!rapport) {
+    return (
+      <CadreCriteres>
+        <Empty
+          title={`Le moteur n'a renvoyé aucun critère pour cette simulation${
+            simResult.unavailable?.message ? ` : ${simResult.unavailable.message}` : '.'}`}
+          hint="Relancez la simulation une fois votre feuille de besoins déposée. Si le message persiste, votre agent AGRICAP peut faire instruire le dossier sans simulation."
+        />
+      </CadreCriteres>
+    );
+  }
+
+  const synthese = syntheseNonEvalues(rapport);
+
   return (
-    <div className="glass-effect p-5 rounded-2xl space-y-3">
-      <div className="flex items-baseline justify-between gap-3 flex-wrap">
-        <h4 className="font-bold text-white">Ce que votre dossier fait examiner</h4>
-        <span className="text-xs text-gray-500 flex items-center gap-1">
-          <Lock className="w-3 h-3" aria-hidden="true" /> détail du calcul réservé à l'analyste
-        </span>
-      </div>
-      <ul className="space-y-1.5">
-        {simResult.breakdown.map((c) => (
-          <li key={c.code} className="flex items-start gap-2 text-sm text-gray-300">
-            <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-emerald-400/70 shrink-0" aria-hidden="true" />
-            <span>
-              {c.label}
-              {c.calculable === false && (
-                <span className="text-amber-300/90"> — non évalué à ce stade</span>
+    <CadreCriteres>
+      <ul className="space-y-3">
+        {rapport.lignes.map((ligne) => (
+          <li key={ligne.code} className="text-sm">
+            <div className="flex items-start gap-2">
+              {ligne.evalue ? (
+                <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-emerald-400/80" aria-hidden="true" />
+              ) : (
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-300/90" aria-hidden="true" />
               )}
-            </span>
+              <div className="min-w-0 space-y-1">
+                <p className="text-gray-200">
+                  {ligne.label}
+                  <span className={ligne.evalue ? 'text-emerald-300/80' : 'text-amber-300/90'}>
+                    {ligne.evalue ? ' — évalué' : ' — non évalué'}
+                  </span>
+                </p>
+                <p className="text-xs text-gray-400">{ligne.fondement}</p>
+                {ligne.motif && (
+                  <div className="text-xs space-y-0.5 border-l-2 border-amber-400/30 pl-2">
+                    <p className="text-amber-100/90">{ligne.motif.fait}</p>
+                    <p className="text-gray-400">
+                      <span aria-hidden="true">→ </span>{ligne.motif.action}
+                    </p>
+                  </div>
+                )}
+                {!ligne.evalue && !ligne.motif && (
+                  <p className="text-xs text-gray-500 border-l-2 border-white/10 pl-2">
+                    Le motif précis n'est pas restitué par la simulation. Il sera repris à
+                    l'instruction de votre dossier.
+                  </p>
+                )}
+              </div>
+            </div>
           </li>
         ))}
       </ul>
-      {nonCalculables.length > 0 && (
-        <p className="text-xs text-gray-500">
-          {nonCalculables.length === 1 ? 'Un critère n’a pas pu être évalué' : `${nonCalculables.length} critères n’ont pas pu être évalués`}
-          {' '}avec les informations disponibles : votre agent AGRICAP peut vous dire ce qui manque.
-        </p>
+
+      {synthese && <p className="text-xs text-gray-400 pt-1">{synthese}</p>}
+
+      {/* La liste qui remplace « votre agent peut vous dire ce qui manque ». */}
+      {rapport.manquantsDossier.length > 0 && (
+        <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3 space-y-2">
+          <p className="text-xs font-semibold text-amber-200 uppercase tracking-wide">
+            Ce qu'il manque à votre dossier
+          </p>
+          <ul className="space-y-2">
+            {rapport.manquantsDossier.map((motif) => (
+              <li key={motif.code} className="text-xs text-amber-100/90">
+                <span className="block">{motif.fait}</span>
+                <span className="block text-gray-300 mt-0.5">
+                  <span aria-hidden="true">→ </span>{motif.action}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
+
+      {/* Séparé du bloc précédent, et jamais confondu avec lui : envoyer un
+          demandeur corriger un dossier complet parce qu'un référentiel AGRICAP
+          manque est une fausse piste, pas une pédagogie. */}
+      {rapport.manquantsInstitution.length > 0 && (
+        <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 space-y-2">
+          <p className="text-xs font-semibold text-gray-300 uppercase tracking-wide flex items-center gap-1.5">
+            <Building2 className="w-3.5 h-3.5" aria-hidden="true" />
+            Ce qui ne dépend pas de vous
+          </p>
+          <ul className="space-y-2">
+            {rapport.manquantsInstitution.map((motif) => (
+              <li key={motif.code} className="text-xs text-gray-300">
+                <span className="block">{motif.fait}</span>
+                <span className="block text-gray-400 mt-0.5">
+                  <span aria-hidden="true">→ </span>{motif.action}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* §4.6 — incertitude assumée : une comparaison faite contre une plage
+          encore indicative ne vaut pas une plage apprise sur des centaines de
+          dossiers, et l'écran le dit. */}
+      {rapport.reserves.map((reserve) => (
+        <p key={reserve} className="text-xs text-gray-500 flex items-start gap-1.5">
+          <Info className="w-3.5 h-3.5 mt-0.5 shrink-0" aria-hidden="true" />
+          <span>{reserve}</span>
+        </p>
+      ))}
+
       <p className="text-xs text-gray-500">
         Votre score global et sa lettre sont affichés ci-dessus. Le détail du calcul — poids de
         chaque critère, barèmes, plages de référence — relève de l'instruction du dossier par
@@ -167,7 +320,7 @@ export const CriteresClient = ({ simResult }) => {
             : ''}.
         </p>
       )}
-    </div>
+    </CadreCriteres>
   );
 };
 
