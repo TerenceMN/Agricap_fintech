@@ -1170,7 +1170,11 @@ def submit_application(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    # Audience MIXTE (titulaire ou agent) : `pour_staff` se CALCULE, il ne
+    # s'affirme pas. Un `True` en dur ici enverrait au demandeur la pièce
+    # d'identité de son garant — exactement ce que le masquage par défaut
+    # protège.
+    return Response(serialize_application(app, pour_staff=_vcs(request).is_staff))
 
 
 @api_view(["POST"])
@@ -1188,7 +1192,7 @@ def start_analysis(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    return Response(serialize_application(app, pour_staff=True))
 
 
 @api_view(["POST"])
@@ -1230,7 +1234,7 @@ def approve_application(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    return Response(serialize_application(app, pour_staff=True))
 
 
 @api_view(["POST"])
@@ -1281,7 +1285,7 @@ def adjourn_application(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    return Response(serialize_application(app, pour_staff=True))
 
 
 @api_view(["POST"])
@@ -1299,7 +1303,65 @@ def reopen_analysis(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    return Response(serialize_application(app, pour_staff=True))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, PeutDecider])
+def close_application(request: Request, code: str) -> Response:
+    """POST /api/credits/applications/<code>/close/ — ACTIVE → CLOSED.
+
+    Corps JSON : `{ comment }` — motif OBLIGATOIRE (`workflow.close` refuse un
+    motif vide) : « soldé à l'échéance », « remboursement anticipé », « abandon
+    de créance ». Deux ans plus tard, c'est cette phrase qui explique la fin du
+    dossier.
+
+    C'est l'UNIQUE déclencheur de la boucle d'apprentissage (principe 10). La
+    transition existait, testée, et rien ne l'atteignait : un dossier décaissé
+    restait `active` indéfiniment, `n_cas_reels` restait à zéro pour toutes les
+    filières, et chaque analyse continuait d'annoncer « référentiel indicatif,
+    fiabilité limitée » quel que soit le nombre de dossiers réellement bouclés.
+    Un mécanisme sans porte n'est pas un mécanisme.
+
+    `CAN_DECIDE` et non `CAN_INSTRUCT` : clore, c'est aussi passer un « abandon
+    de créance ». Un agent de terrain monte des dossiers, il ne solde pas une
+    dette — c'est la même frontière qu'à l'approbation, et elle vaut aussi à la
+    sortie du cycle. La clôture reste un acte HUMAIN (principe 2) : le moteur
+    n'en déduit aucune d'un solde à zéro, ce qui confondrait « remboursé » et
+    « pas encore appelé ».
+    """
+    app = _load_app(code)
+    if not app:
+        return Response({"detail": "Dossier introuvable."}, status=404)
+
+    from credits.workflow import close as _close, WorkflowError
+    try:
+        observation = _close(
+            app,
+            closer_sub=getattr(request.user, "sub", "") or "",
+            comment=request.data.get("comment", ""),
+        )
+    except WorkflowError as exc:
+        return _workflow_error(exc)
+
+    from credits.workflow import serialize_application
+    data = serialize_application(app, pour_staff=True)
+    # Ce que la clôture a CAPITALISÉ, dit explicitement. Une clôture qui n'a rien
+    # appris (filière sans référentiel actif, ventilation absente) est légitime —
+    # `enregistrer_cloture` retourne `None` sans faire échouer l'acte — mais elle
+    # doit se voir : sinon `n_cas_reels` stagne et personne ne sait pourquoi.
+    data["closure"] = {
+        "closedAt": app.closed_at.isoformat() if app.closed_at else None,
+        "comment": app.closure_comment,
+        "capitalisee": observation is not None,
+        "observationId": observation.pk if observation else None,
+        "referentiel": observation.referentiel.code if observation else None,
+        # `contributive` : l'observation compte-t-elle dans `n_cas_reels` ?
+        # Une observation figée sans ventilation de coûts exploitable est
+        # conservée (principe 3) mais n'apprend rien à la filière.
+        "contributive": bool(observation.contributive) if observation else False,
+    }
+    return Response(data)
 
 
 @api_view(["POST"])
@@ -1334,7 +1396,9 @@ def client_consent(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    # Audience mixte — et ici c'est le TITULAIRE qui est l'appelant normal :
+    # `pour_staff` calculé, jamais affirmé.
+    return Response(serialize_application(app, pour_staff=_vcs(request).is_staff))
 
 
 @api_view(["POST"])
@@ -1362,7 +1426,7 @@ def renew_client_consent(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    return Response(serialize_application(app, pour_staff=True))
 
 
 # ── Garanties ─────────────────────────────────────────────────────────────────
@@ -1392,7 +1456,11 @@ def list_guarantees(request: Request, code: str) -> Response:
     if (refus := _assert_can_read_app(request, app)) is not None:
         return refus
     from credits.guarantees import get_guarantee_summary
-    return Response(get_guarantee_summary(app))
+    # Le titulaire ET le personnel atteignent cette vue : c'est LA vue à
+    # audience mixte du module, celle pour laquelle `pour_staff` a été
+    # introduit. L'agent a besoin de la pièce d'identité du garant (elle est la
+    # preuve qu'il l'a vue) ; le demandeur n'en a aucun usage.
+    return Response(get_guarantee_summary(app, pour_staff=_vcs(request).is_staff))
 
 
 @api_view(["POST"])
@@ -1440,7 +1508,7 @@ def place_savings_guarantee(request: Request, code: str) -> Response:
                          "errors": [{"code": exc.code, "message": str(exc)}]}, status=400)
 
     from credits.guarantees import get_guarantee_summary
-    return Response(get_guarantee_summary(app), status=201)
+    return Response(get_guarantee_summary(app, pour_staff=True), status=201)
 
 
 @api_view(["POST"])
@@ -1509,7 +1577,7 @@ def register_moral_guarantee(request: Request, code: str) -> Response:
         )
 
     from credits.guarantees import get_guarantee_summary
-    return Response(get_guarantee_summary(app), status=201)
+    return Response(get_guarantee_summary(app, pour_staff=True), status=201)
 
 
 # ── Demandes de caution du garant (SPEC §2.5) ─────────────────────────────────
@@ -1691,7 +1759,10 @@ def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
         return Response({"detail": str(exc)}, status=400)
 
     from credits.guarantees import get_guarantee_summary
-    return Response(get_guarantee_summary(app))
+    # Deux acteurs, dont un NON-staff : le garant désigné confirme sa propre
+    # caution. Il n'a pas à recevoir pour autant la pièce d'identité des AUTRES
+    # garants du dossier — d'où le calcul plutôt que le `True`.
+    return Response(get_guarantee_summary(app, pour_staff=_vcs(request).is_staff))
 
 
 @api_view(["POST"])
@@ -1736,7 +1807,9 @@ def place_asset_guarantee_view(request: Request, code: str) -> Response:
         return Response({"detail": "asset_id invalide."}, status=400)
 
     from credits.guarantees import get_guarantee_summary
-    return Response(get_guarantee_summary(app), status=201)
+    # Le propriétaire du dossier propose son propre actif : audience mixte.
+    return Response(get_guarantee_summary(app, pour_staff=_vcs(request).is_staff),
+                    status=201)
 
 
 @api_view(["POST"])
@@ -1770,7 +1843,7 @@ def release_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
         _do_release(guarantee)
 
     from credits.guarantees import get_guarantee_summary
-    return Response(get_guarantee_summary(app))
+    return Response(get_guarantee_summary(app, pour_staff=True))
 
 
 # ── Décaissement (Étape 6) ────────────────────────────────────────────────────
@@ -1832,7 +1905,7 @@ def request_disbursement_view(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app), status=201)
+    return Response(serialize_application(app, pour_staff=True), status=201)
 
 
 @api_view(["POST"])
@@ -1880,7 +1953,7 @@ def cancel_disbursement_view(request: Request, code: str) -> Response:
         return _workflow_error(exc)
 
     from credits.workflow import serialize_application
-    return Response(serialize_application(app))
+    return Response(serialize_application(app, pour_staff=True))
 
 
 # ── Tableau de bord — Étape 7 ─────────────────────────────────────────────────

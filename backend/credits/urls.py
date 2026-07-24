@@ -21,6 +21,8 @@ urlpatterns = [
     path("applications/<str:code>/reject/", views.reject_application),
     path("applications/<str:code>/adjourn/", views.adjourn_application),
     path("applications/<str:code>/reopen-analysis/", views.reopen_analysis),
+    # Clôture (ACTIVE → CLOSED) : seule porte de la boucle d'apprentissage (P10).
+    path("applications/<str:code>/close/", views.close_application),
     path("applications/<str:code>/client-consent/", views.client_consent),
     path("applications/<str:code>/renew-consent/", views.renew_client_consent),
     # Décaissement (Étape 6)

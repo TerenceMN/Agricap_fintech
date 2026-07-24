@@ -318,6 +318,202 @@ class GardeDeGroupeTests(AuthedAPITestCase):
             self.client.post(f"{BASE}/baremes/DSCR/", {}, format="json").status_code, 403)
 
 
+class ClotureDuDossierTests(AuthedAPITestCase):
+    """`POST /applications/<code>/close/` — la porte qui manquait.
+
+    `workflow.close()` existait, testée, et **aucun endpoint ne l'atteignait**.
+    Conséquence : un dossier décaissé restait `active` indéfiniment, la boucle
+    d'apprentissage (principe 10) n'avait aucun déclencheur en production, et
+    `n_cas_reels` serait resté à zéro pour toutes les filières — donc chaque
+    analyse aurait continué d'annoncer « référentiel indicatif, fiabilité
+    limitée » quel que soit le nombre de dossiers réellement bouclés.
+
+    Un mécanisme sans porte n'est pas un mécanisme : c'est ce que ces tests
+    verrouillent.
+    """
+
+    def setUp(self):
+        self.titulaire = _make_user("sub-client-cloture")
+        self.app = _make_app("sub-client-cloture", "sub-client-cloture",
+                             status="active", amount=Decimal("1330"))
+        self.url = f"{APPS}/{self.app.code}/close/"
+
+    def test_un_gestionnaire_clot_un_dossier_actif_avec_motif(self):
+        self.login(role="gest_credit", sub="sub-gestionnaire-cloture")
+        reponse = self.client.post(
+            self.url, {"comment": "Soldé à l'échéance, dernier remboursement reçu."},
+            format="json")
+        self.assertEqual(reponse.status_code, 200, reponse.data)
+        self.app.refresh_from_db()
+        self.assertEqual(self.app.status, "closed")
+        self.assertIsNotNone(self.app.closed_at)
+        self.assertEqual(self.app.closed_by_sub, "sub-gestionnaire-cloture")
+
+    def test_la_reponse_dit_si_la_cloture_a_capitalise(self):
+        """Une clôture qui n'apprend rien (filière sans référentiel actif) est
+        légitime — mais elle doit se VOIR : sinon `n_cas_reels` stagne et
+        personne ne sait pourquoi. Pas de moyenne sans effectif (§4.6)."""
+        self.login(role="gest_credit", sub="sub-gestionnaire-cloture")
+        reponse = self.client.post(self.url, {"comment": "Remboursement anticipé."},
+                                   format="json")
+        cloture = reponse.data["closure"]
+        self.assertEqual(
+            set(cloture) >= {"closedAt", "comment", "capitalisee", "observationId",
+                             "referentiel", "contributive"}, True, cloture)
+        self.assertEqual(cloture["comment"], "Remboursement anticipé.")
+        self.assertIsInstance(cloture["capitalisee"], bool)
+
+    def test_le_motif_est_obligatoire(self):
+        """« Deux ans plus tard, c'est cette phrase qui explique la fin du
+        dossier » — chaque décision exige son motif (§7.2)."""
+        self.login(role="gest_credit", sub="sub-gestionnaire-cloture")
+        reponse = self.client.post(self.url, {"comment": "   "}, format="json")
+        self.assertEqual(reponse.status_code, 422, reponse.data)
+        self.app.refresh_from_db()
+        self.assertEqual(self.app.status, "active")
+
+    def test_un_agent_de_terrain_ne_solde_pas_une_dette(self):
+        """`CAN_DECIDE` et non `CAN_INSTRUCT` : clore, c'est aussi passer un
+        « abandon de créance ». Même frontière qu'à l'approbation, appliquée à
+        la sortie du cycle."""
+        self.login(role="agent_terrain", sub="sub-terrain-cloture")
+        self.assertEqual(
+            self.client.post(self.url, {"comment": "Soldé."}, format="json").status_code,
+            403)
+        self.app.refresh_from_db()
+        self.assertEqual(self.app.status, "active")
+
+    def test_le_titulaire_ne_clot_pas_son_propre_credit(self):
+        self.login(role="client", sub=self.titulaire.pk)
+        self.assertEqual(
+            self.client.post(self.url, {"comment": "Soldé."}, format="json").status_code,
+            403)
+
+    def test_sans_jeton_la_cloture_repond_401(self):
+        self.assertEqual(
+            self.client.post(self.url, {"comment": "Soldé."}, format="json").status_code,
+            401)
+
+    def test_on_ne_clot_pas_un_dossier_qui_n_est_pas_actif(self):
+        """La machine à états tranche, pas la vue : `workflow.close` refuse tout
+        statut autre qu'`active` et porte lui-même son code et son 409."""
+        brouillon = _make_app("sub-client-cloture", "sub-client-cloture", status="draft")
+        self.login(role="gest_credit", sub="sub-gestionnaire-cloture")
+        reponse = self.client.post(f"{APPS}/{brouillon.code}/close/",
+                                   {"comment": "Soldé."}, format="json")
+        self.assertEqual(reponse.status_code, 409, reponse.data)
+
+    def test_la_cloture_est_servie_en_vue_staff(self):
+        """Endpoint `CAN_DECIDE` : la réponse est celle de l'instruction."""
+        garant = _make_user("sub-garant-cloture")
+        CreditGuarantee.objects.create(
+            application=self.app,
+            guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
+            status=CreditGuarantee.Status.ACTIVE, guarantor=garant,
+            guarantor_name="Kalala Mutombo", guarantor_phone="+243970000077",
+            guarantor_id_number="CD-CNI-55443322", covered_amount=Decimal("1330"),
+        )
+        self.login(role="gest_credit", sub="sub-gestionnaire-cloture")
+        reponse = self.client.post(self.url, {"comment": "Soldé à l'échéance."},
+                                   format="json")
+        item = reponse.data["guarantees"]["items"][0]
+        self.assertEqual(item["guarantorIdNumber"], "CD-CNI-55443322")
+
+
+class PieceIdentiteDuGarantTests(AuthedAPITestCase):
+    """`pour_staff` : l'instruction voit la pièce, le demandeur ne la voit pas.
+
+    Le défaut de `get_guarantee_summary` est le MASQUAGE — une vue qui oublie de
+    préciser son audience doit se tromper du côté prudent. Restait à brancher les
+    endpoints staff, faute de quoi un agent d'instruction voyait la CNI du garant
+    masquée : gêne visible et réversible, préférable à une fuite invisible.
+
+    Le vrai risque de ce branchement est l'inverse : poser `pour_staff=True` en
+    dur sur une vue à audience MIXTE enverrait la pièce d'identité d'un tiers au
+    demandeur. Les deux sens sont donc testés sur les mêmes routes.
+    """
+
+    PIECE = "CD-CNI-90817263"
+
+    def setUp(self):
+        self.titulaire = _make_user("sub-client-piece")
+        self.app = _make_app("sub-client-piece", "sub-client-piece",
+                             status="submitted", amount=Decimal("900"))
+        self.garant = _make_user("sub-garant-piece")
+        CreditGuarantee.objects.create(
+            application=self.app,
+            guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
+            status=CreditGuarantee.Status.CONSENTED, guarantor=self.garant,
+            guarantor_name="Bosco Ilunga", guarantor_phone="+243970000088",
+            guarantor_id_number=self.PIECE, covered_amount=Decimal("900"),
+        )
+        self.url = f"{APPS}/{self.app.code}/guarantees/"
+
+    def test_l_agent_d_instruction_voit_la_piece_en_clair(self):
+        """C'est l'objet du branchement : la CNI est la preuve qu'un agent a vu
+        la pièce, et cette preuve appartient à l'instruction."""
+        self.login(role="gest_credit", sub="sub-agent-piece")
+        reponse = self.client.get(self.url)
+        self.assertEqual(reponse.status_code, 200)
+        self.assertEqual(reponse.data["items"][0]["guarantorIdNumber"], self.PIECE)
+
+    def test_le_titulaire_ne_voit_toujours_pas_la_piece_de_son_garant(self):
+        """Donnée personnelle d'un TIERS, dont le demandeur n'a aucun usage.
+        `guarantorIdProvided` lui dit ce qui lui est utile — la caution est
+        complète — sans livrer le contenu."""
+        self.login(role="client", sub=self.titulaire.pk)
+        item = self.client.get(self.url).data["items"][0]
+        self.assertNotEqual(item["guarantorIdNumber"], self.PIECE)
+        self.assertNotIn(self.PIECE, self.client.get(self.url).content.decode())
+        self.assertTrue(item["guarantorIdProvided"])
+
+    def test_le_garant_lui_meme_ne_recolte_pas_les_pieces_du_dossier(self):
+        """`confirm_guarantee` admet un non-staff : le garant désigné. Un
+        `pour_staff=True` en dur sur cette route lui aurait livré les pièces des
+        AUTRES garants du dossier."""
+        self.login(role="client", sub=self.garant.pk)
+        corps = self.client.get(self.url).content.decode()
+        self.assertNotIn(self.PIECE, corps)
+
+    def test_les_transitions_staff_servent_la_piece(self):
+        """`serialize_application` embarque le résumé des garanties : les
+        transitions réservées au personnel doivent la porter aussi, sinon
+        l'agent la perd dès qu'il agit sur le dossier."""
+        instruction = _make_app("sub-client-piece", "sub-client-piece",
+                                status="in_analysis")
+        CreditGuarantee.objects.create(
+            application=instruction,
+            guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
+            status=CreditGuarantee.Status.CONSENTED, guarantor=self.garant,
+            guarantor_name="Bosco Ilunga", guarantor_phone="+243970000088",
+            guarantor_id_number=self.PIECE, covered_amount=Decimal("900"),
+        )
+        self.login(role="gest_credit", sub="sub-agent-piece")
+        reponse = self.client.post(
+            f"{APPS}/{instruction.code}/adjourn/",
+            {"comment": "Feuille de besoins incomplète, à re-déposer."},
+            format="json")
+        self.assertEqual(reponse.status_code, 200, reponse.data)
+        self.assertEqual(
+            reponse.data["guarantees"]["items"][0]["guarantorIdNumber"], self.PIECE)
+
+    def test_une_transition_a_audience_mixte_ne_fuit_pas_au_titulaire(self):
+        """`submit` est ouvert au titulaire ET à l'agent : `pour_staff` s'y
+        CALCULE. C'est la ligne où un `True` en dur aurait fuité."""
+        brouillon = _make_app("sub-client-piece", "sub-client-piece", status="draft")
+        CreditGuarantee.objects.create(
+            application=brouillon,
+            guarantee_type=CreditGuarantee.GuaranteeType.MORALE,
+            status=CreditGuarantee.Status.CONSENTED, guarantor=self.garant,
+            guarantor_name="Bosco Ilunga", guarantor_phone="+243970000088",
+            guarantor_id_number=self.PIECE, covered_amount=Decimal("500"),
+        )
+        self.login(role="client", sub=self.titulaire.pk)
+        corps = self.client.post(f"{APPS}/{brouillon.code}/submit/", {},
+                                 format="json").content.decode()
+        self.assertNotIn(self.PIECE, corps)
+
+
 class FeuilleDeBesoinsDAutruiTests(AuthedAPITestCase):
     """Faille TROUVÉE en cartographiant les gardes de corps — sans lien avec la
     migration, et qu'aucune `permission_classes` n'aurait pu couvrir.
