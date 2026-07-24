@@ -764,6 +764,33 @@ class SavingsAccountingEventsTests(AuthedAPITestCase):
                          {"action": "rate_update", "annualRate": "5"}, format="json")
         self.assertEqual(SavingsEvent.objects.filter(plan_id=plan_id).count(), 0)
 
+    def test_un_plan_ne_nait_pas_dans_une_devise_non_nommable(self):
+        """La devise du plan devient celle de l'événement comptable. Non contrôlée, elle
+        laissait créer un plan en « XYZ » : un plan mort (aucun portefeuille dans cette
+        devise) et, si un portefeuille venait à exister, une file d'événements que le plan
+        comptable ne sait pas nommer — donc un écart au bilan que rien ne résorbe."""
+        self.login(role="client", sub="ev-devise-folle")
+        for devise in ("XYZ", "eur", ""):
+            res = self.client.post("/api/savings/plans/mine",
+                                   {"name": "Plan", "currency": devise}, format="json")
+            if devise == "":
+                # Devise absente = défaut USD, pas un refus.
+                self.assertEqual(res.status_code, 201, devise)
+                self.assertEqual(res.data["currency"], "USD")
+                continue
+            self.assertEqual(res.status_code, 422, devise)
+            self.assertEqual(res.data["errors"][0]["code"], "CURRENCY_UNKNOWN")
+        self.assertEqual(SavingsPlan.objects.filter(user_id="ev-devise-folle").count(), 1)
+
+    def test_la_devise_du_plan_est_normalisee(self):
+        """« usd » et « USD » sont la même devise — normaliser évite deux plans que la
+        comptabilité verrait comme deux devises distinctes."""
+        self.login(role="client", sub="ev-devise-casse")
+        res = self.client.post("/api/savings/plans/mine", {"name": "Plan", "currency": "cdf"},
+                               format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["currency"], "CDF")
+
     def test_emettre_refuse_un_montant_negatif(self):
         """Garde-fou du producteur lui-même : le signe ne porte jamais le sens."""
         from common.exceptions import ValidationFailed

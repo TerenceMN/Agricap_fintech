@@ -57,6 +57,27 @@ _FREQUENCY_DAYS = {
 }
 
 
+def _devises_supportees() -> set[str]:
+    """Devises dans lesquelles un plan d'épargne peut exister.
+
+    Ce ne sont pas « les devises de l'épargne » : ce sont celles où un PORTEFEUILLE peut
+    exister (`caisses.TreasuryAccount.Currency`), puisque depuis « une seule porte » tout
+    dépôt débite le wallet et tout retrait le crédite. La liste est LUE chez le propriétaire
+    du concept plutôt que recopiée ici (principe 6, une seule nomenclature par concept).
+
+    Sans ce contrôle, `currency` arrivait brut du client : un plan en « XYZ » était créé,
+    n'acceptait plus jamais un dépôt (aucun portefeuille dans cette devise, donc
+    `WALLET_MISSING` à perpétuité), et surtout — si un portefeuille venait un jour à exister
+    dans cette devise — produisait des `SavingsEvent` que le plan comptable ne sait pas
+    nommer. Ces événements resteraient en file indéfiniment et gonfleraient à jamais
+    « l'écart connu des états financiers » que la comptabilité déclare désormais au bilan.
+    Une devise non nommable pollue l'écart au lieu de le mesurer.
+    """
+    from caisses.models import TreasuryAccount
+
+    return set(TreasuryAccount.Currency.values)
+
+
 def _monthly_rate(annual: Decimal) -> Decimal:
     """Taux mensuel équivalent = annuel / 12, quantize 0.0001. CALCUL SERVEUR : c'est
     la ligne que le front faisait en `(val/12)` — désormais la seule source."""
@@ -84,10 +105,20 @@ def my_plans(request):
     if request.method == "GET":
         return Response([_plan_row(p) for p in SavingsPlan.objects.filter(user=request.user)])
     data = request.data or {}
+    currency = (data.get("currency") or "USD").strip().upper()
+    if currency not in _devises_supportees():
+        return Response(
+            {"detail": f"Devise « {currency} » non supportée : un plan d'épargne n'existe "
+                       f"que dans une devise où un portefeuille existe "
+                       f"({', '.join(sorted(_devises_supportees()))}).",
+             "errors": [{"code": "CURRENCY_UNKNOWN",
+                         "message": f"Devise non supportée : {currency}."}]},
+            status=422,
+        )
     plan = SavingsPlan.objects.create(
         user=request.user, name=data.get("name", ""), objective_type=data.get("objectiveType", "autre"),
         plan_type=data.get("type", "campagne"), objectif=data.get("objectif", "0"),
-        currency=data.get("currency", "USD"),
+        currency=currency,
     )
     audit_record(actor=getattr(request.user, "sub", ""), action="savings.plan.create",
                  entity_type="SavingsPlan", entity_id=str(plan.pk))
