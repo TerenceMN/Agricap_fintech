@@ -11,10 +11,19 @@ Deux familles :
   versé qu'APRÈS l'approbation humaine et le débit du portefeuille. Ces cas passent par un
   `PaymentOrder` (voir `caisses/payments.py`), jamais par un crédit/débit direct.
 
-Les codes reprennent volontairement la nomenclature de `savings.SavingsPlan.Channel`
-(`agent` / `mobile_money` / `bank` / `wallet`) — principe 6 : une seule nomenclature PAR
-concept. Cette table gagnerait à vivre dans `common/` pour être partagée entre `savings` et
-`caisses` sans duplication (demandé dans le rapport ; `common/` n'est pas dans ce périmètre).
+Les codes ne sont plus déclarés ici : ils viennent de `common.choices.Channel`, source
+unique du vocabulaire de canal (principe 6). La dette que documentait cet en-tête —
+`savings.SavingsPlan.Channel` et ce module portant les mêmes valeurs chacun de son côté —
+est levée côté `caisses` ; le raccordement de `savings` reste à faire (voir `common/choices.py`).
+
+Ce module garde en propre ce qui relève de la POLITIQUE de `caisses`, que `common` n'a pas
+à connaître :
+
+* `Channel.WALLET` est délibérément absent des canaux connus ici. `caisses` EST le
+  portefeuille : « déposer par portefeuille sur le portefeuille » ne désigne aucune porte.
+  Le vocabulaire est commun, le sous-ensemble accepté ne l'est pas — d'où des ensembles
+  énumérés à la main plutôt que dérivés mécaniquement de `CANAUX_INTERNES`.
+* la chaîne vide reste un canal interne, par compatibilité ascendante (cf. plus bas).
 
 Le NOM d'opération renvoyé (`MM_COLLECT`, `BANK_PAYOUT`…) est une clé LOGIQUE dans
 `settings.MAKUTA["OPERATIONS"]` : aucun endpoint métier Makuta n'est codé en dur ici, la
@@ -22,13 +31,14 @@ documentation fournisseur ne décrivant que l'authentification (cf. `payments.py
 """
 from __future__ import annotations
 
+from common.choices import Channel
 from common.exceptions import ValidationFailed
 
 #: Canal interne — le staff constate la remise physique (espèces/agence).
-AGENT = "agent"
+AGENT = Channel.AGENT.value
 #: Canaux externes — l'argent traverse un tiers, donc passe par un ordre de paiement Makuta.
-MOBILE_MONEY = "mobile_money"
-BANK = "bank"
+MOBILE_MONEY = Channel.MOBILE_MONEY.value
+BANK = Channel.BANK.value
 
 #: Vide = interne par défaut (compatibilité : l'ancien dépôt ne portait pas de canal).
 INTERNAL_CHANNELS = frozenset({AGENT, ""})
