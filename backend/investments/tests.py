@@ -23,7 +23,9 @@ from common.exceptions import ConflictError, NotFoundError, ValidationFailed
 from common.idempotency import IdempotentReplay
 from common.testing import AuthedAPITestCase
 
-from . import committee, funding, metrics, serializers, services, workflow
+from . import (
+    committee, echeancier_retour, funding, metrics, obligations, serializers, services, workflow,
+)
 from .models import (
     AnalystObservation, BondConversion, BondWithdrawal, Collateral, Distribution,
     FinancialAnalysis, InvestmentCommitteeVote, InvestmentEvent, Investor, Movement, Offer,
@@ -118,7 +120,13 @@ def funded_project(code: str, investor: Investor, bonds: int = 80) -> tuple[Proj
 
 
 def to_p10(project: Project, offer: Offer, *, amount: str = "8000", due_in_days: int = 30) -> Project:
-    """Amène un projet doté jusqu'à la phase de remboursement, échéancier compris."""
+    """Amène un projet doté jusqu'à la phase de remboursement.
+
+    Le décaissement PRODUIT l'échéancier de retour (`echeancier_retour`) : toutes
+    ses échéances sont à venir. La ligne ajoutée ici est une échéance de CONTRÔLE à
+    date maîtrisée (`due_in_days`, éventuellement négatif), le seul moyen d'éprouver
+    le retard sans attendre trois mois.
+    """
     project = funding.close_fundraising(project=project, by="dg", reason="Clôture de la levée.")
     project = funding.disburse(project=project, amount=amount,
                                 idempotency_key=f"d-{project.code}", by="dg")
@@ -412,10 +420,9 @@ class AllowedTransitionsTests(AuthedAPITestCase):
                                  by="caissier", reason="Décaissement.")
 
     def _repaying_project(self, code: str) -> Project:
+        """P10 atteint SANS écriture manuelle : l'échéancier vient du décaissement."""
         p = self._disbursed_project(code)
         p = services.transition_status(project=p, to_status=S.P09, by="mgr", reason="En cours.")
-        RepaymentSchedule.objects.create(offer=p.offers.first(), due_date=date.today(),
-                                          amount_due=Decimal("9900"))
         return services.transition_status(project=p, to_status=S.P10, by="mgr",
                                            reason="Remboursement démarré.")
 
@@ -534,6 +541,10 @@ class ForbiddenTransitionsTests(AuthedAPITestCase):
     def test_p10_sans_echeancier_refuse(self):
         p = AllowedTransitionsTests()._disbursed_project("F-P10")
         p = services.transition_status(project=p, to_status=S.P09, by="mgr", reason="En cours.")
+        # Le décaissement PRODUIT désormais l'échéancier de retour : pour éprouver la
+        # garde il faut le retirer, ce qui est exactement la situation d'un projet
+        # décaissé avant l'existence du producteur. La garde reste utile pour eux.
+        RepaymentSchedule.objects.filter(offer__project=p).delete()
         with self.assertRaises(workflow.TransitionGuardFailed):
             services.transition_status(project=p, to_status=S.P10, by="mgr", reason="Sans échéancier.")
 
@@ -1006,8 +1017,6 @@ class DisbursementAndDistributionTests(AuthedAPITestCase):
     def _to_p10(self) -> Project:
         p = funding.disburse(project=self.project, amount="8000", idempotency_key="dp10", by="dg")
         p = services.transition_status(project=p, to_status=S.P09, by="mgr", reason="En cours.")
-        RepaymentSchedule.objects.create(offer=self.offer, due_date=date.today(),
-                                          amount_due=Decimal("8800"))
         return services.transition_status(project=p, to_status=S.P10, by="mgr",
                                            reason="Remboursement démarré.")
 
@@ -1322,9 +1331,10 @@ class LateAndNextPaymentTests(AuthedAPITestCase):
         p, offer, _ = funded_project("L-1", inv)
         p = to_p10(p, offer, due_in_days=-10)   # échéance dépassée de 10 jours
         subs = funded_subs(inv)
-        # Le statut est resté PENDING : aucun producteur ne pose OVERDUE dans ce module.
-        self.assertEqual(RepaymentSchedule.objects.get(offer=offer).status,
-                          RepaymentSchedule.Status.PENDING)
+        # Les statuts sont restés PENDING : aucun producteur ne pose OVERDUE dans ce
+        # module — le retard se constate sur les DATES, pas sur un statut jamais écrit.
+        self.assertFalse(RepaymentSchedule.objects.filter(offer=offer)
+                          .exclude(status=RepaymentSchedule.Status.PENDING).exists())
         retard = metrics._late(subs)
         self.assertEqual(retard["share"], Decimal("1.0000"))
         self.assertEqual(retard["lateProjects"], 1)
@@ -1355,7 +1365,10 @@ class LateAndNextPaymentTests(AuthedAPITestCase):
         res = metrics._next_payment(funded_subs(inv))
         self.assertEqual(res["nextPaymentDate"], (date.today() + timedelta(days=15)).isoformat())
         self.assertEqual(res["nextPaymentSource"], "repayment_schedule")
-        self.assertEqual(res["upcomingCount"], 2)
+        # L'échéancier généré au décaissement s'ajoute aux échéances posées ici :
+        # le compte « à venir » exclut la SEULE échéance dépassée, pas davantage.
+        total = RepaymentSchedule.objects.filter(offer=offer).count()
+        self.assertEqual(res["upcomingCount"], total - 1)
 
     def test_prochain_paiement_ignore_les_echeances_deja_payees(self):
         inv = make_investor("n-2")
@@ -2706,3 +2719,272 @@ class ProjectCreationTests(AuthedAPITestCase):
             services.create_offer(project=p, code="OFR-BAD2", coupon_rate="9", maturity_months=24,
                                    min_ticket="0", available_bonds=10, funding_goal="1000",
                                    oversubscription_policy="LOTERIE", by="u")
+
+
+# ── 12. Échéancier de retour (B12) : le producteur qui manquait ──────────────
+
+class EcheancierRetourTests(AuthedAPITestCase):
+    """Construction pure — `Decimal` partout, dernière ligne ajustée au solde exact.
+
+    Cas chiffré de référence (docstring du module) : 9 000 USD à 9 %, trimestriel,
+    24 mois → 8 coupons de 202,50 et un capital de 9 000,00 à 24 mois.
+    """
+
+    DEPART = date(2026, 1, 15)
+
+    def _construire(self, **kw):
+        params = {"capital": "9000", "taux_annuel": "9", "frequence": Offer.Frequency.QUARTERLY,
+                  "maturite_mois": 24, "date_depart": self.DEPART}
+        params.update(kw)
+        return echeancier_retour.construire_echeancier_retour(**params)
+
+    def test_cas_chiffre_9000_a_9_pourcent_trimestriel_24_mois(self):
+        lignes = self._construire()
+        coupons = [l for l in lignes if l["kind"] == RepaymentSchedule.Kind.COUPON]
+        capitaux = [l for l in lignes if l["kind"] == RepaymentSchedule.Kind.CAPITAL]
+        self.assertEqual(len(coupons), 8)
+        self.assertEqual(len(capitaux), 1)
+        self.assertTrue(all(c["montant"] == Decimal("202.50") for c in coupons))
+        self.assertEqual(capitaux[0]["montant"], Decimal("9000.00"))
+        t = echeancier_retour.totaux(lignes)
+        self.assertEqual(t["capital"], Decimal("9000.00"))
+        self.assertEqual(t["rendement"], Decimal("1620.00"))
+        self.assertEqual(t["total"], Decimal("10620.00"))
+
+    def test_crd_final_rigoureusement_nul(self):
+        for capital, taux, freq, maturite in (
+            ("9000", "9", Offer.Frequency.QUARTERLY, 24),
+            ("1333.33", "18.5", Offer.Frequency.MONTHLY, 7),
+            ("77777.77", "12.75", Offer.Frequency.ANNUAL, 36),
+            ("500.01", "7.125", Offer.Frequency.QUARTERLY, 10),
+            ("10000", "9", Offer.Frequency.BULLET, 18),
+        ):
+            with self.subTest(capital=capital, freq=freq, maturite=maturite):
+                lignes = self._construire(capital=capital, taux_annuel=taux, frequence=freq,
+                                           maturite_mois=maturite)
+                t = echeancier_retour.totaux(lignes)
+                self.assertEqual(t["crd_final"], Decimal("0.00"))
+                # Σ capital = capital décaissé AU CENTIME : le cantonnement 419-OFF
+                # se solde exactement, jamais à un centime près.
+                self.assertEqual(t["capital"], Decimal(capital))
+                # Σ coupons = intérêt total du titre tel que LE MODULE le définit
+                # (`obligations.coupon_periodique`, seule convention de coupon de
+                # l'app : intérêt simple sur le nominal, coupon annuel quantizé).
+                # L'échéancier ne réinvente pas la convention, il la découpe.
+                attendu = obligations.coupon_periodique(
+                    montant=Decimal(capital), taux_annuel=Decimal(taux),
+                    frequence=Offer.Frequency.BULLET, maturite_mois=maturite)
+                self.assertEqual(t["rendement"], attendu)
+                # …et cette convention ne dérive pas de l'arithmétique exacte de plus
+                # d'un centime par période : le quantize du coupon annuel est visible,
+                # borné et assumé, pas un écart qui s'accumule.
+                exact = (Decimal(capital) * Decimal(taux) / Decimal("100")
+                         * Decimal(maturite) / Decimal("12"))
+                self.assertLessEqual(abs(t["rendement"] - exact), Decimal("0.02"))
+
+    def test_aucun_float_dans_les_montants_produits(self):
+        for ligne in self._construire():
+            self.assertIsInstance(ligne["montant"], Decimal)
+            self.assertIsInstance(ligne["crd"], Decimal)
+            self.assertEqual(ligne["montant"], ligne["montant"].quantize(Decimal("0.01")))
+
+    def test_in_fine_produit_deux_lignes_de_nature_unique_et_non_une_ligne_mixte(self):
+        """Une ligne « capital + intérêts » serait inventilable pour B12."""
+        lignes = self._construire(frequence=Offer.Frequency.BULLET, maturite_mois=18)
+        self.assertEqual(len(lignes), 2)
+        self.assertEqual({l["kind"] for l in lignes},
+                          {RepaymentSchedule.Kind.COUPON, RepaymentSchedule.Kind.CAPITAL})
+        self.assertEqual({l["due_date"] for l in lignes}, {date(2027, 7, 15)})
+        self.assertEqual(sum(l["montant"] for l in lignes), Decimal("10215.00"))
+
+    def test_maturite_non_multiple_produit_une_periode_brisee_prorata_temporis(self):
+        """10 mois en trimestriel = 3 + 3 + 3 + 1 : on n'allonge pas le titre pour
+        arrondir sa durée, et le coupon du mois orphelin est calculé sur SON mois."""
+        lignes = self._construire(capital="12000", taux_annuel="12", maturite_mois=10)
+        coupons = [l for l in lignes if l["kind"] == RepaymentSchedule.Kind.COUPON]
+        self.assertEqual([c["mois"] for c in coupons], [3, 6, 9, 10])
+        self.assertEqual([c["montant"] for c in coupons],
+                          [Decimal("360.00")] * 3 + [Decimal("120.00")])
+
+    def test_offre_a_taux_nul_ne_produit_pas_des_coupons_nuls(self):
+        lignes = self._construire(taux_annuel="0")
+        self.assertEqual([l["kind"] for l in lignes], [RepaymentSchedule.Kind.CAPITAL])
+
+    def test_dates_calees_sur_le_decaissement_et_fin_de_mois_tronquee(self):
+        lignes = self._construire(date_depart=date(2026, 8, 31), maturite_mois=6,
+                                   frequence=Offer.Frequency.MONTHLY)
+        self.assertEqual([l["due_date"] for l in lignes][:3],
+                          [date(2026, 9, 30), date(2026, 10, 31), date(2026, 11, 30)])
+
+    def test_termes_inexploitables_refuses_jamais_devines(self):
+        for kw in ({"maturite_mois": 0}, {"capital": "0"}, {"taux_annuel": "-1"}):
+            with self.subTest(**kw):
+                with self.assertRaises(echeancier_retour.EcheancierRetourError):
+                    self._construire(**kw)
+
+
+class ProductionEcheancierRetourTests(AuthedAPITestCase):
+    """Le décaissement produit l'échéancier — P09→P10 n'exige plus d'écriture manuelle."""
+
+    def test_projet_decaisse_produit_son_echeancier_de_retour(self):
+        inv = make_investor("er-1")
+        project, offer, _ = disbursed_project("ER-1", inv)   # 8 000 encaissés puis décaissés
+        lignes = list(RepaymentSchedule.objects.filter(offer=offer))
+        self.assertEqual(len(lignes), 9)                      # 8 coupons + 1 capital
+        capital = sum((l.amount_due for l in lignes
+                       if l.kind == RepaymentSchedule.Kind.CAPITAL), Decimal("0"))
+        rendement = sum((l.amount_due for l in lignes
+                         if l.kind == RepaymentSchedule.Kind.COUPON), Decimal("0"))
+        # CRD final nul : le capital rendu est exactement le capital décaissé.
+        self.assertEqual(capital, Decimal("8000.00"))
+        self.assertEqual(rendement, Decimal("1440.00"))       # 8 000 × 9 % × 2 ans
+        self.assertTrue(all(l.status == RepaymentSchedule.Status.PENDING for l in lignes))
+
+    def test_p09_vers_p10_franchi_sans_ecrire_une_seule_echeance_a_la_main(self):
+        inv = make_investor("er-2")
+        project, _, _ = disbursed_project("ER-2", inv)
+        project = services.transition_status(project=project, to_status=S.P09, by="mgr",
+                                              reason="Fonds reçus.")
+        project = services.transition_status(project=project, to_status=S.P10, by="mgr",
+                                              reason="Échéancier de retour en cours.")
+        self.assertEqual(project.status, S.P10)
+
+    def test_prochain_paiement_nest_plus_null_pour_un_projet_decaisse(self):
+        inv = make_investor("er-3")
+        disbursed_project("ER-3", inv)
+        res = metrics._next_payment(funded_subs(inv))
+        self.assertIsNotNone(res["nextPaymentDate"])
+        self.assertEqual(res["nextPaymentSource"], "repayment_schedule")
+        self.assertIsNone(res["unavailableReason"])
+
+    def test_echeancier_ne_se_regenere_pas_en_silence(self):
+        inv = make_investor("er-4")
+        project, _, _ = disbursed_project("ER-4", inv)
+        with self.assertRaises(echeancier_retour.EcheancierDejaGenere):
+            echeancier_retour.generer_pour_projet(project=project, base_total="8000",
+                                                   date_depart=date.today(), by="dg")
+
+    def test_repartition_entre_offres_au_prorata_de_lencaisse_au_centime(self):
+        """Ségrégation : chaque cantonnement se voit rendre ce qu'il a financé."""
+        inv = make_investor("er-5")
+        project = advance_to(make_project("ER-5"), S.P05)
+        services.create_offer(project=project, code="OFR-ER5-A", coupon_rate="9",
+                               maturity_months=12, min_ticket="0", available_bonds=100,
+                               funding_goal="10000", min_funding_amount="0", by="mgr")
+        services.create_offer(project=project, code="OFR-ER5-B", coupon_rate="6",
+                               maturity_months=12, min_ticket="0", available_bonds=100,
+                               funding_goal="10000", min_funding_amount="0", by="mgr")
+        services.clear_conditions(project=project, by="dg", note="OK.")
+        project.refresh_from_db()
+        project = services.transition_status(project=project, to_status=S.P06, by="dg",
+                                              reason="Offres publiées.")
+        for index, offre in enumerate(project.offers.order_by("pk")):
+            sub = funding.reserve(investor=inv, offer_id=offre.pk, bonds=30 + index * 10,
+                                   idempotency_key=f"r-er5-{index}", by="t")
+            funding.settle(subscription=sub, idempotency_key=f"s-er5-{index}", by="caisse")
+        project.refresh_from_db()
+        project = funding.close_fundraising(project=project, by="dg", reason="Clôture.")
+        project = funding.disburse(project=project, amount="7000", idempotency_key="d-er5",
+                                    by="dg")
+        capital = sum(
+            (l.amount_due for l in RepaymentSchedule.objects.filter(offer__project=project)
+             if l.kind == RepaymentSchedule.Kind.CAPITAL), Decimal("0"))
+        self.assertEqual(capital, Decimal("7000.00"))
+        self.assertEqual(RepaymentSchedule.objects.filter(
+            offer__project=project, kind=RepaymentSchedule.Kind.CAPITAL).count(), 2)
+
+
+class VentilationRetourTests(AuthedAPITestCase):
+    """B12 : `record_return` publie la ventilation capital / rendement.
+
+    Sans ces deux clés dans le payload, l'événement `PROJECT_RETURN_RECEIVED` reste
+    inconsommable côté comptabilité : le schéma ventile entre 419-OFF et 719 « selon
+    l'échéancier », et un total ne porte pas cette répartition.
+    """
+
+    def setUp(self):
+        self.inv = make_investor("vt-1")
+        self.project, self.offer, _ = disbursed_project("VT-1", self.inv)
+        self.project = services.transition_status(project=self.project, to_status=S.P09,
+                                                   by="mgr", reason="Fonds reçus.")
+
+    def _dernier_evenement(self):
+        return InvestmentEvent.objects.filter(
+            event_type=InvestmentEvent.Type.PROJECT_RETURN_RECEIVED).order_by("-pk").first()
+
+    def _retour(self, montant: str, key: str):
+        self.project = funding.record_return(project=self.project, amount=montant,
+                                              idempotency_key=key, by="caisse")
+        return self._dernier_evenement()
+
+    def test_le_payload_porte_capital_rembourse_et_rendement(self):
+        evt = self._retour("180", "vt-r1")
+        self.assertIn("capital_rembourse", evt.payload)
+        self.assertIn("rendement", evt.payload)
+        self.assertIn("retour_total", evt.payload)
+
+    def test_ventilation_selon_lecheancier_le_premier_coupon_est_du_rendement(self):
+        evt = self._retour("180", "vt-r2")       # exactement le premier coupon
+        self.assertEqual(evt.payload["rendement"], "180.00")
+        self.assertEqual(evt.payload["capital_rembourse"], "0.00")
+
+    def test_somme_des_deux_jambes_egale_lencaissement_au_centime(self):
+        for montant, key in (("180", "a"), ("1234.56", "b"), ("7000.11", "c")):
+            with self.subTest(montant=montant):
+                evt = self._retour(montant, f"vt-inv-{key}")
+                total = (Decimal(evt.payload["capital_rembourse"])
+                         + Decimal(evt.payload["rendement"]))
+                self.assertEqual(total, Decimal(evt.payload["retour_total"]))
+                self.assertEqual(total, Decimal(montant).quantize(Decimal("0.01")))
+
+    def test_imputation_partielle_puis_seconde_imputation_ne_paie_pas_deux_fois(self):
+        self._retour("100", "vt-p1")
+        premiere = RepaymentSchedule.objects.filter(
+            offer=self.offer, kind=RepaymentSchedule.Kind.COUPON).order_by("due_date").first()
+        premiere.refresh_from_db()
+        self.assertEqual(premiere.amount_paid, Decimal("100.00"))
+        self.assertEqual(premiere.status, RepaymentSchedule.Status.PENDING)
+        evt = self._retour("100", "vt-p2")
+        premiere.refresh_from_db()
+        self.assertEqual(premiere.status, RepaymentSchedule.Status.PAID)
+        # 80 pour solder le premier coupon, 20 sur le deuxième : toujours du rendement,
+        # et surtout jamais 180 imputés deux fois.
+        self.assertEqual(evt.payload["rendement"], "100.00")
+        self.assertEqual(premiere.amount_paid, Decimal("180.00"))
+
+    def test_retour_integral_solde_capital_et_rendement_sans_reliquat(self):
+        evt = self._retour("9440", "vt-full")
+        self.assertEqual(evt.payload["capital_rembourse"], "8000.00")
+        self.assertEqual(evt.payload["rendement"], "1440.00")
+        self.assertFalse(RepaymentSchedule.objects.filter(offer=self.offer)
+                          .exclude(status=RepaymentSchedule.Status.PAID).exists())
+
+    def test_surplus_au_dela_de_lecheancier_est_un_produit_signale_jamais_du_capital(self):
+        self._retour("9440", "vt-s1")
+        evt = self._retour("50", "vt-s2")
+        self.assertEqual(evt.payload["capital_rembourse"], "0.00")
+        self.assertEqual(evt.payload["rendement"], "50.00")
+        self.assertEqual(evt.payload["surplusEnRendement"], "50.00")
+
+    def test_sans_echeancier_aucune_ventilation_nest_inventee(self):
+        """Projet décaissé avant l'existence du producteur : on le dit, on ne devine pas."""
+        RepaymentSchedule.objects.filter(offer__project=self.project).delete()
+        evt = self._retour("1000", "vt-sans")
+        self.assertNotIn("capital_rembourse", evt.payload)
+        self.assertNotIn("rendement", evt.payload)
+        self.assertIn("ventilationIndisponible", evt.payload)
+        self.assertEqual(evt.amount, Decimal("1000.00"))
+
+    def test_les_montants_ventiles_sont_des_chaines_decimales_jamais_des_float(self):
+        evt = self._retour("1234.56", "vt-dec")
+        for cle in ("retour_total", "capital_rembourse", "rendement"):
+            self.assertIsInstance(evt.payload[cle], str)
+            self.assertEqual(Decimal(evt.payload[cle]),
+                              Decimal(evt.payload[cle]).quantize(Decimal("0.01")))
+
+    def test_lecheance_imputee_pointe_le_mouvement_qui_la_paye(self):
+        self._retour("180", "vt-mv")
+        ligne = RepaymentSchedule.objects.filter(
+            offer=self.offer, status=RepaymentSchedule.Status.PAID).first()
+        self.assertIsNotNone(ligne.paid_movement)
+        self.assertEqual(ligne.paid_movement.type, Movement.Type.PROJECT_RETURN)

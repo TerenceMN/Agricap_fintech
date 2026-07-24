@@ -551,6 +551,18 @@ class Movement(models.Model):
 
 
 class RepaymentSchedule(models.Model):
+    """Échéance de RETOUR d'une offre — ce que le projet financé doit rendre.
+
+    Produite par `investments/echeancier_retour.py` au décaissement (B11), lue par
+    la garde P09→P10, par « prochain paiement » (Annexe D) et par la ventilation
+    capital / rendement de chaque encaissement (B12).
+
+    **La nature d'une ligne est unique** : une échéance rend du capital (retour au
+    cantonnement 419-OFF) OU du rendement (produit 719), jamais les deux. C'est
+    cette unicité qui rend un encaissement ventilable sans rien deviner — une
+    offre in fine produit donc deux lignes à la même date plutôt qu'une ligne mixte.
+    """
+
     class Kind(models.TextChoices):
         COUPON = "COUPON", "Coupon"
         CAPITAL = "CAPITAL", "Capital"
@@ -565,6 +577,11 @@ class RepaymentSchedule(models.Model):
     offer = models.ForeignKey(Offer, on_delete=models.CASCADE, related_name="schedules")
     due_date = models.DateField()
     amount_due = models.DecimalField(max_digits=16, decimal_places=2)
+    #: Cumul IMPUTÉ sur cette échéance par les encaissements de retour. Un retour
+    #: partiel existe (le promoteur paie ce qu'il peut) : sans ce champ, deux
+    #: encaissements successifs imputeraient deux fois la même échéance et la
+    #: ventilation comptable serait fausse dès le second.
+    amount_paid = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
     kind = models.CharField(max_length=10, choices=Kind.choices, default=Kind.COUPON)
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
     paid_movement = models.ForeignKey(Movement, null=True, blank=True, on_delete=models.SET_NULL,
@@ -572,6 +589,16 @@ class RepaymentSchedule(models.Model):
 
     class Meta:
         ordering = ["due_date"]
+        constraints = [
+            models.CheckConstraint(condition=Q(amount_paid__gte=0),
+                                    name="repayment_schedule_amount_paid_nonneg"),
+        ]
+
+    @property
+    def outstanding(self) -> Decimal:
+        """Reste dû sur l'échéance — jamais négatif."""
+        reste = Decimal(self.amount_due) - Decimal(self.amount_paid)
+        return reste if reste > Decimal("0") else Decimal("0.00")
 
     def __str__(self) -> str:
         return f"{self.offer.code} {self.kind} {self.due_date}"

@@ -32,7 +32,7 @@ from common.exceptions import BusinessError, ConflictError, InsufficientFundsErr
     ValidationFailed
 from common.parsing import to_decimal
 
-from . import workflow
+from . import echeancier_retour, workflow
 from .models import (
     Distribution, DistributionLine, InvestmentConfig, InvestmentEvent, Investor, Movement,
     Offer, Project, Subscription,
@@ -532,6 +532,13 @@ def disburse(*, project: Project, amount, idempotency_key: str, by: str = "",
     Impossible avant clôture de souscription : la machine à états n'offre P08 que
     depuis P07. Impossible au-delà du cantonnement disponible : on ne décaisse jamais
     plus que ce qui a été encaissé pour CE projet (ségrégation des fonds).
+
+    **Le décaissement produit l'échéancier de retour** (`echeancier_retour`), dans
+    cette transaction : l'obligation de rendre naît le jour où l'argent part, et
+    c'est cet échéancier qui rend P10 atteignable, « prochain paiement » calculable
+    et chaque encaissement B12 ventilable. Des termes d'offre inexploitables font
+    donc échouer le décaissement, plutôt que de laisser un projet décaissé sans
+    calendrier de retour.
     """
     if project.status != Project.Status.P07:
         raise ConflictError(
@@ -560,6 +567,9 @@ def disburse(*, project: Project, amount, idempotency_key: str, by: str = "",
                              assigned_manager_sub=project.manager_sub)
     _emit(InvestmentEvent.Type.PROJECT_DISBURSED, project=project, offer=offer, amount=montant,
           occurred_at=now, actor_sub=by, projectCode=project.code, reason=reason)
+    echeancier_retour.generer_pour_projet(
+        project=project, base_total=montant, date_depart=timezone.localdate(), by=by,
+    )
 
     project = workflow.transition(
         project, to_status=Project.Status.P08, actor_sub=by,
@@ -580,7 +590,23 @@ def disburse(*, project: Project, amount, idempotency_key: str, by: str = "",
 @transaction.atomic
 def record_return(*, project: Project, amount, idempotency_key: str, by: str = "",
                   value_date=None, reason: str = "") -> Project:
-    """Encaisse un retour du projet — B12. Aucune distribution n'est possible avant."""
+    """Encaisse un retour du projet — B12. Aucune distribution n'est possible avant.
+
+    **L'événement porte sa ventilation.** Le schéma B12 ventile l'encaissement entre
+    le cantonnement 419-OFF (capital rendu) et le compte 719 (rendement) « selon
+    l'échéancier » : cette répartition ne se déduit pas d'un total, et la deviner
+    fabriquerait un produit financier qui n'a jamais existé — elle fausserait
+    directement le rendement affiché aux investisseurs. Elle est donc calculée ici,
+    par imputation déterministe sur l'échéancier de retour du projet
+    (`echeancier_retour.ventiler_retour`), et publiée dans le payload de
+    l'événement sous les clés attendues par le catalogue : `retour_total`,
+    `capital_rembourse`, `rendement` — avec l'invariant
+    `capital_rembourse + rendement == amount` au centime.
+
+    Un projet décaissé AVANT l'existence du producteur d'échéanciers n'en porte
+    aucun : l'événement est alors émis SANS ventilation, avec le motif. Il reste en
+    file côté comptabilité au lieu d'y entrer faux.
+    """
     if project.status not in (Project.Status.P09, Project.Status.P10, Project.Status.P12):
         raise ConflictError(
             "Un retour ne s'encaisse que sur un projet en cours, en remboursement ou en "
@@ -598,13 +624,34 @@ def record_return(*, project: Project, amount, idempotency_key: str, by: str = "
     Project.objects.filter(pk=project.pk).update(returned_amount=F("returned_amount") + montant)
     project.refresh_from_db()
     offer = project.offers.order_by("pk").first()
-    Movement.objects.create(type=Movement.Type.PROJECT_RETURN, project=project, amount=montant,
-                             currency="USD", status="posted")
+    mouvement = Movement.objects.create(type=Movement.Type.PROJECT_RETURN, project=project,
+                                         amount=montant, currency="USD", status="posted")
+    ventilation = echeancier_retour.ventiler_retour(project=project, montant=montant,
+                                                     movement=mouvement)
+    detail_ventilation = {}
+    if ventilation["disponible"]:
+        detail_ventilation = {
+            "retour_total": str(ventilation["retour_total"]),
+            "capital_rembourse": str(ventilation["capital_rembourse"]),
+            "rendement": str(ventilation["rendement"]),
+        }
+        if ventilation["surplus"] > Decimal("0"):
+            # Un encaissement au-delà de tout l'échéancier n'est pas du capital :
+            # le principal dû est déjà intégralement imputé. Il est signalé pour
+            # que le comptable le voie, jamais fondu dans le remboursement.
+            detail_ventilation["surplusEnRendement"] = str(ventilation["surplus"])
+    else:
+        detail_ventilation = {"ventilationIndisponible": ventilation["motif"]}
+
     _emit(InvestmentEvent.Type.PROJECT_RETURN_RECEIVED, project=project, offer=offer,
           amount=montant, occurred_at=now, actor_sub=by, projectCode=project.code,
-          valueDate=str(value_date) if value_date else now.date().isoformat(), reason=reason)
+          valueDate=str(value_date) if value_date else now.date().isoformat(), reason=reason,
+          **detail_ventilation)
     audit_record(actor=by, action="investments.project.return", entity_type="Project",
-                 entity_id=project.code, details={"amount": str(montant)})
+                 entity_id=project.code,
+                 details={"amount": str(montant),
+                          "echeancesImputees": len(ventilation["lignes_imputees"]),
+                          **detail_ventilation})
 
     from . import serializers
     idempotency.complete(rec, response=serializers.project_row(project),
