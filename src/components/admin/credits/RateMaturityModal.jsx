@@ -13,6 +13,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { api } from '@/services/api';
 import SimulateurMoteur from '@/components/analyse/simulateur/SimulateurMoteur';
 import { formatMontant } from '@/components/guarantees/format';
+import { readLoanRates } from '@/lib/loanRateDisplay';
 import {
     Calculator, CalendarClock, Ban, PauseCircle, PlayCircle, Save, AlertTriangle,
     TrendingUp, Percent, FlaskConical
@@ -49,17 +50,34 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
     const [history, setHistory] = useState([]);
     const [confirmAction, setConfirmAction] = useState(null);
 
+    /**
+     * Taux tels que le SERVEUR les a servis, conservés à part de `config`.
+     *
+     * `config` est un brouillon de saisie : l'utilisateur y modifie le taux
+     * mensuel sans que rien ne soit encore écrit. Le taux annuel, lui,
+     * n'appartient pas à ce brouillon — il est figé avec le prêt par
+     * `portfolio/rates.py` et ne change qu'à l'enregistrement. Les mélanger
+     * ferait réapparaître, sous une autre forme, l'annualisation au navigateur
+     * que cet écran vient de perdre.
+     */
+    const [tauxServeur, setTauxServeur] = useState(null);
+
     // Charge la config + l'historique depuis le backend (repli sur les props du crédit).
     useEffect(() => {
         if (!credit || !isOpen) return;
         let alive = true;
-        const fallback = () => setConfig({
-            rate: credit.rate || 0,
-            duration: credit.duration || 12,
-            frequency: credit.frequency || 'monthly',
-            status: credit.status || 'Active',
-            startDate: credit.startDate || new Date().toISOString().split('T')[0],
-        });
+        const fallback = () => {
+            setConfig({
+                rate: credit.rate || 0,
+                duration: credit.duration || 12,
+                frequency: credit.frequency || 'monthly',
+                status: credit.status || 'Active',
+                startDate: credit.startDate || new Date().toISOString().split('T')[0],
+            });
+            // `loan_row()` sert les mêmes quatre champs de taux que `config_payload()` :
+            // la ligne de la table reste une source SERVEUR valable pour l'affichage.
+            setTauxServeur(credit);
+        };
         api.portfolio.config(credit.id).then((data) => {
             if (!alive) return;
             const c = data.currentConfig || {};
@@ -70,10 +88,18 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                 status: c.status || credit.status || 'Active',
                 startDate: c.startDate || new Date().toISOString().split('T')[0],
             });
+            setTauxServeur(c);
             setHistory(data.history || []);
         }).catch(() => { if (alive) { fallback(); setHistory([]); } });
         return () => { alive = false; };
     }, [credit, isOpen]);
+
+    const taux = readLoanRates(tauxServeur);
+    // Le brouillon s'écarte-t-il du taux mensuel servi ? Tant qu'il s'en écarte,
+    // le taux annuel affiché est celui du prêt EN BASE, pas celui de la saisie —
+    // et l'écran le dit plutôt que de laisser croire que le chiffre a suivi.
+    const tauxMensuelModifie = taux.monthly !== null
+        && Number(config.rate) !== Number(taux.monthly);
 
     const handleConfigChange = (field, value) => {
         setConfig(prev => ({ ...prev, [field]: value }));
@@ -104,6 +130,9 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
             });
             setHistory(data.history || []);
             if (data.currentConfig?.status) setConfig((c) => ({ ...c, status: data.currentConfig.status }));
+            // Le serveur vient de recalculer et de figer le taux annuel : on relit
+            // le sien plutôt que d'anticiper la valeur qu'il aurait dû produire.
+            if (data.currentConfig) setTauxServeur(data.currentConfig);
             toast({ title: "Configuration enregistrée", description: "Les paramètres du crédit ont été mis à jour." });
         } catch (e) {
             toast({ variant: "destructive", title: "Échec", description: e.message });
@@ -150,6 +179,9 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                     status: c.status || prev.status,
                     startDate: c.startDate || prev.startDate,
                 }));
+                // `block` met le taux à 0 côté serveur : le taux annuel affiché
+                // doit suivre CE que le serveur a écrit, pas ce qu'on suppose.
+                setTauxServeur(c);
                 setHistory(data.history || []);
             } catch {
                 // La relecture a échoué : on ne fabrique pas d'état local optimiste.
@@ -215,19 +247,42 @@ const RateMaturityModal = ({ isOpen, onOpenChange, credit }) => {
                                 <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700/50 space-y-4">
                                     <h4 className="font-semibold text-emerald-400 flex items-center gap-2"><Percent className="w-4 h-4"/> Taux d'Intérêt</h4>
                                     <div>
-                                        <Label className="text-xs text-slate-400">Taux Mensuel (%)</Label>
+                                        <Label className="text-xs text-slate-400">Taux mensuel (%/mois)</Label>
                                         <div className="flex items-center gap-2 mt-1">
-                                            <Input 
-                                                type="number" 
-                                                step="0.01" 
-                                                value={config.rate} 
+                                            <Input
+                                                type="number"
+                                                step="0.01"
+                                                value={config.rate}
                                                 onChange={(e) => handleConfigChange('rate', e.target.value)}
                                                 className="bg-slate-900 border-slate-700 font-mono text-lg"
                                             />
                                         </div>
                                     </div>
-                                    <div className="text-xs text-slate-500">
-                                        Taux annuel approx: <span className="text-slate-300">{(config.rate * 12).toFixed(2)}%</span>
+                                    {/* Cette ligne affichait « Taux annuel approx : (config.rate × 12) » :
+                                        une annualisation calculée au navigateur, présentée à côté des
+                                        chiffres serveur. Le taux annuel est SERVI (`annualRate`, figé
+                                        avec le prêt par `portfolio/rates.py`) — on l'affiche, on ne le
+                                        refait pas. Quand il n'est pas servi, on écrit « non servi » :
+                                        un « 0,00 % » se lirait comme un prêt gratuit. */}
+                                    <div className="text-xs space-y-1">
+                                        <div className="text-slate-500">
+                                            Taux annuel (serveur) :{' '}
+                                            <span className={taux.annualServed ? 'text-slate-300 font-mono' : 'text-amber-400 font-mono'}>
+                                                {taux.annualText}
+                                            </span>
+                                        </div>
+                                        {!taux.annualServed && (
+                                            <p className="text-[11px] text-amber-400/80 leading-relaxed">
+                                                {taux.annualUnavailableReason}
+                                            </p>
+                                        )}
+                                        {taux.annualServed && tauxMensuelModifie && (
+                                            <p className="text-[11px] text-amber-300 leading-relaxed">
+                                                Taux mensuel modifié dans le formulaire ({config.rate}) : le taux annuel
+                                                ci-dessus reste celui du prêt EN BASE ({taux.monthlyText}). Le serveur
+                                                le recalculera et le figera à l'enregistrement.
+                                            </p>
+                                        )}
                                     </div>
                                 </div>
 

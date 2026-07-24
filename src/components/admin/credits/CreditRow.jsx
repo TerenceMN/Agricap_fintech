@@ -9,6 +9,7 @@ import {
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import { motion, AnimatePresence } from 'framer-motion';
 import TransactionSubTable from './TransactionSubTable';
+import { readLoanRates } from '@/lib/loanRateDisplay';
 
 const ProgressBar = ({ value }) => {
     const pct = Number.isFinite(Number(value)) ? Math.max(0, Math.min(100, Number(value))) : 0;
@@ -41,6 +42,13 @@ const fmtDate = (iso) => {
 
 const CreditRow = ({ credit, onAction }) => {
     const [isExpanded, setIsExpanded] = useState(false);
+
+    // Les DEUX taux du prêt, chacun avec l'unité que le serveur DÉCLARE.
+    // Cette cellule affichait `credit.rate` seul, sous une colonne « Taux » :
+    // un taux MENSUEL (2 %) lu comme annuel, soit douze fois moins cher que le
+    // prêt réel (24 %/an). Le taux annuel est servi (`annualRate`) — on le
+    // montre en premier, et le mensuel dessous, chacun nommé.
+    const taux = readLoanRates(credit);
 
     const statusConfig = {
         'Approuvé': { variant: 'success' },
@@ -82,7 +90,12 @@ const CreditRow = ({ credit, onAction }) => {
                 <TableCell className="text-right font-mono text-slate-300">{formatCurrency(credit.amountDisbursed, credit.currency)}</TableCell>
                 <TableCell>{credit.currency ? <Badge variant="outline">{credit.currency}</Badge> : '—'}</TableCell>
                 <TableCell className="text-center">{credit.duration != null && credit.duration !== '' ? credit.duration : '—'}</TableCell>
-                <TableCell className="text-center">{credit.rate != null && Number.isFinite(Number(credit.rate)) ? `${credit.rate}%` : '—'}</TableCell>
+                <TableCell className="text-center whitespace-nowrap" title={taux.title}>
+                    <span className={`block font-mono text-sm ${taux.annualServed ? 'text-slate-200' : 'text-amber-400/80 text-xs'}`}>
+                        {taux.annualText}
+                    </span>
+                    <span className="block font-mono text-[10px] text-slate-500">{taux.monthlyText}</span>
+                </TableCell>
                 <TableCell>{fmtDate(credit.dueDate)}</TableCell>
                 <TableCell>{orDash(credit.manager)}</TableCell>
                 <TableCell>{orDash(credit.investor)}</TableCell>

@@ -8,6 +8,7 @@ import RateMaturityModal from './RateMaturityModal';
 import { Search, FileDown, UserPlus, RefreshCw, Calculator, CalendarDays, AlertCircle } from 'lucide-react';
 import { useToast } from '@/components/ui/use-toast';
 import { exportToExcel } from '@/lib/export.js';
+import { loanRateExportCells } from '@/lib/loanRateDisplay';
 
 const CreditsTable = ({ credits, onAction }) => {
     const { toast } = useToast();
@@ -81,7 +82,12 @@ const CreditsTable = ({ credits, onAction }) => {
             "Décaissé": c.amountDisbursed,
             "Devise": c.currency,
             "Durée (mois)": c.duration,
-            "Taux (%)": c.rate,
+            // « Taux (%) » portait `c.rate`, un taux MENSUEL, dans un classeur
+            // qui circule sans l'écran qui l'a produit : 2 s'y lisait 2 %/an au
+            // lieu de 24 %/an. Les deux taux servis sortent désormais dans deux
+            // colonnes qui NOMMENT leur unité ; un taux annuel non servi sort en
+            // « non servi », jamais en 0 (un 0 entre dans une moyenne).
+            ...loanRateExportCells(c),
             "Échéance": c.dueDate,
             "Gestionnaire": c.manager,
             "Investisseur": c.investor,
@@ -136,7 +142,16 @@ const CreditsTable = ({ credits, onAction }) => {
                             <TableHead className="text-right">Décaissé</TableHead>
                             <TableHead>Devise</TableHead>
                             <TableHead className="text-center">Durée</TableHead>
-                            <TableHead className="text-center">Taux</TableHead>
+                            {/* « Taux » sans unité se lit comme un taux ANNUEL. La colonne
+                                servait `rate`, qui est MENSUEL : elle annonçait douze fois
+                                moins cher que le prêt réel. L'unité est désormais dans
+                                l'en-tête ET dans chaque cellule (cf. `loanRateDisplay.ts`). */}
+                            <TableHead className="text-center whitespace-nowrap">
+                                <span className="block">Taux annuel</span>
+                                <span className="block text-[10px] font-normal normal-case text-slate-500">
+                                    puis taux mensuel
+                                </span>
+                            </TableHead>
                             <TableHead>Échéance</TableHead>
                             <TableHead>Gestionnaire</TableHead>
                             <TableHead>Investisseur</TableHead>

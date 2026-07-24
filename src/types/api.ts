@@ -193,7 +193,15 @@ export interface LoanRow {
   amountDisbursed: number;
   currency: string;
   duration: number;
+  /** Taux **MENSUEL** en points de pourcentage. Son unité est servie à côté :
+   *  affiché sans elle, « 2 » se lit 2 %/an au lieu de 24 %/an. */
   rate: number;
+  rateUnit?: string;
+  /** Taux **ANNUEL** figé avec le prêt (`portfolio/rates.py`). `null` sur une
+   *  ligne héritée que `_accorder_les_taux()` n'a pas encore complétée — il
+   *  n'est alors PAS reconstitué côté front (cf. `lib/loanRateDisplay.ts`). */
+  annualRate?: number | null;
+  annualRateUnit?: string;
   dueDate: string;
   manager: string;
   investor: string;
@@ -244,7 +252,15 @@ export interface ScheduleRow {
 }
 
 export interface LoanConfig {
-  currentConfig: { rate: number; duration: number; frequency: string; status: string; statusCode: string; startDate: string };
+  currentConfig: {
+    /** MENSUEL — `config_payload()` sert son unité dans `rateUnit`. */
+    rate: number;
+    rateUnit?: string;
+    /** ANNUEL, `null` tant que le serveur ne l'a pas figé. Jamais déduit du mensuel. */
+    annualRate?: number | null;
+    annualRateUnit?: string;
+    duration: number; frequency: string; status: string; statusCode: string; startDate: string;
+  };
   history: Array<{ date: string; action: string; user: string; details: string }>;
   schedule?: ScheduleRow[];
   totals?: { total_principal: number; total_interest: number; total_payments: number; apr: number };

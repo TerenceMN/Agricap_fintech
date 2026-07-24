@@ -13,6 +13,7 @@ import {
 import ComparaisonAnalyse from './ComparaisonAnalyse';
 import DiagnosticDiffere from './DiagnosticDiffere';
 import EcheancierServeur from './EcheancierServeur';
+import { readLoanRates } from '@/lib/loanRateDisplay';
 import {
   formatRatio2, formatPourcent, formatDateHeureFr, NULL_DISPLAY,
   MODE_DIFFERE_LABEL, MODE_DIFFERE_AIDE, RECOMMANDATION_LABEL,
@@ -59,10 +60,20 @@ const STATUT = {
 const parametresDepuisCredit = (credit) => ({
   dureeMois: Number(credit?.duration) || 12,
   differeMois: 0,
-  // `credit.rate` du portefeuille est un taux MENSUEL (cf. RateMaturityModal) ;
-  // le moteur attend un taux ANNUEL. La conversion est une conversion d'unité de
-  // saisie, pas un calcul financier — et l'analyste peut la corriger.
-  tauxAnnuel: Number(credit?.rate) ? Number((Number(credit.rate) * 12).toFixed(2)) : 0,
+  // Ce champ valait `Number(credit.rate) * 12`.
+  //
+  // Ce n'était pas de l'affichage : cette valeur part dans
+  // `POST .../reanalyser/` et ressort en échéancier, en DSCR et en
+  // recommandation — que l'analyste lit ensuite comme des chiffres serveur. Une
+  // annualisation fabriquée au navigateur devenait ainsi l'hypothèse d'une
+  // analyse opposable, sans que rien ne dise d'où venait le taux.
+  //
+  // Le serveur sert le taux annuel du prêt (`annualRate`, figé par
+  // `portfolio/rates.py`) : on le reprend TEL QUEL. Quand il ne le sert pas, le
+  // champ reste VIDE et l'analyste renseigne le taux qu'il simule — un taux
+  // déduit d'un mensuel arrondi à 6 décimales ne vaut pas mieux qu'une saisie,
+  // et il aurait l'air d'une donnée du dossier.
+  tauxAnnuel: readLoanRates(credit).annual ?? '',
   modeDiffere: 'interets_seuls',
 });
 
@@ -81,6 +92,10 @@ const SimulateurMoteur = ({ code, credit, actif = true }) => {
   const [busy, setBusy] = useState(false);
   const [erreurRun, setErreurRun] = useState(null);
   const [baseComparaison, setBaseComparaison] = useState('precedente'); // 'precedente' | 'initiale'
+
+  // Taux du prêt tels que le SERVEUR les sert — sert à dire d'où vient (ou ne
+  // vient pas) la valeur pré-remplie du champ « Taux annuel ».
+  const tauxCredit = useMemo(() => readLoanRates(credit), [credit]);
 
   const courante = runs.length ? runs[runs.length - 1] : null;
   const initiale = runs.length ? runs[0] : null;
@@ -118,6 +133,12 @@ const SimulateurMoteur = ({ code, credit, actif = true }) => {
     if (!Number.isFinite(d) || d < 1) return 'La durée doit valoir au moins 1 mois.';
     if (!Number.isFinite(f) || f < 0) return 'Le différé ne peut pas être négatif.';
     if (f >= d) return "Le différé doit rester strictement inférieur à la durée : sans mois d'amortissement, il n'y a pas d'échéancier.";
+    // Champ vide : `Number('')` vaut 0, et une analyse lancée « à 0 % » par
+    // omission ne se distinguerait pas d'une analyse voulue à 0 %. On exige la
+    // saisie plutôt que de laisser un zéro implicite entrer dans le moteur.
+    if (params.tauxAnnuel === '' || params.tauxAnnuel === null || params.tauxAnnuel === undefined) {
+      return "Le taux annuel n'est pas servi par le serveur pour ce prêt : saisissez le taux annuel à simuler.";
+    }
     if (!Number.isFinite(t) || t < 0) return 'Le taux annuel ne peut pas être négatif.';
     return null;
   }, [params]);
@@ -280,12 +301,31 @@ const SimulateurMoteur = ({ code, credit, actif = true }) => {
             </div>
 
             <div>
-              <Label className="text-xs text-slate-400">Taux annuel (%)</Label>
+              <Label className="text-xs text-slate-400">Taux annuel (%/an)</Label>
               <Input
                 type="number" step="0.01" min="0" value={params.tauxAnnuel}
                 onChange={(e) => majParam('tauxAnnuel', e.target.value)}
                 className="bg-slate-900 border-slate-700 mt-1 font-mono"
               />
+              {/* Provenance de la valeur pré-remplie. Sans elle, l'analyste ne
+                  peut pas savoir si le taux vient du dossier ou de sa propre
+                  saisie précédente — et c'est cette hypothèse-là qui fait
+                  l'échéancier. */}
+              {!courante && (
+                tauxCredit.annualServed ? (
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Repris du prêt : {tauxCredit.annualText} (servi par le serveur, taux
+                    contractuel {tauxCredit.monthlyText}). Modifiable pour simuler.
+                  </p>
+                ) : (
+                  <p className="text-[11px] text-amber-400/80 mt-1 leading-relaxed">
+                    Aucun taux annuel n'est servi pour ce prêt : le champ reste vide.
+                    Il n'est pas déduit du taux contractuel ({tauxCredit.monthlyText}) —
+                    une annualisation faite ici deviendrait l'hypothèse d'une analyse
+                    opposable sans que rien ne dise qu'elle vient du navigateur.
+                  </p>
+                )
+              )}
             </div>
 
             <div>
