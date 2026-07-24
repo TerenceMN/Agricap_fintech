@@ -65,21 +65,46 @@ from .schedule import ZERO, q2
 logger = logging.getLogger(__name__)
 
 
-def _imputer(lignes: list[dict], total: Decimal) -> dict:
+def imputer(lignes: list[dict], total: Decimal) -> dict:
     """Impute `total` sur l'échéancier : plus ancienne d'abord, intérêts puis capital.
 
-    Renvoie les cumuls (capital, intérêts) et le reliquat non imputable une fois
-    tout l'échéancier soldé.
+    Fonction PUBLIQUE : `accounting.provisions` la consomme pour dater le premier
+    impayé, et un consommateur ne doit pas signer pour une rupture sans préavis sur
+    le chemin qui décide d'une provision.
+
+    Args:
+        lignes: lignes de `services.schedule_for(loan)["schedule"]` — chacune porte
+            `principal`, `interest` (`Decimal`) et `date` (chaîne ISO).
+        total: montant CUMULÉ réglé, à imputer depuis la première échéance.
+
+    Returns:
+        `capital` et `interets` effectivement imputés, `surplus` (reliquat non
+        imputable une fois tout l'échéancier soldé), `par_ligne` (détail des seules
+        échéances SERVIES) et `premiere_echeance_impayee` — date ISO de la plus
+        ancienne échéance non intégralement réglée, `None` si tout est à jour.
+
+    Deux pièges, tous deux tenus ici :
+
+    1. **La boucle ne s'interrompt pas quand le règlement est épuisé.** Elle
+       parcourt TOUTES les lignes, parce que la première échéance impayée est
+       précisément, le plus souvent, la première que le règlement n'a pas atteinte —
+       donc absente de `par_ligne`. Sortir tôt rendrait `None` sur un dossier en
+       défaut, c'est-à-dire zéro jour de retard et aucune provision.
+
+    2. **Une échéance à 0/0 est réglée par définition** (`0 >= 0`) : c'est le cas
+       des lignes de différé en franchise totale, où rien n'est exigible. Les
+       compter impayées reclasserait en PAR90 des clients parfaitement à jour.
     """
     reste = q2(total)
     capital = ZERO
     interets = ZERO
     par_ligne: dict = {}
+    premiere_impayee = None
     for ligne in lignes:
-        if reste <= ZERO:
-            break
         du_interets = ligne.get("interest", ZERO)
         du_capital = ligne.get("principal", ZERO)
+        # Une fois `reste` épuisé, ces parts valent 0 — et l'échéance est impayée
+        # dès qu'elle devait quelque chose.
         paye_interets = du_interets if du_interets <= reste else reste
         reste = q2(reste - paye_interets)
         paye_capital = du_capital if du_capital <= reste else reste
@@ -93,8 +118,11 @@ def _imputer(lignes: list[dict], total: Decimal) -> dict:
                 "capital": paye_capital,
                 "interets": paye_interets,
             }
+        if (paye_interets < du_interets or paye_capital < du_capital) \
+                and premiere_impayee is None:
+            premiere_impayee = ligne.get("date")
     return {"capital": capital, "interets": interets, "surplus": reste,
-            "par_ligne": par_ligne}
+            "par_ligne": par_ligne, "premiere_echeance_impayee": premiere_impayee}
 
 
 def _lignes_du_versement(avant: dict, apres: dict) -> list[dict]:
@@ -164,8 +192,8 @@ def ventiler_remboursement(loan, *, montant, deja_regle=ZERO) -> dict:
             ),
         }
 
-    avant = _imputer(lignes, q2(deja_regle))
-    apres = _imputer(lignes, q2(q2(deja_regle) + total))
+    avant = imputer(lignes, q2(deja_regle))
+    apres = imputer(lignes, q2(q2(deja_regle) + total))
 
     capital = q2(apres["capital"] - avant["capital"])
     interets = q2(apres["interets"] - avant["interets"])

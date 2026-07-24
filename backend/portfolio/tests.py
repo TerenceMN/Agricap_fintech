@@ -1105,55 +1105,102 @@ class ImputationUniqueTests(TestCase):
     et jusque-là, il empêche la divergence silencieuse.
     """
 
-    CAS = ["0", "10", "19.95", "186.20", "200", "286.20", "700", "1419.78"]
+    CAS = ["0", "10", "19.95", "186.20", "200", "286.20", "700", "1419.78", "2000"]
 
-    def _loan(self) -> Loan:
-        loan = Loan.objects.create(
+    def _loan(self, **kwargs) -> Loan:
+        defaults = dict(
             reference="CRD-2026-970", operator="Coopérative Test",
             amount_approved=D("1330"), annual_rate=D("18"), duration_months=8,
             frequency="monthly", start_date=DEBUT, currency="USD")
+        defaults.update(kwargs)
+        loan = Loan.objects.create(**defaults)
         loan.transactions.create(kind="DISBURSEMENT", amount=D("1330"),
                                  currency="USD", date=DEBUT, status="VALIDE")
         return loan
 
-    def test_les_deux_imputations_donnent_le_meme_capital_et_les_memes_interets(self):
+    def _traduire(self, lignes):
+        """Les mêmes lignes, dans la nomenclature de `provisions`."""
+        return [{"date": date.fromisoformat(l["date"]), "capital": l["principal"],
+                 "interets": l["interest"]} for l in lignes]
+
+    def test_les_quatre_champs_concordent_au_centime(self):
         from accounting import provisions
 
         loan = self._loan()
         lignes = services.schedule_for(loan)["schedule"]
-        # `provisions` travaille sur sa propre traduction des mêmes lignes.
-        traduites = [{"date": date.fromisoformat(l["date"]), "capital": l["principal"],
-                      "interets": l["interest"]} for l in lignes]
+        traduites = self._traduire(lignes)
         for total in self.CAS:
             with self.subTest(total=total):
-                mien = repayment._imputer(lignes, D(total))
+                mien = repayment.imputer(lignes, D(total))
                 sien = provisions.imputer(traduites, D(total))
                 self.assertEqual(mien["capital"], sien["capital_rembourse"])
                 self.assertEqual(mien["interets"], sien["interets_regles"])
                 self.assertEqual(mien["surplus"], sien["avance"])
+                attendue = sien["premiere_echeance_impayee"]
+                self.assertEqual(
+                    mien["premiere_echeance_impayee"],
+                    attendue.isoformat() if attendue else None)
 
-    def test_la_premiere_echeance_impayee_concorde(self):
-        """Le champ dont dépendent les jours de retard, donc la provision."""
+    def test_les_deux_concordent_aussi_sur_un_differe_en_franchise_totale(self):
+        """Le cas que la règle du 0/0 gouverne — donc celui qu'il faut comparer.
+
+        Cinq lignes à 0/0 : si les deux implémentations ne les traitaient pas
+        identiquement, l'une daterait le premier impayé au 1er mois et l'autre au
+        6ᵉ — un client à jour serait provisionné à 50 % d'un côté et sain de
+        l'autre, sans que rien ne le signale.
+        """
         from accounting import provisions
 
-        loan = self._loan()
+        loan = self._loan(reference="CRD-2026-974", deferral_months=5,
+                          deferral_mode=schedule_module.MODE_FRANCHISE_TOTALE)
         lignes = services.schedule_for(loan)["schedule"]
-        traduites = [{"date": date.fromisoformat(l["date"]), "capital": l["principal"],
-                      "interets": l["interest"]} for l in lignes]
-        for total in self.CAS:
+        traduites = self._traduire(lignes)
+        for total in ("0", "100", "477.59", "500", "1500"):
             with self.subTest(total=total):
+                mien = repayment.imputer(lignes, D(total))
                 sien = provisions.imputer(traduites, D(total))
-                mien = repayment._imputer(lignes, D(total))
-                # La première échéance NON intégralement servie par notre
-                # imputation est celle que `provisions` date comme impayée.
-                servies = {l["numero"] for l in mien["par_ligne"].values()
-                           if l["capital"] == next(x["principal"] for x in lignes
-                                                   if x["number"] == l["numero"])
-                           and l["interets"] == next(x["interest"] for x in lignes
-                                                     if x["number"] == l["numero"])}
-                attendue = next((date.fromisoformat(l["date"]) for l in lignes
-                                 if l["number"] not in servies), None)
-                self.assertEqual(sien["premiere_echeance_impayee"], attendue)
+                self.assertEqual(mien["capital"], sien["capital_rembourse"])
+                self.assertEqual(mien["interets"], sien["interets_regles"])
+                self.assertEqual(mien["surplus"], sien["avance"])
+                # Le champ dont dépendent les jours de retard, donc la provision.
+                attendue = sien["premiere_echeance_impayee"]
+                self.assertEqual(
+                    mien["premiere_echeance_impayee"],
+                    attendue.isoformat() if attendue else None)
+
+    def test_la_premiere_impayee_est_trouvee_meme_hors_des_lignes_servies(self):
+        """Le piège : la boucle ne doit PAS s'arrêter quand le règlement est épuisé.
+
+        La première échéance impayée est le plus souvent celle que le règlement n'a
+        pas atteinte — donc absente de `par_ligne`. Sortir tôt rendrait `None` sur un
+        dossier en défaut : zéro jour de retard, et aucune provision.
+        """
+        loan = self._loan(reference="CRD-2026-971")
+        lignes = services.schedule_for(loan)["schedule"]
+        resultat = repayment.imputer(lignes, D("186.20"))    # échéance 1 seulement
+        self.assertEqual(set(resultat["par_ligne"]), {1})
+        self.assertEqual(resultat["premiere_echeance_impayee"], lignes[1]["date"])
+
+    def test_tout_regle_ne_laisse_aucune_echeance_impayee(self):
+        loan = self._loan(reference="CRD-2026-972")
+        lignes = services.schedule_for(loan)["schedule"]
+        self.assertIsNone(
+            repayment.imputer(lignes, D("1419.78"))["premiere_echeance_impayee"])
+
+    def test_un_differe_en_franchise_totale_ne_compte_aucun_retard(self):
+        """Une échéance à 0/0 est réglée par définition (`0 >= 0`).
+
+        Sans cette règle, les cinq lignes de franchise — où RIEN n'est exigible —
+        seraient « impayées » et reclasseraient en PAR90 un client parfaitement à
+        jour : exactement le faux positif que la livraison du différé a éliminé.
+        """
+        loan = self._loan(reference="CRD-2026-973", deferral_months=5,
+                          deferral_mode=schedule_module.MODE_FRANCHISE_TOTALE)
+        lignes = services.schedule_for(loan)["schedule"]
+        resultat = repayment.imputer(lignes, D("0"))
+        self.assertEqual(resultat["par_ligne"], {})           # rien n'a été servi
+        # …et pourtant la première impayée est la 6ᵉ, pas la 1re.
+        self.assertEqual(resultat["premiere_echeance_impayee"], lignes[5]["date"])
 
 
 class EvenementsComptablesTests(TestCase):
