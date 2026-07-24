@@ -259,6 +259,14 @@ class CreditApplication(models.Model):
     disbursed_by_sub = models.CharField(max_length=255, blank=True)
     disbursed_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
 
+    # ── Clôture (fin de vie du dossier) ───────────────────────────────────────
+    # Le statut `closed` existait depuis l'origine sans qu'AUCUNE transition ne
+    # l'atteigne : un dossier décaissé restait `active` pour toujours, et la
+    # boucle d'apprentissage du principe 10 n'avait donc aucun déclencheur.
+    closed_at = models.DateTimeField(null=True, blank=True)
+    closed_by_sub = models.CharField(max_length=255, blank=True)
+    closure_comment = models.TextField(blank=True)
+
     # Consentement client (demande par agent)
     client_consent_at = models.DateTimeField(null=True, blank=True)
     client_consent_method = models.CharField(max_length=20, blank=True)  # app|sms|ussd
@@ -1422,4 +1430,121 @@ class CreditEvent(models.Model):
             f.attname: copy.deepcopy(getattr(self, f.attname))
             for f in self._meta.concrete_fields
             if f.attname not in self.MUTABLE_FIELDS and f.attname != "id"
+        }
+
+
+# ── Boucle d'apprentissage (principe 10) ──────────────────────────────────────
+
+class ImmutableObservation(Exception):
+    """Tentative de réécriture d'une observation de clôture (principe 3)."""
+
+
+class ObservationFiliere(models.Model):
+    """Ce qu'un dossier CLÔTURÉ apprend à sa filière — append-only.
+
+    Le principe 10 promet que « chaque dossier clôturé enrichit les statistiques
+    par filière ». Il ne l'était pas : `ReferentielFiliere.n_cas_reels` était LU
+    partout (autorité du référentiel affichée à l'analyste, mention « fiabilité
+    limitée » servie au client) et n'était JAMAIS incrémenté — seul l'import du
+    référentiel le posait à 0. Toutes les filières restaient donc éternellement
+    « indicatives », quel que soit le nombre de dossiers réellement bouclés.
+
+    Cette table est le chaînon manquant. Une ligne = un dossier clôturé, figée au
+    moment de la clôture : le référentiel peut être re-versionné ensuite sans
+    que l'observation change de sens. `n_cas_reels` en est le DÉCOMPTE, pas un
+    compteur incrémenté à l'aveugle — un compteur se désynchronise, un décompte
+    se recalcule et se vérifie.
+
+    Le champ décisif est `contributive` :
+
+        Un dossier dont la ventilation par module a été DÉRIVÉE du référentiel
+        (aucune feuille de besoins exploitable → `ModuleAllocation.source =
+        "referential"`) n'apprend rien à ce référentiel : il en est la copie.
+        Le compter gonflerait N de dossiers qui ne portent aucune information —
+        et ferait basculer une filière en « appris » sur des données qu'elle a
+        elle-même produites. L'observation est donc enregistrée (la clôture est
+        un fait), mais elle ne compte pas dans N.
+
+    Ce que cette table ne fait PAS : substituer un référentiel. Franchir le seuil
+    de N ne bascule rien — `source` reste `indicatif` jusqu'à ce qu'un comité
+    propose et qu'un second membre active la version apprise (maker-checker).
+    Une plage apprise qui s'installerait toute seule serait exactement la
+    « substitution silencieuse » que le principe 10 interdit.
+    """
+
+    #: `OneToOne` : un dossier ne se clôture qu'une fois, donc n'apprend qu'une
+    #: fois. C'est aussi le verrou d'idempotence de `enregistrer_cloture`.
+    application = models.OneToOneField(
+        CreditApplication, on_delete=models.PROTECT, related_name="observation_filiere",
+    )
+    referentiel = models.ForeignKey(
+        ReferentielFiliere, on_delete=models.PROTECT, related_name="observations",
+    )
+    #: Recopiés à la clôture : l'observation reste lisible même si le dossier
+    #: change de filière ou si le référentiel est archivé.
+    value_chain_code = models.CharField(max_length=50, blank=True, db_index=True)
+    filiere = models.CharField(max_length=100, blank=True)
+
+    devise = models.CharField(max_length=3, default="USD")
+    montant_decaisse = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+    quantite_reference = models.DecimalField(
+        max_digits=12, decimal_places=3, null=True, blank=True,
+    )
+    unite_reference = models.CharField(max_length=30, blank=True)
+
+    #: {"semences": "850.00", …} — montants en CHAÎNES, comme
+    #: `ReferentielFiliere.couts_modules` : un JSON `float` réintroduirait le
+    #: binaire flottant que le principe 4 bannit du calcul financier.
+    couts_modules = models.JSONField(default=dict)
+    cout_total = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+    #: Provenance des coûts (`needs_sheet`, `referential`, `manual`, `mixte`).
+    origine_couts = models.CharField(max_length=20, blank=True)
+
+    #: Faux quand les coûts viennent du référentiel lui-même : l'observation
+    #: existe, mais n'entre pas dans N (cf. docstring).
+    contributive = models.BooleanField(default=False, db_index=True)
+
+    clos_le = models.DateTimeField()
+    clos_par = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-clos_le", "-id"]
+        indexes = [models.Index(fields=["referentiel", "contributive"])]
+
+    def __str__(self) -> str:
+        return f"Observation {self.application.code} → {self.referentiel.code}"
+
+    # ── Immuabilité (principe 3) ─────────────────────────────────────────────
+
+    #: Aucune. Une observation décrit un dossier clos à une date : elle ne se
+    #: corrige pas, elle se complète par une nouvelle clôture — qui n'existe pas.
+    MUTABLE_FIELDS: tuple[str, ...] = ()
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._db_snapshot = {
+            name: copy.deepcopy(getattr(instance, name))
+            for name in field_names if name != "id"
+        }
+        return instance
+
+    def save(self, *args, **kwargs):
+        snapshot = getattr(self, "_db_snapshot", None)
+        if snapshot is not None:
+            modifies = [
+                name for name, ancien in snapshot.items()
+                if getattr(self, name) != ancien
+            ]
+            if modifies:
+                raise ImmutableObservation(
+                    "Une observation de clôture est immuable : elle décrit un "
+                    "dossier tel qu'il était le jour où il s'est terminé. Champs "
+                    f"modifiés : {', '.join(sorted(modifies))}."
+                )
+        super().save(*args, **kwargs)
+        self._db_snapshot = {
+            f.attname: copy.deepcopy(getattr(self, f.attname))
+            for f in self._meta.concrete_fields if f.attname != "id"
         }

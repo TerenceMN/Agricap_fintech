@@ -588,6 +588,61 @@ def reopen_analysis(app, analyst_sub: str) -> None:
 
 
 @transaction.atomic
+def close(app, closer_sub: str, comment: str = ""):
+    """ACTIVE → CLOSED — et c'est ici que la filière apprend (principe 10).
+
+    Le statut `closed` existait depuis l'origine sans qu'aucune transition ne
+    l'atteigne : un dossier décaissé restait `active` indéfiniment. Conséquence
+    invisible mais lourde — la boucle d'apprentissage n'avait AUCUN
+    déclencheur, `n_cas_reels` restait à zéro pour toutes les filières, et
+    chaque analyse continuait d'annoncer « référentiel indicatif, fiabilité
+    limitée » quel que soit le nombre de dossiers réellement bouclés.
+
+    La clôture est un ACTE HUMAIN, motivé : c'est un gestionnaire qui constate
+    que le prêt est soldé (ou abandonné). Le moteur ne clôt rien tout seul —
+    déduire une clôture d'un solde à zéro confondrait « remboursé » et « pas
+    encore appelé ».
+
+    L'observation d'apprentissage vit dans CETTE transaction : un dossier
+    clôturé sans son observation serait un dossier dont l'expérience est perdue
+    sans que rien ne le signale.
+
+    Retourne l'`ObservationFiliere` figée, ou `None` quand la filière du dossier
+    n'a pas de référentiel actif (la clôture reste valide — cf.
+    `apprentissage.enregistrer_cloture`).
+    """
+    _assert_status(app, "active")
+
+    if not comment.strip():
+        raise WorkflowError(
+            "Un motif de clôture est obligatoire : « soldé à l'échéance », "
+            "« remboursement anticipé », « abandon de créance »… Deux ans plus "
+            "tard, c'est cette phrase qui explique la fin du dossier."
+        )
+
+    from credits.apprentissage import enregistrer_cloture
+
+    app.status = "closed"
+    app.closed_at = timezone.now()
+    app.closed_by_sub = closer_sub
+    app.closure_comment = comment
+    app.save(update_fields=[
+        "status", "closed_at", "closed_by_sub", "closure_comment", "updated_at",
+    ])
+
+    observation = enregistrer_cloture(app, par=closer_sub, clos_le=app.closed_at)
+
+    _audit_transition(
+        app, actor=closer_sub, action="credits.workflow.close",
+        etape="cloture", motif=comment,
+        observationId=(observation.pk if observation else None),
+        referentiel=(observation.referentiel.code if observation else None),
+        contributive=(observation.contributive if observation else None),
+    )
+    return observation
+
+
+@transaction.atomic
 def record_client_consent(
     app, client_sub: str, method: str = "app"
 ) -> None:

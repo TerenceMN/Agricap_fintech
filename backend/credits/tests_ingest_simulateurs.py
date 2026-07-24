@@ -228,8 +228,17 @@ class IngestionSimulateursTests(TestCase):
         couverture passe de 9 à 14 classeurs : le garde-fou s'applique maintenant
         aussi aux filières hors-sol, qu'il ne protégeait pas puisqu'elles étaient
         refusées.
+
+        PORTÉE ÉLARGIE (dette §6, « créer les simulateurs manquants ») : les
+        classeurs ajoutés (riz, manioc, café arabica) partagent leur NUMÉRO de
+        chaîne avec un classeur existant — « 01 » désigne désormais le maïs ET le
+        riz. Compter les classeurs vérifiés et les comparer à 14 devenait donc
+        faux dès le premier ajout, alors que l'exigence, elle, n'a pas bougé :
+        TOUS les classeurs disponibles passent le garde-fou, et les 14 chaînes
+        institutionnelles sont couvertes. C'est ce qu'on assère maintenant —
+        nommer les chaînes attendues vaut mieux que compter les fichiers.
         """
-        verifies = 0
+        verifies: set[str] = set()
         for source in simulateurs_disponibles():
             spec = charger_depuis_simulateur(source)
             quantite = Decimal(spec["_lignage"]["quantiteReference"])
@@ -260,11 +269,12 @@ class IngestionSimulateursTests(TestCase):
                     f"{source.original_name}/{module} : {obtenu_ref} ≠ {attendu_ref} "
                     "(le coût doit être relu du classeur, jamais inventé).",
                 )
-            verifies += 1
+            verifies.add(_numero(source.original_name))
         self.assertEqual(
-            verifies, len(UNITE_ATTENDUE),
-            "Les 14 filières doivent passer le contrôle de dérivation — aucune ne "
-            "doit sortir du garde-fou anti-invention.",
+            verifies, set(UNITE_ATTENDUE),
+            "Les 14 chaînes doivent passer le contrôle de dérivation — aucune ne "
+            "doit sortir du garde-fou anti-invention, et aucun classeur ne doit "
+            "porter un numéro de chaîne inconnu du référentiel.",
         )
 
     def test_le_mais_ne_reproduit_pas_la_fiction_historique_des_semences(self):
