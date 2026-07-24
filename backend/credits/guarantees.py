@@ -847,8 +847,50 @@ def serialize_guarantee_request(guarantee) -> dict[str, Any]:
 
 # ── Vue synthèse des garanties d'un dossier ───────────────────────────────────
 
-def get_guarantee_summary(application) -> dict[str, Any]:
-    """Retourne un résumé des garanties actives d'un dossier."""
+#: Nombre de caractères de fin conservés par le masquage d'une pièce d'identité.
+#: Assez pour qu'un agent rapproche une pièce qu'il a déjà vue, trop peu pour la
+#: reconstituer.
+PIECE_VISIBLE = 4
+
+
+def masquer_piece_identite(numero: str) -> str:
+    """Masque un numéro de pièce d'identité en n'en laissant que la fin.
+
+    « CD-CNI-99887766 » → « ••••7766 ». Un numéro plus court que la fenêtre
+    visible est masqué en ENTIER : une pièce de cinq caractères dont on
+    montrerait les quatre derniers ne serait pas masquée, elle serait publiée.
+    """
+    valeur = (numero or "").strip()
+    if not valeur:
+        return ""
+    if len(valeur) <= PIECE_VISIBLE:
+        return "•" * len(valeur)
+    return "•" * PIECE_VISIBLE + valeur[-PIECE_VISIBLE:]
+
+
+def get_guarantee_summary(application, *, pour_staff: bool = False) -> dict[str, Any]:
+    """Résumé des garanties d'un dossier — masqué par défaut.
+
+    `pour_staff=False` (défaut) sert le TITULAIRE du dossier. Le cloisonnement
+    d'accès est correct depuis le lot sécurité — seuls le titulaire et le
+    personnel atteignent cette vue — mais le titulaire y lisait la pièce
+    d'identité COMPLÈTE de son garant : la donnée personnelle d'un TIERS,
+    saisie par un agent (`register_moral_guarantee` exige `CAN_INSTRUCT`), et
+    dont le demandeur n'a aucun usage. Un numéro de CNI ne sert qu'à une chose
+    dans ce dossier : prouver qu'un agent a vu la pièce. Cette preuve appartient
+    à l'instruction, pas au demandeur.
+
+    Le défaut est donc le masquage, et non l'inverse : une vue qui oublierait de
+    préciser son audience doit se tromper du côté prudent. `guarantorIdProvided`
+    conserve l'information UTILE au titulaire — la pièce a bien été renseignée,
+    la caution est donc complète — sans en livrer le contenu.
+
+    À BRANCHER (hors périmètre) : les endpoints staff doivent passer
+    `pour_staff=True`. Ils vivent dans `credits/views.py`, tenu par un autre
+    agent ; la liste exacte est dans le rapport de lot. Tant que ce n'est pas
+    fait, un agent voit la pièce masquée — une gêne visible et réversible en une
+    ligne, préférable à une fuite invisible.
+    """
     from credits.models import CreditGuarantee
 
     guarantees = list(
@@ -914,7 +956,13 @@ def get_guarantee_summary(application) -> dict[str, Any]:
             item.update({
                 "guarantorName": g.guarantor_name,
                 "guarantorPhone": g.guarantor_phone,
-                "guarantorIdNumber": g.guarantor_id_number,
+                # Pièce d'identité d'un TIERS : en clair pour l'instruction,
+                # masquée pour le titulaire du dossier.
+                "guarantorIdNumber": (
+                    g.guarantor_id_number if pour_staff
+                    else masquer_piece_identite(g.guarantor_id_number)
+                ),
+                "guarantorIdProvided": bool((g.guarantor_id_number or "").strip()),
                 "guarantorSub": str(g.guarantor_id) if g.guarantor_id else None,
                 "confirmedAt": g.confirmed_at.isoformat() if g.confirmed_at else None,
                 "expiresAt": g.expires_at.isoformat() if g.expires_at else None,

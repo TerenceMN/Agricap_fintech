@@ -730,8 +730,16 @@ def renew_client_consent(app, agent_sub: str) -> None:
 
 # ── Sérialiseur de dossier ─────────────────────────────────────────────────────
 
-def serialize_application(app) -> dict[str, Any]:
-    """Sérialise un CreditApplication pour l'API."""
+def serialize_application(app, *, pour_staff: bool = False) -> dict[str, Any]:
+    """Sérialise un CreditApplication pour l'API.
+
+    `pour_staff` n'ouvre aujourd'hui qu'une seule porte — la pièce d'identité du
+    garant, masquée pour le titulaire du dossier (cf.
+    `guarantees.get_guarantee_summary`). Le défaut est la vue la plus fermée :
+    un appelant qui ne précise pas son audience ne doit pas obtenir la vue la
+    plus ouverte. Les endpoints staff de `credits/views.py` doivent le passer —
+    signalé au propriétaire de ce fichier.
+    """
     from credits.guarantees import get_guarantee_summary
 
     client = app.client
@@ -769,7 +777,7 @@ def serialize_application(app) -> dict[str, Any]:
         } if ns else None,
         "scoreResult": app.score_result or None,
         "guaranteeType": app.guarantee_type or None,
-        "guarantees": get_guarantee_summary(app),
+        "guarantees": get_guarantee_summary(app, pour_staff=pour_staff),
         "reviewedBySub": app.reviewed_by_sub or None,
         "reviewedAt": app.reviewed_at.isoformat() if app.reviewed_at else None,
         "approvalComment": app.approval_comment or None,

@@ -151,32 +151,74 @@ def _debt_rating(ratio: float | None) -> str:
     return "élevé"
 
 
+#: Champs de `ValueChain` servis au CLIENT dans le préremplissage.
+#:
+#: LISTE BLANCHE, jamais liste noire : une colonne ajoutée demain à `ValueChain`
+#: n'a aucune raison d'arriver toute seule dans un payload client. Le sens de la
+#: règle par défaut décide de ce qui fuit dans six mois.
+#:
+#: Ce que le client a BESOIN de voir pour choisir sa filière et comprendre son
+#: calendrier : le code, le libellé, la durée du cycle, les mois de récolte, et
+#: les types de garantie admis (sans quoi l'écran lui proposerait de constituer
+#: une garantie que sa filière refuse).
+CHAMPS_FILIERE_CLIENT = (
+    "code", "label", "cycle_months", "harvest_months", "eligible_guarantees",
+)
+
+#: Ce que le client NE VOIT PAS, et pourquoi (principe 7) :
+#:   cost_per_hectare_usd / _cdf → le coût de référence : c'est le dénominateur
+#:     du contrôle de cohérence de sa feuille de besoins. Le connaître permet de
+#:     dimensionner un plan pour tomber pile dans la fourchette tolérée ;
+#:   module_weights → la signature de coûts de la filière, soit exactement la
+#:     grille du critère de fiabilité technique (25 % de la note) ;
+#:   min_score_required → le score à atteindre. Un demandeur qui le connaît
+#:     sait s'il doit gonfler son dossier, et de combien ;
+#:   base_rate → le taux de base sur lequel s'applique la grille de
+#:     tarification ; sa combinaison avec le taux proposé révèle l'ajustement,
+#:     donc la bande de score du dossier.
+#: Ces mêmes chiffres viennent d'être fermés sur `reference-data/value-chains/`
+#: et au diff de révision : les servir ici les rouvrirait sans bruit.
+CHAMPS_FILIERE_RETENUS = (
+    "cost_per_hectare_usd", "cost_per_hectare_cdf", "base_rate",
+    "min_score_required", "module_weights",
+)
+
+
 def _get_active_value_chains() -> list[dict]:
-    """Retourne les chaînes de valeur actives (depuis le cache si disponible)."""
+    """Chaînes de valeur actives, dans leur forme CLIENT (cf. liste blanche).
+
+    Le cache porte désormais une clé distincte de celle du référentiel complet
+    (`reference_data:value_chains:active`, forme STAFF) : une seule entrée pour
+    deux formes différentes ferait servir la forme staff au client dès qu'un
+    écran de backoffice aurait chauffé le cache le premier — une fuite
+    intermittente, donc introuvable.
+
+    Cette clé porte l'empreinte de la version ACTIVE du référentiel plutôt que
+    de compter sur une invalidation externe : `reference_data.activate_file`
+    n'efface que SA clé, et il n'a pas à connaître les nôtres. Une activation
+    produit mécaniquement une nouvelle clé, donc un contenu à jour — sans
+    couplage entre les deux apps.
+    """
     try:
         from django.core.cache import cache
-        from reference_data.models import ValueChain
+        from reference_data.models import ReferenceFileUpload, ValueChain
 
-        CACHE_KEY = "reference_data:value_chains:active"
+        version = (
+            ReferenceFileUpload.objects
+            .filter(status=ReferenceFileUpload.Status.ACTIVE)
+            .order_by("-activated_at", "-id")
+            .values_list("id", "activated_at")
+            .first()
+        ) or (0, None)
+        CACHE_KEY = f"credits:prefill:value_chains:client:{version[0]}:{version[1]}"
+
         cached = cache.get(CACHE_KEY)
         if cached is not None:
             return cached
 
         chains = list(
-            ValueChain.objects.filter(active=True)
-            .values(
-                "code", "label", "cycle_months",
-                "cost_per_hectare_usd", "cost_per_hectare_cdf",
-                "base_rate", "min_score_required",
-                "harvest_months", "module_weights", "eligible_guarantees",
-            )
+            ValueChain.objects.filter(active=True).values(*CHAMPS_FILIERE_CLIENT)
         )
-        # Décimaux → float pour sérialisation JSON
-        for c in chains:
-            c["cost_per_hectare_usd"] = float(c["cost_per_hectare_usd"] or 0)
-            c["cost_per_hectare_cdf"] = float(c["cost_per_hectare_cdf"] or 0)
-            c["base_rate"] = float(c["base_rate"] or 0)
-
         cache.set(CACHE_KEY, chains, 300)
         return chains
     except Exception:
