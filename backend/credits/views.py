@@ -1006,11 +1006,32 @@ def _create_application(request: Request) -> Response:
         except ValueChain.DoesNotExist:
             return Response({"detail": f"Filière '{vc_code}' introuvable."}, status=404)
 
-    # Feuille de besoins
+    # ── Feuille de besoins ────────────────────────────────────────────────────
+    # `uploaded_by` est FILTRÉ, et ce n'est pas une précaution de style.
+    #
+    # `NeedsSheet.pk` est un entier séquentiel, et cette résolution était nue
+    # (`objects.get(pk=...)`). N'importe quel membre pouvait donc rattacher à SON
+    # dossier la feuille de besoins d'un autre, puis la lire par la porte de
+    # devant : `GET /applications/<son propre code>/analysis-report/` sert
+    # `serialize_analysis_report(app.needs_sheet)` — les lignes du classeur
+    # d'autrui (libellés, quantités, prix, écarts) et jusqu'aux commentaires
+    # internes de l'analyste. Le contrôle d'étanchéité de cette vue ne pouvait
+    # rien voir : le DOSSIER interrogé appartient bien à l'appelant. C'est la
+    # référence entrante qui n'était pas vérifiée, pas la lecture.
+    #
+    # Deux origines légitimes, et deux seulement : le client a téléversé sa
+    # feuille lui-même, ou l'agent qui monte le dossier l'a fait pour lui
+    # (`parse_needs_sheet_view` pose `uploaded_by` = sub du DÉPOSANT, d'où les
+    # deux valeurs admises et non la seule `client_sub`).
+    #
+    # Un identifiant qui existe mais n'appartient à aucun des deux répond comme
+    # un identifiant inexistant : rien ne doit renseigner sur le nombre de
+    # feuilles en base ni sur celles d'autrui.
     ns = None
     if ns_id := data.get("needs_sheet_id"):
         try:
-            ns = NeedsSheet.objects.get(pk=int(ns_id))
+            ns = NeedsSheet.objects.get(pk=int(ns_id),
+                                        uploaded_by__in={client_sub, requester_sub})
         except (NeedsSheet.DoesNotExist, ValueError):
             return Response({"detail": "Feuille de besoins introuvable."}, status=404)
 

@@ -318,6 +318,105 @@ class GardeDeGroupeTests(AuthedAPITestCase):
             self.client.post(f"{BASE}/baremes/DSCR/", {}, format="json").status_code, 403)
 
 
+class FeuilleDeBesoinsDAutruiTests(AuthedAPITestCase):
+    """Faille TROUVÉE en cartographiant les gardes de corps — sans lien avec la
+    migration, et qu'aucune `permission_classes` n'aurait pu couvrir.
+
+    `POST /applications/` acceptait `needs_sheet_id` sans vérifier à qui la
+    feuille appartient. `NeedsSheet.pk` étant un entier séquentiel, tout membre
+    pouvait rattacher à SON dossier la feuille de besoins d'un autre, puis la
+    lire par la porte de devant : `GET /applications/<son code>/analysis-report/`
+    sert `serialize_analysis_report(app.needs_sheet)`, c'est-à-dire les lignes du
+    classeur d'autrui — libellés, quantités, prix, écarts — et les commentaires
+    internes de l'analyste.
+
+    L'étanchéité de `analysis-report` ne pouvait rien voir : le dossier
+    interrogé appartient bien à l'appelant. C'est la référence ENTRANTE qui
+    n'était pas vérifiée. `simulate_scoring`, dans le même fichier, filtrait
+    pourtant déjà sur `uploaded_by` — l'intention existait, une seule des deux
+    portes l'appliquait.
+    """
+
+    def setUp(self):
+        from credits.models import NeedsSheet
+
+        self.victime = _make_user("sub-victime-ns")
+        self.curieux = _make_user("sub-curieux-ns")
+        self.feuille = NeedsSheet.objects.create(
+            uploaded_by="sub-victime-ns", currency="USD", parsed_ok=True,
+            grand_total=Decimal("1330"),
+            total_by_module={"semences": "400", "engrais": "930"},
+        )
+
+    def test_un_tiers_ne_rattache_pas_la_feuille_d_un_autre_a_son_dossier(self):
+        self.login(role="client", sub=self.curieux.pk)
+        reponse = self.client.post(
+            f"{APPS}/", {"amount_requested": "1000", "needs_sheet_id": self.feuille.pk},
+            format="json")
+        self.assertEqual(reponse.status_code, 404)
+        self.assertEqual(reponse.data["detail"], "Feuille de besoins introuvable.")
+
+    def test_le_refus_est_indiscernable_d_un_identifiant_inexistant(self):
+        """Sinon la réponse compte les feuilles en base et signale celles
+        d'autrui — le même oracle que les codes `CRED-AAAAMMJJ-NNNN`."""
+        self.login(role="client", sub=self.curieux.pk)
+        corps = {"amount_requested": "1000"}
+        interdit = self.client.post(
+            f"{APPS}/", {**corps, "needs_sheet_id": self.feuille.pk}, format="json")
+        inexistant = self.client.post(
+            f"{APPS}/", {**corps, "needs_sheet_id": 999_999}, format="json")
+        self.assertEqual(interdit.status_code, inexistant.status_code)
+        self.assertEqual(interdit.data, inexistant.data)
+
+    def test_le_titulaire_rattache_sa_propre_feuille(self):
+        """Non-régression du parcours normal : le client qui a téléversé sa
+        feuille la rattache à son dossier."""
+        self.login(role="client", sub=self.victime.pk)
+        reponse = self.client.post(
+            f"{APPS}/", {"amount_requested": "1000", "needs_sheet_id": self.feuille.pk},
+            format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.data)
+        self.assertEqual(
+            CreditApplication.objects.get(code=reponse.data["code"]).needs_sheet_id,
+            self.feuille.pk)
+
+    def test_l_agent_rattache_la_feuille_qu_il_a_televersee_pour_le_client(self):
+        """`parse_needs_sheet_view` pose `uploaded_by` = sub du DÉPOSANT : quand
+        l'agent téléverse pour le client, la feuille porte le sub de l'agent.
+        Filtrer sur le seul `client_sub` aurait cassé ce parcours — c'est le
+        durcissement de trop qu'il fallait éviter."""
+        from credits.models import NeedsSheet
+
+        feuille_agent = NeedsSheet.objects.create(
+            uploaded_by="sub-agent-ns", currency="USD", parsed_ok=True,
+            grand_total=Decimal("2000"), total_by_module={"semences": "2000"},
+        )
+        self.login(role="agent_terrain", sub="sub-agent-ns")
+        reponse = self.client.post(
+            f"{APPS}/",
+            {"amount_requested": "2000", "client_sub": self.victime.pk,
+             "needs_sheet_id": feuille_agent.pk},
+            format="json")
+        self.assertEqual(reponse.status_code, 201, reponse.data)
+        self.assertEqual(
+            CreditApplication.objects.get(code=reponse.data["code"]).needs_sheet_id,
+            feuille_agent.pk)
+
+    def test_la_fuite_par_analysis_report_est_refermee(self):
+        """Le test de bout en bout : c'est la lecture, pas le rattachement, qui
+        faisait le dommage."""
+        self.login(role="client", sub=self.curieux.pk)
+        self.client.post(
+            f"{APPS}/", {"amount_requested": "1000", "needs_sheet_id": self.feuille.pk},
+            format="json")
+        dossier = CreditApplication.objects.filter(client_id=self.curieux.pk).first()
+        if dossier is not None:                      # le dossier n'est pas créé (404)
+            self.assertIsNone(dossier.needs_sheet_id)
+        self.assertFalse(
+            CreditApplication.objects.filter(needs_sheet=self.feuille)
+            .exclude(client_id=self.victime.pk).exists())
+
+
 def _nom_de_decorateur(noeud) -> str:
     """`@api_view(["GET"])` comme `@api_view` → « api_view »."""
     import ast
