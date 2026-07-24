@@ -4,6 +4,7 @@ from __future__ import annotations
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from rbac.permissions import HasCapability
 
 from . import services
@@ -19,7 +20,7 @@ def _row(p: Partner) -> dict:
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def partners(request):
     return Response([_row(p) for p in Partner.objects.all()])
 
@@ -63,7 +64,7 @@ def partner_test(request, partner_id):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def partner_logs(request, partner_id):
     p = Partner.objects.filter(pk=partner_id).first()
     if not p:

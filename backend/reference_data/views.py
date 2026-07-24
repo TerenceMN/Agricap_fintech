@@ -5,6 +5,7 @@ from rest_framework.decorators import api_view, parser_classes, permission_class
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from rbac.permissions import HasCapability
 
 from .models import ReferenceFileUpload, ValueChain
@@ -106,8 +107,14 @@ def activate_reference_file(request, upload_id: int):
 # ── GET /api/reference-data/value-chains/ ────────────────────────────────────
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def list_value_chains(request):
+    """Le référentiel des filières — coût/hectare, poids des modules, facteur de risque,
+    score minimum requis et taux de base. C'est un BARÈME : principe 7 (anti-gaming) veut
+    qu'il ne descende jamais chez un demandeur, qui y lirait où viser. Le seul écran qui
+    le consomme est l'onglet Référence du backoffice (`ValueChainsPanel.tsx`), déjà prêt à
+    afficher un refus. Le parcours client passe, lui, par `application/prefill/`, qui ne
+    sert que le libellé des filières."""
     cached = cache.get(CACHE_KEY_ACTIVE)
     if cached is not None:
         return Response(cached)

@@ -451,3 +451,63 @@ class SavingsGroupDetailTests(AuthedAPITestCase):
         res = self.client.get(f"/api/savings/groups/{group_id}/audit")
         self.assertEqual(res.status_code, 200)
         self.assertTrue(any(e["action"] == "savings.group.create" for e in res.data))
+
+
+class CloisonnementEpargneTests(AuthedAPITestCase):
+    """Ce qui appartient au membre, ce qui appartient à l'institution.
+
+    Le module épargne mélangeait les deux derrière un même `HasCapability("read")` : le
+    catalogue des groupes (que le membre doit voir pour en rejoindre un) et le back-office
+    épargne (tous les plans, tous les titulaires, les adhésions nominatives). Les rôles
+    clients portant `read=True`, la seconde famille était publique.
+    """
+
+    def _groupe(self, nom="Coopérative de Goma"):
+        self.login(role="gest_zone", sub="gz-cloisonnement")
+        return self.client.post("/api/savings/groups", {"name": nom, "rate": "5.0"},
+                                format="json").data["id"]
+
+    def test_un_membre_ne_lit_pas_tous_les_plans_de_la_cooperative(self):
+        self.login(role="client", sub="membre-epargne")
+        self.assertEqual(self.client.get("/api/savings/plans").status_code, 403)
+
+    def test_un_membre_lit_le_catalogue_sans_les_soldes_ni_les_noms_des_autres(self):
+        """Le catalogue reste ouvert — sans lui, personne ne peut demander à rejoindre un
+        groupe. Ce qui en sort est réduit : le solde du groupe est un agrégat de
+        l'institution, et la liste de ses membres l'identité de tiers."""
+        gid = self._groupe()
+        self.login(role="client", sub="membre-epargne")
+        res = self.client.get("/api/savings/groups")
+        self.assertEqual(res.status_code, 200)
+        ligne = next(g for g in res.data if g["id"] == gid)
+        self.assertEqual(ligne["name"], "Coopérative de Goma")
+        self.assertIn("membersCount", ligne)      # la taille, oui
+        self.assertNotIn("balance", ligne)        # l'encours, non
+        self.assertNotIn("members", ligne)        # les noms, non
+
+    def test_le_personnel_conserve_le_catalogue_complet(self):
+        gid = self._groupe()
+        self.login(role="gest_zone", sub="gz-cloisonnement")
+        ligne = next(g for g in self.client.get("/api/savings/groups").data if g["id"] == gid)
+        self.assertIn("balance", ligne)
+        self.assertIn("members", ligne)
+
+    def test_un_investisseur_ne_cree_pas_une_cooperative_d_epargne(self):
+        """`invest` porte `create` : garder la création de groupe sous cette capacité la
+        mettait à sa portée, taux compris. Administrer le réseau mutualiste est la
+        capacité `cooperatives`, qu'aucun rôle client ne porte."""
+        self.login(role="invest", sub="investisseur-epargne")
+        res = self.client.post("/api/savings/groups", {"name": "Groupe pirate", "rate": "99"},
+                               format="json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_un_membre_ne_lit_ni_la_fiche_ni_le_journal_d_un_groupe(self):
+        gid = self._groupe()
+        self.login(role="client", sub="membre-epargne")
+        self.assertEqual(self.client.get(f"/api/savings/groups/{gid}").status_code, 403)
+        self.assertEqual(self.client.get(f"/api/savings/groups/{gid}/audit").status_code, 403)
+
+    def test_un_membre_lit_ses_propres_adhesions(self):
+        self.login(role="client", sub="membre-epargne")
+        self.assertEqual(self.client.get("/api/savings/groups/mine").status_code, 200)
+        self.assertEqual(self.client.get("/api/savings/plans/mine").status_code, 200)

@@ -88,3 +88,35 @@ class KycLevelTests(AuthedAPITestCase):
         self.assertEqual(res.data["kycLevel"], "T1")
         self.assertEqual(res.data["monthlyLimit"], float(kyc_levels.LEVEL_LIMITS["T1"]))
         self.assertIn("USD", res.data["withdrawnThisMonth"])
+
+
+class CloisonnementKycTests(AuthedAPITestCase):
+    """Le registre KYC/AML de l'institution n'est pas une donnée de membre.
+
+    `GET /api/compliance/kyc` renvoyait, pour TOUS les utilisateurs, leur statut KYC et
+    leur **score de risque AML** — l'appréciation que l'institution porte sur chacun de
+    ses membres. Le garde était `HasCapability("read")`, que porte tout rôle client.
+    Connaître un score de risque, fût-ce le sien, c'est pouvoir calibrer son comportement
+    pour en sortir (principe 7, anti-gaming).
+    """
+
+    def test_un_membre_ne_lit_pas_le_registre_kyc(self):
+        self.login(role="client", sub="membre-kyc")
+        self.assertEqual(self.client.get("/api/compliance/kyc").status_code, 403)
+
+    def test_un_investisseur_non_plus_malgre_sa_capacite_read(self):
+        self.login(role="invest", sub="investisseur-kyc")
+        self.assertEqual(self.client.get("/api/compliance/kyc").status_code, 403)
+
+    def test_le_membre_garde_son_propre_dossier_kyc_sans_score_de_risque(self):
+        self.login(role="client", sub="membre-kyc")
+        res = self.client.get("/api/compliance/kyc/mine")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("kycLevel", res.data)
+        self.assertIn("monthlyLimit", res.data)
+        self.assertNotIn("riskScore", res.data)
+
+    def test_la_conformite_lit_le_registre(self):
+        self.login(role="compliance", sub="conformite-1")
+        res = self.client.get("/api/compliance/kyc")
+        self.assertEqual(res.status_code, 200)

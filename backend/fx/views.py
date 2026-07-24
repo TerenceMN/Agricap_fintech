@@ -15,6 +15,7 @@ from __future__ import annotations
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from common.exceptions import NotFoundError
 from common.parsing import to_date, to_int
 from rbac.permissions import HasCapability
@@ -26,6 +27,31 @@ from .permissions import CapabilityByMethod
 #: Plafond de lignes servies ; le total réel accompagne toujours la liste tronquée
 #: (CLAUDE.md §4.6 : « `total_rows` sur toute liste tronquée »).
 MAX_ROWS = 200
+
+
+#: Champs de GOUVERNANCE du taux : qui l'a saisi, qui l'a validé, de combien il a bougé
+#: et à partir de quel seuil un second acteur devient obligatoire. Ce sont les rouages
+#: internes de la fabrique du taux — un membre a le droit de connaître le PRIX qu'on lui
+#: applique, pas la mécanique qui décide s'il passe tout seul (principe 7 : le seuil est
+#: précisément ce qu'il ne faut pas publier, sous peine d'apprendre à rester dessous).
+_RATE_STAFF_FIELDS = (
+    "id", "status", "version", "source", "sourceReference", "variationPct", "thresholdPct",
+    "referenceRateId", "supersedesId", "supersededAt", "reason", "createdBy", "createdAt",
+    "validatedBy", "validatedAt", "validationReason",
+)
+
+
+def _rate_row_for(request, r: ExchangeRate) -> dict:
+    """Choisit le sérialiseur selon le rôle — jamais un `if` d'affichage côté front.
+
+    `current` et `convert` restent ouverts à tout porteur de `read` : le taux appliqué à
+    une conversion est une information due au membre qui la subit. C'est la GOUVERNANCE
+    du taux qui reste interne, pas le taux.
+    """
+    ligne = _rate_row(r)
+    if getattr(getattr(request, "user", None), "is_staff_role", False):
+        return ligne
+    return {k: v for k, v in ligne.items() if k not in _RATE_STAFF_FIELDS}
 
 
 def _rate_row(r: ExchangeRate) -> dict:
@@ -53,7 +79,7 @@ def _rate_row(r: ExchangeRate) -> dict:
 
 
 @api_view(["GET", "POST"])
-@permission_classes([CapabilityByMethod(safe="read", unsafe="config")])
+@permission_classes([IsStaff, CapabilityByMethod(safe="read", unsafe="config")])
 def rates(request):
     """GET : historique filtrable. POST : saisie d'un taux (maker)."""
     if request.method == "GET":
@@ -128,7 +154,7 @@ def current(request):
         # Message explicite plutôt qu'un « Aucun taux disponible » générique : l'écran doit
         # pouvoir dire QUEL taux manque (palier, devise, usage, date).
         return Response({"detail": str(exc)}, status=404)
-    row = _rate_row(rate)
+    row = _rate_row_for(request, rate)
     row["stale"] = meta["stale"]
     row["stalenessDays"] = meta["stalenessDays"]
     row["askedFor"] = meta["askedFor"]
@@ -136,7 +162,7 @@ def current(request):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def pending(request):
     """Corbeille des taux en attente d'un second acteur (écart > seuil)."""
     rows = services.pending_rates(
@@ -151,7 +177,7 @@ def pending(request):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("config")])
+@permission_classes([IsStaff, HasCapability("config")])
 def validate(request, pk: int):
     """Second acteur : valide ou rejette un taux en attente, avec motif obligatoire.
 
@@ -169,7 +195,7 @@ def validate(request, pk: int):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("config")])
+@permission_classes([IsStaff, HasCapability("config")])
 def sync_bcc(request):
     """Synchronise le taux BCC du jour depuis la page publique bcc.cd (pas d'API officielle
     — parsing HTML, cf. services.fetch_bcc_rates). En cas d'échec (site injoignable, format
@@ -181,14 +207,27 @@ def sync_bcc(request):
     return Response([_rate_row(r) for r in rates_synced])
 
 
+#: Mêmes rouages internes que `_RATE_STAFF_FIELDS`, sous les clés que `rate_provenance`
+#: emploie (`rateId`, pas `id`) : la provenance est d'abord un objet de JOURNAL d'audit,
+#: pas une réponse d'API client.
+_PROVENANCE_STAFF_FIELDS = ("rateId", "source", "sourceReference", "version", "status",
+                            "validatedBy")
+
+
 @api_view(["GET"])
 @permission_classes([HasCapability("read")])
 def convert(request):
+    """Ouvert à tout porteur de `read` : le membre qui subit la conversion a le droit de
+    voir le taux appliqué, sa date et sa fraîcheur. La provenance complète — identifiant
+    interne du taux, version, source, validateur — reste au personnel."""
     result, provenance = services.convert_with_provenance(
         amount=request.GET.get("amount", "0"), from_currency=request.GET.get("from", "CDF"),
         to_currency=request.GET.get("to", "USD"), tier=request.GET.get("tier", "CLIENT"),
         usage=request.GET.get("usage", ExchangeRate.Usage.OPERATIONNEL),
         on=to_date(request.GET.get("on")),
     )
+    if provenance and not getattr(request.user, "is_staff_role", False):
+        provenance = {k: v for k, v in provenance.items()
+                      if k not in _PROVENANCE_STAFF_FIELDS}
     return Response({"amount": float(result), "from": request.GET.get("from", "CDF"),
                       "to": request.GET.get("to", "USD"), "rate": provenance})

@@ -5,8 +5,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from audit.services import record as audit_record
-from rbac.permissions import HasCapability
-from rbac.role_registry import get_role
+from accounts.permissions import IsStaff
+from rbac.permissions import CapaciteSelonMethode, HasCapability
 
 from .models import Supplier
 
@@ -17,12 +17,10 @@ def _row(s: Supplier) -> dict:
 
 
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", POST="create")])
 def suppliers(request):
     if request.method == "GET":
         return Response([_row(s) for s in Supplier.objects.all()])
-    if not get_role(getattr(request.user, "role", "")).create:
-        return Response({"detail": "Capacité requise : create."}, status=403)
     data = request.data or {}
     supplier = Supplier.objects.create(name=data.get("name", ""), category=data.get("category", ""),
                                         compliance_status=data.get("complianceStatus", ""))
@@ -30,7 +28,7 @@ def suppliers(request):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def supplier_action(request, supplier_id):
     supplier = Supplier.objects.filter(pk=supplier_id).first()
     if not supplier:

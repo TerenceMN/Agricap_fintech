@@ -1,14 +1,26 @@
 """API des caisses/comptes de trésorerie (Wallets.jsx, Treasury.jsx) et portefeuilles
-clients (ClientWallet.jsx)."""
+clients (ClientWallet.jsx).
+
+Deux populations d'endpoints qu'il ne faut jamais confondre :
+
+* la **trésorerie de l'institution** (`TreasuryAccount`, séances de caisse) — soldes des
+  caisses et coffres par agence, plafonds journaliers, gérants. Interne : `IsStaff` cumulé
+  à la capacité. `HasCapability("read")` seul ne protégeait rien, les rôles clients le
+  portant tous ;
+* le **portefeuille du client** (`ClientWallet`) — les vues `*_mine`, gardées par
+  `IsAuthenticated` et filtrées par `user=request.user`. Elles restent inchangées : c'est
+  l'argent de l'appelant, et le filtre est dans la requête, pas dans un identifiant d'URL.
+"""
 from __future__ import annotations
 
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from common import idempotency, makuta
 from common.makuta import MakutaConfigurationError
-from rbac.permissions import HasCapability
+from rbac.permissions import CapaciteSelonMethode, HasCapability
 from rbac.role_registry import get_role
 
 from . import cash_register, channels, partner_link, payments, regularization, serializers, services, \
@@ -22,7 +34,7 @@ def _require(request, capability: str) -> bool:
 
 
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", POST="create")])
 def accounts(request):
     if request.method == "GET":
         qs = TreasuryAccount.objects.all()
@@ -43,7 +55,7 @@ def accounts(request):
 
 
 @api_view(["GET", "PATCH"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", PATCH="create")])
 def account_detail(request, code):
     account = TreasuryAccount.objects.filter(code=code).first()
     if not account:
@@ -131,7 +143,7 @@ def account_action(request, code):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def account_register_sessions(request, code):
     account = TreasuryAccount.objects.filter(code=code).first()
     if not account:

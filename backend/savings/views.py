@@ -1,4 +1,22 @@
-"""API épargne (Savings.jsx + admin/savings/*) — CRUD léger, toujours audité."""
+"""API épargne (Savings.jsx + admin/savings/*) — CRUD léger, toujours audité.
+
+Trois cercles de visibilité, et la ligne passe par le PROPRIÉTAIRE de la donnée :
+
+1. **Mes données** (`my_plans`, `my_groups`, `plan_deposit`…) — `IsAuthenticated` et filtre
+   `user=request.user` dans la requête. Inchangé : c'est l'épargne de l'appelant.
+2. **Le catalogue des groupes** (`GET /groups`) — un membre a besoin de la liste des
+   coopératives/AVEC pour demander à en rejoindre une (modale « Rejoindre un groupe »).
+   Il reste donc en `read`, mais servi par un sérialiseur RÉDUIT : ni le solde du groupe,
+   ni le nom de ses membres. Ces deux champs concernent des tiers et l'institution.
+3. **Le back-office épargne** (`all_plans`, détail et journal d'un groupe) — soldes de
+   tous les titulaires, adhésions nominatives, journal d'audit : `IsStaff` cumulé.
+   `HasCapability("read")` seul ne filtrait rien, les rôles clients le portant tous.
+
+Écrire sur un groupe (créer, renommer, changer le taux) relève de la capacité
+`cooperatives` — « administrer le réseau mutualiste », déjà utilisée par `assign_group` —
+et non de `create`, que le rôle `invest` porte : un investisseur pouvait créer une
+coopérative d'épargne et en fixer le taux.
+"""
 from __future__ import annotations
 
 import datetime
@@ -11,12 +29,12 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from audit.services import record as audit_record
 from common import idempotency
 from common.exceptions import InsufficientFundsError
 from common.parsing import to_date, to_decimal
-from rbac.permissions import HasCapability
-from rbac.role_registry import get_role
+from rbac.permissions import CapaciteSelonMethode, HasCapability
 
 from .models import (
     GroupIntegrationRequest, SavingsAdjustment, SavingsDeposit, SavingsGroup,
@@ -76,7 +94,7 @@ def my_plans(request):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def all_plans(request):
     """Vue admin (AdminSavingsTable) — tous les plans, tous titulaires.
 
@@ -512,13 +530,28 @@ def _group_detail_payload(g: SavingsGroup) -> dict:
     }
 
 
+def _group_public_row(g: SavingsGroup) -> dict:
+    """Ligne servie à un MEMBRE : de quoi choisir un groupe à rejoindre, rien de plus.
+
+    Deux champs de `_group_row` sont retirés, et ce sont les deux qui ne lui appartiennent
+    pas : `balance` — l'encours du groupe, un agrégat de l'institution — et `members` —
+    l'identité nominative de tiers, que nul n'a consenti à publier. `membersCount` reste :
+    la taille d'un groupe est ce qu'on veut savoir avant d'y adhérer, et elle ne désigne
+    personne.
+    """
+    return {k: v for k, v in _group_row(g).items() if k not in ("balance", "members")}
+
+
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([CapaciteSelonMethode(GET="read", POST="cooperatives")])
 def groups(request):
+    """GET : le catalogue des groupes, réduit pour un membre (cf. `_group_public_row`).
+    POST : CRÉER un groupe et fixer son taux — capacité `cooperatives`, jamais `create`
+    (que le rôle `invest` porte, ce qui mettait la création d'une coopérative d'épargne
+    à la portée d'un investisseur)."""
     if request.method == "GET":
-        return Response([_group_row(g) for g in SavingsGroup.objects.all()])
-    if not get_role(getattr(request.user, "role", "")).create:
-        return Response({"detail": "Capacité requise : create."}, status=403)
+        ligne = _group_row if getattr(request.user, "is_staff_role", False) else _group_public_row
+        return Response([ligne(g) for g in SavingsGroup.objects.all()])
     data = request.data or {}
     group = SavingsGroup.objects.create(
         name=data.get("name", ""), type=data.get("type", "AVEC"), description=data.get("description", ""),
@@ -531,20 +564,20 @@ def groups(request):
 
 
 @api_view(["GET", "PATCH", "DELETE"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", PATCH="cooperatives",
+                                                   DELETE="config")])
 def group_detail(request, group_id):
+    """Fiche complète d'un groupe — historique nominatif des adhésions et journal des
+    demandes d'intégration. Interne : un membre a `my_groups` (ses adhésions) et le
+    catalogue réduit de `GET /groups`. Ici, il lirait qui d'autre a demandé à entrer dans
+    le groupe, et pourquoi."""
     group = SavingsGroup.objects.filter(pk=group_id).first()
     if not group:
         return Response({"detail": "Groupe introuvable."}, status=404)
-    role = get_role(getattr(request.user, "role", ""))
     if request.method == "DELETE":
-        if not role.config:
-            return Response({"detail": "Capacité requise : config."}, status=403)
         group.delete()
         return Response({"detail": "Groupe supprimé."})
     if request.method == "PATCH":
-        if not role.create:
-            return Response({"detail": "Capacité requise : create."}, status=403)
         data = request.data or {}
         for field, model_field in (("name", "name"), ("description", "description"), ("rate", "rate"),
                                     ("frequency", "frequency")):
@@ -560,7 +593,7 @@ def group_detail(request, group_id):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def group_audit(request, group_id):
     """Journal d'audit SERVEUR d'un groupe (création, mise à jour de taux, affectations,
     décisions d'intégration). Remplace `group_audit_${id}` de `localStorage`, qui vivait

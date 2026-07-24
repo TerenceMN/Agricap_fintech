@@ -68,8 +68,27 @@ def _vcs(request: Request) -> ViewContextService:
 
 
 def _require_read(request: Request) -> bool:
-    """Tout utilisateur authentifié — les données sont filtrées par ViewContextService."""
+    """Tout utilisateur authentifié — les données sont filtrées par ViewContextService.
+
+    ⚠️ Ce garde n'autorise QUE l'entrée dans la vue. Il ne dit rien du dossier demandé :
+    dès qu'une vue résout un dossier par son `code`, elle DOIT enchaîner sur
+    `_assert_can_read_app()`. Le code est prévisible (`CRED-AAAAMMJJ-NNNN`) — sans ce
+    second contrôle, `_require_read` + `_get_application(code)` est un IDOR complet.
+    """
     return bool(request.user and hasattr(request.user, "sub"))
+
+
+def _assert_can_read_app(request: Request, app) -> Response | None:
+    """`None` si l'appelant a le droit de lire CE dossier, sinon la réponse de refus.
+
+    Réponse 404 et non 403, alignée sur `analysis_report` : les codes de dossier suivent
+    `CRED-AAAAMMJJ-NNNN` et s'énumèrent. Un 403 confirmerait l'existence du dossier
+    sondé — l'oracle suffit à cartographier la production de l'institution jour par jour.
+    Le message est donc rigoureusement celui d'un dossier absent.
+    """
+    if _vcs(request).can_read_app(app):
+        return None
+    return Response({"detail": "Dossier introuvable."}, status=404)
 
 
 def _workflow_error(exc) -> Response:
@@ -1142,6 +1161,12 @@ def client_consent(request: Request, code: str) -> Response:
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
+    # `record_client_consent` refuse déjà un consentement donné par un tiers, mais son
+    # refus (« Seul le client bénéficiaire… ») CONFIRME l'existence du dossier sondé.
+    # Le cloisonnement doit répondre avant la règle métier, et répondre comme un dossier
+    # absent.
+    if (refus := _assert_can_read_app(request, app)) is not None:
+        return refus
 
     sub = getattr(request.user, "sub", "") or ""
     method = request.data.get("method", "app")
@@ -1198,12 +1223,21 @@ def _get_application(code: str):
 
 @api_view(["GET"])
 def list_guarantees(request: Request, code: str) -> Response:
-    """GET /api/credits/applications/<code>/guarantees/"""
+    """GET /api/credits/applications/<code>/guarantees/
+
+    Le titulaire du dossier et le personnel — personne d'autre. `get_guarantee_summary`
+    porte le **nom, le téléphone et le numéro de pièce d'identité nationale** du garant,
+    ainsi que les soldes d'épargne gagés : c'est la réponse la plus nominative de tout le
+    module crédit. Elle n'était protégée que par `_require_read`, c'est-à-dire par rien —
+    tout membre authentifié pouvait la lire sur n'importe quel `code`.
+    """
     if not _require_read(request):
         return Response({"detail": "Permission refusée."}, status=403)
     app = _get_application(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
+    if (refus := _assert_can_read_app(request, app)) is not None:
+        return refus
     from credits.guarantees import get_guarantee_summary
     return Response(get_guarantee_summary(app))
 
@@ -1431,6 +1465,13 @@ def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
     POST /api/credits/applications/<code>/guarantees/<id>/confirm/
 
     Confirmation par le garant (ou un agent avec preuve physique).
+
+    Deux acteurs légitimes, et deux seulement : l'équipe d'instruction, et le GARANT
+    désigné de cette caution précise. Le garde d'origine (`_require_read`) n'en vérifiait
+    aucun : le dossier était résolu par son code, la caution par son identifiant, et tout
+    membre authentifié pouvait rendre opposable — au nom d'autrui — la caution d'un
+    dossier qui ne le concernait pas. C'est l'inverse exact de ce que le consentement
+    établit (cf. `IsDesignatedGuarantor`).
     """
     if not _require_read(request):
         return Response({"detail": "Permission refusée."}, status=403)
@@ -1443,6 +1484,31 @@ def confirm_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
         guarantee = CreditGuarantee.objects.get(pk=guarantee_id, application=app)
     except CreditGuarantee.DoesNotExist:
         return Response({"detail": "Garantie introuvable."}, status=404)
+
+    # Deux refus DISTINCTS, et la distinction est délibérée :
+    #
+    #  - un inconnu (ni garant, ni agent, ni titulaire) reçoit « Dossier introuvable » en
+    #    404, exactement comme sur un code inexistant : lui répondre 403 lui apprendrait
+    #    que le dossier existe, et le code s'énumère ;
+    #  - le TITULAIRE reçoit un 403 explicite. Il sait déjà que son dossier existe : rien
+    #    ne fuite, et il a droit à la raison — confirmer sa propre caution reviendrait à
+    #    se porter garant de soi-même.
+    #
+    # `guarantor_id` est le lien opposable ; les cautions déclaratives historiques n'en
+    # portent pas, et restent donc du seul ressort de l'agent.
+    est_garant = (
+        guarantee.guarantor_id is not None
+        and str(guarantee.guarantor_id) == str(getattr(request.user, "pk", ""))
+    )
+    if not (est_garant or _require_group(request, CAN_INSTRUCT)):
+        if (refus := _assert_can_read_app(request, app)) is not None:
+            return refus
+        return Response(
+            {"detail": "Seul le garant désigné ou un agent instructeur peut confirmer "
+                       "cette garantie.",
+             "code": "CONFIRMATION_NON_AUTORISEE"},
+            status=403,
+        )
 
     from credits.guarantees import (
         GuaranteeError, confirm_asset_guarantee, confirm_moral_guarantee,
@@ -1554,18 +1620,38 @@ def release_guarantee(request: Request, code: str, guarantee_id: int) -> Respons
 
 # ── Décaissement (Étape 6) ────────────────────────────────────────────────────
 
+#: Champs du décaissement qui n'appartiennent pas au client — mêmes deux familles que
+#: `view_context._CLIENT_HIDDEN_FIELDS` : les identifiants des PERSONNES qui ont manipulé
+#: le dossier (le maker et le checker du décaissement — les nommer, c'est désigner qui
+#: solliciter hors procédure) et les références de RATTACHEMENT COMPTABLE, internes par
+#: nature. Restent servis : statut, montant, devise, dates — ce que le bénéficiaire a le
+#: droit de savoir de son propre argent.
+_DISBURSEMENT_STAFF_FIELDS = ("requestedBySub", "confirmedBySub", "journalEntryId", "notes")
+
+
 @api_view(["GET"])
 def disbursement_detail(request: Request, code: str) -> Response:
-    """GET /api/credits/applications/<code>/disbursement/"""
+    """GET /api/credits/applications/<code>/disbursement/
+
+    Le titulaire suit SON décaissement ; le personnel voit la chaîne complète. Avant, ni
+    l'un ni l'autre n'était vérifié : `_require_read` puis `_load_app(code)` livraient à
+    tout membre authentifié, sur n'importe quel code de dossier, l'identité de l'agent
+    demandeur et celle du confirmateur — donc la paire maker/checker d'un décaissement
+    réel — plus sa référence d'écriture comptable.
+    """
     if not _require_read(request):
         return Response({"detail": "Permission refusée."}, status=403)
     app = _load_app(code)
     if not app:
         return Response({"detail": "Dossier introuvable."}, status=404)
+    if (refus := _assert_can_read_app(request, app)) is not None:
+        return refus
     from credits.disbursement import serialize_disbursement
     data = serialize_disbursement(app)
     if data is None:
         return Response({"detail": "Aucune demande de décaissement pour ce dossier."}, status=404)
+    if not _vcs(request).is_staff:
+        data = {k: v for k, v in data.items() if k not in _DISBURSEMENT_STAFF_FIELDS}
     return Response(data)
 
 

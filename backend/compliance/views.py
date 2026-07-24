@@ -1,10 +1,24 @@
-"""API KYC/AML + documents (Compliance.jsx, ClientDocuments.jsx, InvestorDocuments.jsx)."""
+"""API KYC/AML + documents (Compliance.jsx, ClientDocuments.jsx, InvestorDocuments.jsx).
+
+Deux publics strictement séparés, et c'est la ligne de partage de tout ce module :
+
+* les vues **`.../mine`** servent au titulaire SES données — filtrées par
+  `user=request.user`, donc jamais adressables par identifiant d'un tiers ;
+* toutes les autres servent le dossier KYC/AML **d'autrui** et relèvent de la conformité :
+  `IsStaff` cumulé à la capacité.
+
+`kyc_profiles` était l'exception qui ne devait pas exister : gardé par
+`HasCapability("read")`, il renvoyait pour TOUS les utilisateurs leur statut KYC et leur
+**score de risque AML** — le jugement que l'institution porte sur ses membres. Or les
+rôles clients portent `read=True` : n'importe quel membre lisait la liste complète.
+"""
 from __future__ import annotations
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from audit.services import record as audit_record
 from common.choices import FlowStatus
 from rbac.permissions import HasCapability
@@ -14,8 +28,15 @@ from .models import Document, KycProfile
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def kyc_profiles(request):
+    """Le registre KYC/AML de l'institution — statut et score de risque de chaque membre.
+
+    Réservé au personnel : un score de risque AML est une appréciation interne, et la
+    connaître (la sienne comme celle d'un tiers) permet de calibrer son comportement pour
+    en sortir. Le titulaire a `GET /compliance/kyc/mine`, qui sert son niveau, son statut
+    et son plafond — jamais son score.
+    """
     return Response([
         {"userSub": k.user_id, "kycStatus": k.kyc_status, "riskScore": k.risk_score, "kycLevel": k.kyc_level,
          "monthlyLimit": float(k.monthly_limit)}
@@ -24,7 +45,7 @@ def kyc_profiles(request):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def validate_kyc(request, user_sub):
     profile, _ = KycProfile.objects.get_or_create(user_id=user_sub)
     profile.kyc_status = KycProfile.Status.VALIDE
@@ -51,7 +72,7 @@ def my_documents(request):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def document_review(request, doc_id):
     doc = Document.objects.filter(pk=doc_id).first()
     if not doc:

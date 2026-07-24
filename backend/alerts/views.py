@@ -4,6 +4,7 @@ from __future__ import annotations
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from rbac.permissions import HasCapability
 
 from . import services
@@ -61,8 +62,10 @@ def alert_rule_detail(request, rule_id):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def alerts(request):
+    """Les alertes de supervision de l'institution (seuils de trésorerie, agences en
+    écart). Interne : aucune ne concerne un membre en particulier."""
     services.evaluate_and_sync_alerts()
     qs = Alert.objects.select_related("rule").all()
     status = request.GET.get("status")

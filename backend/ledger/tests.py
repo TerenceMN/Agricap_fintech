@@ -6,7 +6,7 @@ from common.exceptions import ValidationFailed
 from common.testing import AuthedAPITestCase
 
 from . import services
-from .models import ChartAccount
+from .models import ChartAccount, JournalEntry
 
 
 class LedgerServiceTests(AuthedAPITestCase):
@@ -192,3 +192,85 @@ class LedgerAccountLinesApiTests(AuthedAPITestCase):
         self.assertEqual(len(res.data), 2)
         self.assertEqual(res.data[0]["balance"], 100.0)
         self.assertEqual(res.data[1]["balance"], 70.0)
+
+
+class CloisonnementGrandLivreTests(AuthedAPITestCase):
+    """Le grand livre n'a pas de vue client — ni en lecture, ni surtout en écriture.
+
+    Les six vues de ce module étaient gardées par `HasCapability("read")`, et deux d'entre
+    elles acceptent un POST : poster une écriture au journal et créer un compte du plan
+    comptable. Les rôles clients portant tous `read=True` dans `rbac.role_registry`, un
+    membre pouvait écrire une écriture comptable arbitraire dans les livres de la
+    coopérative. La capacité dépend désormais de la méthode : `read` pour consulter,
+    `create` pour saisir (maker), `config` pour toucher au plan comptable.
+    """
+
+    LECTURES = (
+        "/api/ledger/accounts",
+        "/api/ledger/entries",
+        "/api/ledger/trial-balance",
+        "/api/ledger/statements/bilan",
+        "/api/ledger/accounts/501T/lines",
+    )
+
+    def setUp(self):
+        ChartAccount.objects.create(code="501T", name="Caisse", class_no=5)
+
+    def test_un_membre_ne_lit_rien_du_grand_livre(self):
+        for role in ("client", "agri_op", "invest", "partner"):
+            self.login(role=role, sub=f"membre-gl-{role}")
+            for url in self.LECTURES:
+                with self.subTest(role=role, url=url):
+                    self.assertEqual(self.client.get(url).status_code, 403)
+
+    def test_un_membre_ne_poste_pas_une_ecriture(self):
+        """La faille en une requête : sans `IsStaff` ni capacité par méthode, ce POST
+        passait avec le seul `read` d'un rôle client."""
+        self.login(role="client", sub="scribe-gl")
+        res = self.client.post("/api/ledger/entries", {
+            "idempotencyKey": "pirate-1", "date": "2026-07-24", "code": "JOD",
+            "pieceRef": "FAKE-1", "currency": "USD",
+            "lines": [{"account": "501T", "debit": "1000000", "credit": "0"},
+                      {"account": "501T", "debit": "0", "credit": "1000000"}],
+        }, format="json")
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(JournalEntry.objects.count(), 0)
+
+    def test_un_membre_ne_cree_pas_un_compte_du_plan_comptable(self):
+        self.login(role="invest", sub="scribe-plan")
+        res = self.client.post("/api/ledger/accounts",
+                               {"code": "999T", "name": "Compte pirate"}, format="json")
+        self.assertEqual(res.status_code, 403)
+        self.assertFalse(ChartAccount.objects.filter(code="999T").exists())
+
+    def test_un_auditeur_lit_sans_ecrire(self):
+        """`aud_fin` porte `read` + `audit` et rien d'autre : il consulte les livres, il
+        n'y saisit pas. C'est le contrôle qui distingue « interne » de « maker »."""
+        self.login(role="aud_fin", sub="auditeur-gl")
+        for url in self.LECTURES:
+            with self.subTest(url=url):
+                self.assertEqual(self.client.get(url).status_code, 200)
+        self.assertEqual(
+            self.client.post("/api/ledger/entries", {"idempotencyKey": "a-1"},
+                             format="json").status_code, 403)
+
+    def test_le_comptable_saisit_et_le_directeur_configure(self):
+        """Contrôle positif : le durcissement n'a pas fermé le backoffice comptable."""
+        self.login(role="gest_credit", sub="comptable-gl")   # read + create + validate
+        res = self.client.post("/api/ledger/entries", {
+            "idempotencyKey": "compta-1", "date": "2026-07-24", "code": "JOD",
+            "pieceRef": "OD-1", "currency": "USD",
+            "lines": [{"account": "501T", "debit": "100", "credit": "0"},
+                      {"account": "501T", "debit": "0", "credit": "100"}],
+        }, format="json")
+        self.assertEqual(res.status_code, 201)
+
+        # `gest_credit` ne porte pas `config` : le plan comptable lui reste fermé.
+        self.assertEqual(
+            self.client.post("/api/ledger/accounts", {"code": "888T", "name": "X"},
+                             format="json").status_code, 403)
+        self.login(role="dg", sub="dg-gl")
+        self.assertEqual(
+            self.client.post("/api/ledger/accounts",
+                             {"code": "888T", "name": "Compte légitime", "classNo": 5},
+                             format="json").status_code, 201)

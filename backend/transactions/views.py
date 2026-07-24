@@ -1,13 +1,25 @@
 """API des transactions (Transactions.jsx, ValidationJournal.jsx, SpecialCases.jsx,
-Supervision.jsx)."""
+Supervision.jsx).
+
+Ces quatre écrans sont des écrans de BACKOFFICE : ils servent le flux de validation de
+l'institution, tous émetteurs et tous bénéficiaires confondus. Le client, lui, voit ses
+mouvements par `caisses` (`/caisses/wallets/mine`, `/caisses/movements/mine`), filtrés
+par propriétaire. Aucune vue d'ici n'a donc de public client, et toutes cumulent `IsStaff`
+avec leur capacité.
+
+Le garde `HasCapability("read")` seul ne disait rien de tel : les rôles clients portent
+`read=True`. Il laissait lire le journal complet des transactions de la coopérative — et
+surtout CRÉER une transaction (`POST /`), qui n'est pas un acte de lecture.
+"""
 from __future__ import annotations
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from common.choices import FlowStatus
 from common.exceptions import BusinessError
-from rbac.permissions import HasCapability
+from rbac.permissions import CapaciteSelonMethode, HasCapability
 from rbac.role_registry import get_role
 
 from . import serializers, services
@@ -15,7 +27,7 @@ from .models import SpecialCase, Transaction, ValidationThreshold
 
 
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", POST="create")])
 def transactions(request):
     if request.method == "GET":
         qs = Transaction.objects.prefetch_related("approvals").all()[:500]
@@ -38,7 +50,7 @@ def transactions(request):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def transaction_detail(request, tx_id):
     tx = Transaction.objects.filter(pk=tx_id).first()
     if not tx:
@@ -47,7 +59,7 @@ def transaction_detail(request, tx_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def transaction_approve(request, tx_id):
     data = request.data or {}
     role = get_role(getattr(request.user, "role", ""))
@@ -59,7 +71,7 @@ def transaction_approve(request, tx_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def transaction_reject(request, tx_id):
     role = get_role(getattr(request.user, "role", ""))
     tx = services.reject(
@@ -70,7 +82,7 @@ def transaction_reject(request, tx_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def transaction_reverse(request, tx_id):
     tx = services.reverse(transaction_id=tx_id, reason=(request.data or {}).get("reason", ""),
                            by=getattr(request.user, "sub", ""))
@@ -78,14 +90,14 @@ def transaction_reverse(request, tx_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def otp_request(request, tx_id):
     challenge = services.request_step_up_otp(transaction_id=tx_id, approver_sub=getattr(request.user, "sub", ""))
     return Response({"challengeId": challenge.pk, "expiresAt": challenge.expires_at.isoformat()})
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def otp_verify(request, tx_id):
     data = request.data or {}
     ok = services.verify_step_up_otp(challenge_id=data.get("challengeId", ""), code=data.get("code", ""))
@@ -93,7 +105,7 @@ def otp_verify(request, tx_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def bulk_action(request):
     data = request.data or {}
     ids = data.get("ids", [])
@@ -134,13 +146,13 @@ def _case_row(c: SpecialCase) -> dict:
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("audit")])
+@permission_classes([IsStaff, HasCapability("audit")])
 def special_cases(request):
     return Response([_case_row(c) for c in SpecialCase.objects.select_related("transaction").all()[:500]])
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("audit")])
+@permission_classes([IsStaff, HasCapability("audit")])
 def special_case_escalate(request, case_id):
     case = SpecialCase.objects.filter(pk=case_id).first()
     if not case:
@@ -151,7 +163,7 @@ def special_case_escalate(request, case_id):
 
 
 @api_view(["GET", "PATCH"])
-@permission_classes([HasCapability("config")])
+@permission_classes([IsStaff, HasCapability("config")])
 def thresholds(request):
     if request.method == "GET":
         return Response([
@@ -170,7 +182,7 @@ def thresholds(request):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def supervision(request):
     return Response({
         "pendingCount": Transaction.objects.filter(status=FlowStatus.PENDING_VALIDATION).count(),

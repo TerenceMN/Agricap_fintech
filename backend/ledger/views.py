@@ -1,4 +1,16 @@
-"""API du grand livre (`Accounting.jsx`)."""
+"""API du grand livre (`Accounting.jsx`).
+
+Le grand livre n'a **aucune vue client** : il ne sert que des données de l'institution.
+Chaque vue cumule donc `IsStaff` et une capacité explicite. Le garde de capacité seul ne
+suffisait pas — `client`, `agri_op`, `invest` et `partner` portent tous `read=True` dans
+`rbac.role_registry` : `HasCapability("read")` laissait n'importe quel membre consulter
+la balance générale et les états financiers de la coopérative.
+
+Plus grave, `read` gardait aussi les POST : poster une écriture au journal et créer un
+compte du plan comptable étaient à la portée du même `read`. Un client pouvait écrire
+dans la comptabilité. La capacité dépend désormais de la MÉTHODE : lire (`read`), saisir
+une écriture (`create`, le maker), toucher au plan comptable (`config`, le référentiel).
+"""
 from __future__ import annotations
 
 from datetime import date as date_cls
@@ -6,9 +18,10 @@ from datetime import date as date_cls
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from common import idempotency
 from common.parsing import to_date
-from rbac.permissions import HasCapability
+from rbac.permissions import CapaciteSelonMethode, HasCapability
 
 from . import serializers, services
 from .models import ChartAccount, JournalEntry
@@ -20,8 +33,11 @@ def _account_row(a: ChartAccount) -> dict:
 
 
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", POST="config")])
 def accounts(request):
+    """GET : le plan comptable. POST : y AJOUTER un compte — un acte de référentiel,
+    donc `config` (principe 8 : les règles vivent en base, mais elles s'y écrivent sous
+    la main du comité, pas sous celle du premier porteur de `read`)."""
     if request.method == "GET":
         return Response([_account_row(a) for a in ChartAccount.objects.all()])
     data = request.data or {}
@@ -34,8 +50,10 @@ def accounts(request):
 
 
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", POST="create")])
 def entries(request):
+    """GET : le journal. POST : POSTER une écriture — l'acte du maker (`create`), que
+    `entry_reverse` (checker, `validate`) vient contrebalancer."""
     if request.method == "GET":
         qs = JournalEntry.objects.prefetch_related("lines__account").all()[:500]
         return Response([serializers.entry_row(e) for e in qs])
@@ -56,7 +74,7 @@ def entries(request):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def entry_reverse(request, entry_id):
     entry = services.reverse_journal_entry(
         entry_id=entry_id, reason=(request.data or {}).get("reason", ""),
@@ -66,7 +84,7 @@ def entry_reverse(request, entry_id):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def account_lines(request, code):
     account = ChartAccount.objects.filter(code=code).first()
     if not account:
@@ -85,12 +103,12 @@ def account_lines(request, code):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def trial_balance_view(request):
     return Response(services.trial_balance(as_of=to_date(request.GET.get("as_of"))))
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def statements(request, kind):
     return Response(services.financial_statements(kind=kind, as_of=to_date(request.GET.get("as_of"))))

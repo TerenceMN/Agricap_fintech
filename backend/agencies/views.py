@@ -1,4 +1,11 @@
-"""API des agences (Agencies.jsx) — CRUD + actions de cycle de vie."""
+"""API des agences (Agencies.jsx) — CRUD + actions de cycle de vie.
+
+Une agence est un objet de l'institution : sa balance USD, son score de conformité, ses
+alertes ouvertes et ses rapprochements ne regardent aucun membre. Toutes les vues cumulent
+donc `IsStaff` — `HasCapability("read")` seul laissait un client lister les soldes de
+toutes les agences (`_row` sert `balanceUSD`), et `POST /reconciliations` ouvrir un
+rapprochement.
+"""
 from __future__ import annotations
 
 from rest_framework.decorators import api_view, parser_classes, permission_classes
@@ -6,7 +13,8 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from common.parsing import to_date
-from rbac.permissions import HasCapability
+from accounts.permissions import IsStaff
+from rbac.permissions import CapaciteSelonMethode, HasCapability
 from rbac.role_registry import get_role
 
 from . import evolution, maker_checker, services
@@ -39,7 +47,7 @@ def _require(request, capability: str):
 
 
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", POST="create")])
 def agencies(request):
     if request.method == "GET":
         return Response([_row(a) for a in Agency.objects.all()])
@@ -56,7 +64,7 @@ def agencies(request):
 
 
 @api_view(["GET", "PATCH"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", PATCH="create")])
 def agency_detail(request, code):
     agency = Agency.objects.filter(code=code).first()
     if not agency:
@@ -157,7 +165,7 @@ def agency_audit(request, code):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def agency_compliance_score(request, code):
     from . import compliance
 
@@ -245,7 +253,7 @@ def _reconciliation_row(r: AgencyReconciliation) -> dict:
 
 
 @api_view(["GET", "POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, CapaciteSelonMethode(GET="read", POST="validate")])
 def reconciliations(request):
     """Liste globale (filtrable `?status=`/`?agency=`) et ouverture d'un nouveau
     rapprochement structuré — distinct de `agency_reconciliation` (rapport de balance en
@@ -367,7 +375,7 @@ def action_request_cancel(request, request_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def action_request_notify(request, request_id):
     """Notifie par SMS les approbateurs désignés qu'une demande les attend.
     Peut être appelé par le maker (re-notification manuelle)."""

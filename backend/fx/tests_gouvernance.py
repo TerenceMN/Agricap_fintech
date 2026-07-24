@@ -420,3 +420,53 @@ class FxApiGouvernanceTests(AuthedAPITestCase):
 
         absent = self.client.get("/api/fx/rates/current?tier=CLIENT&currency=ZAR&usage=CLOTURE")
         self.assertEqual(absent.status_code, 404)
+
+
+class CloisonnementTauxTests(AuthedAPITestCase):
+    """Le TAUX appartient à qui le subit ; sa GOUVERNANCE reste interne.
+
+    Nuance délibérée, et c'est la seule vue du lot qui n'est pas simplement fermée : un
+    membre qui voit une conversion a le droit de savoir à quel taux, de quel jour, et si
+    ce taux est périmé. Il n'a pas à connaître le seuil au-delà duquel un second acteur
+    devient obligatoire — c'est précisément la valeur qu'il faudrait publier en dernier
+    (principe 7) — ni qui a saisi et validé le taux.
+
+    La liste historisée (`/rates`) et la corbeille (`/rates/pending`), elles, sont des
+    écrans de gouvernance : `IsStaff`.
+    """
+
+    def setUp(self):
+        services.set_rate(tier="CLIENT", currency="USD", buy="2790", sell="2800",
+                          effective_date=JOUR, by="maker", source="MANUELLE")
+
+    def test_un_membre_obtient_le_taux_du_jour_sans_sa_gouvernance(self):
+        self.login(role="client", sub="membre-fx")
+        res = self.client.get(f"/api/fx/rates/current?tier=CLIENT&currency=USD&on={JOUR}")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["sell"], 2800.0)
+        self.assertIn("stale", res.data)
+        for champ in ("thresholdPct", "variationPct", "createdBy", "validatedBy",
+                      "status", "version", "source"):
+            self.assertNotIn(champ, res.data)
+
+    def test_le_personnel_conserve_la_gouvernance_complete(self):
+        self.login(role="aud_fin", sub="auditeur-fx")
+        res = self.client.get(f"/api/fx/rates/current?tier=CLIENT&currency=USD&on={JOUR}")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("thresholdPct", res.data)
+        self.assertIn("createdBy", res.data)
+
+    def test_un_membre_n_atteint_ni_l_historique_ni_la_corbeille(self):
+        self.login(role="client", sub="membre-fx")
+        self.assertEqual(self.client.get("/api/fx/rates").status_code, 403)
+        self.assertEqual(self.client.get("/api/fx/rates/pending").status_code, 403)
+
+    def test_la_conversion_sert_le_taux_applique_sans_son_validateur(self):
+        self.login(role="client", sub="membre-fx")
+        res = self.client.get(
+            f"/api/fx/convert?amount=28000&from=CDF&to=USD&tier=CLIENT&on={JOUR}")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["amount"], 10.0)
+        self.assertEqual(res.data["rate"]["sell"], "2800.000000")
+        for champ in ("rateId", "validatedBy", "source", "version", "status"):
+            self.assertNotIn(champ, res.data["rate"])

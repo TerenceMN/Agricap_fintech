@@ -126,3 +126,52 @@ class SpecialCaseApiTests(AuthedAPITestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.data["status"], "EN_OBSERVATION")
         self.assertEqual(res.data["escalatedTo"], "sup-1")
+
+
+class CloisonnementTransactionsTests(AuthedAPITestCase):
+    """Le journal des transactions de l'institution, et sa création, sont internes.
+
+    `GET /api/transactions/` sert les 500 dernières transactions TOUS émetteurs confondus
+    (émetteur, bénéficiaire, montant, devise, approbations) : c'est le flux de validation
+    du backoffice, pas l'historique d'un membre — celui-ci passe par
+    `/api/caisses/wallets/mine/movements`, filtré par propriétaire.
+
+    Le POST était le vrai danger : créer une transaction sous le seul `read` d'un rôle
+    client, et la voir auto-validée si elle passait sous le seuil de `ValidationThreshold`.
+    """
+
+    def setUp(self):
+        ValidationThreshold.objects.create(operation_type="PAYMENT", auto_limit="1000",
+                                            manager_limit="5000")
+
+    def test_un_membre_ne_lit_pas_le_journal_des_transactions(self):
+        for role in ("client", "agri_op", "invest", "partner"):
+            self.login(role=role, sub=f"membre-tx-{role}")
+            for url in ("/api/transactions/", "/api/transactions/supervision"):
+                with self.subTest(role=role, url=url):
+                    self.assertEqual(self.client.get(url).status_code, 403)
+
+    def test_un_membre_ne_lit_pas_la_transaction_d_un_autre(self):
+        tx = services.create_transaction(
+            agency_id=None, kind="debit", amount="50", currency="USD",
+            operation_type="PAYMENT", emitter="autrui", idempotency_key="tx-idor",
+            by="agent")
+        self.login(role="client", sub="curieux-tx")
+        self.assertEqual(self.client.get(f"/api/transactions/{tx.pk}").status_code, 403)
+
+    def test_un_membre_ne_cree_pas_une_transaction(self):
+        self.login(role="invest", sub="scribe-tx")
+        res = self.client.post("/api/transactions/", {
+            "idempotencyKey": "pirate-tx", "type": "credit", "amount": "900",
+            "currency": "USD", "operationType": "PAYMENT", "receiver": "moi-meme",
+        }, format="json")
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(Transaction.objects.count(), 0)
+
+    def test_le_personnel_conserve_le_journal_et_la_creation(self):
+        self.login(role="gest_caisse", sub="caissier-tx")
+        self.assertEqual(self.client.get("/api/transactions/").status_code, 200)
+        self.assertEqual(self.client.post("/api/transactions/", {
+            "idempotencyKey": "legit-tx", "type": "debit", "amount": "50",
+            "currency": "USD", "operationType": "PAYMENT",
+        }, format="json").status_code, 201)

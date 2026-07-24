@@ -10,6 +10,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from accounts.services import UserDisplayService
 from common.exceptions import ConflictError, NotFoundError, PermissionDeniedError, ValidationFailed
 from rbac.permissions import HasCapability
@@ -226,7 +227,7 @@ def ticket_detail(request, ticket_id):
 # ── Actions sur tickets ────────────────────────────────────────────────────────
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def ticket_assign(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -246,7 +247,7 @@ def ticket_assign(request, ticket_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def ticket_claim(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -269,7 +270,7 @@ def ticket_claim(request, ticket_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def ticket_escalate(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -291,7 +292,7 @@ def ticket_escalate(request, ticket_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def ticket_resolve(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -312,7 +313,7 @@ def ticket_resolve(request, ticket_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def ticket_reject(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -365,7 +366,7 @@ def ticket_reopen(request, ticket_id):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def ticket_waiting_on(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -413,7 +414,7 @@ def ticket_rate(request, ticket_id):
 # ── Mobile Money ───────────────────────────────────────────────────────────────
 
 @api_view(["POST"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def ticket_verify_mm(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -446,7 +447,7 @@ def ticket_verify_mm(request, ticket_id):
 # ── Force-crédit ───────────────────────────────────────────────────────────────
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def ticket_force_credit(request, ticket_id):
     try:
         ticket = _require_ticket(ticket_id)
@@ -567,7 +568,7 @@ def ticket_messages(request, ticket_id):
 # ── Dashboard stats ────────────────────────────────────────────────────────────
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def dashboard_stats(request):
     sla.check_sla_breaches()
     open_statuses = (Ticket.Status.OUVERT, Ticket.Status.EN_TRAITEMENT, Ticket.Status.ESCALADE)

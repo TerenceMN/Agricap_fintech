@@ -8,13 +8,14 @@ from django.db.models import Sum
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from accounts.permissions import IsStaff
 from rbac.permissions import HasCapability
 
 from . import services
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def overview(request):
     from agencies.models import Agency
     from caisses.models import TreasuryAccount
@@ -32,6 +33,6 @@ def overview(request):
 
 
 @api_view(["GET"])
-@permission_classes([HasCapability("read")])
+@permission_classes([IsStaff, HasCapability("read")])
 def compliance_score(request):
     return Response(services.compute_compliance_score())
