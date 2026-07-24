@@ -1,5 +1,25 @@
 /**
- * Échéancier prévisionnel — servi ligne à ligne par le moteur.
+ * Échéancier PRÉVISIONNEL d'une analyse — servi ligne à ligne par le moteur.
+ *
+ * ─── POURQUOI PAS `echeances/LoanScheduleModal` (concept distinct, déclaré) ───
+ *
+ * `LoanScheduleModal` affiche l'échéancier d'un prêt DÉCAISSÉ : app `portfolio`,
+ * route `GET /portfolio/loans/<ref>/schedule`, lignes `{number, date, principal,
+ * interest, total, balance}`, dans un `Dialog` piloté par une référence de prêt.
+ * Ce qui s'affiche ici est un autre objet : l'échéancier PROJETÉ d'une
+ * `AnalyseCredit`, servi à l'intérieur de `GET /credits/applications/<code>/analyse/`,
+ * lignes `{mois, phase, capital, interets, interetsCapitalises, echeance, crd}`.
+ *
+ * Trois écarts rendent la réutilisation impossible sans dégrader l'écran :
+ *   1. un échéancier prévisionnel n'a pas de DATES — le crédit n'est pas
+ *      décaissé. Les fabriquer serait inventer un calendrier ;
+ *   2. la colonne `phase` (différé / franchise / amortissement) est le sujet
+ *      même de cet écran : c'est elle qui montre l'effet du levier « différé »
+ *      que la direction manipule. Le modal du portefeuille ne la porte pas ;
+ *   3. les `interetsCapitalises` (mode franchise totale) n'existent pas dans le
+ *      contrat du portefeuille ; les taire ferait disparaître à l'écran des
+ *      intérêts qui grossissent le capital dû.
+ * Les deux écrans restent donc distincts, et aucun ne recalcule quoi que ce soit.
  *
  * Chaque montant vient de `credits/echeancier.py` (`Decimal`, quantize 0,01,
  * dernière échéance ajustée au solde exact). Le front n'additionne AUCUNE

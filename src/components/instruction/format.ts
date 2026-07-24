@@ -1,22 +1,96 @@
 /**
- * Mise en forme de l'écran d'instruction DG.
+ * Mise en forme de l'écran d'instruction — **adaptateur, pas implémentation**.
  *
- * AUCUNE fonction de ce module ne calcule un chiffre métier (CLAUDE.md §5,
- * « zéro chiffre métier calculé côté client ») : elles habillent des valeurs que
- * le moteur a déjà arrêtées en `Decimal` côté serveur. Pas de multiplication, pas
- * de division, pas de somme — l'anti-modèle du projet est un simulateur qui
- * multipliait un taux par 12 dans le navigateur pour alimenter le moteur.
+ * ─── CE MODULE N'ÉCRIT AUCUN FORMATEUR QUI EXISTE DÉJÀ ───────────────────────
  *
- * Le formateur de MONTANT n'est pas réécrit ici : c'est celui du module
- * garanties, formateur unique du projet (principe 6 — une seule nomenclature par
- * concept, y compris pour écrire une somme d'argent).
+ * Principe 6, règle « le code validé se consomme, il ne se réécrit pas » : les
+ * formateurs du module crédit vivent dans `@/components/analyse/analyseFormat`
+ * (score, points, poids, DSCR, écart, taux, horodatage, libellé d'indicateur),
+ * eux-mêmes adossés au formateur de montants unique du projet
+ * (`@/components/guarantees/format::formatMontant`). Cet écran les IMPORTE et se
+ * contente de leur donner des signatures typées : deux rendus d'un même DSCR
+ * dans deux onglets voisins seraient un défaut visible par l'analyste.
  *
- * Règle §4.6 tenue partout : une valeur absente s'affiche « — », jamais « 0 ».
- * Un zéro affiché est un zéro que le serveur a dit.
+ * N'est AJOUTÉ ici que ce qui n'existait pas : entier nu, durée en mois,
+ * empreinte abrégée, garde de type. Chaque ajout est justifié sur place.
+ *
+ * ─── DEUX FORMATEURS ÉCARTÉS, ET POURQUOI ────────────────────────────────────
+ *
+ * `@/lib/utils::formatCurrency` est inutilisable pour un échéancier, non par
+ * goût mais pour trois défauts vérifiables :
+ *   1. `Number(amount) || 0` transforme une valeur ABSENTE en zéro — l'inverse
+ *      exact de la règle §4.6 que cet écran doit tenir ;
+ *   2. il rend l'USD à `maximumFractionDigits: 0` : sur un échéancier quantizé
+ *      au centime, un capital restant dû de 0,004 s'afficherait « 0 $ » et
+ *      passerait pour l'invariant respecté ;
+ *   3. il formate l'USD en `en-US` là où le standard front impose fr-FR.
+ * `formatMontant` (fr-FR, deux décimales, « — » sur l'absence) n'a aucun de ces
+ * trois défauts et sert déjà dans une trentaine de fichiers.
+ *
+ * `@/lib/investorSpaceWire::formatPercent` produit exactement le même rendu que
+ * `analyseFormat.formatTaux` (deux décimales, virgule, symbole) : ce sont deux
+ * noms pour un seul comportement, dans deux domaines. On garde celui du module
+ * crédit, celui que l'onglet Analyse voisin utilise déjà. Les unifier est un
+ * chantier transverse, pas un effet de bord de cet écran — et sans divergence
+ * visible en attendant. Attention en revanche à `rateToPercent` du même module :
+ * il multiplie par 100 les taux exprimés en FRACTION, alors que le moteur crédit
+ * sert ses taux en POINTS (18 = 18 %/an) ; l'appeler ici donnerait 1 800 %.
  */
 import { formatMontant, NULL_DISPLAY } from '@/components/guarantees/format';
+import {
+  formatDateTimeFr as formatDateTimeFrBrut,
+  formatDscr as formatDscrBrut,
+  formatEcartPct as formatEcartPctBrut,
+  formatPoids as formatPoidsBrut,
+  formatPoints as formatPointsBrut,
+  formatScore as formatScoreBrut,
+  formatTaux as formatTauxBrut,
+  libelleIndicateur as libelleIndicateurBrut,
+} from '@/components/analyse/analyseFormat';
 
 export { formatMontant, NULL_DISPLAY };
+
+// ── Formateurs existants, re-typés à l'identique ─────────────────────────────
+//
+// Les signatures `unknown` ne sont pas cosmétiques : ces valeurs arrivent de
+// blocs `details` typés `[k: string]: unknown` côté contrat. Sans ce typage,
+// chaque appel exigerait un `as` — c'est-à-dire une affirmation non vérifiée sur
+// une forme que rien ne garantit.
+
+/** Score sur 100 — une décimale, comme le sert le moteur (`quantize(0.1)`). */
+export const formatScore = (v: unknown): string => formatScoreBrut(v);
+
+/** Points d'un critère (`score × poids / 100`), arrêtés par le serveur. */
+export const formatPoints = (v: unknown): string => formatPointsBrut(v);
+
+/** Poids d'un critère, en pourcentage. */
+export const formatPoids = (v: unknown): string => formatPoidsBrut(v);
+
+/** DSCR — ratio au millième : la 3e décimale porte l'information près du plancher de 1,0. */
+export const formatDscr = (v: unknown): string => formatDscrBrut(v);
+
+/** Écart relatif SIGNÉ — le signe porte le sens de l'écart. */
+export const formatEcartPct = (v: unknown): string => formatEcartPctBrut(v);
+
+/** Taux annuel nominal, en points de taux. */
+export const formatTaux = (v: unknown): string => formatTauxBrut(v);
+
+/** Horodatage complet fr-FR — une analyse est datée, c'est une pièce probante. */
+export const formatDateTimeFr = (v: unknown): string => formatDateTimeFrBrut(v);
+
+/** `cout_module:semences` → « semences ». Le code canonique reste affiché à côté. */
+export const libelleIndicateur = (v: unknown): string => libelleIndicateurBrut(v);
+
+/**
+ * Pourcentage non signé (amplitude d'un choc de stress).
+ *
+ * Même rendu qu'un poids — c'est volontaire : on ne crée pas un SECOND rendu de
+ * pourcentage, seulement un nom qui dit ce que la valeur mesure au point d'appel.
+ * Un « choc » affiché par une fonction nommée `formatPoids` se relit mal.
+ */
+export const formatPourcent = (v: unknown): string => formatPoidsBrut(v);
+
+// ── Ajouts : rien de tout cela n'existait ────────────────────────────────────
 
 /** `true` si la valeur est un nombre exploitable — `null`, `''` et `NaN` ne le sont pas. */
 export function estNombre(value: unknown): value is number {
@@ -24,100 +98,28 @@ export function estNombre(value: unknown): value is number {
 }
 
 /**
- * Nombre fr-FR à décimales fixes, ou « — ».
- *
- * Volontairement PRIVÉ : chaque grandeur du moteur a sa propre précision
- * (score au dixième, ratio au millième, montant au centime) et l'exposer nu
- * inviterait à choisir la précision à l'affichage, donc à masquer une décimale
- * porteuse d'information (0,999 n'est pas 1,00 devant un seuil DSCR).
+ * Entier nu — numéro de mois, nombre d'échéances, effectif de dossiers, révision.
+ * Aucun formateur du projet ne rendait un entier SANS unité ni symbole : les
+ * existants ajoutent tous « % », une devise ou une décimale.
  */
-function nombreFr(value: unknown, min: number, max: number): string {
-  if (value === null || value === undefined || value === '') return NULL_DISPLAY;
-  const n = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(n)) return NULL_DISPLAY;
-  return new Intl.NumberFormat('fr-FR', {
-    minimumFractionDigits: min,
-    maximumFractionDigits: max,
-  }).format(n);
-}
-
-/** Score sur 100 — une décimale, comme le sert le moteur (`quantize(0.1)`). */
-export function formatScore(value: unknown): string {
-  return nombreFr(value, 1, 1);
-}
-
-/** Points d'un critère (`score × poids / 100`), arrêtés par le serveur. */
-export function formatPoints(value: unknown): string {
-  return nombreFr(value, 1, 1);
-}
-
-/** Poids d'un critère, en pourcentage. */
-export function formatPoids(value: unknown): string {
-  const n = nombreFr(value, 0, 1);
-  return n === NULL_DISPLAY ? n : `${n} %`;
-}
-
-/**
- * DSCR — ratio au millième côté serveur (`quantize(0.001)`, principe 4).
- * On garde la 3e décimale : elle porte l'information près du plancher de 1,0.
- */
-export function formatDscr(value: unknown): string {
-  return nombreFr(value, 2, 3);
-}
-
-/** Écart relatif SIGNÉ, en pourcentage — le signe porte le sens de l'écart. */
-export function formatEcartPct(value: unknown): string {
+export function formatEntier(value: unknown): string {
   if (!estNombre(value)) return NULL_DISPLAY;
-  const signe = value > 0 ? '+' : '';
-  return `${signe}${nombreFr(value, 1, 1)} %`;
+  return new Intl.NumberFormat('fr-FR', {
+    minimumFractionDigits: 0, maximumFractionDigits: 0,
+  }).format(value);
 }
 
-/** Pourcentage non signé (choc de stress, part). */
-export function formatPourcent(value: unknown): string {
-  const n = nombreFr(value, 0, 2);
-  return n === NULL_DISPLAY ? n : `${n} %`;
-}
-
-/** Taux annuel nominal, en points de taux. */
-export function formatTaux(value: unknown): string {
-  const n = nombreFr(value, 2, 2);
-  return n === NULL_DISPLAY ? n : `${n} %`;
-}
-
-/** Durée en mois — « 8 mois », « 1 mois », « — » si le serveur n'a rien dit. */
+/** Durée en mois — la grandeur la plus manipulée de cet écran, sans équivalent existant. */
 export function formatMois(value: unknown): string {
   if (!estNombre(value)) return NULL_DISPLAY;
-  const n = nombreFr(value, 0, 0);
-  return `${n} ${Math.abs(value) > 1 ? 'mois' : 'mois'}`;
-}
-
-/** Entier nu (nombre d'échéances, effectif de dossiers). */
-export function formatEntier(value: unknown): string {
-  return nombreFr(value, 0, 0);
-}
-
-/** Horodatage complet fr-FR — une analyse est datée, c'est une pièce probante. */
-export function formatDateTimeFr(iso: unknown): string {
-  if (typeof iso !== 'string' || !iso) return NULL_DISPLAY;
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return NULL_DISPLAY;
-  return d.toLocaleString('fr-FR', {
-    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
-  });
+  return `${formatEntier(value)} mois`;
 }
 
 /**
- * Libellé lisible d'un code d'indicateur (`cout_module:semences` → « semences »).
- * Purement cosmétique : le code canonique reste affiché à côté et c'est LUI qui
- * repart au serveur (principe 6).
+ * SHA-256 abrégé. La comparaison entre révisions reste serveur : cette forme
+ * courte sert à RECONNAÎTRE une empreinte d'un coup d'œil, pas à en juger
+ * l'égalité — d'où le début ET la fin conservés.
  */
-export function libelleIndicateur(code: unknown): string {
-  if (typeof code !== 'string' || !code) return NULL_DISPLAY;
-  const sep = code.indexOf(':');
-  return sep === -1 ? code : code.slice(sep + 1);
-}
-
-/** SHA-256 abrégé pour l'affichage — la comparaison entre révisions reste serveur. */
 export function abregerSha(sha: unknown): string {
   if (typeof sha !== 'string' || !sha) return NULL_DISPLAY;
   return sha.length <= 16 ? sha : `${sha.slice(0, 12)}…${sha.slice(-4)}`;

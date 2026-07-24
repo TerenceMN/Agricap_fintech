@@ -1,3 +1,11 @@
+/**
+ * Ce fichier teste un ADAPTATEUR : la plupart de ces fonctions délèguent à
+ * `@/components/analyse/analyseFormat`, formateur du module crédit qu'on
+ * consomme au lieu de le réécrire. Les assertions ci-dessous valent donc comme
+ * contrat de ce que l'écran d'instruction attend de lui — si un remaniement de
+ * `analyseFormat` faisait disparaître la 3e décimale du DSCR ou rendait « 0 »
+ * pour une valeur absente, c'est ici que ça casserait.
+ */
 import { describe, it, expect } from 'vitest';
 import {
   NULL_DISPLAY, abregerSha, estNombre, formatDateTimeFr, formatDscr, formatEcartPct,
