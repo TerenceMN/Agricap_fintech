@@ -13,6 +13,8 @@ correspondance sémantique d'en-têtes — sans jamais inventer une valeur absen
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
 from django.db import models
 
 
@@ -109,43 +111,64 @@ class InstitutionConfig(models.Model):
     """
     Paramètres de l'institution (PROMPT §8.1 : « jamais codés en dur »), issus de
     la feuille `16_Calibrage_Gouvernance`. Un seul actif à la fois.
+
+    ⚠ POURQUOI `DecimalField` ET PAS `FloatField` (principe 4). Cette table n'est
+    pas un référentiel documentaire : c'est la source des paramètres que le moteur
+    de scoring relit à CHAQUE analyse — les cinq poids (`analyse.poids_effectifs()`),
+    les seuils DSCR et le score global minimum (`analyse.regles_decision()`), la
+    décote appliquée aux garanties (`assets.services.valeur_apres_decote`). En
+    binaire, 0,30 n'existe pas : `float` stockait 0,29999999999999998889776975…
+    Sur une somme de poids, l'écart se propage jusqu'à faire diverger un score de
+    0,1 point — et 0,1 point autour d'une frontière de recommandation change la
+    recommandation. `credits/analyse.py` raisonne déjà en `Decimal` de bout en
+    bout ; ces colonnes le contredisaient à la source.
+
+    Précisions retenues :
+    - ratios de couverture / DSCR / multiples : `0.001` (§4 « 0,001 pour les ratios ») ;
+    - points de score et poids (base 100) : `0.01` ;
+    - taux, frais et décotes exprimés en FRACTION : `0.0001`, car `0.001` sur une
+      fraction ne sait pas représenter un taux courant comme 18,75 %/an (0,1875) ;
+    - montants : `0.01` (§4).
     """
     version = models.ForeignKey(
         ReferentielVersion, null=True, blank=True, on_delete=models.SET_NULL, related_name="configs"
     )
     is_active = models.BooleanField(default=True)
 
-    # Seuils prudentiels (feuille 16, section A).
-    seuil_dscr = models.FloatField(default=1.20)
-    seuil_dscr_stresse = models.FloatField(default=1.00)
-    couverture_min = models.FloatField(default=1.00)          # 100 %
-    score_global_min = models.FloatField(default=70.0)
+    # Seuils prudentiels (feuille 16, section A). Lus par le moteur de décision.
+    seuil_dscr = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("1.200"))
+    seuil_dscr_stresse = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("1.000"))
+    couverture_min = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("1.000"))  # 100 %
+    score_global_min = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("70.00"))
 
-    # Pondérations du score (§8.1). Somme attendue = 100.
-    poids_technique = models.FloatField(default=25.0)
-    poids_financier = models.FloatField(default=20.0)
-    poids_stress = models.FloatField(default=10.0)
-    poids_comportemental = models.FloatField(default=30.0)
-    poids_garanties = models.FloatField(default=15.0)
+    # Pondérations du score (§8.1). Somme attendue = 100 — invariant vérifié par
+    # `analyse.poids_effectifs()`, qui compare à `Decimal(100)` : une somme
+    # flottante de 99,99999999999999 le faisait retomber sur les poids de secours.
+    poids_technique = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("25.00"))
+    poids_financier = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("20.00"))
+    poids_stress = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("10.00"))
+    poids_comportemental = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("30.00"))
+    poids_garanties = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("15.00"))
 
-    # Paramètres crédit.
-    taux_interet_annuel = models.FloatField(default=0.24)     # 24 %/an par défaut
-    frais_dossier = models.FloatField(default=0.02)           # 2 % du montant
-    commissions = models.FloatField(default=0.01)
+    # Paramètres crédit. Taux/frais/décotes en fraction (0,24 = 24 %).
+    taux_interet_annuel = models.DecimalField(max_digits=6, decimal_places=4, default=Decimal("0.2400"))
+    frais_dossier = models.DecimalField(max_digits=6, decimal_places=4, default=Decimal("0.0200"))
+    commissions = models.DecimalField(max_digits=6, decimal_places=4, default=Decimal("0.0100"))
     duree_max_mois = models.IntegerField(default=24)
-    plafond_delegue = models.FloatField(default=25000.0)      # USD
-    decote_garantie = models.FloatField(default=0.30)
+    plafond_delegue = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("25000.00"))  # USD
+    decote_garantie = models.DecimalField(max_digits=6, decimal_places=4, default=Decimal("0.3000"))
 
     # Caution solidaire (SPEC §2.5). Principe 8 : ces seuils gouvernent qui peut
     # engager quoi — ils appartiennent au comité, pas à un déploiement. Lus par
     # `credits.guarantor`, qui logge un warning s'il doit retomber sur ses
     # valeurs de secours.
-    caution_ratio_epargne = models.FloatField(default=2.0)        # k : Σ cautions ≤ k × épargne
+    caution_ratio_epargne = models.DecimalField(
+        max_digits=6, decimal_places=3, default=Decimal("2.000"))  # k : Σ cautions ≤ k × épargne
     caution_max_actives = models.IntegerField(default=3)          # cautions vivantes par garant
     caution_consent_window_hours = models.IntegerField(default=72)  # fenêtre de consentement
     # Décote de la caution morale : elle sécurise socialement, pas financièrement.
     # Distincte de `decote_garantie`, qui s'applique aux actifs gagés.
-    decote_caution_morale = models.FloatField(default=0.70)
+    decote_caution_morale = models.DecimalField(max_digits=6, decimal_places=4, default=Decimal("0.7000"))
 
     # Phase de déploiement (§9 : validation humaine échantillonnée).
     phase_deploiement = models.CharField(max_length=20, default="PHASE_1")  # PHASE_1|2|3
@@ -163,6 +186,15 @@ class InstitutionConfig(models.Model):
         return cfg or cls()  # défauts si aucune importée (jamais None)
 
     @property
-    def taux_echantillon(self) -> float:
-        """Fraction de dossiers contre-analysés selon la phase (§9)."""
-        return {"PHASE_1": 1.0, "PHASE_2": 0.30, "PHASE_3": 0.10}.get(self.phase_deploiement, 1.0)
+    def taux_echantillon(self) -> Decimal:
+        """Fraction de dossiers contre-analysés selon la phase (§9).
+
+        `Decimal` comme le reste de la table : ce taux se multiplie à un effectif
+        de dossiers, et rien de ce que lit la gouvernance ne doit repasser par un
+        flottant (principe 4).
+        """
+        return {
+            "PHASE_1": Decimal("1.00"),
+            "PHASE_2": Decimal("0.30"),
+            "PHASE_3": Decimal("0.10"),
+        }.get(self.phase_deploiement, Decimal("1.00"))

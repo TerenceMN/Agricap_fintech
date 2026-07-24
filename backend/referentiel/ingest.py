@@ -17,7 +17,7 @@ from django.db import transaction
 
 from .chains import BY_SHEET
 from .models import InstitutionConfig, ReferenceRange, ReferentielVersion
-from .range_parser import to_number, to_range
+from .range_parser import to_decimal_range, to_number, to_range
 
 CALIBRATION_SHEET = "16_Calibrage_Gouvernance"
 
@@ -211,7 +211,12 @@ def rebuild_chain_from_records(version, chain, header_names, row_dicts) -> int:
 
 @transaction.atomic
 def rebuild_config_from_records(version, header_names, row_dicts) -> bool:
-    """Re-dérive `InstitutionConfig` (feuille 16) depuis les lignes éditées en base."""
+    """Re-dérive `InstitutionConfig` (feuille 16) depuis les lignes éditées en base.
+
+    Lecture en `to_decimal_range` (et non `to_range`) : ces cellules deviennent les
+    seuils du moteur de décision, pas des ordres de grandeur — elles ne doivent
+    jamais transiter par un `float` (principe 4, cf. `InstitutionConfig`).
+    """
     if not header_names:
         return False
     cfg = InstitutionConfig(version=version, is_active=True)
@@ -226,7 +231,7 @@ def rebuild_config_from_records(version, header_names, row_dicts) -> bool:
         value = cells[1] if len(cells) > 1 else None
         for needle, attr in _CFG_KEYS.items():
             if needle in label:
-                lo, hi = to_range(value)
+                lo, hi = to_decimal_range(value)
                 if hi is not None:
                     setattr(cfg, attr, hi)
                     found = True
@@ -248,6 +253,8 @@ _CFG_KEYS = {
 
 
 def _ingest_calibration(version, ws) -> tuple[bool, list[str]]:
+    """Feuille 16 → `InstitutionConfig`. `to_decimal_range` : ces valeurs sont
+    les paramètres du moteur, elles restent exactes de la cellule à la colonne."""
     cfg = InstitutionConfig(version=version, is_active=True)
     raw: list[list] = []
     found = False
@@ -260,7 +267,7 @@ def _ingest_calibration(version, ws) -> tuple[bool, list[str]]:
         label = _norm(row[0])
         for needle, attr in _CFG_KEYS.items():
             if needle in label:
-                lo, hi = to_range(row[1])
+                lo, hi = to_decimal_range(row[1])
                 if hi is not None:
                     setattr(cfg, attr, hi)
                     found = True

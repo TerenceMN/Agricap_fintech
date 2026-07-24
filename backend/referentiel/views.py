@@ -70,6 +70,13 @@ def config(request):
     donnée STAFF, protégée par `IsStaff` comme le reste des paramètres du moteur
     (principe 7 : elle ne transite jamais vers un rôle client). La valeur retenue
     d'un actif reste calculée serveur ; le taux n'est ici qu'informatif.
+
+    Ces champs sont des `Decimal` en base (principe 4) et sont servis TELS QUELS :
+    le rendu JSON de DRF les sérialise en nombres, ce qu'attend le front
+    (`AssetVerification.tsx` teste `typeof cfg.decote_garantie === 'number'`).
+    Ne pas les faire passer par un serializer DRF sans neutraliser
+    `COERCE_DECIMAL_TO_STRING` — l'écran cesserait d'afficher la décote en
+    silence. Verrouillé par `ConfigDecoteExpositionTests`.
     """
     c = InstitutionConfig.active()
     return Response({
