@@ -8,7 +8,26 @@ import JournalViewer from '@/components/accounting/JournalViewer';
 import ChartOfAccountsViewer from '@/components/accounting/ChartOfAccountsViewer';
 import FinancialStatementsViewer from '@/components/accounting/FinancialStatementsViewer';
 import ExchangeRateManager from '@/components/accounting/ExchangeRateManager';
+import PiecesViewer from '@/components/accounting/PiecesViewer';
+import ProvisionsViewer from '@/components/accounting/ProvisionsViewer';
+import RestitutionsViewer from '@/components/accounting/RestitutionsViewer';
 import { api } from '@/services/api';
+
+/*
+ * ⚠ `EtatsComptables.jsx` existe mais n'est VOLONTAIREMENT pas monté ici.
+ *
+ * Il sert bilan et compte de résultat depuis l'app `accounting` (bi-devise),
+ * alors que l'onglet « États Financiers » ci-dessous sert les MÊMES états depuis
+ * l'app `ledger` (SYSCOHADA, mono-devise). Les afficher côte à côte donnerait
+ * deux bilans contradictoires dans le même écran, sans qu'un comptable puisse
+ * savoir lequel fait foi. L'audit a classé ce doublon de grands livres en
+ * constat majeur — dont la collision du compte 137, qui vaut « Provisions pour
+ * risques de crédit » d'un côté et « Résultat des activités ordinaires » de
+ * l'autre.
+ *
+ * Quel moteur fait autorité est une décision du fondateur, pas un arbitrage
+ * d'ingénierie. Tant qu'elle n'est pas prise, on n'en affiche qu'un seul.
+ */
 
 const Accounting = () => {
   const [todayRate, setTodayRate] = useState(null);
@@ -27,11 +46,14 @@ const Accounting = () => {
       </motion.div>
       
        <Tabs defaultValue="rates" className="mt-8">
-        <TabsList className="grid w-full grid-cols-5 bg-slate-800/60">
+        <TabsList className="grid w-full grid-cols-4 lg:grid-cols-8 bg-slate-800/60">
             <TabsTrigger value="rates">Taux de Change</TabsTrigger>
             <TabsTrigger value="dashboard">Tableau de Bord</TabsTrigger>
             <TabsTrigger value="journal">Journaux</TabsTrigger>
             <TabsTrigger value="plan">Plan Comptable</TabsTrigger>
+            <TabsTrigger value="pieces">Pièces</TabsTrigger>
+            <TabsTrigger value="provisions">Provisions</TabsTrigger>
+            <TabsTrigger value="restitutions">Restitutions</TabsTrigger>
             <TabsTrigger value="etats">États Financiers</TabsTrigger>
         </TabsList>
 
@@ -62,6 +84,21 @@ const Accounting = () => {
         <TabsContent value="plan" className="mt-6">
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
                 <ChartOfAccountsViewer />
+            </motion.div>
+        </TabsContent>
+        <TabsContent value="pieces" className="mt-6">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                <PiecesViewer />
+            </motion.div>
+        </TabsContent>
+        <TabsContent value="provisions" className="mt-6">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                <ProvisionsViewer />
+            </motion.div>
+        </TabsContent>
+        <TabsContent value="restitutions" className="mt-6">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                <RestitutionsViewer />
             </motion.div>
         </TabsContent>
          <TabsContent value="etats" className="mt-6">

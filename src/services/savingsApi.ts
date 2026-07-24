@@ -220,6 +220,23 @@ export const savingsAdminApi = {
 /* ─────────────────────────── Logique PURE (testée) ─────────────────────────── */
 
 /** Libellé fr d'un statut de taux. Un code inconnu se montre tel quel — jamais deviné. */
+/**
+ * Déplie une erreur serveur en liste de `{code, message}` pour `ErrorPanel`.
+ *
+ * Un 422 multi-erreurs restitue CHAQUE refus (solde insuffisant, portefeuille
+ * absent, taux hors plage…) plutôt qu'un message unique qui en masquerait deux :
+ * l'administrateur doit voir tout ce qui bloque, pas seulement le premier motif.
+ * Même contrat que `deplierErreur` d'`accountingApi` — un seul dépliage par
+ * module de service, jamais un troisième mécanisme parallèle (principe 6).
+ */
+export function savingsOperationErrors(err: unknown): Array<{ code: string; message: string }> {
+  if (err instanceof ApiError) {
+    if (err.errors && err.errors.length) return err.errors;
+    return [{ code: err.code ?? 'ERREUR', message: err.message }];
+  }
+  return [{ code: 'ERREUR', message: err instanceof Error ? err.message : String(err) }];
+}
+
 export function rateStatusLabel(status: string): string {
   const map: Record<string, string> = { actif: 'Actif', suspendu: 'Suspendu', bloque: 'Bloqué' };
   return map[status] ?? status;
