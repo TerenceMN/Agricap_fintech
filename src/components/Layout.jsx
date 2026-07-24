@@ -103,6 +103,12 @@ const allMenuItems = {
     // distincts est une confusion qu'on ne laisse pas s'installer.
     { section: 'Documents' },
     { icon: LayoutDashboard, label: 'Tableau de bord crédit', path: '/credit/tableau-de-bord' },
+    // Écran d'instruction de la direction : fixer durée/différé/taux, lire l'échéancier
+    // et le DSCR recalculés par le moteur, confronter le classeur du demandeur au
+    // référentiel de sa filière poste par poste. Il expose références, tolérances et
+    // empreintes de documents internes : entrée de PERSONNEL uniquement — jamais dans
+    // les menus client ou investisseur (principe 7).
+    { icon: ClipboardCheck, label: 'Instruction (direction)', path: '/credit/instruction' },
     { icon: Folder, label: 'Mes données', path: '/admin/data' },
     { icon: ClipboardCheck, label: 'Vérification des actifs', path: '/credit/actifs' },
     { icon: Landmark, label: 'Corbeille du comité', path: '/credit/comite' },

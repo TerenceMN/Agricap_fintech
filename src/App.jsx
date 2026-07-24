@@ -22,6 +22,7 @@ import AuditJournal from '@/pages/credit/AuditJournal';
 import Guarantees from '@/pages/credit/Guarantees';
 import ReferenceData from '@/pages/credit/ReferenceData';
 import CreditDashboard from '@/pages/credit/Dashboard';
+import Instruction from '@/pages/credit/Instruction';
 import Referentiel from '@/pages/Referentiel';
 import DataAdmin from '@/pages/admin/DataAdmin';
 
@@ -124,6 +125,18 @@ const AppRoutes = () => {
           portée par la nav (entrée présente dans les seuls menus de personnel). */}
       <Route path="/credit/referentiel" element={<PrivateRoute><Layout><Referentiel /></Layout></PrivateRoute>} />
       <Route path="/credit/tableau-de-bord" element={<PrivateRoute><Layout><CreditDashboard /></Layout></PrivateRoute>} />
+      {/* Écran d'instruction de la direction : paramètres du dossier → échéancier et
+          DSCR recalculés par le moteur, puis confrontation poste par poste du classeur
+          au référentiel de la filière. Deux routes pour un même écran — sans code, il
+          propose la liste des dossiers ; une entrée de navigation ne peut pas porter de
+          référence de dossier, et un écran inatteignable est un écran qui n'existe pas.
+          Volontairement SANS prop `roles`, comme les autres écrans du backoffice crédit :
+          `roles` repose sur `menuKeyFor`, qui écrase les 16 rôles canoniques en 5 clés de
+          menu et fermerait la page à `gest_credit` ou `gest_zone`, qui y ont droit. Les
+          gardes réels sont serveur (`me.is_staff` pour l'affichage, `STAFF_ROLES` sur
+          `analyse/`, `CAN_INSTRUCT` sur `reanalyser/`), et la page relaie chaque refus. */}
+      <Route path="/credit/instruction" element={<PrivateRoute><Layout><Instruction /></Layout></PrivateRoute>} />
+      <Route path="/credit/instruction/:code" element={<PrivateRoute><Layout><Instruction /></Layout></PrivateRoute>} />
       <Route path="/admin/data" element={<PrivateRoute roles={['admin']}><Layout><DataAdmin /></Layout></PrivateRoute>} />
       
       {/* Client Routes */}
