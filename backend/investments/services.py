@@ -14,7 +14,7 @@ Répartition des responsabilités depuis le lot « cycle de vie » :
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
 from django.db.models import Sum
@@ -330,6 +330,16 @@ def subscribe(*, investor: Investor, offer_id: int, bonds: int, idempotency_key:
                             idempotency_key=idempotency_key, by=by)
 
 
+def _montant(value) -> Decimal:
+    """Montant du reporting promoteur, quantizé à 0,01 / `ROUND_HALF_UP` — jamais un `float`."""
+    return to_decimal(value or 0).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _quantite(value) -> Decimal:
+    """Quantité produite, quantizée à 0,001 (tonnes, litres… — pas un montant)."""
+    return to_decimal(value or 0).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+
+
 def _deviation_percent(actual, forecast) -> Decimal:
     """`(réalisé − prévu) / prévu × 100`, en `Decimal`, quantifié à 0,01.
 
@@ -341,7 +351,8 @@ def _deviation_percent(actual, forecast) -> Decimal:
     prevu = to_decimal(forecast or 0)
     if prevu == 0:
         return Decimal("0.00")
-    return ((to_decimal(actual or 0) - prevu) / prevu * Decimal("100")).quantize(Decimal("0.01"))
+    return ((to_decimal(actual or 0) - prevu) / prevu * Decimal("100")).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def submit_performance_report(*, project: Project, data: dict, by: str = "") -> PerformanceReport:
@@ -364,16 +375,19 @@ def submit_performance_report(*, project: Project, data: dict, by: str = "") -> 
     couts = _deviation_percent(data.get("actualCosts"), data.get("forecastCosts"))
     production = _deviation_percent(data.get("actualProduction"), data.get("forecastProduction"))
 
+    # Les montants sont écrits en `Decimal` : le `float(…)` qui les enveloppait
+    # reprenait d'une main ce que `to_decimal` donnait de l'autre, et rendait
+    # 1 000,10 relisible en 1 000,0999999999999 (principe 4).
     report = PerformanceReport.objects.create(
         project=project, reporting_period=data.get("reportingPeriod", ""),
-        actual_revenue=float(to_decimal(data.get("actualRevenue", 0) or 0)),
-        forecast_revenue=float(to_decimal(data.get("forecastRevenue", 0) or 0)),
-        actual_costs=float(to_decimal(data.get("actualCosts", 0) or 0)),
-        forecast_costs=float(to_decimal(data.get("forecastCosts", 0) or 0)),
-        actual_production=float(to_decimal(data.get("actualProduction", 0) or 0)),
-        forecast_production=float(to_decimal(data.get("forecastProduction", 0) or 0)),
-        deviation_percent=float(revenu), cost_deviation_percent=float(couts),
-        production_deviation_percent=float(production),
+        actual_revenue=_montant(data.get("actualRevenue")),
+        forecast_revenue=_montant(data.get("forecastRevenue")),
+        actual_costs=_montant(data.get("actualCosts")),
+        forecast_costs=_montant(data.get("forecastCosts")),
+        actual_production=_quantite(data.get("actualProduction")),
+        forecast_production=_quantite(data.get("forecastProduction")),
+        deviation_percent=revenu, cost_deviation_percent=couts,
+        production_deviation_percent=production,
         deviation_comments=data.get("deviationComments", ""),
     )
 

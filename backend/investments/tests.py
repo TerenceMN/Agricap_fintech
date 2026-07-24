@@ -29,8 +29,8 @@ from . import (
 from .models import (
     AnalystObservation, BondConversion, BondWithdrawal, Collateral, Distribution,
     FinancialAnalysis, InvestmentCommitteeVote, InvestmentEvent, Investor, Movement, Offer,
-    ObligationPosition, Project, ProjectQuestion, ProjectTransition, RepaymentSchedule,
-    Subscription, TechnicalAnalysis,
+    ObligationPosition, PerformanceReport, Project, ProjectQuestion, ProjectTransition,
+    RepaymentSchedule, Subscription, TechnicalAnalysis,
 )
 
 S = Project.Status
@@ -2988,3 +2988,89 @@ class VentilationRetourTests(AuthedAPITestCase):
             offer=self.offer, status=RepaymentSchedule.Status.PAID).first()
         self.assertIsNotNone(ligne.paid_movement)
         self.assertEqual(ligne.paid_movement.type, Movement.Type.PROJECT_RETURN)
+
+
+# ── 13. `Decimal` sur les grandeurs financières (principe 4) ─────────────────
+
+class DecimalSurLesGrandeursFinancieresTests(AuthedAPITestCase):
+    """Reporting promoteur et analyse financière : plus un seul `float` en base.
+
+    Ces champs ne sont pas décoratifs — les trois écarts déclenchent une observation
+    de risque HIGH sur le dossier, et le DSCR décide de l'entrée en comité. Un
+    binaire flottant y fait apparaître des 19,999999999999996 % et rend deux lectures
+    du même rapport non identiques.
+    """
+
+    CHAMPS_DECIMAUX = {
+        "PerformanceReport": ("actual_revenue", "forecast_revenue", "actual_costs",
+                              "forecast_costs", "actual_production", "forecast_production",
+                              "deviation_percent", "cost_deviation_percent",
+                              "production_deviation_percent"),
+        "FinancialAnalysis": ("ebitda_margin", "dscr", "irr"),
+    }
+
+    def test_aucun_de_ces_champs_nest_plus_un_floatfield(self):
+        from django.db.models import DecimalField, FloatField
+
+        for modele, champs in ((PerformanceReport, self.CHAMPS_DECIMAUX["PerformanceReport"]),
+                               (FinancialAnalysis, self.CHAMPS_DECIMAUX["FinancialAnalysis"])):
+            for nom in champs:
+                with self.subTest(modele=modele.__name__, champ=nom):
+                    champ = modele._meta.get_field(nom)
+                    self.assertIsInstance(champ, DecimalField)
+                    self.assertNotIsInstance(champ, FloatField)
+
+    def test_un_montant_a_deux_decimales_se_relit_a_lidentique(self):
+        """Le test que `FloatField` ne passait pas : 1 000,10 relu 1 000,0999999999999."""
+        project = make_project("DEC-1")
+        rapport = services.submit_performance_report(
+            project=project, data={"actualRevenue": "1000.10", "forecastRevenue": "1000.10",
+                                    "actualCosts": "0.07", "forecastCosts": "0.07",
+                                    "actualProduction": "12.345",
+                                    "forecastProduction": "12.345"}, by="u")
+        rapport.refresh_from_db()
+        self.assertEqual(rapport.actual_revenue, Decimal("1000.10"))
+        self.assertEqual(rapport.actual_costs, Decimal("0.07"))
+        self.assertEqual(rapport.actual_production, Decimal("12.345"))
+        self.assertIsInstance(rapport.actual_revenue, Decimal)
+
+    def test_les_ecarts_figes_sont_des_decimal_quantizes_a_0_01(self):
+        project = make_project("DEC-2")
+        rapport = services.submit_performance_report(
+            project=project, data={"actualRevenue": 1000, "forecastRevenue": 3000,
+                                    "actualCosts": 1200, "forecastCosts": 1000}, by="u")
+        rapport.refresh_from_db()
+        for valeur in (rapport.deviation_percent, rapport.cost_deviation_percent,
+                       rapport.production_deviation_percent):
+            self.assertIsInstance(valeur, Decimal)
+            self.assertEqual(valeur, valeur.quantize(Decimal("0.01")))
+        # −66,666…% arrondi une seule fois, au moment du calcul, et figé tel quel.
+        self.assertEqual(rapport.deviation_percent, Decimal("-66.67"))
+
+    def test_le_dscr_a_la_meme_forme_que_celui_du_module_credit(self):
+        """Une seule nomenclature par concept : le même ratio, la même précision."""
+        from credits.models import AnalyseCredit
+
+        ici = FinancialAnalysis._meta.get_field("dscr")
+        la_bas = AnalyseCredit._meta.get_field("dscr")
+        self.assertEqual((ici.max_digits, ici.decimal_places),
+                          (la_bas.max_digits, la_bas.decimal_places))
+
+    def test_analyse_financiere_relue_en_decimal(self):
+        project = make_project("DEC-3")
+        FinancialAnalysis.objects.create(project=project, dscr="1.235", irr="14.200",
+                                          ebitda_margin="32.500")
+        analyse = FinancialAnalysis.objects.get(project=project)
+        self.assertEqual(analyse.dscr, Decimal("1.235"))
+        self.assertIsInstance(analyse.irr, Decimal)
+        self.assertIsInstance(analyse.ebitda_margin, Decimal)
+
+    def test_lapi_sert_toujours_des_nombres_le_contrat_du_front_est_inchange(self):
+        project = make_project("DEC-4")
+        rapport = services.submit_performance_report(
+            project=project, data={"actualRevenue": "1000.10", "forecastRevenue": "1000"}, by="u")
+        ligne = serializers.performance_report_row(rapport)
+        self.assertIsInstance(ligne["actualRevenue"], float)
+        self.assertEqual(ligne["actualRevenue"], 1000.10)
+        analyse = FinancialAnalysis.objects.create(project=project, dscr="1.235")
+        self.assertIsInstance(serializers.financial_analysis_row(analyse)["dscr"], float)

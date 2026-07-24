@@ -826,23 +826,31 @@ class PerformanceReport(models.Model):
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="performance_reports")
     reporting_period = models.CharField(max_length=40, blank=True)
     submission_date = models.DateTimeField(auto_now_add=True)
-    actual_revenue = models.FloatField(default=0)
-    forecast_revenue = models.FloatField(default=0)
-    actual_costs = models.FloatField(default=0)
-    forecast_costs = models.FloatField(default=0)
-    actual_production = models.FloatField(default=0)
-    forecast_production = models.FloatField(default=0)
+    # Revenus et coûts : des MONTANTS. `DecimalField` et non `FloatField` (principe 4)
+    # — un binaire flottant ne représente pas 0,10 exactement, et ces montants nourrissent
+    # les trois écarts qui déclenchent une observation de risque sur le dossier.
+    actual_revenue = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    forecast_revenue = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    actual_costs = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    forecast_costs = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0"))
+    #: Quantités produites — trois décimales (tonnes, litres…), pas deux : ce ne sont
+    #: pas des montants, mais elles se comparent au centième d'unité près.
+    actual_production = models.DecimalField(max_digits=16, decimal_places=3, default=Decimal("0"))
+    forecast_production = models.DecimalField(max_digits=16, decimal_places=3, default=Decimal("0"))
     #: Écart de REVENU (réalisé − prévu) / prévu × 100. Le nom est générique pour des
     #: raisons historiques : il est consommé tel quel par le front. Ses deux frères
     #: ci-dessous lèvent l'ambiguïté plutôt que de le renommer sous les pieds d'un
-    #: écran livré.
-    deviation_percent = models.FloatField(default=0)
+    #: écran livré. Quantizés à 0,01 par `services._deviation_percent`, et STOCKÉS
+    #: comme tels : un écart figé au rapport ne se relit pas à 19,999999999999996 %.
+    deviation_percent = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
     #: Écart de COÛTS. Attention au sens : un écart POSITIF est défavorable (les coûts
     #: dépassent la prévision), là où un écart de revenu positif est favorable. Deux
     #: grandeurs de même forme et de sens opposé — d'où `unfavorable_deviations`.
-    cost_deviation_percent = models.FloatField(default=0)
+    cost_deviation_percent = models.DecimalField(max_digits=12, decimal_places=2,
+                                                  default=Decimal("0"))
     #: Écart de PRODUCTION (positif = favorable, comme le revenu).
-    production_deviation_percent = models.FloatField(default=0)
+    production_deviation_percent = models.DecimalField(max_digits=12, decimal_places=2,
+                                                        default=Decimal("0"))
     deviation_comments = models.TextField(blank=True)
     validation_status = models.CharField(max_length=10, choices=ValidationStatus.choices,
                                           default=ValidationStatus.PENDING)
@@ -882,9 +890,17 @@ class FinancialAnalysis(models.Model):
     revenue_forecast = models.JSONField(default=dict, blank=True)
     cost_structure = models.JSONField(default=dict, blank=True)
     cashflow_projection = models.JSONField(default=dict, blank=True)
-    ebitda_margin = models.FloatField(default=0)
-    dscr = models.FloatField(default=0)
-    irr = models.FloatField(default=0)
+    # Marge, DSCR et TRI décident de l'entrée en comité d'un dossier : ce sont des
+    # grandeurs financières, donc des `Decimal` (principe 4). Le DSCR reprend la forme
+    # exacte de `credits.models.AnalyseCredit.dscr` (8,3) — une seule nomenclature par
+    # concept (principe 6) : le même ratio ne se stocke pas sous deux formes selon
+    # l'app qui le calcule.
+    ebitda_margin = models.DecimalField(max_digits=8, decimal_places=3, default=Decimal("0"))
+    dscr = models.DecimalField(max_digits=8, decimal_places=3, default=Decimal("0"))
+    irr = models.DecimalField(max_digits=8, decimal_places=3, default=Decimal("0"))
+    #: Dette assumée : score /100, non migré ici faute d'être une grandeur financière
+    #: (même famille que les champs techniques ci-dessus). `Project.global_score` l'a
+    #: été, lui, parce qu'il pondère une décision de comité.
     financial_score = models.FloatField(default=0)
     #: Approbation explicite — condition d'entrée en comité (P04, Annexe C).
     approved_at = models.DateTimeField(null=True, blank=True)

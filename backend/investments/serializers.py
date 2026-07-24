@@ -300,11 +300,15 @@ def technical_analysis_row(t) -> dict:
 
 
 def financial_analysis_row(f) -> dict:
+    """Marge, DSCR et TRI sont stockés en `Decimal` (principe 4) et sortent en nombre,
+    comme tous les montants de ce module (`float(m.amount)` ci-dessus) : la conversion
+    est faite ICI, à la frontière, jamais à l'écriture — le front n'a pas changé de
+    contrat, la base a cessé de stocker du binaire flottant."""
     return {
         "projectId": f.project_id, "investmentBreakdown": f.investment_breakdown,
         "revenueForecast": f.revenue_forecast, "costStructure": f.cost_structure,
-        "cashflowProjection": f.cashflow_projection, "ebitdaMargin": f.ebitda_margin,
-        "dscr": f.dscr, "irr": f.irr, "financialScore": f.financial_score,
+        "cashflowProjection": f.cashflow_projection, "ebitdaMargin": float(f.ebitda_margin),
+        "dscr": float(f.dscr), "irr": float(f.irr), "financialScore": f.financial_score,
     }
 
 
@@ -320,17 +324,21 @@ def performance_report_row(r) -> dict:
     return {
         "id": r.pk, "projectId": r.project_id, "reportingPeriod": r.reporting_period,
         "submissionDate": r.submission_date.isoformat(),
-        "actualRevenue": r.actual_revenue, "forecastRevenue": r.forecast_revenue,
-        "actualCosts": r.actual_costs, "forecastCosts": r.forecast_costs,
-        "actualProduction": r.actual_production, "forecastProduction": r.forecast_production,
+        # Montants, quantités et écarts sont stockés en `Decimal` (principe 4) ; la
+        # conversion en nombre se fait ICI, à la frontière, comme pour tous les
+        # montants du module — le contrat du front est inchangé.
+        "actualRevenue": float(r.actual_revenue), "forecastRevenue": float(r.forecast_revenue),
+        "actualCosts": float(r.actual_costs), "forecastCosts": float(r.forecast_costs),
+        "actualProduction": float(r.actual_production),
+        "forecastProduction": float(r.forecast_production),
         # Trois écarts CALCULÉS ET FIGÉS par le serveur. `deviationPercent` reste
         # l'écart de revenu (nom historique consommé tel quel). `unfavorable` dit le
         # sens : un écart de coûts positif est défavorable, un écart de revenu positif
         # ne l'est pas — l'écran n'a pas à connaître cette règle métier.
-        "deviationPercent": r.deviation_percent,
-        "revenueDeviationPercent": r.deviation_percent,
-        "costDeviationPercent": r.cost_deviation_percent,
-        "productionDeviationPercent": r.production_deviation_percent,
+        "deviationPercent": float(r.deviation_percent),
+        "revenueDeviationPercent": float(r.deviation_percent),
+        "costDeviationPercent": float(r.cost_deviation_percent),
+        "productionDeviationPercent": float(r.production_deviation_percent),
         "unfavorable": {
             "revenue": r.deviation_percent < 0,
             "costs": r.cost_deviation_percent > 0,

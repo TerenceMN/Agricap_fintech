@@ -833,7 +833,8 @@ def performance_reports(request):
     if not project:
         return Response({"detail": "Projet introuvable."}, status=404)
     report = services.submit_performance_report(project=project, data=data, by=getattr(request.user, "sub", ""))
-    return Response({"id": report.pk, "deviationPercent": report.deviation_percent}, status=201)
+    return Response({"id": report.pk, "deviationPercent": float(report.deviation_percent)},
+                     status=201)
 
 
 # --- Obligations (produit épargne obligataire client) -----------------------
