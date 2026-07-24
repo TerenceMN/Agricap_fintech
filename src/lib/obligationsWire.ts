@@ -150,6 +150,51 @@ export function totalBondsActive(rows: ObligationPositionRow[]): number {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Maturité — une DATE, pas une valeur
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MaturityReading {
+  /** Date d'échéance = souscription + maturité servie. */
+  maturityDate: Date;
+  /** Mois calendaires restants, borné à 0. Jamais négatif : une position échue
+   *  n'a pas « −3 mois » à courir. */
+  monthsRemaining: number;
+  /** Part de la durée écoulée, en pourcents (0–100), pour une barre d'avancement.
+   *  C'est une proportion de TEMPS, pas une proportion d'argent. */
+  elapsedPercent: number;
+}
+
+/**
+ * Où en est une position dans sa durée de vie.
+ *
+ * Purement calendaire : aucune valeur, aucun intérêt, aucun rendement. Le calcul
+ * précédent divisait un écart de millisecondes par `1000 × 60 × 60 × 24 × 30`,
+ * c'est-à-dire par des « mois de 30 jours » — une précision affichée à l'unité
+ * près sur une convention qui dérive d'un jour tous les deux mois. On compte
+ * désormais en mois CALENDAIRES, ce que la maturité mesure réellement.
+ */
+export function readMaturity(
+  dateCreated: string,
+  termMonths: number,
+  now: Date = new Date(),
+): MaturityReading {
+  const start = new Date(dateCreated);
+  const maturityDate = new Date(start);
+  maturityDate.setMonth(maturityDate.getMonth() + (Number(termMonths) || 0));
+
+  const brut = (maturityDate.getFullYear() - now.getFullYear()) * 12
+    + (maturityDate.getMonth() - now.getMonth())
+    - (now.getDate() < maturityDate.getDate() ? 0 : 1) + 1;
+  const monthsRemaining = Math.max(0, brut);
+
+  const total = Number(termMonths) || 0;
+  const elapsedPercent = total > 0
+    ? Math.min(100, Math.max(0, ((total - monthsRemaining) / total) * 100))
+    : 0;
+  return { maturityDate, monthsRemaining, elapsedPercent };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Retraits — la pénalité est une donnée de LIGNE, pas une constante
 // ─────────────────────────────────────────────────────────────────────────────
 

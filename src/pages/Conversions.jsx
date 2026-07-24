@@ -11,6 +11,7 @@ import { ArrowRightLeft, TrendingUp, Clock, CheckCircle2 } from 'lucide-react';
 import { useToast } from '@/components/ui/use-toast';
 import { api } from '@/services/api';
 import { formatPercent, rowRateToPercent } from '@/lib/investorSpaceWire';
+import { readMaturity } from '@/lib/obligationsWire';
 
 const FLOW_STATUS_LABEL = { EN_ATTENTE: 'En attente', APPROUVE: 'Approuvé', REJETE: 'Rejeté' };
 const FLOW_STATUS_COLOR = {
@@ -22,14 +23,24 @@ const FLOW_STATUS_COLOR = {
 const SimulationDialog = ({ open, onOpenChange, position, onConfirm, busy }) => {
   if (!position) return null;
 
-  const coupons = Math.floor(position.investedAmount / position.couponAmount);
+  const coupons = position.couponAmount > 0
+    ? Math.floor(position.investedAmount / position.couponAmount)
+    : 0;
   const conversionValue = coupons * position.couponAmount;
   const shares = Math.floor(conversionValue / 100);
 
-  const maturity = new Date(position.dateCreated);
-  maturity.setMonth(maturity.getMonth() + position.termMonths);
-  const monthsRemaining = Math.max(0, Math.round((maturity - new Date()) / (1000 * 60 * 60 * 24 * 30)));
-  const estimatedRemainingInterest = position.investedAmount * (position.rate / 100) * (monthsRemaining / 12);
+  // `estimatedRemainingInterest` a été SUPPRIMÉ. Il valait
+  // `investedAmount × (rate / 100) × (moisRestants / 12)` : un intérêt simple
+  // calculé au navigateur, avec un `/100` posé à la main alors que
+  // `rowRateToPercent` — qui lit l'unité DÉCLARÉE par la ligne — est importé
+  // trois lignes plus haut et utilisé ailleurs sur la même page. Il alimentait
+  // « Intérêts restants (est.) » et « Total estimé à terme », deux montants
+  // qu'aucun échéancier serveur ne confirme : le module ne sert aucun calendrier
+  // de coupons (cf. `MATURITY_VALUE_GAP`). Les coupons déjà versés, les retraits
+  // anticipés approuvés et un éventuel défaut n'y entraient pas davantage.
+  const maturite = readMaturity(position.dateCreated, position.termMonths);
+  const { monthsRemaining } = maturite;
+  const ratePercent = rowRateToPercent(position, 'rate', position.rate);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -60,22 +71,47 @@ const SimulationDialog = ({ open, onOpenChange, position, onConfirm, busy }) => 
             <h3 className="font-bold text-blue-400 flex items-center gap-2 mb-3">
               <Clock className="w-4 h-4"/> Conservation jusqu'à Maturité
             </h3>
+            {/* « Capital garanti » annonçait une garantie que personne n'a donnée :
+                un projet passé en défaut (P12) déprécie le capital, et le module
+                le modélise (`valuation`, `recoveryRate`). Le capital PLACÉ, lui,
+                est un fait servi. */}
             <ul className="space-y-2 text-sm text-gray-300">
-              <li className="flex justify-between"><span>Capital garanti:</span> <span className="text-white font-mono">{position.investedAmount.toLocaleString()} $</span></li>
-              <li className="flex justify-between"><span>Intérêts restants (est., {monthsRemaining} mois):</span> <span className="text-white font-mono">{Math.round(estimatedRemainingInterest).toLocaleString()} $</span></li>
-              <li className="flex justify-between text-gray-500"><span>Risque Capital:</span> <span>Faible</span></li>
-              <li className="border-t border-blue-500/20 pt-2 flex justify-between font-bold text-lg text-blue-100">
-                <span>Total estimé à terme:</span> <span>{Math.round(position.investedAmount + estimatedRemainingInterest).toLocaleString()} $</span>
+              <li className="flex justify-between">
+                <span>Capital placé:</span>
+                <span className="text-white font-mono">{position.investedAmount.toLocaleString('fr-FR')} $</span>
+              </li>
+              <li className="flex justify-between">
+                <span>Coupon du titre:</span>
+                <span className="text-white font-mono">{formatPercent(ratePercent)} / an</span>
+              </li>
+              <li className="flex justify-between">
+                <span>Échéance:</span>
+                <span className="text-white font-mono">
+                  {maturite.maturityDate.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })}
+                </span>
+              </li>
+              <li className="flex justify-between">
+                <span>Temps restant:</span>
+                <span className="text-white font-mono">{monthsRemaining} mois</span>
               </li>
             </ul>
+            <p className="text-[11px] text-blue-200/70 mt-3 leading-relaxed border-t border-blue-500/20 pt-2">
+              Aucun « total à terme » n'est affiché : le module ne sert pas d'échéancier de
+              coupons, et le projeter ici supposerait une convention de calcul, l'absence de
+              retrait anticipé et l'absence de défaut — trois hypothèses prises au navigateur.
+            </p>
           </div>
         </div>
 
         <Alert className="bg-slate-800 border-l-4 border-l-yellow-500 border-y-0 border-r-0 text-gray-300">
           <TrendingUp className="h-4 w-4 text-yellow-500" />
           <AlertTitle className="text-yellow-400">Aucune valorisation de marché</AlertTitle>
-          <AlertDescription className="text-xs">
-            Les actions AGRICAP ne sont pas cotées sur un marché secondaire — leur valeur ci-dessus est fixée à 100 $/action par les conditions AGRICAP, pas une estimation de marché.
+          <AlertDescription className="text-xs leading-relaxed">
+            Les actions AGRICAP ne sont pas cotées : les 100 $/action ci-dessus ne sont pas une
+            estimation de marché. C'est le ratio qu'applique le serveur au moment de la
+            validation (<code>obligation_convert</code>) — une constante écrite dans le code, pas
+            un paramètre voté par le comité ni un terme porté par une offre. Le nombre d'actions
+            réellement attribué est celui que le serveur renvoie.
           </AlertDescription>
         </Alert>
 
@@ -85,7 +121,7 @@ const SimulationDialog = ({ open, onOpenChange, position, onConfirm, busy }) => 
             <span>Maturité</span>
           </div>
           <div className="h-3 bg-slate-800 rounded-full overflow-hidden relative">
-            <div className="absolute left-0 top-0 h-full bg-emerald-500" style={{ width: `${Math.min(100, Math.max(0, 100 - (monthsRemaining / position.termMonths) * 100))}%` }}></div>
+            <div className="absolute left-0 top-0 h-full bg-emerald-500" style={{ width: `${maturite.elapsedPercent}%` }}></div>
           </div>
           <p className="text-center text-xs text-emerald-400 mt-1">
             <CheckCircle2 className="w-3 h-3 inline mr-1"/> {monthsRemaining} mois restants avant maturité
@@ -145,7 +181,10 @@ const Conversions = () => {
       <Helmet><title>Conversions - AGRICAP</title></Helmet>
       <div className="mb-8">
         <h1 className="text-3xl font-bold gradient-text">Conversion de Titres</h1>
-        <p className="text-gray-400">Convertissez vos obligations en actions AGRICAP (100 $/action).</p>
+        <p className="text-gray-400">
+          Convertissez vos obligations en actions AGRICAP. Le ratio appliqué est celui du
+          serveur au moment de la validation ; il n'est pas porté par votre offre.
+        </p>
       </div>
 
       <div className="space-y-4 mb-10">

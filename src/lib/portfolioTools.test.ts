@@ -40,6 +40,7 @@ import {
   ESG_GAP,
   MOVEMENTS_SERVER_LIMIT,
   REBALANCE_MISSING_CONTRACT,
+  SECONDARY_MARKET_FEE_GAP,
   buildGlobalReport,
   buildMovementRows,
   buildPortfolioAlerts,
@@ -415,6 +416,16 @@ describe('trous de données énoncés, jamais comblés', () => {
   it('le rééquilibrage énonce le contrat serveur manquant plutôt qu’un bouton mort', () => {
     expect(REBALANCE_MISSING_CONTRACT.serverContract.join(' ')).toContain('target-allocation');
     expect(REBALANCE_MISSING_CONTRACT.whatIsMissing.join(' ')).toContain('Aucune allocation cible');
+  });
+
+  it('le marché secondaire dit que le taux de frais n’est servi par aucun endpoint', () => {
+    // `Holdings` affichait « Frais (1.5%) » puis « Net estimé si vendu » sur un
+    // `0.015` en dur. Le champ existe en base, mais AUCUNE réponse ne le porte :
+    // le net affiché n'avait donc pas de source, et supposait un acheteur.
+    expect(SECONDARY_MARKET_FEE_GAP.whatIsMissing.join(' ')).toContain('fee_rate');
+    expect(SECONDARY_MARKET_FEE_GAP.whatIsMissing.join(' ')).toContain('aucun endpoint');
+    expect(SECONDARY_MARKET_FEE_GAP.serverContract.join(' ')).toContain('feeRate');
+    expect(DATA_GAPS.secondaryMarketFee).toBe(SECONDARY_MARKET_FEE_GAP);
   });
 
   it('chaque trou dit ce qui existe, ce qui manque, et comment ce serait alimenté', () => {

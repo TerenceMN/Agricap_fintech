@@ -683,10 +683,60 @@ export const BENCHMARK_GAP: DataGap = {
   ],
 };
 
+/**
+ * Marché secondaire — le net d'une vente n'est confirmé par personne.
+ *
+ * Le simulateur de vente de `Holdings` affichait « Frais (1.5 %) » puis
+ * « Net estimé si vendu » en gras, calculés dans le navigateur sur un `0.015`
+ * en dur. `SecondaryMarketListing.fee_rate` existe bien côté serveur — mais
+ * comme `default=` de champ, et il n'est servi NULLE PART : ni par le GET du
+ * marché secondaire (`{id, subscriptionId, askPrice, status}`), ni en réponse à
+ * la création d'une annonce. Le taux affiché n'avait donc aucune source, et le
+ * net qu'il produisait était une promesse sans auteur — sur l'écran même où
+ * l'investisseur place son ordre.
+ *
+ * S'y ajoute une confusion de nature que le chiffre masquait : une annonce n'est
+ * pas une vente. Tant qu'aucun acheteur ne s'est manifesté, il n'y a ni prix
+ * réalisé, ni frais dus, ni net à recevoir.
+ */
+export const SECONDARY_MARKET_FEE_GAP: DataGap = {
+  key: 'secondaryMarketFee',
+  title: 'Net d’une vente au marché secondaire — le taux de frais n’est servi nulle part',
+  question: 'Si je vends ma position, combien vais-je réellement toucher ?',
+  whatExists: [
+    'Le nominal de votre position et le prix d’offre que vous fixez : de quoi afficher le '
+    + 'prix DEMANDÉ, qui est la seule grandeur que vous décidez.',
+    '`POST /investments/secondary-market` enregistre l’annonce au prix demandé — une '
+    + 'intention de vente, pas une vente.',
+  ],
+  whatIsMissing: [
+    'Le taux de frais applicable. `SecondaryMarketListing.fee_rate` existe en base '
+    + '(défaut 0,015) mais n’est renvoyé par aucun endpoint : ni la liste du marché '
+    + 'secondaire, ni la création d’annonce ne le portent.',
+    'Le prix RÉALISÉ. Une annonce ouverte n’a pas d’acheteur : tant qu’il n’y en a pas, '
+    + 'un « net si vendu » suppose à la fois un prix et une contrepartie qui n’existent pas.',
+    'La règle des frais elle-même : un `default=` de modèle est du code. Des frais prélevés '
+    + 'sur l’argent d’un client relèvent du comité (principe 8), versionnés comme un barème.',
+  ],
+  howItWouldBeFed: [
+    'Le taux en base (`InvestmentConfig`), versionné maker-checker, servi avec l’annonce et '
+    + 'avec son unité — comme `penaltyRate` l’est déjà sur les retraits obligataires.',
+    'Un dénouement d’annonce qui journalise le prix réalisé, les frais retenus et le net '
+    + 'versé : c’est cette ligne-là, et pas une projection, qui répond à la question.',
+  ],
+  serverContract: [
+    'GET /investments/secondary-market — ajouter `feeRate` et son `units`, à l’identique de '
+    + '`obligation_withdrawals`.',
+    'GET /investments/secondary-market/quote?subscriptionId=&askPrice= — frais applicables '
+    + 'et net attendu, calculés par le serveur avant le placement de l’ordre.',
+  ],
+};
+
 export const DATA_GAPS: Record<string, DataGap> = {
   esg: ESG_GAP,
   benchmarks: BENCHMARK_GAP,
   rebalance: REBALANCE_MISSING_CONTRACT,
+  secondaryMarketFee: SECONDARY_MARKET_FEE_GAP,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

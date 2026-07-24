@@ -71,10 +71,19 @@ const SellSimulatorDialog = ({ open, onOpenChange, holding, onSubmitted }) => {
     const [pricePercent, setPricePercent] = useState(98);
     const [submitting, setSubmitting] = useState(false);
 
+    // `salePrice` est le prix que L'INVESTISSEUR fixe (nominal × son curseur) :
+    // c'est sa décision, et c'est la valeur envoyée telle quelle en `askPrice`.
+    //
+    // `fees = salePrice * 0.015` et `netProceeds` ont été SUPPRIMÉS. Le taux
+    // n'avait aucune source : `SecondaryMarketListing.fee_rate` existe en base
+    // comme `default=` de champ, mais n'est servi par aucun endpoint — ni le GET
+    // du marché secondaire (`{id, subscriptionId, askPrice, status}`), ni la
+    // création d'annonce. Le « Net estimé si vendu » affiché en gras était donc
+    // une promesse sans auteur, sur l'écran même où l'ordre se place — et il
+    // supposait de surcroît un acheteur, alors qu'une annonce n'est pas une
+    // vente. Cf. `SECONDARY_MARKET_FEE_GAP`.
     const faceValue = holding?.amount || 0;
     const salePrice = (faceValue * pricePercent) / 100;
-    const fees = salePrice * 0.015;
-    const netProceeds = salePrice - fees;
 
     const handlePlaceOrder = async () => {
         setSubmitting(true);
@@ -94,8 +103,10 @@ const SellSimulatorDialog = ({ open, onOpenChange, holding, onSubmitted }) => {
         <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent className="glass-effect text-white sm:max-w-[600px]">
                 <DialogHeader>
-                    <DialogTitle className="flex items-center gap-2"><Calculator className="text-blue-400"/> Simulateur de Vente</DialogTitle>
-                    <DialogDescription>Estimez vos gains en cas de vente anticipée sur le marché secondaire.</DialogDescription>
+                    <DialogTitle className="flex items-center gap-2"><Calculator className="text-blue-400"/> Placer un ordre de vente</DialogTitle>
+                    <DialogDescription>
+                        Fixez le prix auquel vous proposez votre position sur le marché secondaire.
+                    </DialogDescription>
                 </DialogHeader>
                 <div className="space-y-6 py-4">
                     <div className="bg-slate-800/50 p-4 rounded-lg border border-slate-700">
@@ -110,22 +121,35 @@ const SellSimulatorDialog = ({ open, onOpenChange, holding, onSubmitted }) => {
                             <span>Prime (110%)</span>
                         </div>
                     </div>
-                    <div className="bg-red-500/10 border border-red-500/30 p-4 rounded-lg space-y-3">
-                        <h4 className="font-bold text-red-200 flex items-center gap-2"><DollarSign className="w-4 h-4"/> Prix d'Offre</h4>
+                    <div className="bg-slate-800/50 border border-slate-700 p-4 rounded-lg space-y-3">
+                        <h4 className="font-bold text-slate-200 flex items-center gap-2"><DollarSign className="w-4 h-4"/> Prix demandé</h4>
                         <div className="space-y-1 text-sm">
-                            <div className="flex justify-between"><span>Prix Brut:</span> <span>{salePrice.toLocaleString(undefined, {maximumFractionDigits: 0})} $</span></div>
-                            <div className="flex justify-between text-red-300"><span>Frais (1.5%):</span> <span>- {fees.toLocaleString(undefined, {maximumFractionDigits: 0})} $</span></div>
-                            <div className="border-t border-red-500/30 pt-2 flex justify-between font-bold text-lg text-white">
-                                <span>Net estimé si vendu:</span>
-                                <span>{netProceeds.toLocaleString(undefined, {maximumFractionDigits: 0})} $</span>
+                            <div className="flex justify-between text-gray-400">
+                                <span>Nominal de la position :</span>
+                                <span className="font-mono">{formatCurrency(faceValue, 'USD')}</span>
+                            </div>
+                            <div className="border-t border-slate-700 pt-2 flex justify-between font-bold text-lg text-white">
+                                <span>Prix demandé ({pricePercent} %) :</span>
+                                <span className="font-mono">{formatCurrency(salePrice, 'USD')}</span>
                             </div>
                         </div>
                     </div>
-                    <Alert className="bg-blue-500/10 border-blue-500/20 text-blue-200">
+                    <Alert className="bg-amber-500/10 border-amber-500/20 text-amber-200">
                         <Info className="h-4 w-4" />
-                        <AlertTitle>Note d'information</AlertTitle>
-                        <AlertDescription className="text-xs">
-                            Votre position sera listée au marché secondaire au prix brut ci-dessus ; la vente n'est effective que lorsqu'un autre investisseur l'achète.
+                        <AlertTitle className="text-sm">Ni frais ni net ne sont affichés — et c'est volontaire</AlertTitle>
+                        <AlertDescription className="text-xs leading-relaxed space-y-2">
+                            <p>
+                                Le taux de frais du marché secondaire n'est servi par aucun endpoint :
+                                il existe en base comme valeur par défaut de champ, jamais publiée.
+                                Un « net estimé » calculé ici serait un montant que personne ne
+                                confirme.
+                            </p>
+                            <p>
+                                Par ailleurs, placer un ordre n'est pas vendre : votre position est
+                                listée au prix demandé ci-dessus, et la vente n'existe que lorsqu'un
+                                autre investisseur l'achète. Tant qu'il n'y en a pas, il n'y a ni
+                                prix réalisé, ni frais dus, ni net à recevoir.
+                            </p>
                         </AlertDescription>
                     </Alert>
                 </div>

@@ -43,6 +43,7 @@ import {
   buildObligationRows,
   buildWithdrawalRows,
   obligationStatusLabel,
+  readMaturity,
   subscriptionAmount,
   totalBondsActive,
   totalInvestedActive,
@@ -173,6 +174,32 @@ describe('totaux — additionner n’est pas dériver', () => {
     const rows = buildObligationRows([POSITION_RATTACHEE, POSITION_ORPHELINE]);
     expect(totalInvestedActive(rows)).toBe(1000); // la position MATURE est exclue
     expect(totalBondsActive(rows)).toBe(4);
+  });
+});
+
+describe('readMaturity — une date, jamais une valeur', () => {
+  it('compte des mois CALENDAIRES, pas des tranches de 30 jours', () => {
+    // Souscrit le 04/03/2026 sur 24 mois → échéance 04/03/2028.
+    const m = readMaturity('2026-03-04T09:00:00Z', 24, new Date('2027-03-04T09:00:00Z'));
+    expect(m.maturityDate.getFullYear()).toBe(2028);
+    expect(m.monthsRemaining).toBe(12);
+  });
+
+  it('ne rend jamais un nombre de mois négatif sur une position échue', () => {
+    const m = readMaturity('2020-01-01T00:00:00Z', 12, new Date('2026-07-24T00:00:00Z'));
+    expect(m.monthsRemaining).toBe(0);
+    expect(m.elapsedPercent).toBe(100);
+  });
+
+  it('borne l’avancement à [0, 100] et ne divise pas par une durée nulle', () => {
+    const m = readMaturity('2026-03-04T09:00:00Z', 0, new Date('2026-03-04T09:00:00Z'));
+    expect(m.elapsedPercent).toBe(0);
+    expect(Number.isFinite(m.elapsedPercent)).toBe(true);
+  });
+
+  it('ne produit AUCUN montant', () => {
+    const m = readMaturity('2026-03-04T09:00:00Z', 24, new Date('2027-03-04T09:00:00Z'));
+    expect(Object.keys(m).sort()).toEqual(['elapsedPercent', 'maturityDate', 'monthsRemaining']);
   });
 });
 
