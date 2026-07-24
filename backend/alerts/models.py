@@ -37,7 +37,14 @@ class AlertRule(models.Model):
     operator = models.CharField(max_length=2, choices=Operator.choices)
     # Unité dépend de la métrique : heures pour AGENCY_SUSPENDED/RECONCILIATION_OVERDUE,
     # points de score pour COMPLIANCE_SCORE_LOW, nombre pour TRANSACTION_OVERDUE/PARTNER_FAILURES.
-    threshold = models.FloatField()
+    #
+    # `Decimal` et non `float` (principe 4) : un seuil est une frontière, et une
+    # frontière n'a d'intérêt que si elle est franchie au bon endroit. En binaire,
+    # un seuil saisi à 79,9 valait 79,900000000000005684…, et la comparaison à
+    # `<` ou `>=` basculait du mauvais côté sur la valeur d'égalité exacte — c'est
+    # le même raisonnement que pour les seuils du moteur de scoring
+    # (`referentiel.InstitutionConfig`), auxquels ces règles font écho.
+    threshold = models.DecimalField(max_digits=12, decimal_places=2)
     severity = models.CharField(max_length=10, choices=Severity.choices)
     # Numéro notifié par SMS à chaque nouvelle alerte matérialisée pour cette règle (vide =
     # pas de notification SMS, comportement historique).

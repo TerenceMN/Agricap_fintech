@@ -6,6 +6,7 @@ contrainte DB `unique_active_alert_dedup_key` en filet de sécurité)."""
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 
 from django.utils import timezone
 
@@ -16,8 +17,36 @@ from .models import Alert, AlertRule
 
 ESCALATION_MINUTES = 60  # une alerte WARNING non acquittée depuis ce délai devient CRITICAL
 
+_SECONDS_PER_HOUR = Decimal(3600)
 
-def _compare(value: float, operator: str, threshold: float) -> bool:
+
+def as_threshold(value) -> Decimal:
+    """Coerce une valeur entrante (JSON, formulaire, code) en seuil `Decimal`.
+
+    Le JSON n'a pas de type décimal : `{"threshold": 79.9}` arrive en `float`.
+    On repasse par `str()` pour retrouver le nombre que l'administrateur a
+    réellement saisi (79,9) plutôt que sa traduction binaire — principe 4.
+    """
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value).strip().replace(",", "."))
+    except (InvalidOperation, AttributeError, TypeError):
+        raise ValidationFailed("Seuil invalide : un nombre est attendu.")
+
+
+def _as_metric(value) -> Decimal:
+    """Métrique mesurée → `Decimal`, pour la comparer au seuil sans flottant."""
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _hours_since(moment) -> Decimal:
+    """Ancienneté en heures, exacte : elle se compare à un seuil `Decimal`."""
+    return Decimal(str((timezone.now() - moment).total_seconds())) / _SECONDS_PER_HOUR
+
+
+def _compare(value, operator: str, threshold: Decimal) -> bool:
+    value = _as_metric(value)
     if operator == AlertRule.Operator.GT:
         return value > threshold
     if operator == AlertRule.Operator.GTE:
@@ -51,7 +80,7 @@ def _evaluate_agency_suspended(rule: AlertRule) -> None:
             entity_type="Agency", entity_id=agency.code, action="agency.suspend",
         ).order_by("-created_at").first()
         since = entry.created_at if entry else agency.updated_at
-        hours = (timezone.now() - since).total_seconds() / 3600
+        hours = _hours_since(since)
         if _compare(hours, rule.operator, rule.threshold):
             _raise_alert(rule=rule, source_type="Agency", source_id=agency.code,
                          title=f"{agency.code} suspendue depuis {int(hours)}h",
@@ -64,7 +93,7 @@ def _evaluate_reconciliation_overdue(rule: AlertRule) -> None:
         status__in=(AgencyReconciliation.Status.PENDING, AgencyReconciliation.Status.IN_PROGRESS),
     ).select_related("agency")
     for recon in pending:
-        hours = (timezone.now() - recon.opened_at).total_seconds() / 3600
+        hours = _hours_since(recon.opened_at)
         if _compare(hours, rule.operator, rule.threshold):
             _raise_alert(rule=rule, source_type="AgencyReconciliation", source_id=recon.pk,
                          title=f"Rapprochement {recon.agency.code} ouvert depuis {int(hours)}h",
@@ -163,14 +192,15 @@ def resolve_alert(*, alert: Alert, note: str = "", by: str = "") -> Alert:
     return alert
 
 
-def create_alert_rule(*, code: str, name: str, metric: str, operator: str, threshold: float, severity: str,
+def create_alert_rule(*, code: str, name: str, metric: str, operator: str, threshold, severity: str,
                        description: str = "", notify_phone: str = "", by: str = "") -> AlertRule:
     if not code or not name:
         raise ValidationFailed("Code et nom de la règle requis.")
     if AlertRule.objects.filter(code=code).exists():
         raise ValidationFailed(f"Une règle avec le code « {code} » existe déjà.")
     rule = AlertRule.objects.create(code=code, name=name, description=description, metric=metric, operator=operator,
-                                     threshold=threshold, severity=severity, notify_phone=notify_phone, created_by=by)
+                                     threshold=as_threshold(threshold), severity=severity,
+                                     notify_phone=notify_phone, created_by=by)
     audit_record(actor=by, action="alert_rule.create", entity_type="AlertRule", entity_id=str(rule.pk),
                  details={"code": code, "metric": metric})
     return rule
@@ -180,7 +210,9 @@ def update_alert_rule(*, rule: AlertRule, by: str = "", **fields) -> AlertRule:
     changed = []
     for field, value in fields.items():
         if value is not None:
-            setattr(rule, field, value)
+            # Le seuil arrive du JSON en `float` : on le rétablit en `Decimal`
+            # exact avant de l'écrire (principe 4).
+            setattr(rule, field, as_threshold(value) if field == "threshold" else value)
             changed.append(field)
     if changed:
         rule.save(update_fields=changed)

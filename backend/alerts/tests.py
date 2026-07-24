@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
+from decimal import Decimal
 from unittest.mock import Mock, patch
 
 from django.test import override_settings
@@ -48,6 +50,80 @@ class AlertRuleTests(AuthedAPITestCase):
         rule.refresh_from_db()
         self.assertFalse(rule.enabled)
         self.assertTrue(AlertRule.objects.filter(pk=rule.pk).exists())  # jamais de suppression physique
+
+
+class AlertThresholdDecimalTests(AuthedAPITestCase):
+    """Principe 4 — un seuil d'alerte est un `Decimal`, jamais un `float`.
+
+    Un seuil n'existe que pour être franchi au bon endroit. En binaire, 79,9
+    valait 79,900000000000005684…, et une règle « score < 79,9 » se déclenchait —
+    ou non — sur la valeur d'égalité exacte selon l'arrondi de la mesure.
+    """
+
+    def setUp(self):
+        AlertRule.objects.all().delete()
+
+    def test_le_seuil_saisi_est_stocke_exactement(self):
+        rule = services.create_alert_rule(code="D1", name="Conformité", metric="COMPLIANCE_SCORE_LOW",
+                                           operator="<", threshold=79.9, severity="WARNING", by="u")
+        rule.refresh_from_db()
+        self.assertIsInstance(rule.threshold, Decimal)
+        self.assertEqual(rule.threshold, Decimal("79.90"))
+        # Le chemin `float` historique ne pouvait pas tenir cette égalité.
+        self.assertNotEqual(Decimal(79.9), Decimal("79.9"))
+
+    def test_les_regles_seedees_relisent_des_decimal(self):
+        """Les règles amorcées par les migrations 0002/0004 traversent la
+        conversion sans changer de valeur."""
+        services.create_alert_rule(code="D2", name="Suspendue", metric="AGENCY_SUSPENDED",
+                                    operator=">=", threshold=72, severity="CRITICAL", by="u")
+        rule = AlertRule.objects.get(code="D2")
+        self.assertIsInstance(rule.threshold, Decimal)
+        self.assertEqual(rule.threshold, Decimal(72))
+
+    def test_la_comparaison_au_seuil_est_exacte_a_l_egalite(self):
+        """Frontière exacte : `>= 24` se déclenche à 24,00 h et pas à 23,99 h."""
+        self.assertTrue(services._compare(24, ">=", Decimal("24.00")))
+        self.assertTrue(services._compare(Decimal("24.00"), ">=", Decimal("24.00")))
+        self.assertFalse(services._compare(Decimal("23.99"), ">=", Decimal("24.00")))
+        self.assertTrue(services._compare(79.8, "<", Decimal("79.90")))
+        self.assertFalse(services._compare(Decimal("79.90"), "<", Decimal("79.90")))
+
+    def test_une_maj_depuis_le_json_reste_exacte(self):
+        """`Supervision.jsx` envoie `Number(rule.threshold)` : le JSON n'a pas de
+        type décimal, la valeur arrive en `float` et doit être rétablie exacte."""
+        self.login(role="admin_it", sub="cfg-dec")
+        created = self.client.post("/api/alerts/rules", {
+            "code": "D3", "name": "Conformité", "metric": "COMPLIANCE_SCORE_LOW",
+            "operator": "<", "threshold": 79.9, "severity": "WARNING",
+        }, format="json")
+        self.assertEqual(created.status_code, 201)
+        rule = AlertRule.objects.get(code="D3")
+        self.assertEqual(rule.threshold, Decimal("79.90"))
+
+        self.client.patch(f"/api/alerts/rules/{rule.pk}", {"threshold": 60.5}, format="json")
+        rule.refresh_from_db()
+        self.assertEqual(rule.threshold, Decimal("60.50"))
+
+    def test_le_json_sert_toujours_un_nombre(self):
+        """Contrat de sortie : `Supervision.jsx` alimente un `<input type="number">`
+        avec `r.threshold`. Le rendu DRF d'un `Decimal` doit rester un nombre JSON,
+        pas une chaîne."""
+        services.create_alert_rule(code="D4", name="Test", metric="TRANSACTION_OVERDUE",
+                                    operator=">=", threshold=5, severity="WARNING", by="u")
+        self.login(role="admin_it", sub="cfg-json")
+        res = self.client.get("/api/alerts/rules")
+        payload = json.loads(res.content)
+        self.assertTrue(payload)
+        for row in payload:
+            self.assertIsInstance(row["threshold"], (int, float))
+
+    def test_un_seuil_illisible_est_refuse(self):
+        from common.exceptions import ValidationFailed
+
+        with self.assertRaises(ValidationFailed):
+            services.create_alert_rule(code="D5", name="Test", metric="TRANSACTION_OVERDUE",
+                                        operator=">=", threshold="beaucoup", severity="WARNING", by="u")
 
 
 class AlertEvaluationTests(AuthedAPITestCase):
