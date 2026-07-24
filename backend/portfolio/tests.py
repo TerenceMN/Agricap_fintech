@@ -1045,6 +1045,41 @@ class ContratDeSortieEcheancierTests(TestCase):
             self.assertGreater(row["interest_capitalized"], D("0.00"))
         self.assertGreater(rows[5]["total"], D("0.00"))   # exigible dès la sortie
 
+    def test_la_provenance_du_capital_porte_des_valeurs_litterales_stables(self):
+        """`accounting` teste `principalSource == "montant_approuve"` pour signaler
+        qu'une provision porte sur un calendrier PAS ENCORE contractuel.
+
+        Renommer ces valeurs ne casserait rien bruyamment : la comparaison
+        deviendrait simplement toujours fausse, et l'anomalie disparaîtrait du
+        rapport d'arrêté. Une alerte qui s'éteint en silence est pire qu'une
+        exception — d'où le gel des CHAÎNES elles-mêmes, pas seulement des noms.
+        """
+        self.assertEqual(services.BASE_APPROUVE, "montant_approuve")
+        self.assertEqual(services.BASE_DECAISSE, "decaisse_valide")
+
+        loan = self._loan(reference="CRD-2026-947")
+        self.assertEqual(services.schedule_for(loan)["principalSource"],
+                         "montant_approuve")
+        loan.transactions.create(kind="DISBURSEMENT", amount=D("1330"),
+                                 currency="USD", date=DEBUT, status="VALIDE")
+        self.assertEqual(services.schedule_for(loan)["principalSource"],
+                         "decaisse_valide")
+
+    def test_les_anomalies_sont_toujours_une_liste_de_chaines(self):
+        """`accounting` reprend cette liste TELLE QUELLE dans son rapport de
+        classification : elle ne doit jamais être `None`, ni contenir autre chose
+        que du texte lisible par un auditeur."""
+        loan = self._loan(reference="CRD-2026-948")
+        for montant, jour in ((D("700"), DEBUT), (D("400"), date(2026, 3, 15))):
+            loan.transactions.create(kind="DISBURSEMENT", amount=montant,
+                                     currency="USD", date=jour, status="VALIDE")
+        data = services.schedule_for(loan)
+        self.assertIsInstance(data["anomalies"], list)
+        self.assertEqual(len(data["anomalies"]), 2)   # partiel + tranches étalées
+        for anomalie in data["anomalies"]:
+            self.assertIsInstance(anomalie, str)
+            self.assertTrue(anomalie.strip())
+
     def test_un_parametrage_refuse_leve_et_ne_rend_pas_un_echeancier_partiel(self):
         """`accounting` absorbe le refus en anomalie de rapport : il faut donc que
         nous levions franchement, jamais que nous rendions un tableau tronqué."""
