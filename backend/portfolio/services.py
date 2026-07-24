@@ -5,7 +5,8 @@ de statut (actions du menu), et agrégats du tableau de bord (résumé + alertes
 """
 from __future__ import annotations
 
-from datetime import date
+import logging
+from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from django.db import transaction
@@ -15,9 +16,12 @@ from audit.services import record as audit_record
 from common.exceptions import InsufficientFundsError, ValidationFailed
 
 from . import rates
+from . import repayment
 from . import schedule as schedule_module
 from .models import Loan, LoanConfigHistory, LoanGuarantee, LoanNote, LoanSubWallet, LoanTransaction
 from .schedule import add_months, build_schedule, schedule_totals
+
+logger = logging.getLogger(__name__)
 
 
 # --- Utilitaires de conversion tolérants -----------------------------------
@@ -660,7 +664,120 @@ def add_transaction(loan: Loan, data: dict, *, by: str = "") -> LoanTransaction:
     ):
         loan.status = Loan.Status.EN_COURS
         loan.save(update_fields=["status"])
+
+    # La file comptable est alimentée DANS la transaction du mouvement : un
+    # encaissement qui existerait sans son événement serait un franc entré sans
+    # trace au grand livre — la divergence la plus dangereuse, parce qu'elle est
+    # silencieuse.
+    emettre_evenements_comptables(loan, tx, by=by)
     return tx
+
+
+def _deja_regle_avant(loan: Loan, tx: LoanTransaction) -> Decimal:
+    """Total des remboursements VALIDÉS antérieurs à `tx`.
+
+    C'est lui qui décale l'imputation : le deuxième versement d'un client ne
+    rembourse pas les mêmes intérêts que le premier. Les mouvements « en attente »
+    sont exclus — on ne ventile que de l'argent réellement encaissé.
+    """
+    total = Decimal("0.00")
+    for autre in loan.transactions.all():
+        if (autre.pk != tx.pk
+                and autre.kind == LoanTransaction.Kind.REPAYMENT
+                and autre.status == LoanTransaction.Status.VALIDE
+                and autre.amount):
+            total += -autre.amount
+    return total
+
+
+def emettre_evenements_comptables(loan: Loan, tx: LoanTransaction, *, by: str = "") -> list:
+    """Publie les événements B2 / B3 / B4 correspondant à un mouvement encaissé.
+
+    - REMBOURSEMENT → B2 (capital) + B3 (intérêts), ventilés par imputation sur
+      l'échéancier réel. JAMAIS un total : les deux natures ne mouvementent ni les
+      mêmes comptes ni les mêmes classes, et la répartition ne se devine pas.
+    - FRAIS → B4 (commission), qui est déjà d'une seule nature.
+
+    Un mouvement « en attente » n'émet rien : l'argent n'est pas encore entré.
+    Une ventilation indisponible n'émet rien non plus — elle laisse une trace dans
+    l'historique du dossier, et la file comptable attend. Un événement en attente
+    vaut mieux qu'une écriture fausse.
+    """
+    if tx.status != LoanTransaction.Status.VALIDE or not tx.amount:
+        return []
+
+    try:
+        from credits.events import emettre_commission, emettre_echeance
+    except Exception:  # noqa: BLE001 — module d'événements absent : rien n'est inventé
+        logger.warning(
+            "Événements comptables indisponibles (import `credits.events`) : "
+            "le mouvement %s du prêt %s n'alimente pas la file.", tx.pk, loan.reference)
+        return []
+
+    commun = dict(
+        currency=tx.currency or loan.currency,
+        application=loan.application if loan.application_id else None,
+        loan_id=loan.pk, loan_reference=loan.reference,
+        occurred_at=_occurred_at(tx), actor_sub=by or tx.verified_by or "",
+    )
+
+    if tx.kind == LoanTransaction.Kind.FEE:
+        evenement = emettre_commission(
+            amount=abs(tx.amount), reference=f"FEE-{loan.reference}-{tx.pk}",
+            libelle=tx.label or "", **commun)
+        return [evenement] if evenement is not None else []
+
+    if tx.kind != LoanTransaction.Kind.REPAYMENT:
+        return []
+
+    montant = -tx.amount           # les remboursements sont stockés NÉGATIFS
+    ventilation = repayment.ventiler_remboursement(
+        loan, montant=montant, deja_regle=_deja_regle_avant(loan, tx))
+
+    if not ventilation["disponible"]:
+        LoanConfigHistory.objects.create(
+            loan=loan, action="Remboursement non ventilé — aucun événement comptable",
+            user=by or "Système", details=ventilation["motif"][:255],
+        )
+        logger.warning("Prêt %s, mouvement %s : %s",
+                       loan.reference, tx.pk, ventilation["motif"])
+        return []
+
+    if ventilation["motif"]:
+        # Ventilation possible mais partielle (versement supérieur au solde) :
+        # les jambes imputables sont émises, le reliquat est tracé et n'est
+        # attribué à aucun compte.
+        LoanConfigHistory.objects.create(
+            loan=loan, action="Remboursement partiellement imputé",
+            user=by or "Système", details=ventilation["motif"][:255],
+        )
+
+    return emettre_echeance(
+        capital=ventilation["capital"], interets=ventilation["interets"],
+        reference=f"RBT-{loan.reference}-{tx.pk}",
+        echeances=[{**l, "capital": str(l["capital"]), "interets": str(l["interets"])}
+                   for l in ventilation["lignes_imputees"]],
+        **commun,
+    )
+
+
+def _occurred_at(tx: LoanTransaction):
+    """Horodatage de l'événement : la DATE du mouvement, pas celle de la saisie.
+
+    Une régularisation saisie en septembre pour un encaissement d'août doit
+    s'écrire sur août, sinon l'exercice comptable ne reflète plus les faits.
+
+    MIDI local, et non minuit : `accounting.consommation` date sa pièce avec
+    `timezone.localdate(occurred_at)`, qui reconvertit correctement — mais minuit
+    local vaut 23 h la VEILLE en UTC (Kinshasa = UTC+1), et toute lecture qui
+    ferait `.date()` sur la valeur stockée daterait la pièce du jour précédent.
+    Midi ne peut basculer de jour sous aucun décalage horaire, et évite au
+    passage les minuits inexistants des fuseaux à heure d'été.
+    """
+    if not tx.date:
+        return None
+    valeur = datetime.combine(tx.date, time(12, 0))
+    return timezone.make_aware(valeur) if timezone.is_naive(valeur) else valeur
 
 
 def _txn_status(value, default=LoanTransaction.Status.VALIDE) -> str:

@@ -12,6 +12,7 @@ from common.exceptions import ValidationFailed
 from common.testing import AuthedAPITestCase
 
 from . import rates
+from . import repayment
 from . import schedule as schedule_module
 from . import services
 from .models import Loan
@@ -981,6 +982,323 @@ class BaseAmortissableTests(TestCase):
         loan = self._loan(reference="CRD-2026-937", start_date=None,
                           date=date(2026, 1, 5))
         self.assertEqual(services.schedule_for(loan)["startDate"], "2026-01-05")
+
+
+# =============================================================================
+# VENTILATION CAPITAL / INTÉRÊTS — B2 + B3, jamais un total.
+#
+# `credits.events.emettre_echeance` attend DEUX montants parce que B2 (501 → 413,
+# l'encours diminue) et B3 (501 → 701, un produit naît) ne mouvementent ni les
+# mêmes comptes ni les mêmes classes. `add_transaction` n'enregistrait qu'un
+# total : aucun producteur ne pouvait appeler l'émetteur, et rien de la vie du
+# prêt n'atteignait le grand livre après le décaissement.
+# =============================================================================
+
+class VentilationRemboursementTests(TestCase):
+    """La répartition est IMPUTÉE sur l'échéancier réel, jamais devinée."""
+
+    def _loan(self, **kwargs) -> Loan:
+        defaults = dict(
+            reference="CRD-2026-950", operator="Coopérative Test",
+            amount_approved=D("1330"), annual_rate=D("18"), duration_months=8,
+            frequency="monthly", start_date=DEBUT, currency="USD",
+        )
+        defaults.update(kwargs)
+        loan = Loan.objects.create(**defaults)
+        loan.transactions.create(kind="DISBURSEMENT", amount=D("1330"),
+                                 currency="USD", date=DEBUT, status="VALIDE")
+        return loan
+
+    def test_une_echeance_exacte_se_ventile_au_centime_de_l_echeancier(self):
+        """1re échéance du cas de référence : 186,20 = 166,25 capital + 19,95 intérêts."""
+        loan = self._loan()
+        v = repayment.ventiler_remboursement(loan, montant=D("186.20"))
+        self.assertTrue(v["disponible"])
+        self.assertEqual(v["capital"], D("166.25"))
+        self.assertEqual(v["interets"], D("19.95"))
+        self.assertEqual(v["surplus"], D("0.00"))
+
+    def test_les_interets_sont_servis_avant_le_capital(self):
+        """Même ordre d'imputation que `accounting.provisions.imputer` : sinon
+        l'encours 413 et les jours de retard décriraient deux réalités."""
+        loan = self._loan(reference="CRD-2026-951")
+        v = repayment.ventiler_remboursement(loan, montant=D("10"))
+        self.assertEqual(v["interets"], D("10.00"))
+        self.assertEqual(v["capital"], D("0.00"))
+
+    def test_un_versement_a_cheval_sur_deux_echeances(self):
+        loan = self._loan(reference="CRD-2026-952")
+        # 186,20 (éch. 1) + 100 sur l'échéance 2 (17,46 d'intérêts puis 82,54 capital)
+        v = repayment.ventiler_remboursement(loan, montant=D("286.20"))
+        self.assertEqual(v["interets"], D("37.41"))          # 19,95 + 17,46
+        self.assertEqual(v["capital"], D("248.79"))          # 166,25 + 82,54
+        self.assertEqual(v["capital"] + v["interets"], D("286.20"))
+        self.assertEqual([l["numero"] for l in v["lignes_imputees"]], [1, 2])
+
+    def test_le_second_versement_ne_rembourse_pas_les_memes_interets(self):
+        """La ventilation d'un versement dépend de ce que les précédents ont éteint."""
+        loan = self._loan(reference="CRD-2026-953")
+        premier = repayment.ventiler_remboursement(loan, montant=D("186.20"))
+        second = repayment.ventiler_remboursement(
+            loan, montant=D("183.71"), deja_regle=D("186.20"))
+        self.assertEqual(premier["interets"], D("19.95"))
+        self.assertEqual(second["interets"], D("17.46"))     # échéance 2, pas 1
+        self.assertEqual(second["capital"], D("166.25"))
+        self.assertEqual([l["numero"] for l in second["lignes_imputees"]], [2])
+
+    def test_la_somme_des_ventilations_successives_egale_le_service_de_la_dette(self):
+        """Invariant : rembourser tout l'échéancier, versement par versement, ne
+        crée ni ne perd un centime de produit."""
+        loan = self._loan(reference="CRD-2026-954")
+        rows = services.schedule_for(loan)["schedule"]
+        cumul_capital, cumul_interets, deja = D("0.00"), D("0.00"), D("0.00")
+        for row in rows:
+            v = repayment.ventiler_remboursement(loan, montant=row["total"],
+                                                 deja_regle=deja)
+            cumul_capital += v["capital"]
+            cumul_interets += v["interets"]
+            deja += row["total"]
+        totaux = schedule_totals(rows, 8, "USD")
+        self.assertEqual(cumul_capital, totaux["total_principal"])
+        self.assertEqual(cumul_interets, totaux["total_interest"])
+
+    def test_sans_echeancier_rien_n_est_ventile_ni_devine(self):
+        loan = Loan.objects.create(reference="CRD-2026-955", operator="X",
+                                   amount_approved=D("0"), duration_months=0)
+        v = repayment.ventiler_remboursement(loan, montant=D("100"))
+        self.assertFalse(v["disponible"])
+        self.assertEqual(v["capital"], D("0.00"))
+        self.assertEqual(v["interets"], D("0.00"))
+        self.assertIn("pas d'échéancier", v["motif"])
+
+    def test_un_echeancier_refuse_ne_produit_aucune_ventilation(self):
+        loan = self._loan(reference="CRD-2026-956", frequency="quarterly")
+        Loan.objects.filter(pk=loan.pk).update(deferral_months=5)
+        v = repayment.ventiler_remboursement(Loan.objects.get(pk=loan.pk),
+                                             montant=D("100"))
+        self.assertFalse(v["disponible"])
+        self.assertIn("Échéancier indisponible", v["motif"])
+
+    def test_un_versement_superieur_au_solde_laisse_le_reliquat_non_attribue(self):
+        """Un remboursement anticipé, une pénalité et une erreur de saisie ne
+        s'écrivent pas au même compte : le reliquat n'est attribué à aucun."""
+        loan = self._loan(reference="CRD-2026-957")
+        v = repayment.ventiler_remboursement(loan, montant=D("2000"))
+        self.assertTrue(v["disponible"])
+        self.assertEqual(v["capital"], D("1330.00"))
+        self.assertEqual(v["interets"], D("89.78"))
+        self.assertEqual(v["surplus"], D("580.22"))          # 2 000 − 1 419,78
+        self.assertIn("instruire", v["motif"])
+
+
+class ImputationUniqueTests(TestCase):
+    """Une seule règle d'imputation pour un même prêt — le doublon est verrouillé.
+
+    `accounting.provisions.imputer` applique le même ordre (échéance la plus
+    ancienne d'abord, intérêts avant capital) pour dater le premier impayé. Tant
+    que les deux implémentations coexistent, elles ne doivent pas pouvoir diverger
+    d'un centime : la quote-part d'intérêts écrite au 701 et les jours de retard
+    qui déclenchent la provision décrivent la MÊME imputation.
+
+    Ce test est la condition de sûreté du retrait de la copie comptable : le jour
+    où `provisions.imputer` appelle `portfolio.repayment`, il devient redondant —
+    et jusque-là, il empêche la divergence silencieuse.
+    """
+
+    CAS = ["0", "10", "19.95", "186.20", "200", "286.20", "700", "1419.78"]
+
+    def _loan(self) -> Loan:
+        loan = Loan.objects.create(
+            reference="CRD-2026-970", operator="Coopérative Test",
+            amount_approved=D("1330"), annual_rate=D("18"), duration_months=8,
+            frequency="monthly", start_date=DEBUT, currency="USD")
+        loan.transactions.create(kind="DISBURSEMENT", amount=D("1330"),
+                                 currency="USD", date=DEBUT, status="VALIDE")
+        return loan
+
+    def test_les_deux_imputations_donnent_le_meme_capital_et_les_memes_interets(self):
+        from accounting import provisions
+
+        loan = self._loan()
+        lignes = services.schedule_for(loan)["schedule"]
+        # `provisions` travaille sur sa propre traduction des mêmes lignes.
+        traduites = [{"date": date.fromisoformat(l["date"]), "capital": l["principal"],
+                      "interets": l["interest"]} for l in lignes]
+        for total in self.CAS:
+            with self.subTest(total=total):
+                mien = repayment._imputer(lignes, D(total))
+                sien = provisions.imputer(traduites, D(total))
+                self.assertEqual(mien["capital"], sien["capital_rembourse"])
+                self.assertEqual(mien["interets"], sien["interets_regles"])
+                self.assertEqual(mien["surplus"], sien["avance"])
+
+    def test_la_premiere_echeance_impayee_concorde(self):
+        """Le champ dont dépendent les jours de retard, donc la provision."""
+        from accounting import provisions
+
+        loan = self._loan()
+        lignes = services.schedule_for(loan)["schedule"]
+        traduites = [{"date": date.fromisoformat(l["date"]), "capital": l["principal"],
+                      "interets": l["interest"]} for l in lignes]
+        for total in self.CAS:
+            with self.subTest(total=total):
+                sien = provisions.imputer(traduites, D(total))
+                mien = repayment._imputer(lignes, D(total))
+                # La première échéance NON intégralement servie par notre
+                # imputation est celle que `provisions` date comme impayée.
+                servies = {l["numero"] for l in mien["par_ligne"].values()
+                           if l["capital"] == next(x["principal"] for x in lignes
+                                                   if x["number"] == l["numero"])
+                           and l["interets"] == next(x["interest"] for x in lignes
+                                                     if x["number"] == l["numero"])}
+                attendue = next((date.fromisoformat(l["date"]) for l in lignes
+                                 if l["number"] not in servies), None)
+                self.assertEqual(sien["premiere_echeance_impayee"], attendue)
+
+
+class EvenementsComptablesTests(TestCase):
+    """B2 / B3 / B4 sont produits dans la transaction du mouvement — ou pas du tout."""
+
+    def _loan(self, **kwargs) -> Loan:
+        defaults = dict(
+            reference="CRD-2026-960", operator="Coopérative Test",
+            amount_approved=D("1330"), annual_rate=D("18"), duration_months=8,
+            frequency="monthly", start_date=DEBUT, currency="USD",
+        )
+        defaults.update(kwargs)
+        loan = Loan.objects.create(**defaults)
+        loan.transactions.create(kind="DISBURSEMENT", amount=D("1330"),
+                                 currency="USD", date=DEBUT, status="VALIDE")
+        return loan
+
+    def _evenements(self, loan, type_=None):
+        from credits.models import CreditEvent
+
+        qs = CreditEvent.objects.filter(loan_id=loan.pk)
+        return list(qs.filter(event_type=type_) if type_ else qs)
+
+    def test_un_remboursement_produit_B2_et_B3_distincts(self):
+        from credits.models import CreditEvent
+
+        loan = self._loan()
+        services.add_transaction(loan, {
+            "kind": "REPAYMENT", "amount": "-186.20", "date": "2026-02-15",
+            "status": "Validé",
+        }, by="caissier")
+        capital = self._evenements(loan, CreditEvent.Type.PRINCIPAL_REPAID)
+        interets = self._evenements(loan, CreditEvent.Type.INTEREST_COLLECTED)
+        self.assertEqual(len(capital), 1)
+        self.assertEqual(len(interets), 1)
+        self.assertEqual(capital[0].amount, D("166.25"))
+        self.assertEqual(interets[0].amount, D("19.95"))
+        self.assertEqual(capital[0].currency, "USD")
+        self.assertEqual(capital[0].loan_reference, loan.reference)
+
+    def test_l_evenement_est_horodate_a_la_date_du_mouvement(self):
+        """Une régularisation saisie en septembre pour un encaissement d'août doit
+        s'écrire sur août, sinon l'exercice ne reflète plus les faits.
+
+        Les DEUX lectures sont vérifiées : `timezone.localdate()`, celle que fait
+        `accounting.consommation` pour dater sa pièce, et `.date()` sur la valeur
+        stockée en UTC. Minuit local passait la première et ratait la seconde
+        (23 h la veille en UTC) — la pièce aurait pu être datée du jour précédent,
+        et en fin de mois d'un exercice précédent.
+        """
+        from django.utils import timezone as tz
+
+        loan = self._loan(reference="CRD-2026-961")
+        services.add_transaction(loan, {
+            "kind": "REPAYMENT", "amount": "-186.20", "date": "2026-02-15",
+            "status": "Validé",
+        }, by="caissier")
+        evenement = self._evenements(loan)[0]
+        self.assertEqual(tz.localdate(evenement.occurred_at), date(2026, 2, 15))
+        self.assertEqual(evenement.occurred_at.date(), date(2026, 2, 15))
+
+    def test_un_mouvement_en_attente_n_emet_rien(self):
+        """L'argent n'est pas encore entré : rien ne doit atteindre le grand livre."""
+        loan = self._loan(reference="CRD-2026-962")
+        services.add_transaction(loan, {
+            "kind": "REPAYMENT", "amount": "-186.20", "status": "En attente",
+        }, by="caissier")
+        self.assertEqual(self._evenements(loan), [])
+
+    def test_le_rejeu_du_meme_mouvement_ne_double_pas_les_evenements(self):
+        """Idempotence par référence d'acte : une écriture ne se passe pas deux fois."""
+        loan = self._loan(reference="CRD-2026-963")
+        tx = services.add_transaction(loan, {
+            "kind": "REPAYMENT", "amount": "-186.20", "status": "Validé"}, by="c")
+        services.emettre_evenements_comptables(loan, tx, by="c")
+        services.emettre_evenements_comptables(loan, tx, by="c")
+        self.assertEqual(len(self._evenements(loan)), 2)     # B2 + B3, pas 6
+
+    def test_deux_versements_produisent_des_ventilations_differentes(self):
+        from credits.models import CreditEvent
+
+        loan = self._loan(reference="CRD-2026-964")
+        services.add_transaction(loan, {"kind": "REPAYMENT", "amount": "-186.20",
+                                        "status": "Validé"}, by="c")
+        services.add_transaction(loan, {"kind": "REPAYMENT", "amount": "-183.71",
+                                        "status": "Validé"}, by="c")
+        interets = sorted(e.amount for e in
+                          self._evenements(loan, CreditEvent.Type.INTEREST_COLLECTED))
+        self.assertEqual(interets, [D("17.46"), D("19.95")])
+
+    def test_des_frais_produisent_une_commission_B4(self):
+        from credits.models import CreditEvent
+
+        loan = self._loan(reference="CRD-2026-965")
+        services.add_transaction(loan, {"kind": "FEE", "amount": "25",
+                                        "label": "Frais de dossier",
+                                        "status": "Validé"}, by="c")
+        commissions = self._evenements(loan, CreditEvent.Type.COMMISSION_COLLECTED)
+        self.assertEqual(len(commissions), 1)
+        self.assertEqual(commissions[0].amount, D("25.00"))
+
+    def test_un_decaissement_n_emet_pas_de_remboursement(self):
+        """B1 est produit par `credits.disbursement`, pas ici — pas de doublon."""
+        loan = self._loan(reference="CRD-2026-966")
+        self.assertEqual(self._evenements(loan), [])
+
+    def test_sans_echeancier_aucun_evenement_et_une_trace_dans_le_dossier(self):
+        """La ligne tenue par tous : un événement en attente vaut mieux qu'une
+        écriture fausse — mais l'absence doit être VISIBLE."""
+        loan = Loan.objects.create(reference="CRD-2026-967", operator="X",
+                                   amount_approved=D("0"), duration_months=0)
+        services.add_transaction(loan, {"kind": "REPAYMENT", "amount": "-100",
+                                        "status": "Validé"}, by="c")
+        self.assertEqual(self._evenements(loan), [])
+        trace = loan.config_history.first()
+        self.assertIn("non ventilé", trace.action)
+        self.assertIn("pas d'échéancier", trace.details)
+
+    def test_un_taux_nul_n_emet_que_le_capital(self):
+        """Une écriture de zéro n'est pas une écriture : pas d'événement B3."""
+        from credits.models import CreditEvent
+
+        loan = self._loan(reference="CRD-2026-968", annual_rate=D("0"))
+        services.add_transaction(loan, {"kind": "REPAYMENT", "amount": "-166.25",
+                                        "status": "Validé"}, by="c")
+        self.assertEqual(len(self._evenements(loan, CreditEvent.Type.PRINCIPAL_REPAID)), 1)
+        self.assertEqual(self._evenements(loan, CreditEvent.Type.INTEREST_COLLECTED), [])
+
+    def test_la_somme_des_evenements_egale_le_service_de_la_dette(self):
+        """Invariant de bout en bout : solder le prêt échéance par échéance produit
+        exactement le capital décaissé et les intérêts de l'échéancier."""
+        from credits.models import CreditEvent
+
+        loan = self._loan(reference="CRD-2026-969")
+        rows = services.schedule_for(loan)["schedule"]
+        for row in rows:
+            services.add_transaction(loan, {
+                "kind": "REPAYMENT", "amount": str(-row["total"]),
+                "date": row["date"], "status": "Validé"}, by="c")
+        somme = lambda t: sum((e.amount for e in self._evenements(loan, t)), D("0.00"))  # noqa: E731
+        totaux = schedule_totals(rows, 8, "USD")
+        self.assertEqual(somme(CreditEvent.Type.PRINCIPAL_REPAID),
+                         totaux["total_principal"])
+        self.assertEqual(somme(CreditEvent.Type.INTEREST_COLLECTED),
+                         totaux["total_interest"])
 
 
 # =============================================================================
