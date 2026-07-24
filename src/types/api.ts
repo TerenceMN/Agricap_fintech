@@ -674,6 +674,18 @@ export interface ObligationPosition {
   termMonths: number;
   status: string;
   dateCreated: string;
+  /** PROVENANCE des termes (`obligation_row`). Sans elle, `rate` et
+   *  `couponAmount` seraient des nombres sans auteur — ce qu'ils étaient quand
+   *  ils tombaient des valeurs par défaut du modèle, aujourd'hui supprimées. */
+  offerId?: number | null;
+  offerCode?: string | null;
+  projectCode?: string | null;
+  paymentFrequency?: string | null;
+  subscriptionId?: number | null;
+  settledAmount?: number | null;
+  /** « investments.Offer », ou la mention explicite d'une position antérieure au
+   *  rattachement obligatoire à une offre. */
+  termsSource?: string;
   /** Unité de chaque taux de cette ligne, déclarée par le serveur (`units`).
    *  Le module stocke ses taux dans DEUX unités jusque dans la même table :
    *  `couponRate` en points de pourcentage (9.0), `loanToValue` en fraction

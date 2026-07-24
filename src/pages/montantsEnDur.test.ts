@@ -24,12 +24,19 @@ const MONTANT_EN_DUR = /<[^<>]*>[^<>{}]*[0-9][0-9.,\s]*\s*(\$|%)\s*<\//g;
  *
  * Le prix de conversion (100 $/action) et les frais de gestion (0 %) sont des
  * constantes inventées par le prototype. Les brancher sur l'endpoint existant ne
- * réglerait rien : il code la même constante. Il faut d'abord arrêter les termes
- * du produit obligataire. Cette liste doit RÉTRÉCIR, jamais grandir.
+ * réglerait rien : il code la même constante. Cette liste doit RÉTRÉCIR, jamais
+ * grandir.
+ *
+ * `Obligations.jsx` en est SORTI : la décision manquante — d'où viennent les
+ * termes du produit — a été prise côté serveur (`obligations.souscrire` les tire
+ * de l'`Offer` souscrite et refuse une création sans offre), et la page lit
+ * désormais `GET /investments/offers/open` au lieu de porter
+ * `COUPON_VALUE = 250 / ANNUAL_RATE = 0.09 / MATURITY_MONTHS = 24 /
+ * WITHDRAWAL_PENALTY_RATE = 0.02`. Aucune offre ouverte n'affiche plus aucun
+ * taux, au lieu de replier sur une brochure.
  */
 const TOLERE = new Set([
   'Conversions.jsx',
-  'Obligations.jsx',
 ]);
 
 function fichiersPages(dir: string, acc: string[] = []): string[] {
