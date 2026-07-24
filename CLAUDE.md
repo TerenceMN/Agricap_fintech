@@ -93,12 +93,25 @@ tu le dis et tu proposes une alternative conforme.
    **figée** : toute fonctionnalité nouvelle l'APPELLE, elle ne la remplace pas, ne la duplique
    pas, ne la renomme pas. **Cette règle prime sur le prompt en cours** : si une demande décrit
    une implémentation d'un mécanisme qui existe déjà — même sous un autre nom, même avec une
-   signature différente — tu réutilises l'existant et tu le dis, au lieu d'en créer une seconde.
+   signature différente — tu ne l'écris pas.
+
+   **Ce que tu fais à la place, dans cet ordre :**
+   1. **L'existant est défectueux ou incomplet pour le besoin ?** Tu l'AMÉLIORES à sa place —
+      un seul endroit continue d'exister.
+   2. **L'existant suffit ?** Tu **SAUTES** cette partie de la demande, tu le dis, et tu
+      **redéploies l'effort** sur ce qui manque réellement :
+      - une fonctionnalité qui **n'existe pas encore** dans le système ;
+      - une fonctionnalité qui existe **côté serveur mais n'est branchée à aucun écran** ;
+      - une fonctionnalité qui existe **côté écran mais qu'aucun endpoint ne sert**.
+
+   Refaire ce qui marche déjà n'ajoute rien et retire du temps à ce qui manque. La valeur est
+   dans les trous, pas dans les doublons.
 
    Exemple : le taux de change est implémenté et fonctionnel. Une demande ultérieure qui
-   propose « une fonction de conversion » sous un autre nom ne crée rien : elle branche le
-   nouveau besoin sur la fonction de change existante. Idem pour l'échéancier, le débit de
-   portefeuille, le dépliage d'erreurs, les gardes de permission, le formatage des montants.
+   propose « une fonction de conversion » sous un autre nom ne produit **aucun code de
+   change** : on saute, on le signale, et on va brancher un endpoint orphelin ou construire un
+   écran manquant. Idem pour l'échéancier, le débit de portefeuille, le dépliage d'erreurs,
+   les gardes de permission, le formatage des montants.
 
    Coût réel constaté sur ce projet : une **4ᵉ** implémentation d'échéancier, **trois** jumeaux
    d'un même garde de permission, **deux** nomenclatures de canal — chacune ajoutant un endroit
