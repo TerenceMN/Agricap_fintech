@@ -120,6 +120,10 @@ const allMenuItems = {
     { icon: Landmark, label: 'Trésorerie', path: '/treasury' },
     { icon: BookOpen, label: 'Comptabilité', path: '/accounting' },
     { section: 'Contrôle' },
+    // Vue des caisses : séances de billetage, plafonds journaliers, gels sur écart.
+    // Lecture (IsStaff+read) ; les actions monétaires sont gardées par `validate`
+    // côté serveur — le bouton non autorisé est masqué, le serveur re-vérifie.
+    { icon: Wallet, label: 'Caisses', path: '/caisses' },
     { icon: CheckSquare2, label: 'Approbations Caisse', path: '/caisses/approbations' },
     // Back-office des ordres de paiement Makuta (réconciliation, suivi de caisse).
     // Réservé au staff porteur de validate/audit ; le serveur re-vérifie (403).
@@ -148,6 +152,9 @@ const allMenuItems = {
   ],
   comptable: [
     { section: 'Institution' },
+    // Lecture des caisses pour le comptable (soldes, séances, écarts/gels). Aucune
+    // action monétaire : elles exigent `validate`, que le rôle comptable ne porte pas.
+    { icon: Wallet, label: 'Caisses', path: '/caisses' },
     { icon: BookOpen, label: 'Comptabilité', path: '/accounting' },
     { icon: ClipboardCheck, label: 'Validation', path: '/validation-journal' },
     { icon: History, label: 'Journal d\'Audit', path: '/audit-log' },
@@ -157,6 +164,8 @@ const allMenuItems = {
     { icon: Store, label: 'Mon Agence', path: '/agencies' },
     { icon: Landmark, label: 'Trésorerie', path: '/treasury' },
     { icon: Repeat, label: 'Transactions', path: '/transactions' },
+    // Vue des caisses (lecture + actions gardées par `validate` côté serveur).
+    { icon: Wallet, label: 'Caisses', path: '/caisses' },
     // Face caisse du circuit Makuta : réconcilier et trancher les ordres dont
     // l'issue est inconnue. Le serveur restreint l'action à la capacité validate.
     { icon: Coins, label: 'Ordres de paiement', path: '/caisses/paiements' },

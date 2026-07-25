@@ -72,6 +72,7 @@ import ApproversConfig from '@/pages/ApproversConfig';
 import SmsTest from '@/pages/SmsTest';
 import CaisseApprobations from '@/pages/CaisseApprobations';
 import PaymentsBackOffice from '@/pages/PaymentsBackOffice';
+import Caisses from '@/pages/Caisses';
 
 const PrivateRoute = ({ children, roles }) => {
   const { isAuthenticated, loading, user } = useAuth();
@@ -208,6 +209,13 @@ const AppRoutes = () => {
       <Route path="/admin/console" element={<PrivateRoute roles={['admin']}><AdminConsole /></PrivateRoute>} />
       <Route path="/admin/approvers" element={<PrivateRoute roles={['admin']}><Layout><ApproversConfig /></Layout></PrivateRoute>} />
       <Route path="/admin/sms-test" element={<PrivateRoute roles={['admin']}><Layout><SmsTest /></Layout></PrivateRoute>} />
+      {/* Vue des caisses (`kind=CAISSE`) : séances, plafonds, gels sur écart.
+          Volontairement SANS prop `roles`, comme les autres écrans `/caisses/*` :
+          la lecture exige `IsStaff`+`read` (403 sur `GET /caisses/accounts`) et les
+          actions monétaires exigent `validate` — des notions de CAPACITÉ que
+          `menuKeyFor` (5 clés de menu) ne sait pas exprimer. Le serveur tranche et
+          la page relaie ; la restriction est portée par la nav (admin/caissier/comptable). */}
+      <Route path="/caisses" element={<PrivateRoute><Layout><Caisses /></Layout></PrivateRoute>} />
       <Route path="/caisses/approbations" element={<PrivateRoute roles={['admin']}><Layout><CaisseApprobations /></Layout></PrivateRoute>} />
       {/* Back-office des ordres de paiement Makuta (file de réconciliation,
           suivi, actions de caisse). Volontairement SANS prop `roles` : l'écran
