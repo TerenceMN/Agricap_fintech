@@ -20,6 +20,7 @@ from common.testing import AuthedAPITestCase
 
 from . import cash_register, partner_link, regularization, services, withdrawal_tiers
 from .models import (
+    CaisseConfig,
     ClientWallet,
     FundTransfer,
     RegularizationOrder,
@@ -259,6 +260,41 @@ class CashRegisterTests(AuthedAPITestCase):
         self.assertEqual(len(res.data), 1)
         self.assertEqual(res.data[0]["status"], "OPEN")
 
+    def test_tolerance_read_from_config_widens_freeze_threshold(self):
+        # Seuil configuré en base (P8) : le comité relève la tolérance à 50 — un écart de -30
+        # qui gèle par défaut (tolérance 1) ne gèle plus.
+        CaisseConfig.objects.create(discrepancy_tolerance=Decimal("50"), updated_by="comite")
+        session = cash_register.open_session(account=self.caisse, opening_count="500", by="u")
+        session = cash_register.close_session(session=session, closing_count="470", by="u")
+        self.assertEqual(session.status, "CLOSED")
+        self.caisse.refresh_from_db()
+        self.assertEqual(self.caisse.status, TreasuryAccount.Status.ACTIF)
+
+    def test_tolerance_config_can_tighten_threshold(self):
+        # …et l'abaisser : à 0, tout écart non nul gèle (écart -0,50, toléré par défaut).
+        CaisseConfig.objects.create(discrepancy_tolerance=Decimal("0"), updated_by="comite")
+        session = cash_register.open_session(account=self.caisse, opening_count="500", by="u")
+        session = cash_register.close_session(session=session, closing_count="499.50", by="u")
+        self.assertEqual(session.status, "DISCREPANCY")
+        self.caisse.refresh_from_db()
+        self.assertEqual(self.caisse.status, TreasuryAccount.Status.BLOQUE)
+
+    def test_tolerance_falls_back_to_default_with_logged_warning(self):
+        # Aucune CaisseConfig : repli sur Decimal("1") AVEC warning loggé (exception P8) —
+        # comportement strictement inchangé (166 tests historiques inclus).
+        self.assertFalse(CaisseConfig.objects.exists())
+        with self.assertLogs("agricap", level="WARNING") as captured:
+            tolerance = cash_register.discrepancy_tolerance()
+        self.assertEqual(tolerance, Decimal("1"))
+        self.assertIsInstance(tolerance, Decimal)
+        self.assertTrue(any("CaisseConfig" in m for m in captured.output))
+
+    def test_configured_tolerance_is_decimal_not_float(self):
+        CaisseConfig.objects.create(discrepancy_tolerance=Decimal("2.50"), updated_by="comite")
+        tolerance = cash_register.discrepancy_tolerance()
+        self.assertIsInstance(tolerance, Decimal)
+        self.assertEqual(tolerance, Decimal("2.50"))
+
     def test_register_open_close_via_action_endpoint(self):
         self.login(role="gest_caisse", sub="mgr-cr2")
         opened = self.client.post(f"/api/caisses/accounts/{self.caisse.code}/action",
@@ -395,6 +431,20 @@ class CaissesApiTests(AuthedAPITestCase):
                                 format="json")
         self.assertEqual(res.status_code, 403)
 
+    def test_action_refuses_non_staff_validate_holder(self):
+        # Asymétrie corrigée : `account_action` exige désormais `[IsStaff, validate]`. Un rôle
+        # NON-staff (type Client) mais porteur de `validate` — possible via un `RoleOverride` —
+        # pouvait AGIR sur une caisse sans pouvoir la LIRE. Il est maintenant refusé (403).
+        from rbac.models import RoleOverride
+        RoleOverride.objects.create(id="client_validate", label="Client validateur (test)",
+                                     type="Client", read=True, validate=True, is_custom=True)
+        self.login(role="client_validate", sub="ghost-validator")
+        res = self.client.post("/api/caisses/accounts/A2/action",
+                                {"action": "block"}, format="json")
+        self.assertEqual(res.status_code, 403)
+        self.a.refresh_from_db()
+        self.assertEqual(self.a.status, TreasuryAccount.Status.ACTIF)  # aucune action passée
+
     def test_insufficient_funds_maps_to_409_via_global_handler(self):
         self.login(role="gest_caisse", sub="mgr-2")
         res = self.client.post("/api/caisses/accounts/A2/action",
@@ -402,6 +452,39 @@ class CaissesApiTests(AuthedAPITestCase):
                                 format="json")
         self.assertEqual(res.status_code, 409)
         self.assertEqual(res.data["code"], "insufficient_funds")
+
+    def test_accounts_default_response_is_bare_list_backward_compatible(self):
+        # Rétro-compat : sans `?meta=1`, la réponse reste un TABLEAU BRUT (Caisses.jsx/Wallets.jsx).
+        self.login(role="gest_caisse", sub="mgr-list-1")
+        res = self.client.get("/api/caisses/accounts")
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.data, list)
+        self.assertEqual({row["code"] for row in res.data}, {"A2", "B2"})
+
+    def test_accounts_meta_returns_total_rows_and_paginates(self):
+        self.login(role="gest_caisse", sub="mgr-list-2")
+        res = self.client.get("/api/caisses/accounts?meta=1&limit=1&offset=0")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["totalRows"], 2)
+        self.assertEqual(res.data["limit"], 1)
+        self.assertEqual(res.data["offset"], 0)
+        self.assertEqual(len(res.data["results"]), 1)
+        # Page suivante : offset 1 renvoie la 2ᵉ ligne, total inchangé.
+        res2 = self.client.get("/api/caisses/accounts?meta=1&limit=1&offset=1")
+        self.assertEqual(res2.data["totalRows"], 2)
+        self.assertEqual(len(res2.data["results"]), 1)
+        self.assertNotEqual(res.data["results"][0]["code"], res2.data["results"][0]["code"])
+
+    def test_accounts_meta_respects_agency_filter(self):
+        from agencies.models import Agency
+        agency = Agency.objects.create(name="Agence Nord", code="AG-N")
+        TreasuryAccount.objects.create(code="A3", name="Caisse Agence", currency="USD",
+                                        balance=Decimal("0"), agency=agency)
+        self.login(role="gest_caisse", sub="mgr-list-3")
+        res = self.client.get(f"/api/caisses/accounts?meta=1&agency={agency.pk}")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["totalRows"], 1)
+        self.assertEqual({row["code"] for row in res.data["results"]}, {"A3"})
 
 
 class WithdrawalTierServiceTests(AuthedAPITestCase):
