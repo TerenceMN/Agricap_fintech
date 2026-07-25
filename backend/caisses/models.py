@@ -116,6 +116,32 @@ class CashRegisterSession(models.Model):
         return f"{self.account.code} [{self.status}] {self.opened_at}"
 
 
+class CaisseConfig(models.Model):
+    """Paramètres de gouvernance des caisses modifiables par le comité SANS redéploiement
+    (principe 8 : « les règles vivent en base, pas dans le code »). L'enregistrement le plus
+    récent fait foi ; aucune ligne = repli codé AVEC warning loggé (voir
+    `cash_register.discrepancy_tolerance`) — comportement strictement inchangé tant que rien
+    n'est saisi.
+
+    ⚠ `DecimalField` et non `FloatField` (principe 4) : la tolérance est comparée au centime
+    à un écart de billetage physique. En binaire, `float` réintroduirait l'imprécision que
+    tout `caisses` bannit (soldes, mouvements, seuils sont en `Decimal` de bout en bout)."""
+
+    #: Tolérance d'écart de caisse (billetage) : au-delà, la clôture gèle le compte
+    #: (`cash_register.close_session`). Montant ABSOLU, valeur unique institution — pas de
+    #: complication per-compte/per-devise tant qu'aucun besoin ne l'exige (principe 6).
+    discrepancy_tolerance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("1"))
+    updated_by = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"CaisseConfig(discrepancy_tolerance={self.discrepancy_tolerance})"
+
+
 class ClientWallet(models.Model):
     class Status(models.TextChoices):
         ACTIF = "ACTIF", "Actif"

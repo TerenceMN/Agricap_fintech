@@ -5,6 +5,7 @@ d'un journal séparé des mouvements du jour). Un écart au-delà de la toléran
 (`status=BLOQUE`) plutôt que de rester une simple valeur affichée sans conséquence."""
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 
 from django.db import transaction
@@ -14,9 +15,30 @@ from audit.services import record as audit_record
 from common.exceptions import ConflictError, ValidationFailed
 from common.parsing import to_decimal
 
-from .models import CashRegisterSession, TreasuryAccount
+from .models import CaisseConfig, CashRegisterSession, TreasuryAccount
 
-DISCREPANCY_TOLERANCE = Decimal("1")
+logger = logging.getLogger("agricap")
+
+#: Valeur de repli de la tolérance d'écart de caisse — appliquée UNIQUEMENT tant qu'aucune
+#: `CaisseConfig` n'est saisie, et alors avec un warning loggé (exception principe 8). Elle
+#: reprend à l'identique l'ancien seuil codé en dur, pour que le comportement soit strictement
+#: inchangé jusqu'à ce que le comité configure une valeur.
+_DEFAULT_DISCREPANCY_TOLERANCE = Decimal("1")
+
+
+def discrepancy_tolerance() -> Decimal:
+    """Tolérance d'écart de caisse, lue en base (principe 8 : le comité la règle sans
+    redéploiement). Aucune `CaisseConfig` en base → repli sur `_DEFAULT_DISCREPANCY_TOLERANCE`
+    AVEC warning loggé : le repli est explicite, jamais silencieux."""
+    config = CaisseConfig.objects.order_by("-created_at").first()
+    if config is not None:
+        return config.discrepancy_tolerance
+    logger.warning(
+        "Aucune CaisseConfig en base — repli sur la tolérance d'écart de caisse par défaut "
+        "(%s). Configurer le seuil (comité) pour lever ce repli.",
+        _DEFAULT_DISCREPANCY_TOLERANCE,
+    )
+    return _DEFAULT_DISCREPANCY_TOLERANCE
 
 
 def _open_session_for(account: TreasuryAccount) -> CashRegisterSession | None:
@@ -53,7 +75,7 @@ def close_session(*, session: CashRegisterSession, closing_count: Decimal | str,
     session.discrepancy = discrepancy
     session.closed_at = timezone.now()
 
-    if abs(discrepancy) > DISCREPANCY_TOLERANCE:
+    if abs(discrepancy) > discrepancy_tolerance():
         session.status = CashRegisterSession.Status.DISCREPANCY
         account.status = TreasuryAccount.Status.BLOQUE
         account.save(update_fields=["status", "updated_at"])
