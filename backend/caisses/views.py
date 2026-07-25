@@ -20,8 +20,22 @@ from rest_framework.response import Response
 from accounts.permissions import IsStaff
 from common import idempotency, makuta
 from common.makuta import MakutaConfigurationError
+from common.parsing import to_int
 from rbac.permissions import CapaciteSelonMethode, HasCapability
 from rbac.role_registry import get_role
+
+#: Taille de page par défaut de `GET /accounts?meta=1` (borne haute `MAX_PAGE`) — aligné sur
+#: le patron de pagination du back-office comptable (`accounting.views._pagination`).
+DEFAULT_PAGE = 50
+MAX_PAGE = 200
+
+
+def _pagination(request) -> tuple[int, int]:
+    """Borne (limit, offset) d'une lecture paginée — même règle que `accounting.views`
+    (principe 6 : ne pas réinventer un troisième parseur de pagination)."""
+    limit = min(to_int(request.GET.get("limit"), DEFAULT_PAGE) or DEFAULT_PAGE, MAX_PAGE)
+    offset = max(to_int(request.GET.get("offset"), 0), 0)
+    return limit, offset
 
 from . import cash_register, channels, partner_link, payments, regularization, serializers, services, \
     withdrawal_tiers
@@ -41,6 +55,21 @@ def accounts(request):
         agency_id = request.GET.get("agency")
         if agency_id:
             qs = qs.filter(agency_id=agency_id)
+        # Pagination ADDITIVE et rétro-compatible (patron `?meta=1` d'`audit.views.entries`).
+        # Sans `?meta=1`, la réponse reste un TABLEAU BRUT : `Caisses.jsx`/`caissesWire.ts` et
+        # `Wallets.jsx` consomment cette forme telle quelle, elle ne doit pas changer. Avec
+        # `?meta=1` (+ `?limit=&offset=`), on enveloppe et on expose `totalRows` DANS LE CORPS
+        # (jamais un header `X-Total-Rows` : illisible en JS sans Access-Control-Expose-Headers,
+        # ce qui casse en prod derrière un autre proxy). Le filtre `?agency=` reste actif ici.
+        if request.GET.get("meta") in ("1", "true", "yes"):
+            total = qs.count()
+            limit, offset = _pagination(request)
+            return Response({
+                "results": [serializers.account_row(a) for a in qs[offset:offset + limit]],
+                "totalRows": total,
+                "limit": limit,
+                "offset": offset,
+            })
         return Response([serializers.account_row(a) for a in qs])
     if not _require(request, "create"):
         return Response({"detail": "Capacité requise : create."}, status=403)
@@ -73,8 +102,13 @@ def account_detail(request, code):
 
 
 @api_view(["POST"])
-@permission_classes([HasCapability("validate")])
+@permission_classes([IsStaff, HasCapability("validate")])
 def account_action(request, code):
+    # `IsStaff` cumulé à `validate` (jamais `validate` seul) : AGIR sur une caisse ne peut pas
+    # être plus permissif que la LIRE. `accounts`/`account_register_sessions` exigent
+    # `[IsStaff, ...]` ; sans `IsStaff` ici, un rôle non-staff porteur de `validate` (possible
+    # via un `RoleOverride` de type Client) pourrait transférer/geler une caisse qu'il ne peut
+    # même pas consulter. Les rôles caisse légitimes (`gest_caisse`…) portent `is_staff_role`.
     account = TreasuryAccount.objects.filter(code=code).first()
     if not account:
         return Response({"detail": "Compte introuvable."}, status=404)
