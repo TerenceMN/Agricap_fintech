@@ -35,6 +35,7 @@ import {
   buildDefaultRateCards,
   buildInstitutionCards,
   buildWeightedReturnCard,
+  readAnalystFigure,
   scopeNote,
 } from '@/lib/adminInvestmentMetrics';
 
@@ -188,6 +189,36 @@ describe('asPortfolioMetrics — un endpoint non typé n’autorise aucune suppo
   it('laisse les cartes en motif sur un refus serveur', () => {
     const cards = buildInstitutionCards(asPortfolioMetrics(null));
     expect(cards.every((c) => c.value === null)).toBe(true);
+  });
+});
+
+describe('readAnalystFigure — un champ saisi n’est pas une mesure', () => {
+  it('affiche « non renseigné » plutôt que « 0 % » sur le défaut du modèle', () => {
+    // `FinancialAnalysis.irr` est `DecimalField(default=Decimal("0"))`, non
+    // nullable : une analyse jamais remplie affichait « TRI 0 % », c'est-à-dire
+    // un rendement nul là où il n'y a qu'un champ vide.
+    const tri = readAnalystFigure(0);
+    expect(tri.value).toBeNull();
+    expect(tri.unavailableReason).toContain('Non renseigné');
+    expect(tri.unavailableReason).toContain('0 par défaut');
+  });
+
+  it('affiche une valeur saisie, avec sa provenance', () => {
+    const tri = readAnalystFigure(14.2);
+    expect(tri.value).toBe('14,20 %');
+    expect(tri.provenance).toContain('Saisi par l’analyste');
+    expect(tri.provenance).toContain('non mesurée');
+    expect(tri.unavailableReason).toBeNull();
+  });
+
+  it('formate un ratio (DSCR) avec son suffixe, pas en pourcents', () => {
+    expect(readAnalystFigure(1.35, 'ratio').value).toBe('1,35 x');
+  });
+
+  it('rend un motif sur une valeur absente ou non numérique', () => {
+    expect(readAnalystFigure(null).value).toBeNull();
+    expect(readAnalystFigure(undefined).unavailableReason).toContain('Non servi');
+    expect(readAnalystFigure(Number.NaN).value).toBeNull();
   });
 });
 

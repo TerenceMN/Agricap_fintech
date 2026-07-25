@@ -71,7 +71,7 @@ const Accounting = () => {
             <TabsTrigger value="pieces">Pièces</TabsTrigger>
             <TabsTrigger value="provisions">Provisions</TabsTrigger>
             <TabsTrigger value="restitutions">Restitutions</TabsTrigger>
-            <TabsTrigger value="etats">États — SYSCOHADA</TabsTrigger>
+            <TabsTrigger value="etats">États — SYSCOHADA  </TabsTrigger>
             <TabsTrigger value="etats-bidevise">États — bi-devise</TabsTrigger>
         </TabsList>
 

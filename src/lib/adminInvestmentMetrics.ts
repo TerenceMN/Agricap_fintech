@@ -225,6 +225,72 @@ export function scopeNote(metrics: PortfolioMetricsPayload | null): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Chiffres SAISIS par un analyste — ni calculés, ni mesurés
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type AnalystFigureKind = 'percent' | 'ratio';
+
+export interface AnalystFigure {
+  /** Valeur formatée, ou `null` quand elle est indistinguable du défaut. */
+  value: string | null;
+  /** Ce que le chiffre est — saisie d'instruction, pas mesure de performance. */
+  provenance: string;
+  /** Motif affiché à la place de la valeur. `null` quand une valeur s'affiche. */
+  unavailableReason: string | null;
+}
+
+/**
+ * Lit un champ de `FinancialAnalysis` (marge EBITDA, DSCR, TRI).
+ *
+ * Ces trois champs sont `DecimalField(default=Decimal("0"))` et non nullables :
+ * ils sont **saisis par un analyste** au moment de l'instruction. Un dossier dont
+ * l'analyse n'a pas été remplie sort donc à `0`, et l'écran affichait
+ * « TRI 0 % » — un rendement nul, c'est-à-dire une information, là où il n'y
+ * avait qu'un champ vide.
+ *
+ * Le serveur ne peut pas lever l'ambiguïté (il n'existe pas de « non renseigné »
+ * distinct de zéro dans ce schéma, et `financial_analysis_row` ne sert ni
+ * `approved_at` ni `approved_by`). On tranche donc dans le sens qui ne fabrique
+ * pas d'information : `0` s'affiche comme NON RENSEIGNÉ, en disant pourquoi.
+ * Perdre l'affichage d'un vrai zéro est un moindre mal — un TRI de 0 % sur un
+ * dossier instruit est de toute façon un signal à faire corriger, pas une valeur
+ * à publier telle quelle.
+ *
+ * Le mot « TRI » lui-même est trompeur ici : le TRI calculé du module est un
+ * XIRR sur flux datés réels (`investments/metrics.py`), pas cette saisie.
+ */
+export function readAnalystFigure(
+  value: number | null | undefined,
+  kind: AnalystFigureKind = 'percent',
+): AnalystFigure {
+  const provenance = 'Saisi par l’analyste à l’instruction du dossier — hypothèse de '
+    + 'montage, non mesurée sur des flux réels.';
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return {
+      value: null,
+      provenance,
+      unavailableReason: 'Non servi par le serveur.',
+      };
+  }
+  if (Number(value) === 0) {
+    return {
+      value: null,
+      provenance,
+      unavailableReason: 'Non renseigné. Ce champ vaut 0 par défaut en base et n’a pas de '
+        + '« vide » distinct : un 0 affiché ici ne se distinguerait pas d’une analyse '
+        + 'jamais remplie.',
+    };
+  }
+  const n = Number(value);
+  const formate = kind === 'percent'
+    ? formatPercent(n)
+    : `${new Intl.NumberFormat('fr-FR', {
+      minimumFractionDigits: 2, maximumFractionDigits: 3,
+    }).format(n)} x`;
+  return { value: formate, provenance, unavailableReason: null };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Ce qui n'est pas servi
 // ─────────────────────────────────────────────────────────────────────────────
 

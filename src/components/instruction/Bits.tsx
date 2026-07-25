@@ -1,18 +1,27 @@
 /**
- * Briques d'affichage de l'écran d'instruction. Volontairement autonomes : les
- * modules `analyse/` et `admin/credits/` appartiennent à d'autres agents, et une
- * dépendance à leur palette ferait de chacun de leurs remaniements une
- * régression ici.
+ * Briques d'affichage de l'écran d'instruction.
+ *
+ * `Card` est RE-EXPORTÉE de `@/components/referentiel/Bits` : c'est exactement
+ * le même conteneur, sur un écran voisin du même back-office. Aucune raison d'en
+ * écrire une seconde.
+ *
+ * Ce qui reste écrit ici l'est parce qu'il n'existe pas ailleurs, et chaque
+ * élément dit pourquoi :
+ *   - `CardHead` accepte un `subtitle` en NŒUD React (celui de `referentiel/Bits`
+ *     n'accepte qu'une chaîne) : les en-têtes de cet écran portent des codes de
+ *     référentiel en `<span className="font-mono">` ;
+ *   - `Note` et `Pill` portent cinq tons dont `alerte` (rouge) et `ok` (vert),
+ *     là où ceux de `referentiel/Bits` n'en ont que deux (info, warn). Rabattre
+ *     l'alerte de substitution de référentiel sur un ambre « warn » affaiblirait
+ *     précisément le signal que le principe 10 demande de ne pas taire ;
+ *   - `Grandeur`, `Champ`, `classeChamp` et `Bouton` n'ont aucun équivalent :
+ *     le projet n'a pas de formulaire de back-office typé ni de tuile de chiffre
+ *     portant SA BASE (§4.6 — pas de pourcentage sans base).
  */
 import React from 'react';
+import { Card } from '@/components/referentiel/Bits';
 
-export const Card: React.FC<{ children: React.ReactNode; className?: string }> = ({
-  children, className = '',
-}) => (
-  <section className={`bg-white/5 border border-white/10 rounded-xl overflow-hidden ${className}`}>
-    {children}
-  </section>
-);
+export { Card };
 
 export const CardHead: React.FC<{
   title: string;

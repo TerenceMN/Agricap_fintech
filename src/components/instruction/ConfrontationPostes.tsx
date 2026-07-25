@@ -17,6 +17,19 @@
  * recalibrent sans redéploiement (principe 8) — la plage affichée serait fausse
  * dès le premier ajustement du comité, sans que rien ne le signale.
  *
+ * ─── POURQUOI PAS `analyse/ModuleGaps` (concept distinct, déclaré) ───────────
+ *
+ * `ModuleGaps` liste les écarts HORS PLAGE — c'est son objet, et il le fait
+ * bien : il fusionne `ecartsHorsPlage` et `indicateursHorsPlage`, et il ouvre le
+ * canal de justification. Ce que le fondateur demande ici est l'autre moitié :
+ * TOUS les postes du classeur, hors plage COMME dans la plage, plus ceux que le
+ * référentiel ne couvre pas du tout. La différence n'est pas cosmétique — un
+ * tableau qui ne montre que les écarts ne dit pas combien de postes ont été
+ * confrontés, donc ne permet pas de lire « 2 écarts sur 9 postes » plutôt que
+ * « 2 écarts ». Il ne montre pas non plus les postes financés mais absents du
+ * référentiel, qui n'entrent dans AUCUN écart et donc dans aucun score.
+ * Les deux vues coexistent, sur deux écrans, sans recalculer quoi que ce soit.
+ *
  * ⚠ STAFF UNIQUEMENT (principe 7) : références, écarts et effectif du référentiel
  * sont exactement ce qu'un demandeur ne doit jamais voir.
  */

@@ -1,32 +1,27 @@
 /**
- * Ce fichier teste un ADAPTATEUR : la plupart de ces fonctions délèguent à
- * `@/components/analyse/analyseFormat`, formateur du module crédit qu'on
- * consomme au lieu de le réécrire. Les assertions ci-dessous valent donc comme
- * contrat de ce que l'écran d'instruction attend de lui — si un remaniement de
- * `analyseFormat` faisait disparaître la 3e décimale du DSCR ou rendait « 0 »
- * pour une valeur absente, c'est ici que ça casserait.
+ * Ce fichier teste un ADAPTATEUR : `formatScore`, `formatEcartPct` et
+ * `formatDateTimeFr` délèguent à `@/components/analyse/analyseFormat`, formateur
+ * du module crédit qu'on consomme au lieu de le réécrire. Les assertions valent
+ * donc comme contrat de ce que l'écran d'instruction attend de lui — si un
+ * remaniement de `analyseFormat` faisait rendre « 0 » pour une valeur absente ou
+ * perdait le signe d'un écart, c'est ici que ça casserait.
+ *
+ * Seuls `formatEntier` et `abregerSha` sont écrits ici, faute d'équivalent.
  */
 import { describe, it, expect } from 'vitest';
 import {
-  NULL_DISPLAY, abregerSha, estNombre, formatDateTimeFr, formatDscr, formatEcartPct,
-  formatEntier, formatMois, formatPoids, formatPoints, formatPourcent, formatScore,
-  formatTaux, libelleIndicateur,
+  NULL_DISPLAY, abregerSha, estNombre, formatDateTimeFr, formatEcartPct, formatEntier,
+  formatScore,
 } from './format';
 
 /** Les espaces d'`Intl` sont insécables : on compare sur des chiffres, pas des blancs. */
-const chiffres = (s: string) => s.replace(/[\s  ]/g, '');
+const chiffres = (s: string) => s.replace(/[\s  ]/g, '');
 
 describe('une valeur absente s’affiche « — », jamais « 0 » (§4.6)', () => {
   const absentes = [null, undefined, '', Number.NaN];
   it.each([
     ['formatScore', formatScore],
-    ['formatPoints', formatPoints],
-    ['formatPoids', formatPoids],
-    ['formatDscr', formatDscr],
     ['formatEcartPct', formatEcartPct],
-    ['formatPourcent', formatPourcent],
-    ['formatTaux', formatTaux],
-    ['formatMois', formatMois],
     ['formatEntier', formatEntier],
   ])('%s', (_nom, fn) => {
     for (const v of absentes) expect(fn(v)).toBe(NULL_DISPLAY);
@@ -34,23 +29,15 @@ describe('une valeur absente s’affiche « — », jamais « 0 » (§4.6)', () 
 
   it('mais un zéro servi par le serveur reste un zéro', () => {
     expect(chiffres(formatScore(0))).toBe('0,0');
-    expect(chiffres(formatDscr(0))).toBe('0,00');
     expect(chiffres(formatEcartPct(0))).toBe('0,0%');
+    expect(formatEntier(0)).toBe('0');
   });
 });
 
-describe('précisions — chaque grandeur garde celle du moteur', () => {
-  it('garde la 3e décimale du DSCR : 0,999 n’est pas 1,00 devant un plancher', () => {
-    expect(chiffres(formatDscr(0.999))).toBe('0,999');
-    expect(chiffres(formatDscr(1.2))).toBe('1,20');
-  });
-
-  it('affiche le score au dixième', () => {
+describe('formatScore — la précision du moteur est conservée', () => {
+  it('affiche le score au dixième, comme le `quantize(0.1)` serveur', () => {
     expect(chiffres(formatScore(29.25))).toBe('29,3');
-  });
-
-  it('affiche le taux à deux décimales, en points de taux', () => {
-    expect(chiffres(formatTaux(18))).toBe('18,00%');
+    expect(chiffres(formatScore(100))).toBe('100,0');
   });
 });
 
@@ -64,24 +51,14 @@ describe('formatEcartPct — le signe porte le sens de l’écart', () => {
   });
 });
 
-describe('formatMois', () => {
-  it('rend la durée avec son unité', () => {
-    expect(chiffres(formatMois(8))).toBe('8mois');
-    expect(chiffres(formatMois(0))).toBe('0mois');
-  });
-});
-
-describe('libelleIndicateur — cosmétique, jamais une renomination', () => {
-  it('extrait le module du code canonique', () => {
-    expect(libelleIndicateur('cout_module:main_oeuvre')).toBe('main_oeuvre');
+describe('formatEntier — entier nu, sans unité ni symbole', () => {
+  it('rend l’entier sans décimale', () => {
+    expect(chiffres(formatEntier(12))).toBe('12');
+    expect(chiffres(formatEntier(2026))).toBe('2026');
   });
 
-  it('rend le code tel quel s’il ne porte pas de préfixe', () => {
-    expect(libelleIndicateur('dscr')).toBe('dscr');
-  });
-
-  it('ne fabrique pas de libellé pour un code absent', () => {
-    expect(libelleIndicateur(undefined)).toBe(NULL_DISPLAY);
+  it('ne rend pas un entier pour une chaîne : le contrat sert des nombres', () => {
+    expect(formatEntier('12')).toBe(NULL_DISPLAY);
   });
 });
 
@@ -93,12 +70,13 @@ describe('abregerSha — l’empreinte reste reconnaissable', () => {
     expect(court.endsWith('beef')).toBe(true);
   });
 
-  it('ne dit pas « — » pour une empreinte courte mais réelle', () => {
+  it('ne tronque pas une empreinte déjà courte', () => {
     expect(abregerSha('abc123')).toBe('abc123');
   });
 
   it('dit « — » quand le serveur n’a pas d’empreinte : non rejouable, pas « vide »', () => {
     expect(abregerSha('')).toBe(NULL_DISPLAY);
+    expect(abregerSha(null)).toBe(NULL_DISPLAY);
   });
 });
 

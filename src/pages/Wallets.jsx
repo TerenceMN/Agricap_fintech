@@ -20,7 +20,22 @@ import { exportToExcel } from '@/lib/export.js';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { api, ApiError } from '@/services/api';
 
-const RISK_LABEL_TO_PCT = { FAIBLE: 2, MODERE: 5, ELEVE: 8 };
+/*
+ * `RISK_LABEL_TO_PCT = { FAIBLE: 2, MODERE: 5, ELEVE: 8 }` a été SUPPRIMÉ.
+ *
+ * `caisses.TreasuryAccount.risk_level` est un champ CATÉGORIEL à trois valeurs.
+ * Le convertir en 2 / 5 / 8 fabriquait une grandeur continue là où il n'y a
+ * qu'un classement : « 5 % » se lit comme un taux mesuré, avec sa précision et
+ * sa comparabilité, alors que rien de tel n'a jamais été calculé. Le chiffre
+ * partait de surcroît dans `rapport_portefeuilles_global.xlsx` sous l'en-tête
+ * « Taux Risque (%) », où il pouvait entrer dans une moyenne.
+ *
+ * On affiche le NIVEAU servi, avec son libellé.
+ */
+const RISK_LEVEL_LABEL = { FAIBLE: 'Faible', MODERE: 'Modéré', ELEVE: 'Élevé' };
+const RISK_LEVEL_CLASS = {
+  FAIBLE: 'text-emerald-400', MODERE: 'text-yellow-400', ELEVE: 'text-red-400',
+};
 const STATUS_CODE_TO_LABEL = { ACTIF: 'Actif', EN_TRAITEMENT: 'En traitement', EN_OBSERVATION: 'En observation',
     BLOQUE: 'Bloqué', ARCHIVE: 'Archivé' };
 
@@ -279,7 +294,9 @@ const DetailsModal = ({ wallet, onClose }) => (
                 {[
                     ['Type', wallet?.type], ['Gestionnaire', wallet?.manager], ['Solde Actuel', `$${wallet?.balance.toLocaleString()}`],
                     ['Montant Initial', `$${wallet?.initialAmount.toLocaleString()}`], ['Statut', wallet?.status],
-                    ['Zone', wallet?.scope], ['Risque', `${wallet?.risk}%`], ['Date Création', wallet?.creationDate],
+                    ['Zone', wallet?.scope],
+                    ['Niveau de risque', RISK_LEVEL_LABEL[wallet?.riskLevel] ?? (wallet?.riskLevel || 'non servi')],
+                    ['Date Création', wallet?.creationDate],
                 ].map(([label, value]) => (
                     <div key={label} className="flex justify-between border-b border-slate-800 pb-1">
                         <span className="text-slate-400">{label}</span>
@@ -483,14 +500,22 @@ const Wallets = () => {
     const [partnerWallet, setPartnerWallet] = useState(null);
     const [ceilingWallet, setCeilingWallet] = useState(null);
 
-    // Mappe le compte de trésorerie réel (backend `caisses`) vers la forme attendue par ce
-    // tableau (hérité du mock : yield/source n'ont pas d'équivalent réel côté trésorerie
-    // pure — pas de rendement sur une caisse cash — laissés à 0/'-' plutôt qu'inventés).
+    // Mappe le compte de trésorerie réel (backend `caisses`) vers la forme attendue
+    // par ce tableau.
+    //
+    // `yield: 0` a été SUPPRIMÉ, avec la colonne « Rendement » et sa colonne
+    // d'export. Le commentaire d'origine disait justement qu'aucun rendement
+    // n'existe sur une caisse cash — mais il concluait « laissés à 0 plutôt
+    // qu'inventés », et un zéro EST une invention : « 0 % » se lit comme une
+    // mesure, c'est-à-dire comme un compte qui ne rapporte rien, et il partait
+    // dans un classeur où il entrait dans les moyennes. Une trésorerie n'a pas
+    // de rendement : la bonne réponse n'est pas zéro, c'est l'absence de colonne.
     const loadWallets = () => api.caisses.accounts.list().then(rows => setWalletsData(rows.map(a => ({
         id: a.code, name: a.name, type: a.kind, source: '-', manager: a.manager || '-',
-        initialAmount: a.initialAmount, balance: a.balance, yield: 0, status: STATUS_CODE_TO_LABEL[a.status] || a.status,
-        creationDate: new Date(a.createdAt).toLocaleDateString(), scope: a.scope || '-',
-        risk: RISK_LABEL_TO_PCT[a.riskLevel] ?? 0,
+        initialAmount: a.initialAmount, balance: a.balance,
+        status: STATUS_CODE_TO_LABEL[a.status] || a.status,
+        creationDate: new Date(a.createdAt).toLocaleDateString('fr-FR'), scope: a.scope || '-',
+        riskLevel: a.riskLevel || null,
         dailyCeiling: a.dailyCeiling, partnerId: a.partnerId, partnerName: a.partnerName,
     })))).catch(() => {});
     useEffect(() => { loadWallets(); api.agencies.list().then(setAgencies).catch(() => {}); }, []);
@@ -519,7 +544,11 @@ const Wallets = () => {
         exportToExcel([{
             "ID Portefeuille": wallet.id, "Nom": wallet.name, "Type": wallet.type, "Gestionnaire": wallet.manager,
             "Montant Initial ($)": wallet.initialAmount, "Solde Actuel ($)": wallet.balance, "Statut": wallet.status,
-            "Date Création": wallet.creationDate, "Zone": wallet.scope, "Taux Risque (%)": wallet.risk,
+            "Date Création": wallet.creationDate, "Zone": wallet.scope,
+            // « Taux Risque (%) » exportait 2/5/8 pour un champ à trois valeurs :
+            // dans un classeur, ce nombre entre dans une moyenne. On exporte le
+            // NIVEAU, qui est ce que le serveur connaît.
+            "Niveau de risque": RISK_LEVEL_LABEL[wallet.riskLevel] ?? (wallet.riskLevel || 'non servi'),
         }], `rapport_${wallet.id}`);
         toast({ title: "Exportation réussie", description: `Rapport de ${wallet.name} téléchargé.` });
     };
@@ -635,11 +664,13 @@ const Wallets = () => {
             "Gestionnaire": w.manager,
             "Montant Initial ($)": w.initialAmount,
             "Solde Actuel ($)": w.balance,
-            "Rendement (%)": w.yield,
+            // « Rendement (%) » exportait un 0 en dur : un compte de trésorerie n'a
+            // pas de rendement, et un zéro dans un tableur se lit — et se moyenne —
+            // comme une mesure. La colonne n'existe plus.
             "Statut": w.status,
             "Date Création": w.creationDate,
             "Zone": w.scope,
-            "Taux Risque (%)": w.risk,
+            "Niveau de risque": RISK_LEVEL_LABEL[w.riskLevel] ?? (w.riskLevel || 'non servi'),
         }));
         exportToExcel(dataToExport, 'rapport_portefeuilles_global');
         toast({ title: "Exportation réussie!", description: "Le fichier 'rapport_portefeuilles_global.xlsx' a été téléchargé." });
@@ -688,7 +719,7 @@ const Wallets = () => {
                                 <TableHead>Source</TableHead>
                                 <TableHead>Gestionnaire</TableHead>
                                 <TableHead>Solde Actuel</TableHead>
-                                <TableHead>Rendement</TableHead>
+                                {/* La colonne « Rendement » servait `yield: 0`, en dur. */}
                                 <TableHead>Statut</TableHead>
                                 <TableHead>Zone</TableHead>
                                 <TableHead>Risque</TableHead>
@@ -706,7 +737,6 @@ const Wallets = () => {
                                     <TableCell>{wallet.source}</TableCell>
                                     <TableCell>{wallet.manager}</TableCell>
                                     <TableCell className="font-mono text-emerald-400">${wallet.balance.toLocaleString()}</TableCell>
-                                    <TableCell className="font-mono text-purple-400">{wallet.yield}%</TableCell>
                                     <TableCell>
                                         <Badge variant={statusInfo.variant} className="flex items-center gap-1.5">
                                             {statusInfo.icon} {wallet.status}
@@ -717,10 +747,15 @@ const Wallets = () => {
                                         <TooltipProvider>
                                             <Tooltip>
                                                 <TooltipTrigger>
-                                                    <span className={`font-mono ${wallet.risk > 5 ? 'text-red-400' : wallet.risk > 3 ? 'text-yellow-400' : 'text-emerald-400'}`}>{wallet.risk}%</span>
+                                                    <span className={RISK_LEVEL_CLASS[wallet.riskLevel] ?? 'text-slate-400'}>
+                                                        {RISK_LEVEL_LABEL[wallet.riskLevel] ?? (wallet.riskLevel || 'non servi')}
+                                                    </span>
                                                 </TooltipTrigger>
                                                 <TooltipContent className="bg-slate-800 text-white border-slate-700">
-                                                    <p>Taux de risque estimé</p>
+                                                    <p>Niveau de risque du compte, classé par l'institution</p>
+                                                    <p className="text-xs text-slate-400">
+                                                        Trois valeurs possibles — ce n'est pas un taux mesuré.
+                                                    </p>
                                                 </TooltipContent>
                                             </Tooltip>
                                         </TooltipProvider>

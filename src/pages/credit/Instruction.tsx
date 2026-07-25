@@ -45,10 +45,17 @@ import {
 import { Card, CardHead, Note, Pill } from '@/components/instruction/Bits';
 import ParametresInstruction from '@/components/instruction/ParametresInstruction';
 import DocumentsReference from '@/components/instruction/DocumentsReference';
-import RecommandationMoteur from '@/components/instruction/RecommandationMoteur';
-import EcheancierPrevisionnel from '@/components/instruction/EcheancierPrevisionnel';
-import IndicateursFinanciers from '@/components/instruction/IndicateursFinanciers';
 import ConfrontationPostes from '@/components/instruction/ConfrontationPostes';
+// Restitution du moteur : quatre composants DÉJÀ écrits, testés et servis par
+// l'onglet Analyse du même dossier. Ils ne sont pas réécrits ici — un second
+// bandeau de recommandation ou un second échéancier auraient divergé du premier
+// au premier remaniement, et `EcheancierTable` porte déjà la troncature à 24
+// lignes et le rouge sur un CRD final non nul (invariant §5) que refaire aurait
+// coûté du temps pris à ce qui manque vraiment.
+import RecommendationBanner from '@/components/analyse/RecommendationBanner';
+import CriteriaTable from '@/components/analyse/CriteriaTable';
+import DscrPanel from '@/components/analyse/DscrPanel';
+import EcheancierTable from '@/components/analyse/EcheancierTable';
 import { construireConfrontation } from '@/components/instruction/confrontation';
 import { construireChoixDocuments } from '@/components/instruction/documents';
 import {
@@ -267,6 +274,7 @@ const Instruction: React.FC = () => {
     () => construireChoixDocuments(sources, simulation), [sources, simulation],
   );
   const modifie = useMemo(() => parametresModifies(saisie, analyse), [saisie, analyse]);
+  const devise = analyse?.devise || analyse?.parametres?.devise || '';
 
   // ── Gardes d'affichage ────────────────────────────────────────────────────
 
@@ -371,9 +379,34 @@ const Instruction: React.FC = () => {
 
           {analyse && (
             <>
-              <RecommandationMoteur analyse={analyse} />
-              <EcheancierPrevisionnel analyse={analyse} />
-              <IndicateursFinanciers analyse={analyse} />
+              <RecommendationBanner
+                recommandation={analyse.recommandation}
+                scoreGlobal={analyse.scoreGlobal}
+                scoreLettre={analyse.scoreLettre}
+                executeLe={analyse.executeLe}
+                versionMoteur={analyse.versionMoteur}
+                referentiel={analyse.referentielInfo?.code || analyse.referentiel}
+                referentielInfo={analyse.referentielInfo}
+              />
+
+              {/* Le moteur recommande, l'humain décide : la page ne porte aucun
+                  bouton de décision, et le dit plutôt que de le laisser deviner. */}
+              <Note tone="info" title="Cette page n'approuve rien">
+                La recommandation ci-dessus éclaire une décision ; elle ne la prend pas.
+                L'approbation, le rejet et l'ajournement se font sur le dossier, avec motif
+                obligatoire, plafond de délégation vérifié par le serveur et journalisation.
+              </Note>
+
+              <CriteriaTable criteres={analyse.criteres} scoreGlobal={analyse.scoreGlobal} />
+
+              <DscrPanel analyse={analyse} currency={devise} />
+
+              <EcheancierTable
+                lignes={analyse.echeancier}
+                currency={devise}
+                totaux={analyse.totaux}
+              />
+
               <ConfrontationPostes
                 confrontation={confrontation}
                 onJustifier={justifier}

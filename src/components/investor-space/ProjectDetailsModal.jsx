@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Button } from '@/components/ui/button';
@@ -13,6 +13,7 @@ import {
 import { api } from '@/services/api';
 import { formatCurrency, formatDate, getRiskLabel, getRiskFlagColor } from '@/lib/investorSpaceUtils';
 import { UNIT_FRACTION, formatPercent, rowRateToPercent } from '@/lib/investorSpaceWire';
+import { readAnalystFigure } from '@/lib/adminInvestmentMetrics';
 import InvestmentDecisionModals from './InvestmentDecisionModals';
 import ProjectQA from './ProjectQA';
 
@@ -254,9 +255,19 @@ const ProjectDetailsModal = ({ project, isOpen, onClose, onInvest }) => {
                         <p className="text-xs text-slate-400 mb-1">Cycle de Production</p>
                         <p className="text-sm text-white">{technical.productionCycleMonths} mois</p>
                       </div>
+                      {/* « Prévision Rendement » se lisait comme un rendement FINANCIER,
+                          au milieu d'un écran qui affiche par ailleurs un taux de coupon
+                          et un TRI. `TechnicalAnalysis.yield_forecast` est un rendement
+                          AGRONOMIQUE — une production attendue, pas un taux. */}
                       <div>
-                        <p className="text-xs text-slate-400 mb-1">Prévision Rendement</p>
-                        <p className="text-sm text-emerald-400 font-bold">{technical.yieldForecast}</p>
+                        <p className="text-xs text-slate-400 mb-1">Rendement agricole prévu (production)</p>
+                        <p className="text-sm text-emerald-400 font-bold">
+                          {technical.yieldForecast || 'Non renseigné'}
+                        </p>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          Prévision de production de l'exploitation. Ce n'est pas un rendement
+                          financier et cela ne se compare pas au taux de coupon.
+                        </p>
                       </div>
                     </CardContent>
                   </Card>
@@ -315,21 +326,45 @@ const ProjectDetailsModal = ({ project, isOpen, onClose, onInvest }) => {
                       </CardContent>
                     </Card>
 
+                    {/* Ces trois champs sont `DecimalField(default=0)` et non nullables :
+                        ils sont SAISIS par un analyste à l'instruction. Une analyse jamais
+                        remplie affichait « Marge EBITDA 0 % », « DSCR 0x », « TRI 0 % » —
+                        trois mesures nulles là où il n'y a que des champs vides. Le mot
+                        « TRI » était de surcroît trompeur : le TRI calculé du module est un
+                        XIRR sur flux datés réels (`investments/metrics.py`), pas cette saisie. */}
                     <Card className="bg-slate-800 border-slate-700">
-                      <CardHeader><CardTitle className="text-lg">Indicateurs</CardTitle></CardHeader>
+                      <CardHeader>
+                        <CardTitle className="text-lg">Hypothèses de montage</CardTitle>
+                        <CardDescription className="text-xs">
+                          Saisies par l'analyste à l'instruction — ni mesurées, ni recalculées.
+                        </CardDescription>
+                      </CardHeader>
                       <CardContent className="space-y-3">
-                        <div>
-                          <p className="text-xs text-slate-400 mb-1">Marge EBITDA</p>
-                          <p className="text-2xl font-bold text-emerald-400">{financial.ebitdaMargin}%</p>
-                        </div>
-                        <div>
-                          <p className="text-xs text-slate-400 mb-1">DSCR</p>
-                          <p className="text-2xl font-bold text-blue-400">{financial.dscr}x</p>
-                        </div>
-                        <div>
-                          <p className="text-xs text-slate-400 mb-1">TRI</p>
-                          <p className="text-2xl font-bold text-purple-400">{financial.irr}%</p>
-                        </div>
+                        {[
+                          { label: 'Marge EBITDA (prévisionnelle)', figure: readAnalystFigure(financial.ebitdaMargin), tone: 'text-emerald-400' },
+                          { label: 'DSCR (prévisionnel)', figure: readAnalystFigure(financial.dscr, 'ratio'), tone: 'text-blue-400' },
+                          { label: 'TRI attendu par l’analyste', figure: readAnalystFigure(financial.irr), tone: 'text-purple-400' },
+                        ].map(({ label, figure, tone }) => (
+                          <div key={label}>
+                            <p className="text-xs text-slate-400 mb-1">{label}</p>
+                            {figure.value === null ? (
+                              <>
+                                <p className="text-base font-semibold text-slate-500">Non renseigné</p>
+                                <p className="text-[11px] text-slate-500 mt-0.5 leading-relaxed">
+                                  {figure.unavailableReason}
+                                </p>
+                              </>
+                            ) : (
+                              <p className={`text-2xl font-bold ${tone}`}>{figure.value}</p>
+                            )}
+                          </div>
+                        ))}
+                        <p className="text-[11px] text-slate-500 pt-2 border-t border-slate-700 leading-relaxed">
+                          Le « TRI » ci-dessus est une attente d'analyste, pas un rendement
+                          constaté. Le rendement réellement réalisé est un XIRR calculé par le
+                          serveur sur des flux datés, et il s'affiche dans votre espace
+                          investisseur — les deux ne se comparent pas.
+                        </p>
                       </CardContent>
                     </Card>
                   </div>
